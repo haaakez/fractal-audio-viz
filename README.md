@@ -80,7 +80,7 @@ The benchmark does not decode audio or encode video:
 
 ```sh
 python3 benchmark.py --renderer native --zoom 1e100 \
-  --width 256 --height 256 --iterations 20000 --repeat 2
+  --width 256 --height 256 --iterations 20000 --series-block 4096 --repeat 2
 ```
 
 It reports deep field-render time and pixels per second. To measure the
@@ -112,9 +112,11 @@ perturbation is far below the BLA radius, the native path automatically uses
 the mathematically equivalent linear branch; it restores the requested
 higher-order series near the escape boundary. A conservative scaled Brent
 cycle check terminates settled interior pixels without mistaking ordinary
-boundary transients for interiors. The currently validated degree-three BLA
-hierarchy is capped at 256 iterations per map; larger `--series-block` values
-are accepted for compatibility but safely clamp to that limit.
+boundary transients for interiors. Degree-three maps remain capped at 256
+iterations per map. Linear maps use a validated 1024-step deep tier and a
+4096-step ultra-deep tier below e60 for the bundled e12 reference; shallower
+frames automatically clamp to the safer tier. `--series-block` defaults to
+4096, but explicit lower values remain useful for conservative comparisons.
 
 Keyframe fields are cached by renderer identity, absolute zoom, dimensions,
 centre, iteration budget and approximation settings. Cache writes and final
