@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.so
+*.o
+*.mp3
+*.wav
+*.mp4
+*.mkv
+keyframes/
+.cache/
+.gitdata/
