@@ -728,7 +728,9 @@ inline ScaledComplex apply_bla_series(
 struct BlaLevels {
     std::vector<std::vector<FastBlaStep>> levels;
     std::vector<std::vector<LinearBlaStep>> linear_levels;
+    std::vector<std::vector<LinearBlaStep>> deep_linear_levels;
     FloatExp input_radius;
+    FloatExp deep_input_radius;
     // First reference-orbit index that a BLA map must not cross.  Once the
     // reference itself escapes, its orbit grows super-exponentially; using a
     // long map across that point can hide an escape behind cancellation in a
@@ -775,23 +777,25 @@ struct BlaLevels {
     const LinearBlaStep* lookup_linear(
         int start,
         const FloatExp& delta_norm_squared,
-        int max_length
+        int max_length,
+        bool deep
     ) const noexcept {
+        const auto& available_levels = deep ? deep_linear_levels : linear_levels;
         if (start <= 0 || max_length <= 0) return nullptr;
-        const int base_count = linear_levels.empty()
-            ? 0 : static_cast<int>(linear_levels[0].size());
+        const int base_count = available_levels.empty()
+            ? 0 : static_cast<int>(available_levels[0].size());
         if (start > base_count) return nullptr;
         int highest_level = highest_level_for_length(max_length);
         highest_level = std::min(
             highest_level,
-            static_cast<int>(linear_levels.size()) - 1);
+            static_cast<int>(available_levels.size()) - 1);
         const int offset = start - 1;
         for (int level = highest_level; level >= 0; --level) {
             const int span_mask = (1 << level) - 1;
             if ((offset & span_mask) != 0) continue;
             const int index = offset >> level;
-            if (index >= static_cast<int>(linear_levels[level].size())) continue;
-            const LinearBlaStep& candidate = linear_levels[level][static_cast<size_t>(index)];
+            if (index >= static_cast<int>(available_levels[level].size())) continue;
+            const LinearBlaStep& candidate = available_levels[level][static_cast<size_t>(index)];
             if (fe_compare(delta_norm_squared, candidate.radius_squared) < 0) {
                 return &candidate;
             }
@@ -1148,53 +1152,64 @@ void build_bla(ReferenceContext& context) {
         }
     }
 
-    // Keep a separate linear hierarchy for the deep branch.  Its compact
-    // A/B-only records fit much better in cache than the cubic records, and
-    // its radius is composed with the actual reusable viewport radius in the
-    // same way as Kalles/Fraktaler's linear BLA maps.
-    std::vector<std::vector<LinearBlaBuilderStep>> linear_builder_levels;
-    linear_builder_levels.emplace_back(static_cast<size_t>(base_count));
-    for (int start = 1; start <= base_count; ++start) {
-        const FloatExpComplex& reference = context.fast_orbit[static_cast<size_t>(start)];
-        const FloatExp radius = fe_mul(
-            tolerance,
-            fe_sqrt(fec_norm_squared(reference)));
-        linear_builder_levels[0][static_cast<size_t>(start - 1)] = {
-            fec_mul(reference, FloatExp::from_parts(2.0, 0)),
-            {FloatExp::from_parts(1.0, 0), FloatExp{0.0, 0}},
-            fe_sqr(radius),
-            1,
-        };
-    }
-    for (size_t level = 1; ; ++level) {
-        if ((1ULL << level) > static_cast<unsigned long long>(MAX_SAFE_LINEAR_BLA_LENGTH)) {
-            break;
+    // Keep separate linear hierarchies for the normal deep branch and for
+    // genuinely tiny viewports.  The first is valid for the reusable
+    // reference viewport; the second is composed with a bound 20 decades
+    // smaller, so e40--e4000 frames can use long maps without paying for the
+    // shallow frame's parameter-radius pessimism.
+    auto build_linear_levels = [&](const FloatExp& composition_input_radius) {
+        std::vector<std::vector<LinearBlaBuilderStep>> builder_levels;
+        builder_levels.emplace_back(static_cast<size_t>(base_count));
+        for (int start = 1; start <= base_count; ++start) {
+            const FloatExpComplex& reference = context.fast_orbit[static_cast<size_t>(start)];
+            const FloatExp radius = fe_mul(
+                tolerance,
+                fe_sqrt(fec_norm_squared(reference)));
+            builder_levels[0][static_cast<size_t>(start - 1)] = {
+                fec_mul(reference, FloatExp::from_parts(2.0, 0)),
+                {FloatExp::from_parts(1.0, 0), FloatExp{0.0, 0}},
+                fe_sqr(radius),
+                1,
+            };
         }
-        const size_t previous_size = linear_builder_levels[level - 1].size();
-        const size_t current_size = (previous_size + 1) / 2;
-        if (current_size == 0) break;
-        linear_builder_levels.emplace_back(current_size);
-        for (size_t index = 0; index < current_size; ++index) {
-            const size_t first = index * 2;
-            if (first + 1 < previous_size) {
-                linear_builder_levels[level][index] = merge_linear_bla(
-                    linear_builder_levels[level - 1][first + 1],
-                    linear_builder_levels[level - 1][first],
-                    context.bla.input_radius);
-            } else {
-                linear_builder_levels[level][index] =
-                    linear_builder_levels[level - 1][first];
+        for (size_t level = 1; ; ++level) {
+            if ((1ULL << level) > static_cast<unsigned long long>(MAX_SAFE_LINEAR_BLA_LENGTH)) {
+                break;
+            }
+            const size_t previous_size = builder_levels[level - 1].size();
+            const size_t current_size = (previous_size + 1) / 2;
+            if (current_size == 0) break;
+            builder_levels.emplace_back(current_size);
+            for (size_t index = 0; index < current_size; ++index) {
+                const size_t first = index * 2;
+                if (first + 1 < previous_size) {
+                    builder_levels[level][index] = merge_linear_bla(
+                        builder_levels[level - 1][first + 1],
+                        builder_levels[level - 1][first],
+                        composition_input_radius);
+                } else {
+                    builder_levels[level][index] =
+                        builder_levels[level - 1][first];
+                }
             }
         }
-    }
-    context.bla.linear_levels.reserve(linear_builder_levels.size());
-    for (const auto& builder_level : linear_builder_levels) {
-        auto& render_level = context.bla.linear_levels.emplace_back();
-        render_level.reserve(builder_level.size());
-        for (const LinearBlaBuilderStep& step : builder_level) {
-            render_level.push_back(compact_linear_bla_step(step));
+        std::vector<std::vector<LinearBlaStep>> render_levels;
+        render_levels.reserve(builder_levels.size());
+        for (const auto& builder_level : builder_levels) {
+            auto& render_level = render_levels.emplace_back();
+            render_level.reserve(builder_level.size());
+            for (const LinearBlaBuilderStep& step : builder_level) {
+                render_level.push_back(compact_linear_bla_step(step));
+            }
         }
-    }
+        return render_levels;
+    };
+
+    context.bla.deep_input_radius = fe_mul(
+        context.bla.input_radius,
+        1.0e-20);
+    context.bla.linear_levels = build_linear_levels(context.bla.input_radius);
+    context.bla.deep_linear_levels = build_linear_levels(context.bla.deep_input_radius);
     context.fast_orbit.clear();
     context.fast_orbit.shrink_to_fit();
 }
@@ -1328,6 +1343,8 @@ void render_bla(
         fe_compare(current_input_radius, context.bla.input_radius) <= 0;
     const bool disable_bla = !bla_radius_covers_view
         || std::getenv("FRACTAL_DISABLE_BLA") != nullptr;
+    const bool use_deep_linear =
+        fe_compare(current_input_radius, context.bla.deep_input_radius) <= 0;
     // The existing BLA hierarchy is a real polynomial approximation, not a
     // compatibility label.  Use its lower-precision tail only after the
     // perturbation has grown large enough for ordinary doubles; keeping BLA
@@ -1336,7 +1353,9 @@ void render_bla(
     // quadratic map to short blocks.
     const int max_bla_length = std::clamp(series_block, 2, MAX_SAFE_BLA_LENGTH);
     const int max_linear_bla_length = std::clamp(
-        series_block, 2, MAX_SAFE_LINEAR_BLA_LENGTH);
+        series_block,
+        2,
+        use_deep_linear ? MAX_SAFE_LINEAR_BLA_LENGTH : MAX_SAFE_BLA_LENGTH);
     const int approximation_order = std::clamp(series_order, 1, 3);
 
     // These offsets are shared by every pixel in a row/column.  Computing
@@ -1470,7 +1489,8 @@ void render_bla(
                         linear_step = context.bla.lookup_linear(
                             reference_index,
                             delta_norm_float,
-                            std::min(max_linear_bla_length, remaining_iterations));
+                            std::min(max_linear_bla_length, remaining_iterations),
+                            use_deep_linear);
                     } else {
                         step = context.bla.lookup(
                             reference_index,

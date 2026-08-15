@@ -380,6 +380,64 @@ class NativeRendererTests(unittest.TestCase):
             finally:
                 self.library.fractal_destroy_reference(handle)
 
+    def test_deep_linear_tier_matches_exact_at_tier_boundary(self):
+        """The extra deep hierarchy must stay exact at e30 and e100."""
+
+        width = height = 4
+        max_iter = 2400
+        output_type = ctypes.c_float * (width * height)
+        handle = self.library.fractal_create_reference(
+            b"-1.711030826576984823314722728180246694222252112777834549259732560022287905717123892927883662257081287304281205446785464750361745",
+            b"0.000001509818957972609043170877177447547323633361751210706181530872644435995661269979265353802853564243259051551728584671844401805",
+            b"1e12",
+            max_iter,
+            768,
+            3,
+        )
+        self.assertTrue(handle, self.library.fractal_last_error())
+        try:
+            for zoom_text in (b"1e30", b"1e100"):
+                with_reference = output_type()
+                exact = output_type()
+                old_value = os.environ.get("FRACTAL_DISABLE_BLA")
+                os.environ["FRACTAL_DISABLE_BLA"] = "1"
+                try:
+                    status = self.library.render_mandelbrot_reference(
+                        exact,
+                        width,
+                        height,
+                        zoom_text,
+                        handle,
+                        max_iter,
+                        2,
+                        3,
+                        1024,
+                    )
+                finally:
+                    if old_value is None:
+                        os.environ.pop("FRACTAL_DISABLE_BLA", None)
+                    else:
+                        os.environ["FRACTAL_DISABLE_BLA"] = old_value
+                self.assertEqual(status, 0, self.library.fractal_last_error())
+                status = self.library.render_mandelbrot_reference(
+                    with_reference,
+                    width,
+                    height,
+                    zoom_text,
+                    handle,
+                    max_iter,
+                    2,
+                    3,
+                    1024,
+                )
+                self.assertEqual(status, 0, self.library.fractal_last_error())
+                self.assertLessEqual(
+                    max(abs(a - b) for a, b in zip(with_reference, exact)),
+                    1e-3,
+                )
+        finally:
+            self.library.fractal_destroy_reference(handle)
+
     def test_deep_field_matches_independent_mpmath_oracle(self):
         """Check the native perturbation result against direct high precision math.
 
