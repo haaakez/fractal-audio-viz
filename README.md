@@ -16,8 +16,9 @@ make test
 ```
 
 `make` builds `mandelbrot.so`. MPFR/GMP are required for native deep zooms.
-The supplied shell opts the local build into `-march=native` for the current
-CPU; the Python fallback remains useful for shallow tests and previews.
+The supplied shell opts the local build into `-O3`, `-march=native`, link-time
+optimization and `-fno-math-errno` for the current CPU; the Python fallback
+remains useful for shallow tests and previews.
 
 ## Render
 
@@ -89,6 +90,9 @@ separate output-stage bottleneck, use:
 python3 benchmark.py --stage compositor --renderer native \
   --width 1920 --height 1080 --threads 6 --repeat 3
 ```
+
+Pass `--x-center` and `--y-center` to benchmark a different deep-zoom target;
+the defaults use the bundled centre.
 
 The video renderer also prints separate tile and frame/crop/pipe timings so
 fractal work and encoding backpressure can be distinguished.

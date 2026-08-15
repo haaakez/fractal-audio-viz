@@ -1,7 +1,7 @@
 CXX ?= g++
 PKG_CONFIG ?= pkg-config
 
-CXXFLAGS ?= -O3 -march=native -std=c++17 -fPIC -Wall -Wextra -Wpedantic
+CXXFLAGS ?= -O3 -march=native -std=c++17 -fPIC -Wall -Wextra -Wpedantic -flto -fno-math-errno
 OPENMP_FLAGS ?= -fopenmp
 MPFR_AVAILABLE := $(shell $(PKG_CONFIG) --exists mpfr gmp && echo yes)
 

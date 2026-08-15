@@ -1087,7 +1087,7 @@ void render_scaled_double_tail(
 }
 
 void render_bla(
-    float* output,
+    float* __restrict output,
     int width,
     int height,
     const char* zoom_text,

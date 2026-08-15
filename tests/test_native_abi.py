@@ -150,11 +150,12 @@ class NativeRendererTests(unittest.TestCase):
         )
         self.assertTrue(handle, self.library.fractal_last_error())
         try:
-            status = self.library.render_mandelbrot_reference(
-                output, width, height, b"1e100", handle, 1000, 2, 3, 256
-            )
-            self.assertEqual(status, 0, self.library.fractal_last_error())
-            self.assertTrue(all(math.isfinite(value) for value in output))
+            for zoom_text in (b"1e100", b"1e4000"):
+                status = self.library.render_mandelbrot_reference(
+                    output, width, height, zoom_text, handle, 1000, 2, 3, 256
+                )
+                self.assertEqual(status, 0, self.library.fractal_last_error())
+                self.assertTrue(all(math.isfinite(value) for value in output))
         finally:
             self.library.fractal_destroy_reference(handle)
 

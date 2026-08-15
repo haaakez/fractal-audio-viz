@@ -25,6 +25,8 @@ def main() -> None:
     )
     parser.add_argument("--zoom", default="1e100")
     parser.add_argument("--iterations", type=int, default=20000)
+    parser.add_argument("--x-center", default=visualizer.DEFAULT_X_CENTER)
+    parser.add_argument("--y-center", default=visualizer.DEFAULT_Y_CENTER)
     parser.add_argument("--renderer", choices=("auto", "native", "python"), default="auto")
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--series-order", type=int, choices=(1, 2, 3), default=3)
@@ -108,8 +110,8 @@ def main() -> None:
     native_library = None
     if args.renderer != "python" and log_zoom >= 12.0:
         native_library, native_reference = visualizer._create_native_reference(
-            visualizer.DEFAULT_X_CENTER,
-            visualizer.DEFAULT_Y_CENTER,
+            args.x_center,
+            args.y_center,
             args.iterations,
             log_zoom,
             args.series_order,
@@ -123,8 +125,8 @@ def main() -> None:
                 args.width,
                 args.height,
                 log_zoom,
-                visualizer.DEFAULT_X_CENTER,
-                visualizer.DEFAULT_Y_CENTER,
+                args.x_center,
+                args.y_center,
                 args.iterations,
                 args.renderer,
                 args.threads,
@@ -141,6 +143,8 @@ def main() -> None:
             "height": args.height,
             "zoom": args.zoom,
             "iterations": args.iterations,
+            "x_center": args.x_center,
+            "y_center": args.y_center,
             "repeat": args.repeat,
             "seconds": timings,
             "best_seconds": min(timings),
