@@ -651,6 +651,12 @@ struct BlaLevels {
     std::vector<std::vector<FastBlaStep>> levels;
     FloatExp input_radius;
 
+    static int highest_level_for_length(int max_length) noexcept {
+        return max_length > 0
+            ? 31 - __builtin_clz(static_cast<unsigned int>(max_length))
+            : 0;
+    }
+
     const FastBlaStep* lookup(
         int start,
         const FloatExp& delta_norm_squared,
@@ -659,11 +665,7 @@ struct BlaLevels {
         if (start <= 0 || max_length <= 0) return nullptr;
         const int base_count = levels.empty() ? 0 : static_cast<int>(levels[0].size());
         if (start > base_count) return nullptr;
-        int highest_level = 0;
-        while (highest_level < 30
-               && (1 << (highest_level + 1)) <= max_length) {
-            ++highest_level;
-        }
+        int highest_level = highest_level_for_length(max_length);
         highest_level = std::min(
             highest_level,
             static_cast<int>(levels.size()) - 1);
