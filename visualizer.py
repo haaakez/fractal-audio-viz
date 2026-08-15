@@ -2649,7 +2649,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--series-block",
         type=int,
         default=256,
-        help="maximum BLA block length (2-4096); 256 is the validated default",
+        help="requested BLA block length (native validated cap is 256)",
     )
     parser.add_argument(
         "--renderer",

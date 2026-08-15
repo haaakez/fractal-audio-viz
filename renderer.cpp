@@ -27,6 +27,10 @@
 namespace {
 
 constexpr int ABI_VERSION = 8;
+// Degree-three maps have been independently checked through this block size.
+// Larger maps are still accepted by the ABI but deliberately fall back to
+// this validated limit until higher-order composition is implemented.
+constexpr int MAX_SAFE_BLA_LENGTH = 256;
 constexpr long double ESCAPE_RADIUS_SQUARED = 4.0L;
 constexpr long double LOG_TWO = 0.693147180559945309417232121458176568L;
 
@@ -935,6 +939,9 @@ void build_bla(ReferenceContext& context) {
     }
 
     for (size_t level = 1; ; ++level) {
+        if ((1ULL << level) > static_cast<unsigned long long>(MAX_SAFE_BLA_LENGTH)) {
+            break;
+        }
         const size_t previous_size = builder_levels[level - 1].size();
         const size_t current_size = previous_size / 2;
         if (current_size == 0) break;
@@ -1106,7 +1113,7 @@ void render_bla(
     // active through e100 is what turns reference reuse into iteration reuse.
     // The cubic terms suppress the accumulated error that limited the old
     // quadratic map to short blocks.
-    const int max_bla_length = std::clamp(series_block, 2, 4096);
+    const int max_bla_length = std::clamp(series_block, 2, MAX_SAFE_BLA_LENGTH);
     const int approximation_order = std::clamp(series_order, 1, 3);
 
     // These offsets are shared by every pixel in a row/column.  Computing

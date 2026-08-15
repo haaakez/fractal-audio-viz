@@ -108,7 +108,9 @@ perturbation is far below the BLA radius, the native path automatically uses
 the mathematically equivalent linear branch; it restores the requested
 higher-order series near the escape boundary. A conservative scaled Brent
 cycle check terminates settled interior pixels without mistaking ordinary
-boundary transients for interiors.
+boundary transients for interiors. The currently validated degree-three BLA
+hierarchy is capped at 256 iterations per map; larger `--series-block` values
+are accepted for compatibility but safely clamp to that limit.
 
 Keyframe fields are cached by renderer identity, absolute zoom, dimensions,
 centre, iteration budget and approximation settings. Cache writes and final
