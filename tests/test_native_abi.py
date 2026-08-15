@@ -352,7 +352,7 @@ class NativeRendererTests(unittest.TestCase):
                         max_iter,
                         2,
                         3,
-                        1024,
+                        4096,
                     )
                 finally:
                     if old_value is None:
@@ -369,7 +369,7 @@ class NativeRendererTests(unittest.TestCase):
                     max_iter,
                     2,
                     3,
-                    1024,
+                    4096,
                 )
                 self.assertEqual(status, 0, self.library.fractal_last_error())
                 self.assertTrue(all(math.isfinite(value) for value in with_reference))

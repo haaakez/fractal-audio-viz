@@ -1043,7 +1043,7 @@ def render_fractal(
     native_threads: int = 0,
     native_reference: Any = None,
     series_order: int = 3,
-    series_block: int = 256,
+    series_block: int = 4096,
 ) -> Any:
     """Render with the C-ABI backend, falling back to the Python backend."""
 
@@ -2638,8 +2638,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--series-block",
         type=int,
-        default=256,
-        help="requested BLA block length (native validated cap is 256)",
+        default=4096,
+        help="requested BLA block length (cubic cap 256; ultra-deep linear cap 4096)",
     )
     parser.add_argument(
         "--renderer",

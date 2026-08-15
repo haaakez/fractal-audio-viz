@@ -31,7 +31,10 @@ constexpr int ABI_VERSION = 8;
 // Larger maps are still accepted by the ABI but deliberately fall back to
 // this validated limit until higher-order composition is implemented.
 constexpr int MAX_SAFE_BLA_LENGTH = 256;
-constexpr int MAX_SAFE_LINEAR_BLA_LENGTH = 1024;
+// Long linear maps are enabled only in the ultra-deep tier below; ordinary
+// e12--e40 frames stay on the independently validated 256/1024 limits.
+constexpr int MAX_SAFE_LINEAR_BLA_LENGTH = 4096;
+constexpr int MAX_SAFE_DEEP_LINEAR_BLA_LENGTH = 1024;
 constexpr long double ESCAPE_RADIUS_SQUARED = 4.0L;
 constexpr long double LOG_TWO = 0.693147180559945309417232121458176568L;
 
@@ -1345,6 +1348,11 @@ void render_bla(
         || std::getenv("FRACTAL_DISABLE_BLA") != nullptr;
     const bool use_deep_linear =
         fe_compare(current_input_radius, context.bla.deep_input_radius) <= 0;
+    const FloatExp ultra_deep_input_radius = fe_mul(
+        context.bla.input_radius,
+        1.0e-40);
+    const bool use_ultra_deep_linear =
+        fe_compare(current_input_radius, ultra_deep_input_radius) <= 0;
     // The existing BLA hierarchy is a real polynomial approximation, not a
     // compatibility label.  Use its lower-precision tail only after the
     // perturbation has grown large enough for ordinary doubles; keeping BLA
@@ -1355,7 +1363,11 @@ void render_bla(
     const int max_linear_bla_length = std::clamp(
         series_block,
         2,
-        use_deep_linear ? MAX_SAFE_LINEAR_BLA_LENGTH : MAX_SAFE_BLA_LENGTH);
+        use_ultra_deep_linear
+            ? MAX_SAFE_LINEAR_BLA_LENGTH
+            : (use_deep_linear
+                ? MAX_SAFE_DEEP_LINEAR_BLA_LENGTH
+                : MAX_SAFE_BLA_LENGTH));
     const int approximation_order = std::clamp(series_order, 1, 3);
 
     // These offsets are shared by every pixel in a row/column.  Computing

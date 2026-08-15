@@ -30,7 +30,7 @@ def main() -> None:
     parser.add_argument("--renderer", choices=("auto", "native", "python"), default="auto")
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--series-order", type=int, choices=(1, 2, 3), default=3)
-    parser.add_argument("--series-block", type=int, default=256)
+    parser.add_argument("--series-block", type=int, default=4096)
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
