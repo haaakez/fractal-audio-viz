@@ -80,6 +80,7 @@ DEFAULT_Y_CENTER = (
 # renderer from silently reusing an old, under-resolved .npy keyframe.
 KEYFRAME_CACHE_SCHEMA = "bla-keyframe-blend-colour-v6"
 AUDIO_CACHE_SCHEMA = "audio-controls-v5-dynamics-pitch"
+ATLAS_CACHE_SCHEMA = "nested-atlas-v1"
 
 _native_library: Any = None
 _native_checked = False
@@ -130,7 +131,7 @@ def _get_native_library() -> Any:
             if not hasattr(library, "fractal_abi_version"):
                 continue
             library.fractal_abi_version.restype = ctypes.c_int
-            if library.fractal_abi_version() != 7:
+            if library.fractal_abi_version() != 8:
                 continue
             library.fractal_last_error.restype = ctypes.c_char_p
             library.fractal_colourise.argtypes = [
@@ -162,6 +163,29 @@ def _get_native_library() -> Any:
                 ctypes.c_int,
             ]
             library.fractal_crop_colourise.restype = ctypes.c_int
+            if hasattr(library, "fractal_atlas_colourise"):
+                library.fractal_atlas_colourise.argtypes = [
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_uint8),
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_int,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_int,
+                ]
+                library.fractal_atlas_colourise.restype = ctypes.c_int
             library.fractal_create_reference.argtypes = [
                 ctypes.c_char_p,
                 ctypes.c_char_p,
@@ -1088,9 +1112,9 @@ def _zoom_plan(
     The total travel is still exactly ``start_zoom`` to ``max_zoom`` at the
     final frame.  A small negative quiet-time velocity lets the camera ease
     back between beats; loud instrumental moments overcome that bias and
-    advance the camera decisively.  The renderer treats the resulting path as
-    a bounded range per keyframe, so these deliberate local zoom-outs remain
-    valid instead of being clamped into a jittery crop.
+    advance the camera decisively. Pullbacks are bounded at the requested
+    starting view, which keeps the absolute tile atlas reusable across songs
+    while preserving backward motion after a punch.
     """
 
     np = _require_numpy()
@@ -1118,7 +1142,8 @@ def _zoom_plan(
         drive = drive - float(np.min(drive)) + 1.0e-3
         cumulative = np.concatenate(([0.0], np.cumsum(drive[:-1])))
         total = max(float(np.sum(drive[:-1])), 1.0e-6) if drive.size > 1 else 1.0
-    return start_log + span * cumulative / total
+    planned = start_log + span * cumulative / total
+    return np.clip(planned, start_log, max_log)
 
 
 def _crop_and_resize(
@@ -1195,6 +1220,511 @@ def _zoom_chunks(zooms: Any, keyframe_factor: float) -> Any:
 
 def _keyframe_count(zooms: Any, keyframe_factor: float) -> int:
     return sum(1 for _ in _zoom_chunks(zooms, keyframe_factor))
+
+
+def _atlas_geometry(
+    zooms: Any,
+    keyframe_factor: float,
+) -> tuple[float, float, int]:
+    """Return the fixed logarithmic tile ladder for a camera path.
+
+    Unlike the legacy chunker, the ladder is independent of audio timing. A
+    tile at level ``n`` covers one factor-sized central region of its parent;
+    the compositor uses the parent for the outer image and the child for the
+    newly revealed centre. This keeps every tile at native sampling density
+    while avoiding a factor-squared full-frame render at every level.
+    """
+
+    if len(zooms) == 0:
+        raise ValueError("cannot build an atlas for an empty zoom path")
+    step = math.log10(max(1.05, float(keyframe_factor)))
+    minimum = float(min(float(value) for value in zooms))
+    maximum = float(max(float(value) for value in zooms))
+    origin = math.floor(minimum / step) * step
+    level_count = max(0, int(math.ceil((maximum - origin) / step - 1.0e-12)))
+    return origin, step, level_count
+
+
+def _atlas_level_for_zoom(log_zoom: float, origin: float, step: float, level_count: int) -> int:
+    level = int(math.floor((float(log_zoom) - origin) / step + 1.0e-9))
+    return max(0, min(level, level_count))
+
+
+def _atlas_tile_path(
+    cache_dir: Optional[Path],
+    cache_identity: str,
+    render_width: int,
+    render_height: int,
+    level: int,
+    log_zoom: float,
+    x_center: str,
+    y_center: str,
+    max_iter: int,
+    series_order: int,
+    series_block: int,
+) -> Optional[Path]:
+    if cache_dir is None:
+        return None
+    cache_key = hashlib.sha256(
+        repr((
+            ATLAS_CACHE_SCHEMA,
+            cache_identity,
+            render_width,
+            render_height,
+            level,
+            log_zoom,
+            x_center,
+            y_center,
+            max_iter,
+            series_order,
+            series_block,
+        )).encode("utf-8")
+    ).hexdigest()[:24]
+    return cache_dir / f"atlas-tile-{cache_key}.npy"
+
+
+def _atlas_tile_field(
+    *,
+    cache_dir: Optional[Path],
+    cache_identity: str,
+    render_width: int,
+    render_height: int,
+    level: int,
+    log_zoom: float,
+    x_center: str,
+    y_center: str,
+    max_iter: int,
+    series_order: int,
+    series_block: int,
+    renderer: str,
+    native_reference: Any,
+    native_threads: int,
+) -> Any:
+    """Load or render one reusable tile in the fixed zoom atlas."""
+
+    np = _require_numpy()
+    cache_path = _atlas_tile_path(
+        cache_dir,
+        cache_identity,
+        render_width,
+        render_height,
+        level,
+        log_zoom,
+        x_center,
+        y_center,
+        max_iter,
+        series_order,
+        series_block,
+    )
+    if cache_path is not None:
+        try:
+            cached = np.load(cache_path, mmap_mode="r", allow_pickle=False)
+            if cached.shape == (render_height, render_width):
+                print(f"Using cached atlas tile {level} ({cache_path.name}).", flush=True)
+                return cached
+        except (OSError, ValueError):
+            pass
+
+    print(
+        f"Rendering atlas tile {level} at zoom {_zoom_label(log_zoom)}, "
+        f"iterations {max_iter}",
+        flush=True,
+    )
+    field = render_fractal(
+        render_width,
+        render_height,
+        log_zoom,
+        x_center,
+        y_center,
+        max_iter,
+        renderer,
+        native_threads,
+        native_reference,
+        series_order,
+        series_block,
+    )
+    if cache_path is not None:
+        _atomic_save_field(cache_path, field)
+        try:
+            return np.load(cache_path, mmap_mode="r", allow_pickle=False)
+        except (OSError, ValueError):
+            pass
+    return np.asarray(field, dtype=np.float32)
+
+
+def _atlas_colourise_native(
+    parent: Any,
+    child: Any,
+    output_width: int,
+    output_height: int,
+    parent_zoom: float,
+    child_fraction: float,
+    parent_iter: int,
+    child_iter: Optional[int],
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    native_threads: int,
+    library: Any,
+    pitch: float,
+) -> Any:
+    """Fused parent/child atlas sampling and pitch-aware colourisation."""
+
+    np = _require_numpy()
+    parent = np.ascontiguousarray(parent, dtype=np.float32)
+    parent_height, parent_width = parent.shape
+    output = np.empty((output_height, output_width, 3), dtype=np.uint8)
+    if child is None or child_iter is None:
+        child_pointer = ctypes.POINTER(ctypes.c_float)()
+        child_height = child_width = child_max_iter = 0
+    else:
+        child = np.ascontiguousarray(child, dtype=np.float32)
+        child_height, child_width = child.shape
+        child_max_iter = int(child_iter)
+        child_pointer = child.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    palette_max_iter = max(int(parent_iter), int(child_iter or parent_iter))
+    status = library.fractal_atlas_colourise(
+        parent.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        parent_width,
+        parent_height,
+        int(parent_iter),
+        child_pointer,
+        child_width,
+        child_height,
+        child_max_iter,
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        output_width,
+        output_height,
+        float(parent_zoom),
+        float(child_fraction),
+        palette_max_iter,
+        float(phase),
+        float(vocal),
+        float(instrumental),
+        float(pitch),
+        native_threads,
+    )
+    if status != 0:
+        message = library.fractal_last_error() or b"unknown native atlas colourizer error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
+def _atlas_colour_frame(
+    parent: Any,
+    child: Any,
+    output_width: int,
+    output_height: int,
+    parent_zoom: float,
+    child_fraction: float,
+    parent_iter: int,
+    child_iter: Optional[int],
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    native_library: Any,
+    native_threads: int,
+    resample: str,
+    palette_name: str,
+    pitch: float,
+) -> Any:
+    """Compose a frame from a parent tile and its central child tile.
+
+    ``child_fraction`` is the fraction of the output frame covered by the
+    child. At the beginning of an atlas interval it is 1/factor; at the end
+    it reaches one. The child is therefore rendered only into its visible
+    central rectangle instead of being expanded into a full temporary frame.
+    """
+
+    np = _require_numpy()
+    if (
+        native_library is not None
+        and hasattr(native_library, "fractal_atlas_colourise")
+        and resample == "bilinear"
+        and palette_name == "aurora"
+    ):
+        return _atlas_colourise_native(
+            parent,
+            child,
+            output_width,
+            output_height,
+            parent_zoom,
+            child_fraction,
+            parent_iter,
+            child_iter,
+            phase,
+            vocal,
+            instrumental,
+            native_threads,
+            native_library,
+            pitch,
+        )
+    parent_rgb = _colour_frame(
+        parent,
+        output_width,
+        output_height,
+        max(float(parent_zoom), 1.0),
+        parent_iter,
+        phase,
+        vocal,
+        instrumental,
+        native_library,
+        native_threads,
+        resample,
+        palette_name,
+        pitch,
+    )
+    if child is None or child_iter is None or child_fraction <= 0.0:
+        return parent_rgb
+    child_fraction = min(float(child_fraction), 1.0)
+    if child_fraction >= 0.999999:
+        return _colour_frame(
+            child,
+            output_width,
+            output_height,
+            1.0,
+            child_iter,
+            phase,
+            vocal,
+            instrumental,
+            native_library,
+            native_threads,
+            resample,
+            palette_name,
+            pitch,
+        )
+
+    child_width = max(1, int(round(output_width * child_fraction)))
+    child_height = max(1, int(round(output_height * child_fraction)))
+    child_rgb = _colour_frame(
+        child,
+        child_width,
+        child_height,
+        1.0,
+        child_iter,
+        phase,
+        vocal,
+        instrumental,
+        native_library,
+        native_threads,
+        resample,
+        palette_name,
+        pitch,
+    )
+    left = (output_width - child_width) // 2
+    top = (output_height - child_height) // 2
+    right = left + child_width
+    bottom = top + child_height
+    region = parent_rgb[top:bottom, left:right]
+    feather = min(16, child_width // 8, child_height // 8)
+    if feather < 2:
+        region[...] = child_rgb
+        return parent_rgb
+
+    yy, xx = np.ogrid[:child_height, :child_width]
+    edge_distance = np.minimum(
+        np.minimum(xx, yy),
+        np.minimum(child_width - 1 - xx, child_height - 1 - yy),
+    )
+    alpha = np.clip(edge_distance.astype(np.float32) / float(feather), 0.0, 1.0)
+    blended = (
+        region.astype(np.float32) * (1.0 - alpha[..., None])
+        + child_rgb.astype(np.float32) * alpha[..., None]
+    )
+    region[...] = np.asarray(np.rint(blended), dtype=np.uint8)
+    return parent_rgb
+
+
+def _render_video_atlas(
+    *,
+    command: list[str],
+    temporary_output: Path,
+    output_path: Path,
+    features: AudioFeatures,
+    width: int,
+    height: int,
+    fps: int,
+    keyframe_factor: float,
+    x_center: str,
+    y_center: str,
+    zooms: Any,
+    iteration_base: int,
+    iterations_per_decade: int,
+    iteration_cap: int,
+    active_renderer: str,
+    native_library: Any,
+    native_reference: Any,
+    native_threads: int,
+    series_order: int,
+    series_block: int,
+    render_width: int,
+    render_height: int,
+    resample: str,
+    palette: str,
+    cache_dir: Optional[Path],
+    cache_limit_mb: float,
+    cache_identity: str,
+) -> None:
+    """Render a song through a fixed nested tile atlas.
+
+    The old renderer tied source fields to audio-dependent chunk boundaries.
+    This path ties them only to absolute logarithmic zoom, so a tile is
+    rendered once and can be reused by every camera path through the same
+    centre. Only two adjacent tiles are retained in memory.
+    """
+
+    np = _require_numpy()
+    origin, step, level_count = _atlas_geometry(zooms, keyframe_factor)
+    factor = 10.0 ** step
+    maximum_log = float(max(float(value) for value in zooms))
+    total_frames = features.frame_count
+    print(
+        f"Atlas source: {render_width}x{render_height}; levels: {level_count + 1}; "
+        f"log step: {step:.6f}; origin: {_zoom_label(origin)}",
+        flush=True,
+    )
+
+    tile_cache: dict[int, Any] = {}
+    tile_iterations: dict[int, int] = {}
+    tile_seconds = 0.0
+
+    def tile_log(level: int) -> float:
+        return origin + step * float(level)
+
+    def tile_iter(level: int) -> int:
+        cached = tile_iterations.get(level)
+        if cached is not None:
+            return cached
+        current_log = tile_log(level)
+        end_log = min(maximum_log, current_log + step)
+        value = max_iterations(
+            end_log,
+            iteration_base,
+            iterations_per_decade,
+            iteration_cap,
+        )
+        tile_iterations[level] = value
+        return value
+
+    def get_tile(level: int) -> Any:
+        nonlocal tile_seconds
+        if level < 0 or level > level_count:
+            return None
+        if level in tile_cache:
+            return tile_cache[level]
+        started = time.perf_counter()
+        tile_cache[level] = _atlas_tile_field(
+            cache_dir=cache_dir,
+            cache_identity=cache_identity,
+            render_width=render_width,
+            render_height=render_height,
+            level=level,
+            log_zoom=tile_log(level),
+            x_center=x_center,
+            y_center=y_center,
+            max_iter=tile_iter(level),
+            series_order=series_order,
+            series_block=series_block,
+            renderer=active_renderer,
+            native_reference=native_reference,
+            native_threads=native_threads,
+        )
+        tile_seconds += time.perf_counter() - started
+        _prune_cache(cache_dir, cache_limit_mb)
+        return tile_cache[level]
+
+    process = None
+    frame_seconds = 0.0
+    render_started = time.perf_counter()
+    active_level = None
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE)
+        for frame_index in range(total_frames):
+            frame_started = time.perf_counter()
+            frame_log_zoom = float(zooms[frame_index])
+            level = _atlas_level_for_zoom(frame_log_zoom, origin, step, level_count)
+            if level != active_level:
+                active_level = level
+                print(
+                    f"Entering atlas level {level}/{level_count} at "
+                    f"frame {frame_index}/{total_frames}.",
+                    flush=True,
+                )
+                # The child is needed for the central high-resolution region
+                # throughout the parent's interval, so prepare it before the
+                # first frame that can display it.
+                get_tile(level)
+                if level < level_count:
+                    get_tile(level + 1)
+                for old_level in tuple(tile_cache):
+                    if old_level < level - 1:
+                        del tile_cache[old_level]
+
+            parent_log = tile_log(level)
+            parent = get_tile(level)
+            child = get_tile(level + 1) if level < level_count else None
+            parent_zoom = max(1.0, 10.0 ** (frame_log_zoom - parent_log))
+            child_fraction = min(1.0, parent_zoom / factor) if child is not None else 0.0
+            parent_max_iter = tile_iter(level)
+            child_max_iter = tile_iter(level + 1) if child is not None else None
+            phase = float(features.phase[frame_index])
+            vocal = float(features.vocal[frame_index])
+            instrumental = float(features.instrumental[frame_index])
+            pitch = float(features.pitch[frame_index])
+            rgb = _atlas_colour_frame(
+                parent,
+                child,
+                width,
+                height,
+                parent_zoom,
+                child_fraction,
+                parent_max_iter,
+                child_max_iter,
+                phase,
+                vocal,
+                instrumental,
+                native_library,
+                native_threads,
+                resample,
+                palette,
+                pitch,
+            )
+            assert process.stdin is not None
+            process.stdin.write(np.ascontiguousarray(rgb, dtype=np.uint8))
+            frame_seconds += time.perf_counter() - frame_started
+            if frame_index % max(1, fps * 5) == 0:
+                print(f"  encoded {100.0 * frame_index / total_frames:5.1f}%")
+
+        assert process.stdin is not None
+        process.stdin.close()
+        process.stdin = None
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(f"ffmpeg exited with status {return_code}")
+        os.replace(temporary_output, output_path)
+        elapsed = time.perf_counter() - render_started
+        print(
+            f"Atlas timing: tiles {tile_seconds:.2f}s, frame/crop/pipe "
+            f"{frame_seconds:.2f}s, total {elapsed:.2f}s.",
+            flush=True,
+        )
+    except BrokenPipeError as exc:
+        if process is not None:
+            process.kill()
+            process.wait()
+        raise RuntimeError("ffmpeg stopped while receiving video frames") from exc
+    except BaseException:
+        if process is not None and process.poll() is None:
+            process.kill()
+        if process is not None:
+            process.wait()
+        raise
+    finally:
+        if temporary_output.exists():
+            try:
+                temporary_output.unlink()
+            except OSError:
+                pass
 
 
 @lru_cache(maxsize=8)
@@ -1508,7 +2038,7 @@ def _prune_cache(cache_dir: Optional[Path], limit_mb: float) -> None:
     limit_bytes = int(limit_mb * 1024 * 1024)
     files = [
         path
-        for pattern in ("keyframe-*.npy", "audio-*.npz")
+        for pattern in ("keyframe-*.npy", "atlas-tile-*.npy", "audio-*.npz")
         for path in cache_dir.glob(pattern)
         if path.is_file()
     ]
@@ -1601,22 +2131,33 @@ def render_video(
     cache_limit_mb: float = 0.0,
     video_codec: str = "libx264",
     crf: int = 18,
+    keyframe_mode: str = "atlas",
 ) -> None:
     np = _require_numpy()
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required to encode the video, but it was not found on PATH")
 
-    quality_settings = {
-        # Draft intentionally permits undersampling for quick musical timing
-        # previews.  All other modes retain at least one output sample per
-        # output pixel at the keyframe boundary.
-        "draft": (max(fractal_scale, 0.25), 0.0),
-        "balanced": (max(fractal_scale, 1.0), 0.12),
-        # A factor-two keyframe needs two samples per output dimension if the
-        # crop itself is to remain native-resolution at the end of its span.
-        "quality": (max(fractal_scale, keyframe_factor), 0.20),
-        "extreme": (max(fractal_scale, keyframe_factor * 2.0), 0.28),
-    }
+    if keyframe_mode not in {"atlas", "legacy"}:
+        raise ValueError(f"unknown keyframe mode: {keyframe_mode}")
+    if keyframe_mode == "atlas":
+        # Nested tiles already provide the missing factor-two density at the
+        # centre of every interval. Keep quality presets as modest optional
+        # supersampling instead of rendering every tile at factor squared.
+        quality_settings = {
+            "draft": (max(fractal_scale, 0.5), 0.0),
+            "balanced": (max(fractal_scale, 1.0), 0.0),
+            "quality": (max(fractal_scale, 1.0), 0.0),
+            "extreme": (max(fractal_scale, 1.25), 0.0),
+        }
+    else:
+        # Legacy full-field mode is retained for visual regression and for
+        # comparing the new atlas against the previous renderer.
+        quality_settings = {
+            "draft": (max(fractal_scale, 0.25), 0.0),
+            "balanced": (max(fractal_scale, 1.0), 0.12),
+            "quality": (max(fractal_scale, keyframe_factor), 0.20),
+            "extreme": (max(fractal_scale, keyframe_factor * 2.0), 0.28),
+        }
     if quality not in quality_settings:
         raise ValueError(f"unknown quality preset: {quality}")
     source_scale, transition_fraction = quality_settings[quality]
@@ -1675,7 +2216,7 @@ def render_video(
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
     total_frames = features.frame_count
-    chunks = list(_zoom_chunks(zooms, keyframe_factor))
+    chunks = list(_zoom_chunks(zooms, keyframe_factor)) if keyframe_mode == "legacy" else []
 
     native_library = None
     native_reference = None
@@ -1727,11 +2268,54 @@ def render_video(
     cache_identity = _field_renderer_cache_identity(active_renderer)
     print(
         f"Keyframe source: {render_width}x{render_height} ({quality}); "
-        f"planned keyframes: {_keyframe_count(zooms, keyframe_factor)}; "
+        f"planned keyframes: "
+        f"{_keyframe_count(zooms, keyframe_factor) if keyframe_mode == 'legacy' else _atlas_geometry(zooms, keyframe_factor)[2] + 1}; "
+        f"mode: {keyframe_mode}; "
         f"field renderer: {active_renderer}; "
         f"native threads: {native_threads}; encoder threads: {encoder_threads}",
         flush=True,
     )
+
+    if keyframe_mode == "atlas":
+        try:
+            _render_video_atlas(
+                command=command,
+                temporary_output=temporary_output,
+                output_path=output_path,
+                features=features,
+                width=width,
+                height=height,
+                fps=fps,
+                keyframe_factor=keyframe_factor,
+                x_center=x_center,
+                y_center=y_center,
+                zooms=zooms,
+                iteration_base=iteration_base,
+                iterations_per_decade=iterations_per_decade,
+                iteration_cap=iteration_cap,
+                active_renderer=active_renderer,
+                native_library=native_library,
+                native_reference=native_reference,
+                native_threads=native_threads,
+                series_order=series_order,
+                series_block=series_block,
+                render_width=render_width,
+                render_height=render_height,
+                resample=resample,
+                palette=palette,
+                cache_dir=cache_dir,
+                cache_limit_mb=cache_limit_mb,
+                cache_identity=_field_renderer_cache_identity(active_renderer),
+            )
+        finally:
+            if native_reference is not None and native_library is not None:
+                native_library.fractal_destroy_reference(native_reference)
+            if temporary_output.exists():
+                try:
+                    temporary_output.unlink()
+                except OSError:
+                    pass
+        return
 
     process = None
     render_started = time.perf_counter()
@@ -1986,8 +2570,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("draft", "balanced", "quality", "extreme"),
         default="balanced",
         help=(
-            "draft is fastest; balanced avoids undersampling; quality renders "
-            "factor-sized keyframes; extreme supersamples further"
+            "draft is fastest; balanced uses output-resolution nested tiles; "
+            "quality preserves source scale; extreme supersamples modestly"
         ),
     )
     parser.add_argument(
@@ -1995,6 +2579,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=2.0,
         help="maximum zoom change between high-resolution keyframes",
+    )
+    parser.add_argument(
+        "--keyframe-mode",
+        choices=("atlas", "legacy"),
+        default="atlas",
+        help="use reusable nested tiles (atlas) or the previous full-field chunk renderer",
     )
     parser.add_argument("--x-center", default=DEFAULT_X_CENTER)
     parser.add_argument("--y-center", default=DEFAULT_Y_CENTER)
@@ -2208,17 +2798,30 @@ def main() -> None:
         f"{args.output}"
     )
     if args.estimate:
-        estimate_scale = {
-            "draft": max(args.fractal_scale, 0.25),
-            "balanced": max(args.fractal_scale, 1.0),
-            "quality": max(args.fractal_scale, args.keyframe_factor),
-            "extreme": max(args.fractal_scale, args.keyframe_factor * 2.0),
-        }[args.quality]
+        if args.keyframe_mode == "atlas":
+            estimate_scale = {
+                "draft": max(args.fractal_scale, 0.5),
+                "balanced": max(args.fractal_scale, 1.0),
+                "quality": max(args.fractal_scale, 1.0),
+                "extreme": max(args.fractal_scale, 1.25),
+            }[args.quality]
+        else:
+            estimate_scale = {
+                "draft": max(args.fractal_scale, 0.25),
+                "balanced": max(args.fractal_scale, 1.0),
+                "quality": max(args.fractal_scale, args.keyframe_factor),
+                "extreme": max(args.fractal_scale, args.keyframe_factor * 2.0),
+            }[args.quality]
         render_width = max(16, int(round(args.width * args.render_scale * estimate_scale)))
         render_height = max(16, int(round(args.height * args.render_scale * estimate_scale)))
+        planned_units = (
+            _atlas_geometry(zooms, args.keyframe_factor)[2] + 1
+            if args.keyframe_mode == "atlas"
+            else _keyframe_count(zooms, args.keyframe_factor)
+        )
         print(
             f"Estimate: {render_width}x{render_height} fractal source, "
-            f"{_keyframe_count(zooms, args.keyframe_factor)} keyframes, "
+            f"{planned_units} {args.keyframe_mode} levels, "
             f"{args.video_preset} encoder, {args.quality} quality."
         )
         return
@@ -2251,6 +2854,7 @@ def main() -> None:
         args.cache_limit_mb,
         args.codec,
         args.crf,
+        args.keyframe_mode,
     )
     print(f"Done -> {args.output}")
 

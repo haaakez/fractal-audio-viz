@@ -3,7 +3,7 @@
 This project renders an audio-reactive Mandelbrot zoom locally. The Python
 front end handles audio, animation and FFmpeg; the C++ C-ABI backend handles
 deep numerical rendering, MPFR reference orbits, perturbation, BLA maps,
-OpenMP and the fused crop/colour path.
+OpenMP and the fused atlas/composite path.
 
 ## Build
 
@@ -41,9 +41,17 @@ that bias. Attack and release are configurable with `--attack` and
 Quality modes:
 
 - `draft`: fastest preview; may undersample source keyframes.
-- `balanced`: output-resolution source fields and transition blending.
-- `quality`: source fields are sized for the complete factor-two crop.
-- `extreme`: additional source supersampling and longer blending.
+- `balanced`: one output-resolution tile per factor-two zoom level.
+- `quality`: the same nested atlas with the requested source scale preserved.
+- `extreme`: modest additional source supersampling.
+
+The default `--keyframe-mode atlas` renders a fixed logarithmic ladder of
+nested tiles. Each frame is composed from two adjacent tiles, so the centre
+keeps native resolution while the outer region is reused from the parent.
+The ladder is independent of audio timing and its absolute tiles can be
+reused by later renders with the same centre, scale and numerical settings.
+Use `--keyframe-mode legacy` only for visual regression against the previous
+full-field chunk renderer.
 
 For a 500×500 preview, `--quality quality --keyframe-factor 2` renders
 approximately 1000×1000 source fields. This costs more memory and fractal
@@ -74,9 +82,16 @@ python3 benchmark.py --renderer native --zoom 1e100 \
   --width 256 --height 256 --iterations 20000 --repeat 2
 ```
 
-It reports field-render time and pixels per second. The video renderer also
-prints separate keyframe and crop/colour/pipe timings so fractal work and
-encoding backpressure can be distinguished.
+It reports deep field-render time and pixels per second. To measure the
+separate output-stage bottleneck, use:
+
+```sh
+python3 benchmark.py --stage compositor --renderer native \
+  --width 1920 --height 1080 --threads 6 --repeat 3
+```
+
+The video renderer also prints separate tile and frame/crop/pipe timings so
+fractal work and encoding backpressure can be distinguished.
 
 Use `--estimate` with the normal visualizer command to analyse the song and
 print the source resolution and keyframe count without rendering. Video
@@ -88,9 +103,12 @@ encoding can be tuned with `--codec`, `--crf` and `--video-preset`; the default
 Deep fields use a reusable high-precision reference orbit. Pixel offsets use
 perturbation arithmetic; the native BLA hierarchy applies polynomial maps
 through degree three and replays blocks that approach the escape boundary.
-The `--series-order` option selects degree one through three. The ordinary
-double tail is entered only after the perturbation is large enough that its
-relative precision is safe.
+The `--series-order` option selects degree one through three. When a deep
+perturbation is far below the BLA radius, the native path automatically uses
+the mathematically equivalent linear branch; it restores the requested
+higher-order series near the escape boundary. A conservative scaled Brent
+cycle check terminates settled interior pixels without mistaking ordinary
+boundary transients for interiors.
 
 Keyframe fields are cached by renderer identity, absolute zoom, dimensions,
 centre, iteration budget and approximation settings. Cache writes and final

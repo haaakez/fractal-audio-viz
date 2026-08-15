@@ -15,7 +15,7 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(zooms.shape, instrumental.shape)
         self.assertAlmostEqual(float(zooms[0]), 0.0, places=12)
         self.assertAlmostEqual(float(zooms[-1]), 12.0, places=9)
-        self.assertLess(float(np.min(zooms)), 0.0)
+        self.assertGreaterEqual(float(np.min(zooms)), 0.0)
         self.assertLess(float(np.min(np.diff(zooms))), 0.0)
         self.assertGreater(float(np.max(np.diff(zooms))), 0.0)
         self.assertGreater(float(zooms[3] - zooms[2]), 0.0)
@@ -27,6 +27,58 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(chunks[-1][1], zooms.size)
         for _, _, low, high in chunks:
             self.assertLess(high - low, np.log10(2.0))
+
+    def test_atlas_has_fixed_levels_independent_of_frame_boundaries(self):
+        zooms = np.linspace(0.0, 100.0, 1001, dtype=np.float64)
+        origin, step, level_count = visualizer._atlas_geometry(zooms, 2.0)
+        self.assertAlmostEqual(origin, 0.0, places=12)
+        self.assertAlmostEqual(step, np.log10(2.0), places=12)
+        self.assertEqual(level_count, 333)
+        self.assertEqual(visualizer._atlas_level_for_zoom(0.0, origin, step, level_count), 0)
+        self.assertEqual(
+            visualizer._atlas_level_for_zoom(100.0, origin, step, level_count),
+            332,
+        )
+        self.assertEqual(
+            visualizer._atlas_level_for_zoom(origin + step * level_count, origin, step, level_count),
+            level_count,
+        )
+
+    def test_atlas_compositor_uses_child_only_in_central_region(self):
+        parent = np.zeros((8, 8), dtype=np.float32)
+        child = np.ones((8, 8), dtype=np.float32)
+        original = visualizer._colour_frame
+
+        def fake_colour(field, output_width, output_height, *args):
+            value = 20 if float(field[0, 0]) > 0.5 else 10
+            return np.full((output_height, output_width, 3), value, dtype=np.uint8)
+
+        visualizer._colour_frame = fake_colour
+        try:
+            result = visualizer._atlas_colour_frame(
+                parent,
+                child,
+                32,
+                32,
+                1.0,
+                0.5,
+                100,
+                100,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                1,
+                "bilinear",
+                "aurora",
+                0.5,
+            )
+        finally:
+            visualizer._colour_frame = original
+        self.assertEqual(result.shape, (32, 32, 3))
+        self.assertEqual(result.dtype, np.uint8)
+        self.assertEqual(int(result[0, 0, 0]), 10)
+        self.assertEqual(int(result[16, 16, 0]), 20)
 
     def test_custom_palettes_are_cached_and_finite(self):
         field = np.linspace(0.0, 100.0, 64 * 64, dtype=np.float32).reshape(64, 64)

@@ -27,7 +27,8 @@ pkgs.mkShell {
     export NIX_ENFORCE_NO_NATIVE=0
     echo "Fractal visualizer shell ready. Run: make && python visualizer.py song.mp3"
     echo "Run 'make test' for correctness checks and 'make benchmark' for native throughput."
-    echo "Use --quality balanced for stable output, --quality quality for factor-sized keyframes."
+    echo "Atlas keyframes are the default; use --keyframe-mode legacy for regression comparisons."
+    echo "Use --quality balanced for stable output, --quality extreme for modest supersampling."
     echo "Set OMP_NUM_THREADS and --native-threads to avoid CPU oversubscription."
     echo "Demucs is used automatically when available; --separation spectral enables proxies explicitly."
   '';

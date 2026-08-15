@@ -26,7 +26,7 @@
 
 namespace {
 
-constexpr int ABI_VERSION = 7;
+constexpr int ABI_VERSION = 8;
 constexpr long double ESCAPE_RADIUS_SQUARED = 4.0L;
 constexpr long double LOG_TWO = 0.693147180559945309417232121458176568L;
 
@@ -101,6 +101,100 @@ std::array<double, 3> pitch_base_colour(double pitch) {
         0.58 * (1.0 - saturation) + chromatic[1] * saturation,
         0.58 * (1.0 - saturation) + chromatic[2] * saturation,
     };
+}
+
+struct BilinearAxis {
+    std::vector<int> index0;
+    std::vector<int> index1;
+    std::vector<float> weight;
+};
+
+BilinearAxis make_bilinear_axis(
+    int source_size,
+    int destination_size,
+    double zoom_factor
+) {
+    if (source_size <= 0 || destination_size <= 0) {
+        throw std::runtime_error("invalid bilinear axis dimensions");
+    }
+    zoom_factor = std::max(zoom_factor, 1.0);
+    const double inverse_zoom = 1.0 / zoom_factor;
+    const double crop_size = static_cast<double>(source_size) * inverse_zoom;
+    const double left = (static_cast<double>(source_size) - crop_size) * 0.5;
+    const double step = crop_size / static_cast<double>(destination_size);
+
+    BilinearAxis axis;
+    axis.index0.resize(static_cast<size_t>(destination_size));
+    axis.index1.resize(static_cast<size_t>(destination_size));
+    axis.weight.resize(static_cast<size_t>(destination_size));
+    for (int destination = 0; destination < destination_size; ++destination) {
+        double source = left
+            + (static_cast<double>(destination) + 0.5) * step - 0.5;
+        source = std::clamp(source, 0.0, static_cast<double>(source_size - 1));
+        const int index0 = static_cast<int>(std::floor(source));
+        axis.index0[static_cast<size_t>(destination)] = index0;
+        axis.index1[static_cast<size_t>(destination)] =
+            std::min(index0 + 1, source_size - 1);
+        axis.weight[static_cast<size_t>(destination)] =
+            static_cast<float>(source - static_cast<double>(index0));
+    }
+    return axis;
+}
+
+inline float sample_bilinear_mapped(
+    const float* source,
+    int source_width,
+    const BilinearAxis& x_axis,
+    const BilinearAxis& y_axis,
+    int x,
+    int y
+) {
+    const int x_index = x_axis.index0[static_cast<size_t>(x)];
+    const int x_next = x_axis.index1[static_cast<size_t>(x)];
+    const float x_weight = x_axis.weight[static_cast<size_t>(x)];
+    const int y_index = y_axis.index0[static_cast<size_t>(y)];
+    const int y_next = y_axis.index1[static_cast<size_t>(y)];
+    const float y_weight = y_axis.weight[static_cast<size_t>(y)];
+    const float* top = source + static_cast<size_t>(y_index) * source_width;
+    const float* bottom = source + static_cast<size_t>(y_next) * source_width;
+    const float top_value = top[x_index] * (1.0F - x_weight)
+        + top[x_next] * x_weight;
+    const float bottom_value = bottom[x_index] * (1.0F - x_weight)
+        + bottom[x_next] * x_weight;
+    return top_value * (1.0F - y_weight) + bottom_value * y_weight;
+}
+
+inline void write_colour_pixel(
+    float smooth,
+    int source_max_iter,
+    const PaletteBasis& basis,
+    float palette_index_scale,
+    double pattern_cos,
+    double pattern_sin,
+    double vocal_mix,
+    double brightness,
+    const std::array<double, 3>& base,
+    std::uint8_t* destination
+) {
+    if (!std::isfinite(smooth)
+        || smooth >= static_cast<float>(source_max_iter) - 0.5F) {
+        destination[0] = 0;
+        destination[1] = 0;
+        destination[2] = 0;
+        return;
+    }
+    const int palette_size = static_cast<int>(basis.cosine.size());
+    const int palette_index = std::clamp(
+        static_cast<int>(smooth * palette_index_scale),
+        0,
+        palette_size - 1);
+    const double cosine = basis.cosine[static_cast<size_t>(palette_index)];
+    const double sine = basis.sine[static_cast<size_t>(palette_index)];
+    const double contour = 0.82 + (0.08 + 0.12 * vocal_mix) * (
+        0.5 - 0.5 * (cosine * pattern_cos + sine * pattern_sin));
+    destination[0] = colour_byte(base[0] * contour * brightness * 255.0);
+    destination[1] = colour_byte(base[1] * contour * brightness * 255.0);
+    destination[2] = colour_byte(base[2] * contour * brightness * 255.0);
 }
 
 long double parse_zoom(const char* text) {
@@ -1051,6 +1145,10 @@ void render_bla(
             bool have_total = false;
             ScaledComplex total{};
             ScaledNorm total_norm{};
+            ScaledComplex cycle_tortoise{};
+            int cycle_power = 1;
+            int cycle_length = 0;
+            bool cycle_ready = false;
 
             while (iteration < max_iter) {
                 if (reference_index < 0
@@ -1069,6 +1167,41 @@ void render_bla(
                     output[index] = smooth_escape_scaled(iteration, total_norm);
                     escaped = true;
                     break;
+                }
+
+                // The scaled perturbation path used to have no interior
+                // termination at all: a deeply zoomed attracting pixel could
+                // execute the entire iteration cap even after its orbit had
+                // settled. Sample a Brent-style cycle detector every 32
+                // iterations so its FloatExp arithmetic is negligible next
+                // to the exact/BLA work. A match requires roughly 2^-80
+                // relative state error and a comfortably bounded orbit; this
+                // is intentionally stricter than a visual similarity test.
+                if (iteration >= 512
+                    && (iteration & 31) == 0
+                    && sc_compare_norm(total_norm, ScaledNorm{0.75, 2}) < 0) {
+                    if (!cycle_ready) {
+                        cycle_tortoise = total;
+                        cycle_power = 1;
+                        cycle_length = 0;
+                        cycle_ready = true;
+                    } else {
+                        const ScaledNorm cycle_distance = sc_norm_squared(
+                            sc_sub(total, cycle_tortoise));
+                        const int scale_exponent = std::max(total_norm.exponent, 0);
+                        if (cycle_distance.mantissa == 0.0
+                            || cycle_distance.exponent <= scale_exponent - 78) {
+                            output[index] = static_cast<float>(max_iter);
+                            escaped = true;
+                            break;
+                        }
+                        ++cycle_length;
+                        if (cycle_length >= cycle_power) {
+                            cycle_tortoise = total;
+                            cycle_power = std::min(cycle_power * 2, 1 << 20);
+                            cycle_length = 0;
+                        }
+                    }
                 }
 
                 // Rebase to the beginning of the same reference orbit when
@@ -1107,11 +1240,23 @@ void render_bla(
                     const int previous_reference_index = reference_index;
                     const int previous_iteration = iteration;
                     const ScaledComplex input_delta = delta;
+                    // Far below the BLA radius, the quadratic and cubic
+                    // terms are many orders smaller than the requested
+                    // float output. Keep the full series for the numerically
+                    // sensitive approach to escape, but use the cheaper
+                    // linear Horner branch while the perturbation is tiny.
+                    // The thresholds are on |delta|^2 in binary exponent
+                    // form; -160 still leaves roughly 80 bits of margin
+                    // before the nonlinear terms can affect a float pixel.
+                    const int effective_order =
+                        approximation_order >= 3 && delta_norm.exponent < -115
+                            ? (delta_norm.exponent < -160 ? 1 : 2)
+                            : approximation_order;
                     delta = apply_bla_series(
                         *step,
                         input_delta,
                         dc,
-                        approximation_order);
+                        effective_order);
                     reference_index += step->length;
                     iteration += step->length;
                     const ScaledComplex endpoint = sc_add(
@@ -1353,6 +1498,234 @@ int fractal_crop_colourise(
                 rgb[1] = colour_byte(base[1] * contour * brightness * 255.0);
                 rgb[2] = colour_byte(base[2] * contour * brightness * 255.0);
             }
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    }
+}
+
+int fractal_atlas_colourise(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    int palette_max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int threads
+) {
+    try {
+        if (!parent || !output
+            || parent_width <= 0 || parent_height <= 0
+            || output_width <= 0 || output_height <= 0
+            || parent_max_iter <= 0
+            || !std::isfinite(parent_zoom) || parent_zoom <= 0.0
+            || !std::isfinite(child_fraction)
+            || child_fraction < 0.0 || child_fraction > 1.0) {
+            throw std::runtime_error("invalid native atlas dimensions or controls");
+        }
+        const bool use_child = child != nullptr && child_fraction > 0.0;
+        if (use_child && (child_width <= 0 || child_height <= 0 || child_max_iter <= 0)) {
+            throw std::runtime_error("invalid native atlas child tile");
+        }
+        (void)instrumental;
+        const int effective_palette_iter = std::max(
+            1,
+            std::max(palette_max_iter, std::max(parent_max_iter, child_max_iter)));
+        const PaletteBasis& basis = colour_basis_for(effective_palette_iter);
+        const double vocal_mix = std::clamp(vocal, 0.0, 1.0);
+        const double split = 0.7 + 0.45 * vocal_mix * vocal_mix;
+        const double brightness = 0.88 + 0.06 * vocal_mix;
+        const double pattern_cos = std::cos(phase + split);
+        const double pattern_sin = std::sin(phase + split);
+        const std::array<double, 3> base = pitch_base_colour(pitch);
+        const int effective_palette_size = static_cast<int>(basis.cosine.size());
+        const float palette_index_scale = static_cast<float>(effective_palette_size - 1)
+            / static_cast<float>(effective_palette_iter);
+        const int visible_child_width = use_child
+            ? std::max(1, static_cast<int>(std::lround(
+                static_cast<double>(output_width) * child_fraction)))
+            : 0;
+        const int visible_child_height = use_child
+            ? std::max(1, static_cast<int>(std::lround(
+                static_cast<double>(output_height) * child_fraction)))
+            : 0;
+        const int child_left = (output_width - visible_child_width) / 2;
+        const int child_top = (output_height - visible_child_height) / 2;
+        const int feather = use_child
+            ? std::min(16, std::min(visible_child_width / 8, visible_child_height / 8))
+            : 0;
+        const bool full_child = use_child && child_fraction >= 0.999999;
+
+        // Coordinate generation is intentionally outside the pixel loop.
+        // The old implementation recomputed two divisions, clamps, floors
+        // and four source indices for every pixel. At 4K that dominated the
+        // otherwise cheap colour pass. These compact maps are per-frame and
+        // are reused for every row below.
+        BilinearAxis parent_x_axis;
+        BilinearAxis parent_y_axis;
+        if (!full_child) {
+            parent_x_axis = make_bilinear_axis(parent_width, output_width, parent_zoom);
+            parent_y_axis = make_bilinear_axis(parent_height, output_height, parent_zoom);
+        }
+        BilinearAxis child_x_axis;
+        BilinearAxis child_y_axis;
+        if (use_child) {
+            const int child_destination_width = full_child ? output_width : visible_child_width;
+            const int child_destination_height = full_child ? output_height : visible_child_height;
+            child_x_axis = make_bilinear_axis(child_width, child_destination_width, 1.0);
+            child_y_axis = make_bilinear_axis(child_height, child_destination_height, 1.0);
+        }
+        std::vector<float> child_edge_x;
+        std::vector<float> child_edge_y;
+        if (use_child && !full_child && feather >= 2) {
+            child_edge_x.resize(static_cast<size_t>(visible_child_width));
+            child_edge_y.resize(static_cast<size_t>(visible_child_height));
+            for (int x = 0; x < visible_child_width; ++x) {
+                const int edge = std::min(x, visible_child_width - 1 - x);
+                child_edge_x[static_cast<size_t>(x)] =
+                    std::min(1.0F, static_cast<float>(edge) / static_cast<float>(feather));
+            }
+            for (int y = 0; y < visible_child_height; ++y) {
+                const int edge = std::min(y, visible_child_height - 1 - y);
+                child_edge_y[static_cast<size_t>(y)] =
+                    std::min(1.0F, static_cast<float>(edge) / static_cast<float>(feather));
+            }
+        }
+
+        auto render_parent_span = [&](int output_y, int begin_x, int end_x) {
+            for (int output_x = begin_x; output_x < end_x; ++output_x) {
+                const float smooth = sample_bilinear_mapped(
+                    parent,
+                    parent_width,
+                    parent_x_axis,
+                    parent_y_axis,
+                    output_x,
+                    output_y);
+                std::uint8_t* destination = output + static_cast<size_t>(
+                    output_y * output_width + output_x) * 3U;
+                write_colour_pixel(
+                    smooth,
+                    parent_max_iter,
+                    basis,
+                    palette_index_scale,
+                    pattern_cos,
+                    pattern_sin,
+                    vocal_mix,
+                    brightness,
+                    base,
+                    destination);
+            }
+        };
+
+#ifdef _OPENMP
+        if (threads > 0) omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#endif
+        for (int output_y = 0; output_y < output_height; ++output_y) {
+            if (full_child) {
+                for (int output_x = 0; output_x < output_width; ++output_x) {
+                    const float smooth = sample_bilinear_mapped(
+                        child,
+                        child_width,
+                        child_x_axis,
+                        child_y_axis,
+                        output_x,
+                        output_y);
+                    std::uint8_t* destination = output + static_cast<size_t>(
+                        output_y * output_width + output_x) * 3U;
+                    write_colour_pixel(
+                        smooth,
+                        child_max_iter,
+                        basis,
+                        palette_index_scale,
+                        pattern_cos,
+                        pattern_sin,
+                        vocal_mix,
+                        brightness,
+                        base,
+                        destination);
+                }
+                continue;
+            }
+
+            if (!use_child || output_y < child_top || output_y >= child_top + visible_child_height) {
+                render_parent_span(output_y, 0, output_width);
+                continue;
+            }
+
+            render_parent_span(output_y, 0, child_left);
+            const int child_right = child_left + visible_child_width;
+            for (int output_x = child_left; output_x < child_right; ++output_x) {
+                const int child_x = output_x - child_left;
+                const int child_y = output_y - child_top;
+                const float parent_smooth = sample_bilinear_mapped(
+                    parent,
+                    parent_width,
+                    parent_x_axis,
+                    parent_y_axis,
+                    output_x,
+                    output_y);
+                const float child_smooth = sample_bilinear_mapped(
+                    child,
+                    child_width,
+                    child_x_axis,
+                    child_y_axis,
+                    child_x,
+                    child_y);
+                std::uint8_t parent_rgb[3];
+                std::uint8_t child_rgb[3];
+                write_colour_pixel(
+                    parent_smooth,
+                    parent_max_iter,
+                    basis,
+                    palette_index_scale,
+                    pattern_cos,
+                    pattern_sin,
+                    vocal_mix,
+                    brightness,
+                    base,
+                    parent_rgb);
+                write_colour_pixel(
+                    child_smooth,
+                    child_max_iter,
+                    basis,
+                    palette_index_scale,
+                    pattern_cos,
+                    pattern_sin,
+                    vocal_mix,
+                    brightness,
+                    base,
+                    child_rgb);
+                const float alpha = feather >= 2
+                    ? std::min(
+                        child_edge_x[static_cast<size_t>(child_x)],
+                        child_edge_y[static_cast<size_t>(child_y)])
+                    : 1.0F;
+                std::uint8_t* destination = output + static_cast<size_t>(
+                    output_y * output_width + output_x) * 3U;
+                const double inverse_alpha = 1.0 - static_cast<double>(alpha);
+                for (int channel = 0; channel < 3; ++channel) {
+                    destination[channel] = colour_byte(
+                        static_cast<double>(parent_rgb[channel]) * inverse_alpha
+                        + static_cast<double>(child_rgb[channel]) * static_cast<double>(alpha));
+                }
+            }
+            render_parent_span(output_y, child_right, output_width);
         }
         set_error("");
         return 0;
