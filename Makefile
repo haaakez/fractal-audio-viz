@@ -14,12 +14,18 @@ else
   MPFR_LIBS :=
 endif
 
-.PHONY: all clean
+.PHONY: all test benchmark clean
 
 all: mandelbrot.so
 
 mandelbrot.so: renderer.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(OPENMP_FLAGS) -shared -o $@ $< $(MPFR_LIBS)
+
+test:
+	python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+benchmark: mandelbrot.so
+	python3 benchmark.py --renderer native --zoom 1e100 --width 256 --height 256
 
 clean:
 	rm -f mandelbrot.so

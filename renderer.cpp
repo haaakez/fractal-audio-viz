@@ -259,16 +259,6 @@ struct FloatExpComplex {
     FloatExp imag;
 };
 
-// The reference orbit is normally O(1), even when the viewport itself is
-// 1e-100 or smaller.  A compact double representation lets the common-scale
-// perturbation path avoid per-operation exponent normalization at practical
-// deep-video zooms.  FloatExp remains the authoritative representation for
-// the arbitrary-depth fallback.
-struct DoubleComplex {
-    double real = 0.0;
-    double imag = 0.0;
-};
-
 inline FloatExpComplex fec_add(const FloatExpComplex& a, const FloatExpComplex& b) {
     return {fe_add(a.real, b.real), fe_add(a.imag, b.imag)};
 }
@@ -286,25 +276,6 @@ inline FloatExpComplex fec_mul(const FloatExpComplex& a, const FloatExp& b) {
 
 inline FloatExp fec_norm_squared(const FloatExpComplex& value) {
     return fe_norm_squared(value.real, value.imag);
-}
-
-inline DoubleComplex dc_add(const DoubleComplex& a, const DoubleComplex& b) {
-    return {a.real + b.real, a.imag + b.imag};
-}
-
-inline DoubleComplex dc_mul(const DoubleComplex& a, const DoubleComplex& b) {
-    return {
-        a.real * b.real - a.imag * b.imag,
-        a.real * b.imag + a.imag * b.real,
-    };
-}
-
-inline DoubleComplex dc_mul(const DoubleComplex& value, double scalar) {
-    return {value.real * scalar, value.imag * scalar};
-}
-
-inline double dc_norm_squared(const DoubleComplex& value) {
-    return value.real * value.real + value.imag * value.imag;
 }
 
 struct BlaStep {
@@ -350,11 +321,9 @@ struct BlaLevels {
 
 struct ReferenceContext {
     std::vector<FloatExpComplex> fast_orbit;
-    std::vector<DoubleComplex> double_orbit;
     BlaLevels bla;
     long double x_center = 0.0L;
     long double y_center = 0.0L;
-    bool double_orbit_usable = false;
 #ifdef FRACTAL_HAVE_MPFR
     mpfr_prec_t precision_bits = 0;
 #endif
@@ -457,17 +426,10 @@ void make_reference_orbit(
     mpfr_set_zero(zr, 0); mpfr_set_zero(zi, 0);
     context.precision_bits = static_cast<mpfr_prec_t>(precision_bits);
     context.fast_orbit.assign(static_cast<size_t>(max_iter) + 1U, {});
-    context.double_orbit.assign(static_cast<size_t>(max_iter) + 1U, {});
-    context.double_orbit_usable = true;
     for (int i = 0; i <= max_iter; ++i) {
         context.fast_orbit[static_cast<size_t>(i)] = {
             FloatExp::from_mpfr(zr), FloatExp::from_mpfr(zi)
         };
-        const double double_real = mpfr_get_d(zr, MPFR_RNDN);
-        const double double_imag = mpfr_get_d(zi, MPFR_RNDN);
-        context.double_orbit[static_cast<size_t>(i)] = {double_real, double_imag};
-        context.double_orbit_usable = context.double_orbit_usable
-            && std::isfinite(double_real) && std::isfinite(double_imag);
         mpfr_mul(next_real, zr, zr, MPFR_RNDN);
         mpfr_mul(temporary, zi, zi, MPFR_RNDN);
         mpfr_sub(next_real, next_real, temporary, MPFR_RNDN);
@@ -680,110 +642,6 @@ void render_double_tail(
     }
 }
 
-inline float smooth_escape_double(int iteration, double magnitude_squared) {
-    const double magnitude = std::sqrt(std::max(magnitude_squared, 4.0000001));
-    return static_cast<float>(static_cast<double>(iteration)
-        - std::log(std::log(magnitude)) / static_cast<double>(LOG_TWO));
-}
-
-// In a single frame every pixel offset has the same tiny viewport scale s.
-// Store delta/s instead of delta, so the hot iteration is ordinary double
-// arithmetic:
-//   d' = 2 Z d + c + s d^2.
-// This is numerically the same perturbation recurrence while s is
-// representable and d remains in the double range.  At the visualizer's
-// small cached source resolutions it outperforms evaluating a cubic BLA map;
-// the FloatExp BLA renderer below covers the arbitrary-depth case.
-void render_bla_scaled_double(
-    float* output,
-    int width,
-    int height,
-    double scale,
-    const ReferenceContext& context,
-    int max_iter,
-    int threads
-) {
-    constexpr double escape_squared = 4.0;
-    const double aspect = static_cast<double>(width) / static_cast<double>(height);
-    const double scale_squared = scale * scale;
-
-#ifdef _OPENMP
-    if (threads > 0) omp_set_num_threads(threads);
-#pragma omp parallel for schedule(static)
-#endif
-    for (int py = 0; py < height; ++py) {
-        const double y_fraction =
-            (static_cast<double>(height - 1) / 2.0 - static_cast<double>(py))
-            / static_cast<double>(height);
-        for (int px = 0; px < width; ++px) {
-            const double x_fraction =
-                (static_cast<double>(px) - static_cast<double>(width - 1) / 2.0)
-                / static_cast<double>(width);
-            // c is the pixel offset after the common scale has been factored
-            // out: dc = scale * c, where scale is the full viewport height.
-            const DoubleComplex c{
-                aspect * x_fraction,
-                y_fraction,
-            };
-            const int index = py * width + px;
-            DoubleComplex delta = c;
-            int reference_index = 1;
-            int iteration = 1;
-            bool escaped = false;
-
-            while (iteration < max_iter) {
-                if (reference_index < 0
-                    || reference_index >= static_cast<int>(context.double_orbit.size())) {
-                    output[index] = static_cast<float>(max_iter);
-                    escaped = true;
-                    break;
-                }
-
-                const DoubleComplex reference =
-                    context.double_orbit[static_cast<size_t>(reference_index)];
-                const DoubleComplex actual_delta = dc_mul(delta, scale);
-                const DoubleComplex total = dc_add(reference, actual_delta);
-                const double total_norm_squared = dc_norm_squared(total);
-                if (total_norm_squared > escape_squared) {
-                    output[index] = smooth_escape_double(iteration, total_norm_squared);
-                    escaped = true;
-                    break;
-                }
-
-                const double scaled_delta_norm_squared = dc_norm_squared(delta);
-                const double actual_delta_norm_squared =
-                    scaled_delta_norm_squared * scale_squared;
-                // At reference index zero, total and delta are mathematically
-                // identical.  Comparing the two differently-associated
-                // double expressions can otherwise rebase forever after a
-                // legitimate rebase, so there is nothing useful to do there.
-                if (reference_index != 0
-                    && total_norm_squared < actual_delta_norm_squared) {
-                    // Rebase in scaled coordinates.  The scale limit that
-                    // selects this path leaves this division far from double
-                    // overflow for a valid perturbation orbit.
-                    delta = {total.real / scale, total.imag / scale};
-                    reference_index = 0;
-                    continue;
-                }
-
-                const DoubleComplex delta_squared = dc_mul(delta, delta);
-                delta = dc_add(
-                    dc_add(dc_mul(reference, delta), dc_mul(delta, reference)),
-                    dc_add(dc_mul(delta_squared, scale), c));
-                if (!std::isfinite(delta.real) || !std::isfinite(delta.imag)) {
-                    output[index] = static_cast<float>(max_iter);
-                    escaped = true;
-                    break;
-                }
-                ++reference_index;
-                ++iteration;
-            }
-            if (!escaped) output[index] = static_cast<float>(max_iter);
-        }
-    }
-}
-
 void render_bla(
     float* output,
     int width,
@@ -792,7 +650,8 @@ void render_bla(
     const ReferenceContext& context,
     int max_iter,
     int threads,
-    int /*series_block*/
+    int series_order,
+    int series_block
 ) {
     const FloatExp zoom = parse_zoom_float_exp(zoom_text, context.precision_bits);
     const FloatExp inverse_zoom = fe_div(FloatExp::from_parts(1.0, 0), zoom);
@@ -806,29 +665,14 @@ void render_bla(
         fe_compare(current_input_radius, context.bla.input_radius) <= 0;
     const bool disable_bla = !bla_radius_covers_view
         || std::getenv("FRACTAL_DISABLE_BLA") != nullptr;
-    const long double shared_scale_long_double = inverse_zoom.as_long_double() * 2.8L;
-    // For the practical video range (including 1e100) the viewport scale
-    // and its square fit in doubles.  Use the common-scale renderer unless
-    // explicitly disabled for numerical regression checks.  Beyond this the
-    // FloatExp path below retains the e4000/e9800 capability.
-    if (context.double_orbit_usable
-        && std::getenv("FRACTAL_DISABLE_SCALED_DOUBLE") == nullptr
-        && std::isfinite(shared_scale_long_double)
-        && shared_scale_long_double >= 1.0e-120L) {
-        render_bla_scaled_double(
-            output,
-            width,
-            height,
-            static_cast<double>(shared_scale_long_double),
-            context,
-            max_iter,
-            threads);
-        return;
-    }
-    // The cubic terms suppress the accumulated error that limited the
-    // quadratic map to 32 iterations.  256 retains a useful safety margin
-    // while substantially reducing work in high-iteration deep frames.
-    constexpr int max_bla_length = 256;
+    // The existing BLA hierarchy is a real polynomial approximation, not a
+    // compatibility label.  Use its lower-precision tail only after the
+    // perturbation has grown large enough for ordinary doubles; keeping BLA
+    // active through e100 is what turns reference reuse into iteration reuse.
+    // The cubic terms suppress the accumulated error that limited the old
+    // quadratic map to short blocks.
+    const int max_bla_length = std::clamp(series_block, 2, 4096);
+    const int approximation_order = std::clamp(series_order, 1, 3);
 
 #ifdef _OPENMP
     if (threads > 0) omp_set_num_threads(threads);
@@ -903,16 +747,23 @@ void render_bla(
                     const FloatExpComplex delta_dc = fec_mul(delta, dc);
                     const FloatExpComplex delta_squared_dc = fec_mul(delta_squared, dc);
                     const FloatExpComplex delta_dc_squared = fec_mul(delta, dc_squared);
-                    delta = fec_add(
-                        fec_add(fec_mul(step->A, delta), fec_mul(step->B, dc)),
-                        fec_add(
-                            fec_add(fec_mul(step->C, delta_squared), fec_mul(step->D, delta_dc)),
+                    delta = fec_add(fec_mul(step->A, delta), fec_mul(step->B, dc));
+                    if (approximation_order >= 2) {
+                        delta = fec_add(
+                            delta,
                             fec_add(
-                                fec_add(fec_mul(step->E, dc_squared), fec_mul(step->F, delta_cubed)),
-                                fec_add(
-                                    fec_add(fec_mul(step->G, delta_squared_dc),
-                                            fec_mul(step->H, delta_dc_squared)),
-                                    fec_mul(step->I, dc_cubed)))));
+                                fec_add(fec_mul(step->C, delta_squared), fec_mul(step->D, delta_dc)),
+                                fec_mul(step->E, dc_squared)));
+                    }
+                    if (approximation_order >= 3) {
+                        delta = fec_add(
+                            delta,
+                            fec_add(
+                                fec_add(fec_mul(step->F, delta_cubed),
+                                        fec_mul(step->G, delta_squared_dc)),
+                                fec_add(fec_mul(step->H, delta_dc_squared),
+                                        fec_mul(step->I, dc_cubed))));
+                    }
                     reference_index += step->length;
                     iteration += step->length;
                     const FloatExpComplex endpoint = fec_add(
@@ -1195,8 +1046,9 @@ int render_mandelbrot_reference(
         if (max_iter <= 0 || max_iter >= static_cast<int>(context->fast_orbit.size())) {
             throw std::runtime_error("render iteration count exceeds prepared reference");
         }
-        // Retained in the ABI for callers of the earlier series renderer.
-        // The active approximation is the quadratic BLA hierarchy.
+        // series_order selects the active polynomial degree.  Values above
+        // three remain accepted for ABI compatibility and are clamped by the
+        // renderer because this table stores terms through degree three.
         (void)series_order;
         (void)series_block;
         long double zoom_log10 = 0.0L;
@@ -1209,7 +1061,8 @@ int render_mandelbrot_reference(
 #endif
         if (zoom_log10 >= 6.0L) {
 #ifdef FRACTAL_HAVE_MPFR
-            render_bla(output, width, height, zoom_text, *context, max_iter, threads, series_block);
+            render_bla(output, width, height, zoom_text, *context, max_iter, threads,
+                       series_order, series_block);
 #else
             (void)zoom;
             throw std::runtime_error("deep rendering requires MPFR/GMP; rebuild with make");
