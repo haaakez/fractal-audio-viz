@@ -31,6 +31,7 @@ constexpr int ABI_VERSION = 8;
 // Larger maps are still accepted by the ABI but deliberately fall back to
 // this validated limit until higher-order composition is implemented.
 constexpr int MAX_SAFE_BLA_LENGTH = 256;
+constexpr int MAX_SAFE_LINEAR_BLA_LENGTH = 1024;
 constexpr long double ESCAPE_RADIUS_SQUARED = 4.0L;
 constexpr long double LOG_TWO = 0.693147180559945309417232121458176568L;
 
@@ -556,7 +557,12 @@ inline FloatExp fe_sqrt(const FloatExp& value) {
 }
 
 inline int fe_compare(const FloatExp& a, const FloatExp& b) {
-    if (a.mantissa == 0.0 && b.mantissa == 0.0) return 0;
+    // Zero is represented canonically with exponent zero, but its exponent
+    // is not a numeric magnitude. Handle it before comparing exponents;
+    // otherwise 0 would compare larger than tiny positive values and a
+    // zero-radius BLA map would be accepted as if it had radius one.
+    if (a.mantissa == 0.0) return b.mantissa == 0.0 ? 0 : -1;
+    if (b.mantissa == 0.0) return 1;
     if (a.mantissa < 0.0 && b.mantissa >= 0.0) return -1;
     if (a.mantissa >= 0.0 && b.mantissa < 0.0) return 1;
     const bool negative = a.mantissa < 0.0;
@@ -626,6 +632,20 @@ struct FastBlaStep {
     int length = 1;
 };
 
+struct LinearBlaStep {
+    ScaledComplex A;
+    ScaledComplex B;
+    FloatExp radius_squared;
+    int length = 1;
+};
+
+struct LinearBlaBuilderStep {
+    FloatExpComplex A;
+    FloatExpComplex B;
+    FloatExp radius_squared;
+    int length = 1;
+};
+
 FastBlaStep compact_bla_step(const BlaStep& step) {
     FastBlaStep result{
         {
@@ -643,6 +663,15 @@ FastBlaStep compact_bla_step(const BlaStep& step) {
         step.length,
     };
     return result;
+}
+
+LinearBlaStep compact_linear_bla_step(const LinearBlaBuilderStep& step) {
+    return {
+        ScaledComplex::from_float_exp(step.A.real, step.A.imag),
+        ScaledComplex::from_float_exp(step.B.real, step.B.imag),
+        step.radius_squared,
+        step.length,
+    };
 }
 
 inline ScaledComplex apply_bla_series(
@@ -694,7 +723,14 @@ inline ScaledComplex apply_bla_series(
 
 struct BlaLevels {
     std::vector<std::vector<FastBlaStep>> levels;
+    std::vector<std::vector<LinearBlaStep>> linear_levels;
     FloatExp input_radius;
+    // First reference-orbit index that a BLA map must not cross.  Once the
+    // reference itself escapes, its orbit grows super-exponentially; using a
+    // long map across that point can hide an escape behind cancellation in a
+    // finite-precision perturbation.  Maps stop at the reference escape and
+    // the ordinary perturbation loop takes over.
+    int map_end = 0;
 
     static int highest_level_for_length(int max_length) noexcept {
         return max_length > 0
@@ -718,12 +754,40 @@ struct BlaLevels {
         // low-to-high walk selected an oversized map and the caller then
         // discarded it, needlessly falling all the way back to one exact
         // iteration. A bounded descent returns the best valid ancestor.
+        const int offset = start - 1;
         for (int level = highest_level; level >= 0; --level) {
-            const int span = 1 << level;
-            if ((start - 1) % span != 0) continue;
-            const int index = (start - 1) / span;
+            const int span_mask = (1 << level) - 1;
+            if ((offset & span_mask) != 0) continue;
+            const int index = offset >> level;
             if (index >= static_cast<int>(levels[level].size())) continue;
             const FastBlaStep& candidate = levels[level][static_cast<size_t>(index)];
+            if (fe_compare(delta_norm_squared, candidate.radius_squared) < 0) {
+                return &candidate;
+            }
+        }
+        return nullptr;
+    }
+
+    const LinearBlaStep* lookup_linear(
+        int start,
+        const FloatExp& delta_norm_squared,
+        int max_length
+    ) const noexcept {
+        if (start <= 0 || max_length <= 0) return nullptr;
+        const int base_count = linear_levels.empty()
+            ? 0 : static_cast<int>(linear_levels[0].size());
+        if (start > base_count) return nullptr;
+        int highest_level = highest_level_for_length(max_length);
+        highest_level = std::min(
+            highest_level,
+            static_cast<int>(linear_levels.size()) - 1);
+        const int offset = start - 1;
+        for (int level = highest_level; level >= 0; --level) {
+            const int span_mask = (1 << level) - 1;
+            if ((offset & span_mask) != 0) continue;
+            const int index = offset >> level;
+            if (index >= static_cast<int>(linear_levels[level].size())) continue;
+            const LinearBlaStep& candidate = linear_levels[level][static_cast<size_t>(index)];
             if (fe_compare(delta_norm_squared, candidate.radius_squared) < 0) {
                 return &candidate;
             }
@@ -739,6 +803,7 @@ struct ReferenceContext {
     std::vector<double> orbit_real_double;
     std::vector<double> orbit_imag_double;
     BlaLevels bla;
+    int requested_max_iter = 0;
     long double x_center = 0.0L;
     long double y_center = 0.0L;
 #ifdef FRACTAL_HAVE_MPFR
@@ -818,6 +883,7 @@ void make_reference_orbit(
     int max_iter,
     int precision_bits
 ) {
+    context.requested_max_iter = max_iter;
     precision_bits = std::max(128, precision_bits);
     mpfr_t cx, cy, viewport_zoom, viewport_radius, zr, zi, next_real, next_imag, temporary;
     mpfr_init2(cx, precision_bits); mpfr_init2(cy, precision_bits);
@@ -842,11 +908,15 @@ void make_reference_orbit(
     }
     mpfr_set_zero(zr, 0); mpfr_set_zero(zi, 0);
     context.precision_bits = static_cast<mpfr_prec_t>(precision_bits);
-    context.fast_orbit.assign(static_cast<size_t>(max_iter) + 1U, {});
+    context.fast_orbit.clear();
+    context.fast_orbit.reserve(static_cast<size_t>(max_iter) + 1U);
+    FloatExp orbit_real_value = FloatExp::from_mpfr(zr);
+    FloatExp orbit_imag_value = FloatExp::from_mpfr(zi);
+    size_t finite_orbit_size = 0;
     for (int i = 0; i <= max_iter; ++i) {
-        context.fast_orbit[static_cast<size_t>(i)] = {
-            FloatExp::from_mpfr(zr), FloatExp::from_mpfr(zi)
-        };
+        if (!orbit_real_value.finite() || !orbit_imag_value.finite()) break;
+        context.fast_orbit.push_back({orbit_real_value, orbit_imag_value});
+        finite_orbit_size = context.fast_orbit.size();
         mpfr_mul(next_real, zr, zr, MPFR_RNDN);
         mpfr_mul(temporary, zi, zi, MPFR_RNDN);
         mpfr_sub(next_real, next_real, temporary, MPFR_RNDN);
@@ -855,6 +925,29 @@ void make_reference_orbit(
         mpfr_mul_ui(next_imag, next_imag, 2, MPFR_RNDN);
         mpfr_add(next_imag, next_imag, cy, MPFR_RNDN);
         mpfr_set(zr, next_real, MPFR_RNDN); mpfr_set(zi, next_imag, MPFR_RNDN);
+        orbit_real_value = FloatExp::from_mpfr(zr);
+        orbit_imag_value = FloatExp::from_mpfr(zi);
+    }
+
+    // MPFR can represent the reference orbit far beyond the range of the
+    // compact FloatExp exponent, but an escaping Mandelbrot orbit eventually
+    // exceeds the signed-int exponent used by that hot-path representation.
+    // Do not let those non-finite tail entries poison BLA coefficients.  The
+    // render loop still retains every finite entry before the cutoff, which is
+    // enough to detect the reference (and nearby) escape without a NaN map.
+    if (finite_orbit_size == 0) {
+        mpfr_clears(cx, cy, viewport_zoom, viewport_radius, zr, zi, next_real, next_imag, temporary, nullptr);
+        throw std::runtime_error("reference orbit lost finite state at iteration zero");
+    }
+    context.bla.map_end = static_cast<int>(finite_orbit_size) - 1;
+    const FloatExp escape_radius_squared = FloatExp::from_parts(4.0, 0);
+    for (size_t index = 1; index < finite_orbit_size; ++index) {
+        if (fe_compare(
+                fec_norm_squared(context.fast_orbit[index]),
+                escape_radius_squared) > 0) {
+            context.bla.map_end = static_cast<int>(index);
+            break;
+        }
     }
     context.fast_orbit_scaled.resize(context.fast_orbit.size());
     for (size_t index = 0; index < context.fast_orbit.size(); ++index) {
@@ -944,10 +1037,36 @@ BlaStep merge_bla(const BlaStep& y, const BlaStep& x, const FloatExp& input_radi
     return result;
 }
 
+LinearBlaBuilderStep merge_linear_bla(
+    const LinearBlaBuilderStep& y,
+    const LinearBlaBuilderStep& x,
+    const FloatExp& input_radius
+) {
+    const FloatExp x_a = fe_sqrt(fec_norm_squared(x.A));
+    const FloatExp x_b = fe_sqrt(fec_norm_squared(x.B));
+    FloatExp radius = fe_sqrt(x.radius_squared);
+    const FloatExp remaining = fe_sub(
+        fe_sqrt(y.radius_squared), fe_mul(x_b, input_radius));
+    if (fe_compare(remaining, FloatExp{0.0, 0}) > 0
+        && fe_compare(x_a, FloatExp{0.0, 0}) > 0) {
+        radius = fe_min(radius, fe_div(remaining, x_a));
+    } else {
+        radius = FloatExp{0.0, 0};
+    }
+    return {
+        fec_mul(y.A, x.A),
+        fec_add(fec_mul(y.A, x.B), y.B),
+        fe_sqr(radius),
+        x.length + y.length,
+    };
+}
+
 void build_bla(ReferenceContext& context) {
     const int max_iter = static_cast<int>(context.fast_orbit.size()) - 1;
-    const int base_count = std::max(0, max_iter - 1);
+    const int map_end = std::clamp(context.bla.map_end, 0, max_iter);
+    const int base_count = std::max(0, std::min(max_iter, map_end) - 1);
     context.bla.levels.clear();
+    context.bla.linear_levels.clear();
     if (base_count == 0) return;
 
     std::vector<std::vector<BlaStep>> builder_levels;
@@ -955,11 +1074,12 @@ void build_bla(ReferenceContext& context) {
     // Keep the fast map below a conservative relative error budget.  The
     // visualizer uses the iteration value for smooth colouring, so a map
     // that is merely visually plausible is not enough at a keyframe seam.
-    // The endpoint guard below replays maps that approach escape, so this
-    // radius may be looser than machine epsilon without changing the smooth
-    // colouring boundary.  A 1e-8 relative bound gives deep frames useful
-    // blocks while leaving a large margin for smooth-colour stability.
-    const FloatExp tolerance = FloatExp::from_long_double(1.0e-8L);
+    // The endpoint guard below replays maps that approach escape, but it
+    // cannot detect a map that has already crossed into the wrong basin.
+    // Keep the radius near Kalles' double-precision glitch budget (about
+    // 2^-43) instead of the old 1e-8 visual-only bound.
+    const FloatExp tolerance = FloatExp::from_long_double(
+        std::ldexp(1.0L, -43));
     for (int start = 1; start <= base_count; ++start) {
         const FloatExpComplex& reference = context.fast_orbit[static_cast<size_t>(start)];
         const FloatExp reference_magnitude = fe_sqrt(fec_norm_squared(reference));
@@ -1023,6 +1143,54 @@ void build_bla(ReferenceContext& context) {
             render_level.push_back(compact_bla_step(step));
         }
     }
+
+    // Keep a separate linear hierarchy for the deep branch.  Its compact
+    // A/B-only records fit much better in cache than the cubic records, and
+    // its radius is composed with the actual reusable viewport radius in the
+    // same way as Kalles/Fraktaler's linear BLA maps.
+    std::vector<std::vector<LinearBlaBuilderStep>> linear_builder_levels;
+    linear_builder_levels.emplace_back(static_cast<size_t>(base_count));
+    for (int start = 1; start <= base_count; ++start) {
+        const FloatExpComplex& reference = context.fast_orbit[static_cast<size_t>(start)];
+        const FloatExp radius = fe_mul(
+            tolerance,
+            fe_sqrt(fec_norm_squared(reference)));
+        linear_builder_levels[0][static_cast<size_t>(start - 1)] = {
+            fec_mul(reference, FloatExp::from_parts(2.0, 0)),
+            {FloatExp::from_parts(1.0, 0), FloatExp{0.0, 0}},
+            fe_sqr(radius),
+            1,
+        };
+    }
+    for (size_t level = 1; ; ++level) {
+        if ((1ULL << level) > static_cast<unsigned long long>(MAX_SAFE_LINEAR_BLA_LENGTH)) {
+            break;
+        }
+        const size_t previous_size = linear_builder_levels[level - 1].size();
+        const size_t current_size = (previous_size + 1) / 2;
+        if (current_size == 0) break;
+        linear_builder_levels.emplace_back(current_size);
+        for (size_t index = 0; index < current_size; ++index) {
+            const size_t first = index * 2;
+            if (first + 1 < previous_size) {
+                linear_builder_levels[level][index] = merge_linear_bla(
+                    linear_builder_levels[level - 1][first + 1],
+                    linear_builder_levels[level - 1][first],
+                    context.bla.input_radius);
+            } else {
+                linear_builder_levels[level][index] =
+                    linear_builder_levels[level - 1][first];
+            }
+        }
+    }
+    context.bla.linear_levels.reserve(linear_builder_levels.size());
+    for (const auto& builder_level : linear_builder_levels) {
+        auto& render_level = context.bla.linear_levels.emplace_back();
+        render_level.reserve(builder_level.size());
+        for (const LinearBlaBuilderStep& step : builder_level) {
+            render_level.push_back(compact_linear_bla_step(step));
+        }
+    }
     context.fast_orbit.clear();
     context.fast_orbit.shrink_to_fit();
 }
@@ -1062,7 +1230,9 @@ void render_scaled_double_tail(
     int cycle_length = 0;
     int tail_steps = 0;
     bool cycle_ready = false;
-    while (iteration < max_iter) {
+    while (iteration < max_iter
+        && reference_index >= 0
+        && reference_index + 1 < static_cast<int>(context.orbit_real_double.size())) {
         const double reference_real =
             context.orbit_real_double[static_cast<size_t>(reference_index)];
         const double reference_imag =
@@ -1161,6 +1331,8 @@ void render_bla(
     // The cubic terms suppress the accumulated error that limited the old
     // quadratic map to short blocks.
     const int max_bla_length = std::clamp(series_block, 2, MAX_SAFE_BLA_LENGTH);
+    const int max_linear_bla_length = std::clamp(
+        series_block, 2, MAX_SAFE_LINEAR_BLA_LENGTH);
     const int approximation_order = std::clamp(series_order, 1, 3);
 
     // These offsets are shared by every pixel in a row/column.  Computing
@@ -1283,36 +1455,40 @@ void render_bla(
 
                 const FloatExp delta_norm_float{delta_norm.mantissa, delta_norm.exponent};
                 const int remaining_iterations = max_iter - iteration;
-                const FastBlaStep* step = disable_bla
-                    ? nullptr
-                    : context.bla.lookup(
-                        reference_index,
-                        delta_norm_float,
-                        std::min(max_bla_length, remaining_iterations));
-                if (step && reference_index + step->length <= max_iter) {
+                const int effective_order =
+                    approximation_order >= 3 && delta_norm.exponent < -115
+                        ? (delta_norm.exponent < -160 ? 1 : 2)
+                        : approximation_order;
+                const LinearBlaStep* linear_step = nullptr;
+                const FastBlaStep* step = nullptr;
+                if (!disable_bla) {
+                    if (effective_order <= 1) {
+                        linear_step = context.bla.lookup_linear(
+                            reference_index,
+                            delta_norm_float,
+                            std::min(max_linear_bla_length, remaining_iterations));
+                    } else {
+                        step = context.bla.lookup(
+                            reference_index,
+                            delta_norm_float,
+                            std::min(max_bla_length, remaining_iterations));
+                    }
+                }
+                const int map_length = linear_step != nullptr
+                    ? linear_step->length
+                    : (step != nullptr ? step->length : 0);
+                if (map_length > 0 && reference_index + map_length <= max_iter) {
                     const ScaledComplex previous_delta = delta;
                     const int previous_reference_index = reference_index;
                     const int previous_iteration = iteration;
                     const ScaledComplex input_delta = delta;
-                    // Far below the BLA radius, the quadratic and cubic
-                    // terms are many orders smaller than the requested
-                    // float output. Keep the full series for the numerically
-                    // sensitive approach to escape, but use the cheaper
-                    // linear Horner branch while the perturbation is tiny.
-                    // The thresholds are on |delta|^2 in binary exponent
-                    // form; -160 still leaves roughly 80 bits of margin
-                    // before the nonlinear terms can affect a float pixel.
-                    const int effective_order =
-                        approximation_order >= 3 && delta_norm.exponent < -115
-                            ? (delta_norm.exponent < -160 ? 1 : 2)
-                            : approximation_order;
-                    delta = apply_bla_series(
-                        *step,
-                        input_delta,
-                        dc,
-                        effective_order);
-                    reference_index += step->length;
-                    iteration += step->length;
+                    delta = linear_step != nullptr
+                        ? sc_add(
+                            sc_mul(linear_step->A, input_delta),
+                            sc_mul(linear_step->B, dc))
+                        : apply_bla_series(*step, input_delta, dc, effective_order);
+                    reference_index += map_length;
+                    iteration += map_length;
                     const ScaledComplex endpoint = sc_add(
                         context.fast_orbit_scaled[static_cast<size_t>(reference_index)], delta);
                     const ScaledNorm endpoint_norm = sc_norm_squared(endpoint);
@@ -1325,7 +1501,7 @@ void render_bla(
                         iteration = previous_iteration;
                         ScaledComplex replay_total{};
                         ScaledNorm replay_norm{};
-                        for (int replay = 0; replay < step->length && iteration < max_iter; ++replay) {
+                        for (int replay = 0; replay < map_length && iteration < max_iter; ++replay) {
                             const ScaledComplex reference =
                                 context.fast_orbit_scaled[static_cast<size_t>(reference_index)];
                             delta = sc_add(
@@ -1790,8 +1966,7 @@ int render_mandelbrot_reference(
             throw std::runtime_error("invalid native render dimensions or handle");
         }
         auto* context = static_cast<ReferenceContext*>(handle);
-        if (max_iter <= 0
-            || max_iter >= static_cast<int>(context->fast_orbit_scaled.size())) {
+        if (max_iter <= 0 || max_iter > context->requested_max_iter) {
             throw std::runtime_error("render iteration count exceeds prepared reference");
         }
         // series_order selects the active polynomial degree.  Values above

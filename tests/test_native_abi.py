@@ -317,6 +317,69 @@ class NativeRendererTests(unittest.TestCase):
         finally:
             self.library.fractal_destroy_reference(handle)
 
+    def test_bla_rejects_nonfinite_reference_tail(self):
+        """Escaping references must not let an overflowed tail create NaN maps."""
+
+        width = height = 4
+        max_iter = 1200
+        output_type = ctypes.c_float * (width * height)
+        cases = (
+            (b"-1.7110308265769848", b"0.00000150981895797"),
+            (b"-0.7453", b"0.1127"),
+        )
+        for x_text, y_text in cases:
+            with_reference = output_type()
+            exact = output_type()
+            handle = self.library.fractal_create_reference(
+                x_text,
+                y_text,
+                b"1e6",
+                max_iter,
+                768,
+                3,
+            )
+            self.assertTrue(handle, self.library.fractal_last_error())
+            try:
+                old_value = os.environ.get("FRACTAL_DISABLE_BLA")
+                os.environ["FRACTAL_DISABLE_BLA"] = "1"
+                try:
+                    status = self.library.render_mandelbrot_reference(
+                        exact,
+                        width,
+                        height,
+                        b"1e30",
+                        handle,
+                        max_iter,
+                        2,
+                        3,
+                        1024,
+                    )
+                finally:
+                    if old_value is None:
+                        os.environ.pop("FRACTAL_DISABLE_BLA", None)
+                    else:
+                        os.environ["FRACTAL_DISABLE_BLA"] = old_value
+                self.assertEqual(status, 0, self.library.fractal_last_error())
+                status = self.library.render_mandelbrot_reference(
+                    with_reference,
+                    width,
+                    height,
+                    b"1e30",
+                    handle,
+                    max_iter,
+                    2,
+                    3,
+                    1024,
+                )
+                self.assertEqual(status, 0, self.library.fractal_last_error())
+                self.assertTrue(all(math.isfinite(value) for value in with_reference))
+                self.assertLessEqual(
+                    max(abs(a - b) for a, b in zip(with_reference, exact)),
+                    1e-3,
+                )
+            finally:
+                self.library.fractal_destroy_reference(handle)
+
     def test_deep_field_matches_independent_mpmath_oracle(self):
         """Check the native perturbation result against direct high precision math.
 
