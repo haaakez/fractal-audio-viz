@@ -20,6 +20,9 @@ delta into zero when it is converted to a Python ``float``.
 Audio separation uses Demucs automatically when it is installed.  When
 reliable stems are unavailable, the default keeps the full song driving both
 controls; an explicit spectral mode is available for frequency-band proxies.
+The default logarithmic zoom velocity is slightly negative between strong
+instrumental events, creating a small musical pullback; the final frame still
+lands exactly on the requested maximum zoom.
 
 Required packages:
     numpy, librosa, Pillow
@@ -75,8 +78,8 @@ DEFAULT_Y_CENTER = (
 # Fields are expensive, so they can be cached; their cache identity must
 # change when native numerical behaviour changes.  This prevents a new
 # renderer from silently reusing an old, under-resolved .npy keyframe.
-KEYFRAME_CACHE_SCHEMA = "bla-keyframe-blend-colour-v5"
-AUDIO_CACHE_SCHEMA = "audio-controls-v2"
+KEYFRAME_CACHE_SCHEMA = "bla-keyframe-blend-colour-v6"
+AUDIO_CACHE_SCHEMA = "audio-controls-v5-dynamics-pitch"
 
 _native_library: Any = None
 _native_checked = False
@@ -127,7 +130,7 @@ def _get_native_library() -> Any:
             if not hasattr(library, "fractal_abi_version"):
                 continue
             library.fractal_abi_version.restype = ctypes.c_int
-            if library.fractal_abi_version() != 6:
+            if library.fractal_abi_version() != 7:
                 continue
             library.fractal_last_error.restype = ctypes.c_char_p
             library.fractal_colourise.argtypes = [
@@ -136,6 +139,7 @@ def _get_native_library() -> Any:
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
+                ctypes.c_double,
                 ctypes.c_double,
                 ctypes.c_double,
                 ctypes.c_double,
@@ -151,6 +155,7 @@ def _get_native_library() -> Any:
                 ctypes.c_int,
                 ctypes.c_double,
                 ctypes.c_int,
+                ctypes.c_double,
                 ctypes.c_double,
                 ctypes.c_double,
                 ctypes.c_double,
@@ -209,6 +214,7 @@ class AudioFeatures:
     vocal: Any
     instrumental: Any
     phase: Any
+    pitch: Any
     frame_count: int
 
 
@@ -247,6 +253,8 @@ def _audio_cache_path(
     sample_rate: int,
     fps: int,
     separation: str,
+    attack: float,
+    release: float,
     cache_dir: Optional[Path],
 ) -> Optional[Path]:
     if cache_dir is None:
@@ -255,6 +263,7 @@ def _audio_cache_path(
     digest.update(AUDIO_CACHE_SCHEMA.encode("ascii"))
     digest.update(str(sample_rate).encode("ascii"))
     digest.update(str(fps).encode("ascii"))
+    digest.update(f"{float(attack):.9g},{float(release):.9g}".encode("ascii"))
     separation_signature = separation
     if separation == "auto":
         separation_signature += "-demucs" if importlib.util.find_spec("demucs") else "-fullmix"
@@ -278,6 +287,7 @@ def _atomic_save_features(path: Path, features: AudioFeatures) -> None:
                 vocal=np.asarray(features.vocal, dtype=np.float32),
                 instrumental=np.asarray(features.instrumental, dtype=np.float32),
                 phase=np.asarray(features.phase, dtype=np.float32),
+                pitch=np.asarray(features.pitch, dtype=np.float32),
                 frame_count=np.asarray(features.frame_count, dtype=np.int64),
             )
             handle.flush()
@@ -360,6 +370,71 @@ def _frame_rms(samples: Any, sample_rate: int, fps: int) -> Any:
     return np.asarray(values, dtype=np.float32)
 
 
+def _frame_pitch(samples: Any, sample_rate: int, fps: int) -> Any:
+    """Estimate a smooth 0..1 pitch control from a mono signal.
+
+    YIN is deliberately used instead of a raw spectral centroid: the latter
+    follows cymbals and broadband transients as if they were notes.  Invalid
+    or unvoiced windows use the median detected pitch, producing a stable
+    neutral colour rather than sudden blue/yellow jumps.
+    """
+
+    np = _require_numpy()
+    librosa = _require_librosa()
+    hop = max(1, round(sample_rate / fps))
+    frame_length = max(2048, 2 * hop)
+    fmin = 55.0
+    fmax = min(1600.0, sample_rate * 0.5 - 20.0)
+    if fmax <= fmin:
+        return np.full(1, 0.5, dtype=np.float32)
+    try:
+        frequencies = librosa.yin(
+            samples,
+            fmin=fmin,
+            fmax=fmax,
+            sr=sample_rate,
+            frame_length=frame_length,
+            hop_length=hop,
+            center=True,
+        )
+    except Exception:
+        # Pitch is an enhancement; a broken/old librosa pitch implementation
+        # must not prevent the visualizer from rendering the song.
+        return np.full(1, 0.5, dtype=np.float32)
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    valid = np.isfinite(frequencies) & (frequencies >= fmin) & (frequencies <= fmax)
+    if int(np.count_nonzero(valid)) < 3:
+        return np.full(max(1, frequencies.size), 0.5, dtype=np.float32)
+    log_frequencies = np.log2(np.clip(frequencies, fmin, fmax))
+    median_pitch = float(np.median(log_frequencies[valid]))
+    log_frequencies[~valid] = median_pitch
+    normalized = (log_frequencies - math.log2(fmin)) / (math.log2(fmax) - math.log2(fmin))
+    return np.clip(normalized, 0.0, 1.0).astype(np.float32)
+
+
+def _relative_pitch(values: Any) -> Any:
+    """Centre pitch around the song's robust average for colour control.
+
+    The returned 0.0..1.0 value is deliberately centred at 0.5.  A pitch
+    equal to the song median therefore has zero chroma and renders grey;
+    higher and lower notes travel in opposite directions around the hue wheel.
+    Log-frequency pitch is already perceptual, so a robust deviation scale is
+    more stable than treating Hz as a linear distance.
+    """
+
+    np = _require_numpy()
+    values = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return np.full(values.shape, 0.5, dtype=np.float32)
+    center = float(np.median(values[finite]))
+    deviation = np.nan_to_num(values - center, nan=0.0, posinf=0.0, neginf=0.0)
+    spread = float(np.percentile(np.abs(deviation[finite]), 80.0))
+    spread = max(spread, 0.08)
+    signed = np.clip(deviation / spread, -1.0, 1.0)
+    return np.asarray(0.5 + 0.5 * signed, dtype=np.float32)
+
+
 def _resample_features(values: Any, frame_count: int, fps: int, sample_rate: int) -> Any:
     np = _require_numpy()
     if frame_count <= 0:
@@ -401,6 +476,34 @@ def _smooth(values: Any, radius: int) -> Any:
     kernel = np.ones(radius, dtype=np.float32) / radius
     padded = np.pad(values, (radius // 2, radius - 1 - radius // 2), mode="edge")
     return np.convolve(padded, kernel, mode="valid").astype(np.float32)
+
+
+def _envelope_follow(values: Any, fps: int, attack: float, release: float) -> Any:
+    """Apply a causal attack/release follower to a normalized control signal."""
+
+    np = _require_numpy()
+    values = np.nan_to_num(
+        np.asarray(values, dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0
+    )
+    if values.size <= 1:
+        return np.clip(values, 0.0, 1.0).astype(np.float32)
+
+    def coefficient(seconds: float) -> float:
+        if seconds <= 0.0:
+            return 0.0
+        return math.exp(-1.0 / max(float(fps) * seconds, 1.0))
+
+    attack_coefficient = coefficient(float(attack))
+    release_coefficient = coefficient(float(release))
+    output = np.empty_like(values, dtype=np.float32)
+    previous = float(np.clip(values[0], 0.0, 1.0))
+    output[0] = previous
+    for index in range(1, values.size):
+        target = float(np.clip(values[index], 0.0, 1.0))
+        decay = attack_coefficient if target > previous else release_coefficient
+        previous = target + decay * (previous - target)
+        output[index] = previous
+    return output
 
 
 def _component_has_signal(component: Any, full_mix: Any) -> bool:
@@ -463,11 +566,15 @@ def analyse_audio(
     fps: int,
     separation: str,
     cache_dir: Optional[Path] = None,
+    attack: float = 0.025,
+    release: float = 0.12,
 ) -> AudioFeatures:
     """Load one song and produce frame-aligned vocal/instrument controls."""
 
     np = _require_numpy()
-    cache_path = _audio_cache_path(audio_path, sample_rate, fps, separation, cache_dir)
+    cache_path = _audio_cache_path(
+        audio_path, sample_rate, fps, separation, attack, release, cache_dir
+    )
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -475,15 +582,17 @@ def analyse_audio(
                 vocal = np.asarray(cached["vocal"], dtype=np.float32)
                 instrumental = np.asarray(cached["instrumental"], dtype=np.float32)
                 phase = np.asarray(cached["phase"], dtype=np.float32)
+                pitch = np.asarray(cached["pitch"], dtype=np.float32)
                 frame_count = int(cached["frame_count"])
             if (
                 frame_count > 0
                 and vocal.shape == (frame_count,)
                 and instrumental.shape == (frame_count,)
                 and phase.shape == (frame_count,)
+                and pitch.shape == (frame_count,)
             ):
                 print(f"Using cached audio controls {cache_path.name}.")
-                return AudioFeatures(vocal, instrumental, phase, frame_count)
+                return AudioFeatures(vocal, instrumental, phase, pitch, frame_count)
         except (OSError, KeyError, ValueError):
             pass
 
@@ -493,12 +602,14 @@ def analyse_audio(
 
     with tempfile.TemporaryDirectory(prefix="fractal-demucs-") as temp:
         stems = None
+        pitch_source = source
         if separation in {"auto", "demucs"}:
             stems = _demucs_stems(audio_path, Path(temp), separation)
 
         if stems is not None:
             vocals = _load_audio(stems[0], sample_rate)
             instruments = _load_audio(stems[1], sample_rate)
+            pitch_source = vocals
             vocal_rms = _frame_rms(vocals, sample_rate, fps)
             instrumental_rms = _frame_rms(instruments, sample_rate, fps)
             print("Using Demucs vocal and instrumental stems.")
@@ -514,7 +625,17 @@ def analyse_audio(
     else:
         vocal_signal = _resample_features(vocal_rms, frame_count, fps, sample_rate)
         instrumental_signal = _resample_features(instrumental_rms, frame_count, fps, sample_rate)
-    full_mix = _smooth(_normalise(full_mix_rms), 5)
+    full_mix = _envelope_follow(
+        _smooth(_normalise(full_mix_rms), 5), fps, attack, release
+    )
+    pitch = _relative_pitch(_smooth(
+        _resample_features(_frame_pitch(pitch_source, sample_rate, fps), frame_count, fps, sample_rate),
+        5,
+    ))
+    pitch_radius = max(5, int(round(fps * 0.15)))
+    if pitch_radius % 2 == 0:
+        pitch_radius += 1
+    pitch = _smooth(pitch, pitch_radius)
 
     vocal_detected = _component_has_signal(vocal_signal, full_mix_rms)
     instrumental_detected = _component_has_signal(instrumental_signal, full_mix_rms)
@@ -524,8 +645,12 @@ def analyse_audio(
         and _controls_are_distinct(vocal_signal, instrumental_signal)
     )
     if separated_controls:
-        vocal = _smooth(_normalise(vocal_signal), 5)
-        instrumental = _smooth(_normalise(instrumental_signal), 7)
+        vocal = _envelope_follow(
+            _smooth(_normalise(vocal_signal), 5), fps, attack, release
+        )
+        instrumental = _envelope_follow(
+            _smooth(_normalise(instrumental_signal), 7), fps, attack, release
+        )
         if stems is not None:
             print("Audio controls: Demucs vocals drive gradient; instruments drive zoom.")
         else:
@@ -536,8 +661,12 @@ def analyse_audio(
         vocal = full_mix
         instrumental = full_mix
         print("No reliable vocal/instrument split; full-song energy drives gradient and zoom.")
-    phase = np.cumsum((vocal.astype(np.float64) ** 2.5) * 60.0 / fps).astype(np.float32)
-    features = AudioFeatures(vocal, instrumental, phase, frame_count)
+    # Phase is a gentle spatial drift, not a strobe.  The old coefficient
+    # advanced the pattern by one radian per frame at peak vocals, which is
+    # nearly ten full visual cycles per second at 60 FPS.
+    phase_rate = 0.02 + 0.58 * (vocal.astype(np.float64) ** 2.2)
+    phase = np.cumsum(phase_rate / max(float(fps), 1.0)).astype(np.float32)
+    features = AudioFeatures(vocal, instrumental, phase, pitch, frame_count)
     if cache_path is not None:
         _atomic_save_features(cache_path, features)
     return features
@@ -889,8 +1018,8 @@ def render_fractal(
     renderer: str = "auto",
     native_threads: int = 0,
     native_reference: Any = None,
-    series_order: int = 8,
-    series_block: int = 32,
+    series_order: int = 3,
+    series_block: int = 256,
 ) -> Any:
     """Render with the C-ABI backend, falling back to the Python backend."""
 
@@ -952,14 +1081,16 @@ def _zoom_plan(
     start_zoom: Any,
     max_zoom: Any,
     punch: float = 3.0,
+    quiet_speed: float = -0.04,
 ) -> Any:
-    """Make loud instrumental moments advance the logarithmic zoom faster.
+    """Make loud instrumental moments punch the logarithmic zoom.
 
-    The total travel is still exactly ``start_zoom`` to ``max_zoom``.  The
-    loudness changes the local velocity, so a loud beat consumes more of that
-    zoom distance and produces a visibly larger punch than a quiet passage.
-    The envelope is already smoothed during analysis; the power curve makes
-    the response musical instead of letting low-level noise move the camera.
+    The total travel is still exactly ``start_zoom`` to ``max_zoom`` at the
+    final frame.  A small negative quiet-time velocity lets the camera ease
+    back between beats; loud instrumental moments overcome that bias and
+    advance the camera decisively.  The renderer treats the resulting path as
+    a bounded range per keyframe, so these deliberate local zoom-outs remain
+    valid instead of being clamped into a jittery crop.
     """
 
     np = _require_numpy()
@@ -972,14 +1103,21 @@ def _zoom_plan(
     if envelope.size == 1:
         return np.asarray([max_log], dtype=np.float64)
     loudness = envelope ** 2.2
-    # A quiet signal still moves smoothly, while a loud signal gets a larger
-    # share of the logarithmic zoom distance.  Normalising by the sum below
-    # keeps the final zoom bounded regardless of the audio or punch setting.
-    drive = 0.15 + (1.0 + punch) * loudness
+    # The default is intentionally slightly negative.  This is a velocity in
+    # logarithmic zoom space, not a zoom position, so it makes quiet passages
+    # pull back a little while strong beats still consume most of the travel.
+    drive = float(quiet_speed) + (1.0 + punch) * loudness
     cumulative = np.concatenate(([0.0], np.cumsum(drive[:-1])))
     # The last sample has no following frame over which to advance. Normalize
-    # by the travelled intervals so the final video frame reaches max_zoom.
-    total = max(float(np.sum(drive[:-1])), 1e-12) if drive.size > 1 else 1.0
+    # by the signed travelled intervals so the final video frame reaches
+    # max_zoom even when the path briefly moves backwards.  A completely
+    # silent track has no positive punches; make that degenerate case crawl
+    # forward rather than reversing the entire movie.
+    total = float(np.sum(drive[:-1])) if drive.size > 1 else 1.0
+    if total <= 1.0e-6:
+        drive = drive - float(np.min(drive)) + 1.0e-3
+        cumulative = np.concatenate(([0.0], np.cumsum(drive[:-1])))
+        total = max(float(np.sum(drive[:-1])), 1.0e-6) if drive.size > 1 else 1.0
     return start_log + span * cumulative / total
 
 
@@ -1026,18 +1164,37 @@ def _crop_and_resize(
     return np.asarray(resized, dtype=np.float32)
 
 
-def _keyframe_count(zooms: Any, keyframe_factor: float) -> int:
+def _zoom_chunks(zooms: Any, keyframe_factor: float) -> Any:
+    """Partition an arbitrary zoom path into crop-safe keyframe ranges.
+
+    A chunk is represented by its minimum zoom, because that is the widest
+    source field needed to crop every frame in the chunk.  Tracking both
+    extrema is important now that the audio response is allowed to pull back
+    slightly between punches; the old monotonic-only partition could silently
+    request a crop factor below one in that case.
+    """
+
     limit = math.log10(max(1.05, keyframe_factor))
-    count = 0
-    index = 0
+    start = 0
     total = len(zooms)
-    while index < total:
-        start = float(zooms[index])
-        index += 1
-        while index < total and float(zooms[index]) - start < limit:
-            index += 1
-        count += 1
-    return count
+    while start < total:
+        low = high = float(zooms[start])
+        end = start + 1
+        while end < total:
+            candidate = float(zooms[end])
+            candidate_low = min(low, candidate)
+            candidate_high = max(high, candidate)
+            if candidate_high - candidate_low >= limit:
+                break
+            low = candidate_low
+            high = candidate_high
+            end += 1
+        yield start, end, low, high
+        start = end
+
+
+def _keyframe_count(zooms: Any, keyframe_factor: float) -> int:
+    return sum(1 for _ in _zoom_chunks(zooms, keyframe_factor))
 
 
 @lru_cache(maxsize=8)
@@ -1051,7 +1208,52 @@ def _palette_basis(max_iter: int) -> tuple[Any, Any, float]:
     return np.cos(angle), np.sin(angle), (palette_size - 1) / max(float(max_iter), 1.0)
 
 
-def _colourise(field: Any, max_iter: int, phase: float, vocal: float, instrumental: float) -> Any:
+def _pitch_colour_controls(pitch: float) -> tuple[float, float]:
+    """Return a signed full-wheel hue and restrained chroma for pitch."""
+
+    np = _require_numpy()
+    signed = float(np.clip(2.0 * (float(pitch) - 0.5), -1.0, 1.0))
+    distance = abs(signed)
+    # Keep ordinary notes close to neutral grey and reserve strong chroma for
+    # notes that are meaningfully above or below the song's pitch centre.
+    t = float(np.clip((distance - 0.08) / 0.92, 0.0, 1.0))
+    saturation = 0.82 * t * t * (3.0 - 2.0 * t)
+    # A signed deviation travels in opposite directions around nearly the
+    # entire wheel.  0.49 avoids making the two extreme endpoints identical
+    # after wrapping at hue 0/1.
+    hue = (0.58 + 0.49 * signed) % 1.0
+    return hue, saturation
+
+
+def _hsv_to_rgb(hue: float, saturation: float, value: float = 1.0) -> Any:
+    """Convert one scalar HSV colour to a float32 RGB triplet."""
+
+    np = _require_numpy()
+    h = (float(hue) % 1.0) * 6.0
+    sector = int(math.floor(h))
+    fraction = h - sector
+    p = value * (1.0 - saturation)
+    q = value * (1.0 - saturation * fraction)
+    t = value * (1.0 - saturation * (1.0 - fraction))
+    colours = (
+        (value, t, p),
+        (q, value, p),
+        (p, value, t),
+        (p, q, value),
+        (t, p, value),
+        (value, p, q),
+    )
+    return np.asarray(colours[sector % 6], dtype=np.float32)
+
+
+def _colourise(
+    field: Any,
+    max_iter: int,
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    pitch: float = 0.5,
+) -> Any:
     np = _require_numpy()
     inside = field >= max_iter - 0.5
     # Colour changes every video frame, but it only depends on the smooth
@@ -1059,22 +1261,23 @@ def _colourise(field: Any, max_iter: int, phase: float, vocal: float, instrument
     # frame rotate the palette with just six scalar trig calls, rather than
     # evaluating three 65k-element cosine arrays every time.
     cosine_basis, sine_basis, scale = _palette_basis(int(max_iter))
-    split = 0.7 + 3.0 * vocal * vocal
-    brightness = 0.65 + 0.35 * instrumental
-    palette = np.empty((cosine_basis.size, 3), dtype=np.uint8)
-    wave = np.empty_like(cosine_basis)
-    for channel, offset, gain in (
-        (0, phase, 150.0 + 80.0 * vocal),
-        (1, phase + split * 0.35, 180.0),
-        (2, phase + split, 210.0),
-    ):
-        np.multiply(cosine_basis, math.cos(offset), out=wave)
-        np.add(wave, sine_basis * math.sin(offset), out=wave)
-        np.multiply(wave, -0.5, out=wave)
-        np.add(wave, 0.5, out=wave)
-        np.multiply(wave, gain * brightness, out=wave)
-        np.clip(wave, 0.0, 255.0, out=wave)
-        palette[:, channel] = wave
+    pitch_hue, pitch_saturation = _pitch_colour_controls(pitch)
+    split = 0.7 + 0.45 * vocal * vocal
+    # Instrumental energy owns zoom. Keep colour luminance restrained so a
+    # beat cannot turn the entire frame into a white/black flash.
+    vocal_mix = float(np.clip(vocal, 0.0, 1.0))
+    brightness = 0.88 + 0.06 * vocal_mix
+    pattern_angle = phase + split
+    wave = cosine_basis * math.cos(pattern_angle) + sine_basis * math.sin(pattern_angle)
+    contour = 0.82 + (0.08 + 0.12 * vocal_mix) * (0.5 - 0.5 * wave)
+    chromatic = _hsv_to_rgb(pitch_hue, pitch_saturation)
+    grey = np.asarray((0.58, 0.58, 0.58), dtype=np.float32)
+    base = grey * (1.0 - pitch_saturation) + chromatic * pitch_saturation
+    palette = np.clip(
+        contour[:, None] * base[None, :] * brightness * 255.0,
+        0.0,
+        255.0,
+    ).astype(np.uint8)
     palette_indices = np.clip(field * scale, 0, palette.shape[0] - 1).astype(np.intp)
     rgb = palette[palette_indices]
     rgb[inside] = 0
@@ -1114,12 +1317,13 @@ def _colourise_custom(
     vocal: float,
     instrumental: float,
     palette_name: str,
+    pitch: float = 0.5,
 ) -> Any:
     np = _require_numpy()
     palette = _custom_palette(palette_name)
     inside = field >= max_iter - 0.5
     position = np.asarray(field, dtype=np.float32) / max(float(max_iter), 1.0)
-    position = np.mod(position + phase * 0.006 + vocal * 0.08, 1.0)
+    position = np.mod(position + phase * 0.006 + vocal * 0.08 + float(pitch) * 0.12, 1.0)
     indices = np.clip(
         position * (palette.shape[0] - 1), 0, palette.shape[0] - 1
     ).astype(np.intp)
@@ -1145,6 +1349,7 @@ def _colourise_native(
     instrumental: float,
     native_threads: int,
     library: Any,
+    pitch: float = 0.5,
 ) -> Any:
     """Colour one smooth-iteration frame through the OpenMP C ABI."""
 
@@ -1161,6 +1366,7 @@ def _colourise_native(
         phase,
         vocal,
         instrumental,
+        pitch,
         native_threads,
     )
     if status != 0:
@@ -1180,6 +1386,7 @@ def _crop_and_colourise_native(
     instrumental: float,
     native_threads: int,
     library: Any,
+    pitch: float = 0.5,
 ) -> Any:
     """Fused centred bilinear crop and colour through the native C ABI."""
 
@@ -1199,6 +1406,7 @@ def _crop_and_colourise_native(
         phase,
         vocal,
         instrumental,
+        pitch,
         native_threads,
     )
     if status != 0:
@@ -1331,6 +1539,7 @@ def _colour_frame(
     native_threads: int,
     resample: str,
     palette_name: str,
+    pitch: float = 0.5,
 ) -> Any:
     if native_library is not None and resample == "bilinear" and palette_name == "aurora":
         return _crop_and_colourise_native(
@@ -1344,6 +1553,7 @@ def _colour_frame(
             instrumental,
             native_threads,
             native_library,
+            pitch,
         )
     view = _crop_and_resize(field, output_width, output_height, zoom_factor, resample)
     if native_library is not None and palette_name == "aurora":
@@ -1355,10 +1565,11 @@ def _colour_frame(
             instrumental,
             native_threads,
             native_library,
+            pitch,
         )
     if palette_name != "aurora":
-        return _colourise_custom(view, max_iter, phase, vocal, instrumental, palette_name)
-    return _colourise(view, max_iter, phase, vocal, instrumental)
+        return _colourise_custom(view, max_iter, phase, vocal, instrumental, palette_name, pitch)
+    return _colourise(view, max_iter, phase, vocal, instrumental, pitch)
 
 
 def render_video(
@@ -1388,6 +1599,8 @@ def render_video(
     quality: str = "balanced",
     palette: str = "aurora",
     cache_limit_mb: float = 0.0,
+    video_codec: str = "libx264",
+    crf: int = 18,
 ) -> None:
     np = _require_numpy()
     if shutil.which("ffmpeg") is None:
@@ -1442,13 +1655,13 @@ def render_video(
         "-map",
         "1:a:0",
         "-c:v",
-        "libx264",
+        video_codec,
         "-preset",
         video_preset,
         "-threads",
         str(encoder_threads),
         "-crf",
-        "18",
+        str(crf),
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -1462,8 +1675,7 @@ def render_video(
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
     total_frames = features.frame_count
-    max_zoom_factor = max(1.05, keyframe_factor)
-    max_log_factor = math.log10(max_zoom_factor)
+    chunks = list(_zoom_chunks(zooms, keyframe_factor))
 
     native_library = None
     native_reference = None
@@ -1486,10 +1698,12 @@ def render_video(
                 iteration_base,
             )
             try:
-                # The BLA input bound must cover the shallowest deep frame,
-                # not the final microscopic frame.  Using max(zooms) would
-                # disable every BLA lookup until the very end of the movie.
-                bla_start_log = max(6.0, float(np.min(zooms)))
+                # Python routes frames below 12 decades through the direct
+                # native path. Size the reusable BLA bound from the first
+                # frame that actually uses this reference, not an unnecessarily
+                # shallow e6 viewport that would make composition too
+                # conservative.
+                bla_start_log = max(12.0, float(np.min(zooms)))
                 _, native_reference = _create_native_reference(
                     x_center,
                     y_center,
@@ -1519,13 +1733,6 @@ def render_video(
         flush=True,
     )
 
-    def chunk_end_for(start: int) -> int:
-        end = start + 1
-        start_zoom = float(zooms[start])
-        while end < total_frames and float(zooms[end]) - start_zoom < max_log_factor:
-            end += 1
-        return end
-
     process = None
     render_started = time.perf_counter()
     keyframe_seconds = 0.0
@@ -1533,18 +1740,19 @@ def render_video(
 
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE)
-        frame_index = 0
-        while frame_index < total_frames:
-            chunk_start = frame_index
-            chunk_log_zoom = float(zooms[chunk_start])
-            chunk_end = chunk_end_for(chunk_start)
-            chunk_last_log_zoom = float(zooms[chunk_end - 1])
+        chunk_index = 0
+        field = None
+        field_source_zoom = None
+        field_max_zoom = None
+        field_iter = None
+        while chunk_index < len(chunks):
+            chunk_start, chunk_end, chunk_log_zoom, chunk_max_zoom = chunks[chunk_index]
 
             # Budget for the deepest crop represented by this field, rather
             # than the first frame of the chunk.  This removes the iteration
             # pop that previously occurred exactly when a keyframe changed.
             current_iter = max_iterations(
-                chunk_last_log_zoom,
+                chunk_max_zoom,
                 iteration_base,
                 iterations_per_decade,
                 iteration_cap,
@@ -1555,59 +1763,85 @@ def render_video(
                 flush=True,
             )
             keyframe_started = time.perf_counter()
-            field = _keyframe_field(
-                cache_dir=cache_dir,
-                cache_identity=cache_identity,
-                renderer=active_renderer,
-                render_width=render_width,
-                render_height=render_height,
-                log_zoom=chunk_log_zoom,
-                x_center=x_center,
-                y_center=y_center,
-                max_iter=current_iter,
-                series_order=series_order,
-                series_block=series_block,
-                native_reference=native_reference,
-                native_threads=native_threads,
-            )
-            _prune_cache(cache_dir, cache_limit_mb)
-
-            next_field = None
-            next_log_zoom = None
-            next_iter = None
-            if transition_fraction > 0.0 and chunk_end < total_frames:
-                next_log_zoom = float(zooms[chunk_end])
-                next_end = chunk_end_for(chunk_end)
-                next_iter = max_iterations(
-                    float(zooms[next_end - 1]),
-                    iteration_base,
-                    iterations_per_decade,
-                    iteration_cap,
-                )
-                next_field = _keyframe_field(
+            if field is None:
+                field = _keyframe_field(
                     cache_dir=cache_dir,
                     cache_identity=cache_identity,
                     renderer=active_renderer,
                     render_width=render_width,
                     render_height=render_height,
-                    log_zoom=next_log_zoom,
+                    log_zoom=chunk_log_zoom,
                     x_center=x_center,
                     y_center=y_center,
-                    max_iter=next_iter,
+                    max_iter=current_iter,
                     series_order=series_order,
                     series_block=series_block,
                     native_reference=native_reference,
                     native_threads=native_threads,
                 )
+                field_source_zoom = chunk_log_zoom
+                field_max_zoom = chunk_max_zoom
+                field_iter = current_iter
                 _prune_cache(cache_dir, cache_limit_mb)
+            else:
+                # The preceding chunk rendered this field ahead of time for
+                # a transition. Promote it in memory instead of rendering or
+                # loading the same absolute zoom again.
+                if (
+                    field_source_zoom != chunk_log_zoom
+                    or field_max_zoom != chunk_max_zoom
+                    or field_iter != current_iter
+                ):
+                    raise RuntimeError("prefetched keyframe metadata mismatch")
+                print("Using prefetched next keyframe.", flush=True)
+
+            next_field = None
+            next_log_zoom = None
+            next_max_zoom = None
+            next_iter = None
+            if transition_fraction > 0.0 and chunk_index + 1 < len(chunks):
+                _, _, next_log_zoom, next_max_zoom = chunks[chunk_index + 1]
+                # Pre-render only when the two source views overlap in world
+                # space. In the ordinary forward zoom case the next source is
+                # narrower than every current frame, so a crossfade cannot be
+                # geometrically aligned and prefetching only increases peak
+                # memory and startup latency.
+                if next_log_zoom <= chunk_max_zoom:
+                    next_iter = max_iterations(
+                        next_max_zoom,
+                        iteration_base,
+                        iterations_per_decade,
+                        iteration_cap,
+                    )
+                    next_field = _keyframe_field(
+                        cache_dir=cache_dir,
+                        cache_identity=cache_identity,
+                        renderer=active_renderer,
+                        render_width=render_width,
+                        render_height=render_height,
+                        log_zoom=next_log_zoom,
+                        x_center=x_center,
+                        y_center=y_center,
+                        max_iter=next_iter,
+                        series_order=series_order,
+                        series_block=series_block,
+                        native_reference=native_reference,
+                        native_threads=native_threads,
+                    )
+                    _prune_cache(cache_dir, cache_limit_mb)
+                else:
+                    next_log_zoom = None
+                    next_max_zoom = None
             keyframe_seconds += time.perf_counter() - keyframe_started
 
             for frame_index in range(chunk_start, chunk_end):
                 frame_started = time.perf_counter()
-                relative_zoom = 10.0 ** (float(zooms[frame_index]) - chunk_log_zoom)
+                frame_log_zoom = float(zooms[frame_index])
+                relative_zoom = 10.0 ** (frame_log_zoom - chunk_log_zoom)
                 phase = float(features.phase[frame_index])
                 vocal = float(features.vocal[frame_index])
                 instrumental = float(features.instrumental[frame_index])
+                pitch = float(features.pitch[frame_index])
                 rgb = _colour_frame(
                     field,
                     width,
@@ -1621,22 +1855,29 @@ def render_video(
                     native_threads,
                     resample,
                     palette,
+                    pitch,
                 )
                 if next_field is not None and next_log_zoom is not None and next_iter is not None:
-                    boundary_span = max(next_log_zoom - chunk_log_zoom, 1e-12)
-                    progress = (float(zooms[frame_index]) - chunk_log_zoom) / boundary_span
+                    progress = (frame_index - chunk_start) / max(
+                        chunk_end - chunk_start - 1,
+                        1,
+                    )
                     blend_start = 1.0 - transition_fraction
                     alpha = np.clip(
                         (progress - blend_start) / transition_fraction,
                         0.0,
                         1.0,
                     )
-                    if alpha > 0.0:
+                    next_relative_zoom = 10.0 ** (frame_log_zoom - next_log_zoom)
+                    # A source field can only crop inward. If the next field
+                    # is narrower than this frame, wait for overlap instead
+                    # of zooming it out and creating a misregistered flash.
+                    if alpha > 0.0 and next_relative_zoom >= 1.0:
                         next_rgb = _colour_frame(
                             next_field,
                             width,
                             height,
-                            1.0,
+                            next_relative_zoom,
                             next_iter,
                             phase,
                             vocal,
@@ -1645,6 +1886,7 @@ def render_video(
                             native_threads,
                             resample,
                             palette,
+                            pitch,
                         )
                         rgb = np.asarray(
                             np.rint(
@@ -1661,12 +1903,20 @@ def render_video(
                 if frame_index % max(1, fps * 5) == 0:
                     print(f"  encoded {100.0 * frame_index / total_frames:5.1f}%")
 
-            del field
-            if next_field is not None:
-                del next_field
-            # The for-loop leaves frame_index at chunk_end - 1. Advance the
-            # outer render loop or the final chunk is rendered forever.
-            frame_index = chunk_end
+            if next_field is None:
+                del field
+                field = None
+                field_source_zoom = None
+                field_max_zoom = None
+                field_iter = None
+            else:
+                # Critical rolling-keyframe reuse: this field becomes the
+                # current field for the next chunk without another render.
+                field = next_field
+                field_source_zoom = next_log_zoom
+                field_max_zoom = next_max_zoom
+                field_iter = next_iter
+            chunk_index += 1
 
         assert process.stdin is not None
         process.stdin.close()
@@ -1779,6 +2029,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="loudness contrast in zoom speed; larger values make loud beats punch harder",
     )
     parser.add_argument(
+        "--zoom-speed",
+        type=float,
+        default=-0.04,
+        help=(
+            "quiet-time logarithmic zoom velocity; the slightly negative default "
+            "lets the camera pull back between loud punches"
+        ),
+    )
+    parser.add_argument(
+        "--attack",
+        type=float,
+        default=0.025,
+        help="audio-control attack time in seconds; lower is more percussive",
+    )
+    parser.add_argument(
+        "--release",
+        type=float,
+        default=0.12,
+        help="audio-control release time in seconds; higher gives calmer motion",
+    )
+    parser.add_argument(
         "--series-order",
         type=int,
         default=3,
@@ -1788,7 +2059,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--series-block",
         type=int,
         default=256,
-        help="maximum BLA block length (2-4096)",
+        help="maximum BLA block length (2-4096); 256 is the validated default",
     )
     parser.add_argument(
         "--renderer",
@@ -1807,6 +2078,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"),
         default="ultrafast",
         help="x264 speed/size tradeoff; ultrafast is the low-power default",
+    )
+    parser.add_argument(
+        "--codec",
+        default="libx264",
+        help="FFmpeg video encoder name, for example libx264, libx265, or a hardware encoder",
+    )
+    parser.add_argument(
+        "--crf",
+        type=int,
+        default=18,
+        help="constant-rate-factor passed to the selected video encoder (0-51)",
     )
     parser.add_argument(
         "--resample",
@@ -1859,6 +2141,19 @@ def main() -> None:
         raise SystemExit("max-zoom must be greater than or equal to base-zoom")
     if max_log > 9800.0:
         raise SystemExit("max-zoom is beyond the native scaled-exponent range; use a zoom below 1e9800")
+    finite_options = (
+        ("render-scale", args.render_scale),
+        ("fractal-scale", args.fractal_scale),
+        ("keyframe-factor", args.keyframe_factor),
+        ("zoom-punch", args.zoom_punch),
+        ("zoom-speed", args.zoom_speed),
+        ("attack", args.attack),
+        ("release", args.release),
+        ("cache-limit-mb", args.cache_limit_mb),
+    )
+    for option_name, option_value in finite_options:
+        if not math.isfinite(option_value):
+            raise SystemExit(f"{option_name} must be finite")
     if args.render_scale < 1.0:
         raise SystemExit("render-scale must be at least 1")
     if args.fractal_scale <= 0:
@@ -1869,14 +2164,20 @@ def main() -> None:
         raise SystemExit("iteration-cap must be greater than iteration-base")
     if args.zoom_punch < 0:
         raise SystemExit("zoom-punch cannot be negative")
+    if args.attack < 0 or args.release < 0:
+        raise SystemExit("attack and release cannot be negative")
     if not 1 <= args.series_order <= 32:
         raise SystemExit("series-order must be between 1 and 32")
-    if args.series_block < 2:
-        raise SystemExit("series-block must be at least 2")
+    if not 2 <= args.series_block <= 4096:
+        raise SystemExit("series-block must be between 2 and 4096")
     if args.native_threads < 0:
         raise SystemExit("native-threads cannot be negative")
     if args.encoder_threads < 0:
         raise SystemExit("encoder-threads cannot be negative")
+    if not args.codec or args.codec.startswith("-"):
+        raise SystemExit("codec must be a non-empty FFmpeg encoder name")
+    if not 0 <= args.crf <= 51:
+        raise SystemExit("crf must be between 0 and 51")
     if args.cache_limit_mb < 0:
         raise SystemExit("cache-limit-mb cannot be negative")
     if args.sample_rate <= 0:
@@ -1891,6 +2192,8 @@ def main() -> None:
         args.fps,
         args.separation,
         args.cache_dir,
+        args.attack,
+        args.release,
     )
     print(f"Audio analysis: {time.perf_counter() - audio_started:.2f}s", flush=True)
     zooms = _zoom_plan(
@@ -1898,6 +2201,7 @@ def main() -> None:
         args.base_zoom,
         args.max_zoom,
         args.zoom_punch,
+        args.zoom_speed,
     )
     print(
         f"{features.frame_count} frames ({features.frame_count / args.fps:.1f}s) -> "
@@ -1945,6 +2249,8 @@ def main() -> None:
         args.quality,
         args.palette,
         args.cache_limit_mb,
+        args.codec,
+        args.crf,
     )
     print(f"Done -> {args.output}")
 

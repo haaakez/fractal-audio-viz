@@ -28,6 +28,19 @@ class NativeRendererTests(unittest.TestCase):
         ]
         library.fractal_create_reference.restype = ctypes.c_void_p
         library.fractal_destroy_reference.argtypes = [ctypes.c_void_p]
+        library.fractal_colourise.argtypes = [
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_int,
+        ]
+        library.fractal_colourise.restype = ctypes.c_int
         library.render_mandelbrot_reference.argtypes = [
             ctypes.POINTER(ctypes.c_float),
             ctypes.c_int,
@@ -42,7 +55,7 @@ class NativeRendererTests(unittest.TestCase):
         library.render_mandelbrot_reference.restype = ctypes.c_int
 
     def test_abi_version(self):
-        self.assertEqual(self.library.fractal_abi_version(), 6)
+        self.assertEqual(self.library.fractal_abi_version(), 7)
 
     def test_bla_matches_exact_perturbation(self):
         width = height = 24
@@ -98,6 +111,67 @@ class NativeRendererTests(unittest.TestCase):
             )
             self.assertEqual(status, 0, self.library.fractal_last_error())
             self.assertTrue(all(math.isfinite(value) for value in output))
+        finally:
+            self.library.fractal_destroy_reference(handle)
+
+    def test_native_pitch_colour_is_neutral_at_average(self):
+        width = height = 2
+        field_type = ctypes.c_float * (width * height)
+        output_type = ctypes.c_uint8 * (width * height * 3)
+        field = field_type(0.0, 25.0, 50.0, 100.0)
+        neutral = output_type()
+        low = output_type()
+        high = output_type()
+        for pitch, output in ((0.5, neutral), (0.0, low), (1.0, high)):
+            status = self.library.fractal_colourise(
+                field,
+                output,
+                width,
+                height,
+                100,
+                0.0,
+                0.5,
+                0.8,
+                pitch,
+                2,
+            )
+            self.assertEqual(status, 0, self.library.fractal_last_error())
+        self.assertLessEqual(abs(int(neutral[0]) - int(neutral[1])), 1)
+        self.assertLessEqual(abs(int(neutral[1]) - int(neutral[2])), 1)
+        self.assertNotEqual(bytes(low), bytes(high))
+
+    def test_shared_exponent_bla_matches_exact_deep_field(self):
+        width = height = 8
+        output_type = ctypes.c_float * (width * height)
+        with_reference = output_type()
+        exact = output_type()
+        handle = self.library.fractal_create_reference(
+            b"-1.7110308265769848",
+            b"0.00000150981895797",
+            b"1e6",
+            4000,
+            512,
+            3,
+        )
+        self.assertTrue(handle, self.library.fractal_last_error())
+        try:
+            status = self.library.render_mandelbrot_reference(
+                with_reference, width, height, b"1e30", handle, 4000, 2, 3, 256
+            )
+            self.assertEqual(status, 0, self.library.fractal_last_error())
+            old_value = os.environ.get("FRACTAL_DISABLE_BLA")
+            os.environ["FRACTAL_DISABLE_BLA"] = "1"
+            try:
+                status = self.library.render_mandelbrot_reference(
+                    exact, width, height, b"1e30", handle, 4000, 2, 3, 256
+                )
+            finally:
+                if old_value is None:
+                    os.environ.pop("FRACTAL_DISABLE_BLA", None)
+                else:
+                    os.environ["FRACTAL_DISABLE_BLA"] = old_value
+            self.assertEqual(status, 0, self.library.fractal_last_error())
+            self.assertLessEqual(max(abs(a - b) for a, b in zip(with_reference, exact)), 1e-3)
         finally:
             self.library.fractal_destroy_reference(handle)
 

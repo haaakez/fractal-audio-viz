@@ -4,6 +4,7 @@
 // without knowing its C++ types.
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cmath>
@@ -25,7 +26,7 @@
 
 namespace {
 
-constexpr int ABI_VERSION = 6;
+constexpr int ABI_VERSION = 7;
 constexpr long double ESCAPE_RADIUS_SQUARED = 4.0L;
 constexpr long double LOG_TWO = 0.693147180559945309417232121458176568L;
 
@@ -69,6 +70,37 @@ const PaletteBasis& colour_basis_for(int max_iter) {
 
 inline std::uint8_t colour_byte(double value) {
     return static_cast<std::uint8_t>(std::clamp(value, 0.0, 255.0));
+}
+
+std::array<double, 3> pitch_base_colour(double pitch) {
+    const double signed_pitch = std::clamp(2.0 * (pitch - 0.5), -1.0, 1.0);
+    const double distance = std::abs(signed_pitch);
+    const double t = std::clamp((distance - 0.08) / 0.92, 0.0, 1.0);
+    const double saturation = 0.82 * t * t * (3.0 - 2.0 * t);
+    double hue = std::fmod(0.58 + 0.49 * signed_pitch, 1.0);
+    if (hue < 0.0) hue += 1.0;
+
+    const double sector_position = hue * 6.0;
+    const int sector = static_cast<int>(std::floor(sector_position)) % 6;
+    const double fraction = sector_position - std::floor(sector_position);
+    const double value = 1.0;
+    const double p = value * (1.0 - saturation);
+    const double q = value * (1.0 - saturation * fraction);
+    const double t_value = value * (1.0 - saturation * (1.0 - fraction));
+    const std::array<std::array<double, 3>, 6> hsv_rgb = {{
+        {{value, t_value, p}},
+        {{q, value, p}},
+        {{p, value, t_value}},
+        {{p, q, value}},
+        {{t_value, p, value}},
+        {{value, p, q}},
+    }};
+    const auto chromatic = hsv_rgb[static_cast<size_t>(sector)];
+    return {
+        0.58 * (1.0 - saturation) + chromatic[0] * saturation,
+        0.58 * (1.0 - saturation) + chromatic[1] * saturation,
+        0.58 * (1.0 - saturation) + chromatic[2] * saturation,
+    };
 }
 
 long double parse_zoom(const char* text) {
@@ -130,6 +162,155 @@ struct FloatExp {
     bool finite() const { return std::isfinite(mantissa); }
     bool zero() const { return mantissa == 0.0; }
 };
+
+// A complex value represented with one shared binary exponent.  The two
+// components of a perturbation normally have comparable magnitudes, so a
+// shared exponent avoids normalizing real and imaginary parts separately in
+// every complex multiply.  It remains valid far beyond double's exponent
+// range while keeping the hot BLA arithmetic in ordinary doubles.
+struct ScaledComplex {
+    double real = 0.0;
+    double imag = 0.0;
+    int exponent = 0;
+
+    void normalize() {
+        const double magnitude = std::max(std::abs(real), std::abs(imag));
+        if (magnitude == 0.0) {
+            real = 0.0;
+            imag = 0.0;
+            exponent = 0;
+            return;
+        }
+        // Products and sums of normalized values overwhelmingly land within
+        // one binary shift of the target interval. Handle that common case
+        // without a libm frexp/ldexp pair; only severe cancellation needs the
+        // general fallback.
+        if (magnitude >= 1.0) {
+            real *= 0.5;
+            imag *= 0.5;
+            ++exponent;
+            return;
+        }
+        if (magnitude >= 0.5) return;
+        if (magnitude >= 0.25) {
+            real *= 2.0;
+            imag *= 2.0;
+            --exponent;
+            return;
+        }
+        int shift = 0;
+        (void)std::frexp(magnitude, &shift);
+        real = std::ldexp(real, -shift);
+        imag = std::ldexp(imag, -shift);
+        exponent += shift;
+    }
+
+    static ScaledComplex from_float_exp(const FloatExp& real_part, const FloatExp& imag_part) {
+        if (real_part.zero() && imag_part.zero()) return {};
+        const int common_exponent = std::max(real_part.exponent, imag_part.exponent);
+        ScaledComplex result{
+            real_part.exponent - common_exponent < -1074
+                ? 0.0 : std::ldexp(real_part.mantissa, real_part.exponent - common_exponent),
+            imag_part.exponent - common_exponent < -1074
+                ? 0.0 : std::ldexp(imag_part.mantissa, imag_part.exponent - common_exponent),
+            common_exponent,
+        };
+        result.normalize();
+        return result;
+    }
+};
+
+inline ScaledComplex sc_add(const ScaledComplex& a, const ScaledComplex& b) {
+    if (a.real == 0.0 && a.imag == 0.0) return b;
+    if (b.real == 0.0 && b.imag == 0.0) return a;
+    const ScaledComplex* larger = &a;
+    const ScaledComplex* smaller = &b;
+    if (b.exponent > a.exponent) {
+        larger = &b;
+        smaller = &a;
+    }
+    const int difference = larger->exponent - smaller->exponent;
+    if (difference > 60) return *larger;
+    ScaledComplex result{
+        larger->real + std::ldexp(smaller->real, -difference),
+        larger->imag + std::ldexp(smaller->imag, -difference),
+        larger->exponent,
+    };
+    result.normalize();
+    return result;
+}
+
+inline ScaledComplex sc_neg(const ScaledComplex& value) {
+    return {-value.real, -value.imag, value.exponent};
+}
+
+inline ScaledComplex sc_sub(const ScaledComplex& a, const ScaledComplex& b) {
+    return sc_add(a, sc_neg(b));
+}
+
+inline ScaledComplex sc_mul(const ScaledComplex& a, const ScaledComplex& b) {
+    if ((a.real == 0.0 && a.imag == 0.0) || (b.real == 0.0 && b.imag == 0.0)) return {};
+    ScaledComplex result{
+        a.real * b.real - a.imag * b.imag,
+        a.real * b.imag + a.imag * b.real,
+        a.exponent + b.exponent,
+    };
+    result.normalize();
+    return result;
+}
+
+inline ScaledComplex sc_double(const ScaledComplex& value) {
+    if (value.real == 0.0 && value.imag == 0.0) return {};
+    // Multiplication by two is exact in this representation and does not
+    // need another mantissa normalization.
+    return {value.real, value.imag, value.exponent + 1};
+}
+
+struct ScaledNorm {
+    double mantissa = 0.0;
+    int exponent = 0;
+};
+
+inline ScaledNorm sc_norm_squared(const ScaledComplex& value) {
+    const double norm = value.real * value.real + value.imag * value.imag;
+    if (norm == 0.0) return {};
+    if (norm >= 1.0) {
+        return {norm * 0.5, value.exponent * 2 + 1};
+    }
+    if (norm < 0.5) {
+        return {norm * 2.0, value.exponent * 2 - 1};
+    }
+    return {norm, value.exponent * 2};
+}
+
+inline int sc_compare_norm(const ScaledNorm& a, const ScaledNorm& b) {
+    if (a.mantissa == 0.0 && b.mantissa == 0.0) return 0;
+    if (a.mantissa == 0.0) return -1;
+    if (b.mantissa == 0.0) return 1;
+    if (a.exponent != b.exponent) return a.exponent < b.exponent ? -1 : 1;
+    return (a.mantissa > b.mantissa) - (a.mantissa < b.mantissa);
+}
+
+inline bool sc_outside_escape(const ScaledNorm& norm) {
+    // 4 == 0.5 * 2^3 in the normalized representation.
+    return sc_compare_norm(norm, ScaledNorm{0.5, 3}) > 0;
+}
+
+inline double sc_to_double(const ScaledComplex& value) {
+    return std::ldexp(value.real, value.exponent);
+}
+
+inline float smooth_escape_scaled(int iteration, const ScaledNorm& norm) {
+    if (norm.mantissa == 0.0) return static_cast<float>(iteration);
+    const long double log_magnitude = 0.5L * (
+        std::log(static_cast<long double>(norm.mantissa))
+        + static_cast<long double>(norm.exponent) * LOG_TWO);
+    if (!(log_magnitude > 0.0L) || !std::isfinite(log_magnitude)) {
+        return static_cast<float>(iteration);
+    }
+    return static_cast<float>(static_cast<long double>(iteration)
+        - std::log(log_magnitude) / LOG_TWO);
+}
 
 inline FloatExp fe_neg(const FloatExp& value) {
     return {-value.mantissa, value.exponent};
@@ -296,31 +477,122 @@ struct BlaStep {
     int length = 1;
 };
 
+struct FastBlaStep {
+    std::array<ScaledComplex, 9> coefficients{};
+    FloatExp radius_squared;
+    int length = 1;
+};
+
+FastBlaStep compact_bla_step(const BlaStep& step) {
+    FastBlaStep result{
+        {
+        ScaledComplex::from_float_exp(step.A.real, step.A.imag),
+        ScaledComplex::from_float_exp(step.B.real, step.B.imag),
+        ScaledComplex::from_float_exp(step.C.real, step.C.imag),
+        ScaledComplex::from_float_exp(step.D.real, step.D.imag),
+        ScaledComplex::from_float_exp(step.E.real, step.E.imag),
+        ScaledComplex::from_float_exp(step.F.real, step.F.imag),
+        ScaledComplex::from_float_exp(step.G.real, step.G.imag),
+        ScaledComplex::from_float_exp(step.H.real, step.H.imag),
+        ScaledComplex::from_float_exp(step.I.real, step.I.imag),
+        },
+        step.radius_squared,
+        step.length,
+    };
+    return result;
+}
+
+inline ScaledComplex apply_bla_series(
+    const FastBlaStep& step,
+    const ScaledComplex& delta,
+    const ScaledComplex& parameter,
+    int order
+) {
+    const auto& coefficient = step.coefficients;
+    if (order <= 1) {
+        return sc_add(sc_mul(coefficient[0], delta), sc_mul(coefficient[1], parameter));
+    }
+
+    if (order == 2) {
+        // P(d,c) = d*(A + d*C + c*D) + c*(B + c*E).
+        const ScaledComplex d_inner = sc_add(
+            sc_mul(coefficient[2], delta),
+            sc_mul(coefficient[3], parameter));
+        const ScaledComplex c_inner = sc_add(
+            coefficient[1],
+            sc_mul(coefficient[4], parameter));
+        return sc_add(
+            sc_mul(delta, sc_add(coefficient[0], d_inner)),
+            sc_mul(parameter, c_inner));
+    }
+
+    // Cubic Horner form cuts the hot polynomial from sixteen complex
+    // products to nine while preserving the same bivariate coefficients:
+    // P(d,c) = d*(A + d*(C + F*d + G*c) + c*(D + H*c))
+    //        + c*(B + c*(E + I*c)).
+    const ScaledComplex d_cubic = sc_add(
+        sc_add(sc_mul(coefficient[5], delta), sc_mul(coefficient[6], parameter)),
+        coefficient[2]);
+    const ScaledComplex c_cubic = sc_add(
+        coefficient[3],
+        sc_mul(coefficient[7], parameter));
+    const ScaledComplex d_inner = sc_add(
+        coefficient[0],
+        sc_add(sc_mul(delta, d_cubic), sc_mul(parameter, c_cubic)));
+    const ScaledComplex c_inner = sc_add(
+        coefficient[1],
+        sc_mul(parameter, sc_add(
+            coefficient[4],
+            sc_mul(coefficient[8], parameter))));
+    return sc_add(
+        sc_mul(delta, d_inner),
+        sc_mul(parameter, c_inner));
+}
+
 struct BlaLevels {
-    std::vector<std::vector<BlaStep>> levels;
+    std::vector<std::vector<FastBlaStep>> levels;
     FloatExp input_radius;
 
-    const BlaStep* lookup(int start, const FloatExp& delta_norm_squared) const noexcept {
-        if (start <= 0) return nullptr;
+    const FastBlaStep* lookup(
+        int start,
+        const FloatExp& delta_norm_squared,
+        int max_length
+    ) const noexcept {
+        if (start <= 0 || max_length <= 0) return nullptr;
         const int base_count = levels.empty() ? 0 : static_cast<int>(levels[0].size());
         if (start > base_count) return nullptr;
-        const BlaStep* selected = nullptr;
-        for (size_t level = 0; level < levels.size(); ++level) {
-            const int span = 1 << std::min<size_t>(level, 30);
-            if ((start - 1) % span != 0) break;
-            const int index = (start - 1) / span;
-            if (index >= static_cast<int>(levels[level].size())) break;
-            const BlaStep& candidate = levels[level][static_cast<size_t>(index)];
-            if (fe_compare(delta_norm_squared, candidate.radius_squared) >= 0) break;
-            selected = &candidate;
+        int highest_level = 0;
+        while (highest_level < 30
+               && (1 << (highest_level + 1)) <= max_length) {
+            ++highest_level;
         }
-        return selected;
+        highest_level = std::min(
+            highest_level,
+            static_cast<int>(levels.size()) - 1);
+        // Start at the largest permitted block and descend. The previous
+        // low-to-high walk selected an oversized map and the caller then
+        // discarded it, needlessly falling all the way back to one exact
+        // iteration. A bounded descent returns the best valid ancestor.
+        for (int level = highest_level; level >= 0; --level) {
+            const int span = 1 << level;
+            if ((start - 1) % span != 0) continue;
+            const int index = (start - 1) / span;
+            if (index >= static_cast<int>(levels[level].size())) continue;
+            const FastBlaStep& candidate = levels[level][static_cast<size_t>(index)];
+            if (fe_compare(delta_norm_squared, candidate.radius_squared) < 0) {
+                return &candidate;
+            }
+        }
+        return nullptr;
     }
 
 };
 
 struct ReferenceContext {
     std::vector<FloatExpComplex> fast_orbit;
+    std::vector<ScaledComplex> fast_orbit_scaled;
+    std::vector<double> orbit_real_double;
+    std::vector<double> orbit_imag_double;
     BlaLevels bla;
     long double x_center = 0.0L;
     long double y_center = 0.0L;
@@ -349,7 +621,7 @@ void render_direct(
     const double center_imag = static_cast<double>(y_center);
 #ifdef _OPENMP
     if (threads > 0) omp_set_num_threads(threads);
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int py = 0; py < height; ++py) {
         const double y_offset =
@@ -439,6 +711,19 @@ void make_reference_orbit(
         mpfr_add(next_imag, next_imag, cy, MPFR_RNDN);
         mpfr_set(zr, next_real, MPFR_RNDN); mpfr_set(zi, next_imag, MPFR_RNDN);
     }
+    context.fast_orbit_scaled.resize(context.fast_orbit.size());
+    for (size_t index = 0; index < context.fast_orbit.size(); ++index) {
+        context.fast_orbit_scaled[index] = ScaledComplex::from_float_exp(
+            context.fast_orbit[index].real,
+            context.fast_orbit[index].imag);
+    }
+    context.orbit_real_double.resize(context.fast_orbit_scaled.size());
+    context.orbit_imag_double.resize(context.fast_orbit_scaled.size());
+    for (size_t index = 0; index < context.fast_orbit_scaled.size(); ++index) {
+        const ScaledComplex& value = context.fast_orbit_scaled[index];
+        context.orbit_real_double[index] = std::ldexp(value.real, value.exponent);
+        context.orbit_imag_double[index] = std::ldexp(value.imag, value.exponent);
+    }
     mpfr_clears(cx, cy, viewport_zoom, viewport_radius, zr, zi, next_real, next_imag, temporary, nullptr);
 }
 
@@ -520,15 +805,16 @@ void build_bla(ReferenceContext& context) {
     context.bla.levels.clear();
     if (base_count == 0) return;
 
-    context.bla.levels.emplace_back(static_cast<size_t>(base_count));
+    std::vector<std::vector<BlaStep>> builder_levels;
+    builder_levels.emplace_back(static_cast<size_t>(base_count));
     // Keep the fast map below a conservative relative error budget.  The
     // visualizer uses the iteration value for smooth colouring, so a map
     // that is merely visually plausible is not enough at a keyframe seam.
     // The endpoint guard below replays maps that approach escape, so this
     // radius may be looser than machine epsilon without changing the smooth
-    // colouring boundary.  1e-14 enables useful map reuse before the zoom
-    // reaches the extreme e20+ range while retaining a large safety margin.
-    const FloatExp tolerance = FloatExp::from_long_double(1.0e-14L);
+    // colouring boundary.  A 1e-8 relative bound gives deep frames useful
+    // blocks while leaving a large margin for smooth-colour stability.
+    const FloatExp tolerance = FloatExp::from_long_double(1.0e-8L);
     for (int start = 1; start <= base_count; ++start) {
         const FloatExpComplex& reference = context.fast_orbit[static_cast<size_t>(start)];
         const FloatExp reference_magnitude = fe_sqrt(fec_norm_squared(reference));
@@ -551,21 +837,46 @@ void build_bla(ReferenceContext& context) {
             fe_sqr(radius),
             1,
         };
-        context.bla.levels[0][static_cast<size_t>(start - 1)] = step;
+        builder_levels[0][static_cast<size_t>(start - 1)] = step;
     }
 
     for (size_t level = 1; ; ++level) {
-        const size_t previous_size = context.bla.levels[level - 1].size();
+        const size_t previous_size = builder_levels[level - 1].size();
         const size_t current_size = previous_size / 2;
         if (current_size == 0) break;
-        context.bla.levels.emplace_back(current_size);
+        builder_levels.emplace_back(current_size);
+        // Compose the orbit map independently of the current frame's
+        // parameter radius.  The old code passed the shallowest-frame radius
+        // here (typically ~1e-6), which made the conservative
+        // `y.radius - |x.B| * input_radius` bound negative for practically
+        // every multi-iteration block.  That collapsed the hierarchy to
+        // length-one maps and turned deep keyframes back into an expensive
+        // perturbation loop.  The per-frame viewport check in render_bla()
+        // still prevents using the map outside its intended zoom range;
+        // deep frames have a tiny enough dc that the zero-radius composition
+        // bound is the useful reusable limit.
+        const FloatExp composition_input_radius{0.0, 0};
         for (size_t index = 0; index < current_size; ++index) {
-            context.bla.levels[level][index] = merge_bla(
-                context.bla.levels[level - 1][index * 2 + 1],
-                context.bla.levels[level - 1][index * 2],
-                context.bla.input_radius);
+            builder_levels[level][index] = merge_bla(
+                builder_levels[level - 1][index * 2 + 1],
+                builder_levels[level - 1][index * 2],
+                composition_input_radius);
         }
     }
+
+    // Exact FloatExp coefficients are needed only while composing the
+    // hierarchy. Keep a compact render-only copy so the hot lookup path does
+    // not stride through hundreds of bytes of unused builder state.
+    context.bla.levels.reserve(builder_levels.size());
+    for (const auto& builder_level : builder_levels) {
+        auto& render_level = context.bla.levels.emplace_back();
+        render_level.reserve(builder_level.size());
+        for (const BlaStep& step : builder_level) {
+            render_level.push_back(compact_bla_step(step));
+        }
+    }
+    context.fast_orbit.clear();
+    context.fast_orbit.shrink_to_fit();
 }
 
 #ifdef FRACTAL_HAVE_MPFR
@@ -583,39 +894,31 @@ FloatExp parse_zoom_float_exp(const char* text, mpfr_prec_t precision_bits) {
     return result;
 }
 
-float smooth_escape_float_exp(int iteration, const FloatExp& magnitude_squared) {
-    const long double log_magnitude = 0.5L * fe_log(magnitude_squared);
-    if (!(log_magnitude > 0.0L) || !std::isfinite(log_magnitude)) {
-        return static_cast<float>(iteration);
-    }
-    return static_cast<float>(static_cast<long double>(iteration)
-        - std::log(log_magnitude) / LOG_TWO);
-}
-
-void render_double_tail(
+void render_scaled_double_tail(
     float& output,
-    const FloatExpComplex& dc,
+    const ScaledComplex& dc,
     const ReferenceContext& context,
     int max_iter,
     int& iteration,
     int& reference_index,
-    FloatExpComplex delta
+    ScaledComplex delta
 ) {
-    // Once the perturbation is comfortably above the double ulp of an
-    // O(1) reference orbit, carrying a separate exponent is unnecessary.
-    // Finish the escape test in ordinary doubles; this is the hot path for
-    // deep boundary pixels and avoids paying frexp/exponent costs for every
-    // remaining iteration.
-    double dc_real = static_cast<double>(dc.real.as_long_double());
-    double dc_imag = static_cast<double>(dc.imag.as_long_double());
-    double delta_real = static_cast<double>(delta.real.as_long_double());
-    double delta_imag = static_cast<double>(delta.imag.as_long_double());
+    const double dc_real = sc_to_double(dc);
+    const double dc_imag = std::ldexp(dc.imag, dc.exponent);
+    double delta_real = sc_to_double(delta);
+    double delta_imag = std::ldexp(delta.imag, delta.exponent);
     output = static_cast<float>(max_iter);
+    double tortoise_real = 0.0;
+    double tortoise_imag = 0.0;
+    int cycle_power = 1;
+    int cycle_length = 0;
+    int tail_steps = 0;
+    bool cycle_ready = false;
     while (iteration < max_iter) {
-        const FloatExpComplex& reference =
-            context.fast_orbit[static_cast<size_t>(reference_index)];
-        const double reference_real = static_cast<double>(reference.real.as_long_double());
-        const double reference_imag = static_cast<double>(reference.imag.as_long_double());
+        const double reference_real =
+            context.orbit_real_double[static_cast<size_t>(reference_index)];
+        const double reference_imag =
+            context.orbit_imag_double[static_cast<size_t>(reference_index)];
         const double linear_real = 2.0 * (reference_real * delta_real - reference_imag * delta_imag);
         const double linear_imag = 2.0 * (reference_real * delta_imag + reference_imag * delta_real);
         const double square_real = delta_real * delta_real - delta_imag * delta_imag;
@@ -624,8 +927,10 @@ void render_double_tail(
         delta_imag = linear_imag + square_imag + dc_imag;
         ++reference_index;
         ++iteration;
-        const double total_real = static_cast<double>(context.fast_orbit[static_cast<size_t>(reference_index)].real.as_long_double()) + delta_real;
-        const double total_imag = static_cast<double>(context.fast_orbit[static_cast<size_t>(reference_index)].imag.as_long_double()) + delta_imag;
+        const double total_real =
+            context.orbit_real_double[static_cast<size_t>(reference_index)] + delta_real;
+        const double total_imag =
+            context.orbit_imag_double[static_cast<size_t>(reference_index)] + delta_imag;
         const double magnitude_squared = total_real * total_real + total_imag * total_imag;
         if (magnitude_squared > 4.0) {
             const double magnitude = std::sqrt(std::max(magnitude_squared, 4.0000001));
@@ -633,11 +938,49 @@ void render_double_tail(
                 - std::log(std::log(magnitude)) / static_cast<double>(LOG_TWO));
             return;
         }
-        if (total_real * total_real + total_imag * total_imag
-            < delta_real * delta_real + delta_imag * delta_imag) {
+        const double delta_magnitude_squared =
+            delta_real * delta_real + delta_imag * delta_imag;
+
+        ++tail_steps;
+        if (tail_steps >= 64) {
+            // Brent-style cycle detection is deliberately conservative: it
+            // only runs after a long bounded tail and requires a near-exact
+            // recurrence well inside the escape circle. This lets attracting
+            // interior pixels finish early without turning a transient
+            // boundary revisit into a false black classification.
+            if (!cycle_ready) {
+                tortoise_real = total_real;
+                tortoise_imag = total_imag;
+                cycle_power = 1;
+                cycle_length = 0;
+                cycle_ready = true;
+            } else {
+                const double cycle_delta_real = total_real - tortoise_real;
+                const double cycle_delta_imag = total_imag - tortoise_imag;
+                const double cycle_distance_squared =
+                    cycle_delta_real * cycle_delta_real
+                    + cycle_delta_imag * cycle_delta_imag;
+                if (iteration >= 512
+                    && magnitude_squared < 3.0
+                    && cycle_distance_squared
+                        <= 1.0e-24 * std::max(1.0, magnitude_squared)) {
+                    return;
+                }
+                ++cycle_length;
+                if (cycle_length >= cycle_power) {
+                    tortoise_real = total_real;
+                    tortoise_imag = total_imag;
+                    cycle_power = std::min(cycle_power * 2, 1 << 20);
+                    cycle_length = 0;
+                }
+            }
+        }
+        if (magnitude_squared < delta_magnitude_squared) {
             delta_real = total_real;
             delta_imag = total_imag;
             reference_index = 0;
+            tail_steps = 0;
+            cycle_ready = false;
         }
     }
 }
@@ -658,8 +1001,6 @@ void render_bla(
     const FloatExp view_height = fe_mul(inverse_zoom, 2.8);
     const FloatExp view_width = fe_mul(
         view_height, static_cast<double>(width) / static_cast<double>(height));
-    const FloatExp escape_squared = FloatExp::from_parts(4.0, 0);
-    const FloatExp conservative_escape_squared = FloatExp::from_parts(3.0, 0);
     const FloatExp current_input_radius = fe_mul(inverse_zoom, 2.8);
     const bool bla_radius_covers_view =
         fe_compare(current_input_radius, context.bla.input_radius) <= 0;
@@ -674,40 +1015,58 @@ void render_bla(
     const int max_bla_length = std::clamp(series_block, 2, 4096);
     const int approximation_order = std::clamp(series_order, 1, 3);
 
-#ifdef _OPENMP
-    if (threads > 0) omp_set_num_threads(threads);
-#pragma omp parallel for schedule(static)
-#endif
+    // These offsets are shared by every pixel in a row/column.  Computing
+    // the FloatExp multiplication once here removes two viewport-scale
+    // operations from the innermost perturbation loop without changing the
+    // exact pixel-centre mapping.
+    std::vector<FloatExp> x_offsets(static_cast<size_t>(width));
+    std::vector<FloatExp> y_offsets(static_cast<size_t>(height));
     for (int py = 0; py < height; ++py) {
         const double y_fraction =
             (static_cast<double>(height - 1) / 2.0 - static_cast<double>(py))
             / static_cast<double>(height);
-        const FloatExp y_offset = fe_mul(view_height, y_fraction);
+        y_offsets[static_cast<size_t>(py)] = fe_mul(view_height, y_fraction);
+    }
+    for (int px = 0; px < width; ++px) {
+        const double x_fraction =
+            (static_cast<double>(px) - static_cast<double>(width - 1) / 2.0)
+            / static_cast<double>(width);
+        x_offsets[static_cast<size_t>(px)] = fe_mul(view_width, x_fraction);
+    }
+
+#ifdef _OPENMP
+    if (threads > 0) omp_set_num_threads(threads);
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int py = 0; py < height; ++py) {
+        const FloatExp& y_offset = y_offsets[static_cast<size_t>(py)];
         for (int px = 0; px < width; ++px) {
-            const double x_fraction =
-                (static_cast<double>(px) - static_cast<double>(width - 1) / 2.0)
-                / static_cast<double>(width);
-            const FloatExp x_offset = fe_mul(view_width, x_fraction);
-            const FloatExpComplex dc{x_offset, y_offset};
-            const FloatExpComplex dc_squared = fec_mul(dc, dc);
-            const FloatExpComplex dc_cubed = fec_mul(dc_squared, dc);
+            const FloatExp& x_offset = x_offsets[static_cast<size_t>(px)];
+            const ScaledComplex dc = ScaledComplex::from_float_exp(x_offset, y_offset);
             const int index = py * width + px;
-            FloatExpComplex delta = dc;
+            ScaledComplex delta = dc;
             int reference_index = 1;
             int iteration = 1;
             bool escaped = false;
+            bool have_total = false;
+            ScaledComplex total{};
+            ScaledNorm total_norm{};
 
             while (iteration < max_iter) {
-                if (reference_index < 0 || reference_index >= static_cast<int>(context.fast_orbit.size())) {
+                if (reference_index < 0
+                    || reference_index >= static_cast<int>(context.fast_orbit_scaled.size())) {
                     output[index] = static_cast<float>(max_iter);
                     escaped = true;
                     break;
                 }
-                const FloatExpComplex total = fec_add(
-                    context.fast_orbit[static_cast<size_t>(reference_index)], delta);
-                const FloatExp total_norm_squared = fec_norm_squared(total);
-                if (fe_compare(total_norm_squared, escape_squared) > 0) {
-                    output[index] = smooth_escape_float_exp(iteration, total_norm_squared);
+                if (!have_total) {
+                    total = sc_add(
+                        context.fast_orbit_scaled[static_cast<size_t>(reference_index)], delta);
+                    total_norm = sc_norm_squared(total);
+                }
+                have_total = false;
+                if (sc_outside_escape(total_norm)) {
+                    output[index] = smooth_escape_scaled(iteration, total_norm);
                     escaped = true;
                     break;
                 }
@@ -715,8 +1074,8 @@ void render_bla(
                 // Rebase to the beginning of the same reference orbit when
                 // the perturbation is larger than the reference state.  This
                 // is the cheap glitch-avoidance step used by deep zoomers.
-                const FloatExp delta_norm_squared = fec_norm_squared(delta);
-                if (fe_compare(total_norm_squared, delta_norm_squared) < 0) {
+                const ScaledNorm delta_norm = sc_norm_squared(delta);
+                if (sc_compare_norm(total_norm, delta_norm) < 0) {
                     delta = total;
                     reference_index = 0;
                     continue;
@@ -728,72 +1087,70 @@ void render_bla(
                 // use ordinary complex doubles without discarding visible
                 // pixel differences.  The previous 2^-22 threshold left
                 // many e12--e14 frames in the much slower FloatExp loop.
-                if (delta_norm_squared.exponent > -90) {
-                    render_double_tail(output[index], dc, context, max_iter,
+                if (delta_norm.exponent > -90) {
+                    render_scaled_double_tail(output[index], dc, context, max_iter,
                                        iteration, reference_index, delta);
                     escaped = true;
                     break;
                 }
 
-                const BlaStep* step = disable_bla
-                    ? nullptr : context.bla.lookup(reference_index, delta_norm_squared);
-                if (step && step->length > max_bla_length) step = nullptr;
+                const FloatExp delta_norm_float{delta_norm.mantissa, delta_norm.exponent};
+                const int remaining_iterations = max_iter - iteration;
+                const FastBlaStep* step = disable_bla
+                    ? nullptr
+                    : context.bla.lookup(
+                        reference_index,
+                        delta_norm_float,
+                        std::min(max_bla_length, remaining_iterations));
                 if (step && reference_index + step->length <= max_iter) {
-                    const FloatExpComplex previous_delta = delta;
+                    const ScaledComplex previous_delta = delta;
                     const int previous_reference_index = reference_index;
                     const int previous_iteration = iteration;
-                    const FloatExpComplex delta_squared = fec_mul(delta, delta);
-                    const FloatExpComplex delta_cubed = fec_mul(delta_squared, delta);
-                    const FloatExpComplex delta_dc = fec_mul(delta, dc);
-                    const FloatExpComplex delta_squared_dc = fec_mul(delta_squared, dc);
-                    const FloatExpComplex delta_dc_squared = fec_mul(delta, dc_squared);
-                    delta = fec_add(fec_mul(step->A, delta), fec_mul(step->B, dc));
-                    if (approximation_order >= 2) {
-                        delta = fec_add(
-                            delta,
-                            fec_add(
-                                fec_add(fec_mul(step->C, delta_squared), fec_mul(step->D, delta_dc)),
-                                fec_mul(step->E, dc_squared)));
-                    }
-                    if (approximation_order >= 3) {
-                        delta = fec_add(
-                            delta,
-                            fec_add(
-                                fec_add(fec_mul(step->F, delta_cubed),
-                                        fec_mul(step->G, delta_squared_dc)),
-                                fec_add(fec_mul(step->H, delta_dc_squared),
-                                        fec_mul(step->I, dc_cubed))));
-                    }
+                    const ScaledComplex input_delta = delta;
+                    delta = apply_bla_series(
+                        *step,
+                        input_delta,
+                        dc,
+                        approximation_order);
                     reference_index += step->length;
                     iteration += step->length;
-                    const FloatExpComplex endpoint = fec_add(
-                        context.fast_orbit[static_cast<size_t>(reference_index)], delta);
-                    const FloatExp endpoint_norm_squared = fec_norm_squared(endpoint);
+                    const ScaledComplex endpoint = sc_add(
+                        context.fast_orbit_scaled[static_cast<size_t>(reference_index)], delta);
+                    const ScaledNorm endpoint_norm = sc_norm_squared(endpoint);
                     // A block that approaches the escape boundary is replayed
                     // one iteration at a time so smooth colouring does not
                     // acquire broad BLA-sized bands.
-                    if (fe_compare(endpoint_norm_squared, conservative_escape_squared) >= 0) {
+                    if (sc_compare_norm(endpoint_norm, ScaledNorm{0.75, 2}) >= 0) {
                         delta = previous_delta;
                         reference_index = previous_reference_index;
                         iteration = previous_iteration;
+                        ScaledComplex replay_total{};
+                        ScaledNorm replay_norm{};
                         for (int replay = 0; replay < step->length && iteration < max_iter; ++replay) {
-                            const FloatExpComplex reference =
-                                context.fast_orbit[static_cast<size_t>(reference_index)];
-                            delta = fec_add(
-                                fec_add(fec_mul(reference, delta), fec_mul(delta, reference)),
-                                fec_add(fec_mul(delta, delta), dc));
+                            const ScaledComplex reference =
+                                context.fast_orbit_scaled[static_cast<size_t>(reference_index)];
+                            delta = sc_add(
+                                sc_double(sc_mul(reference, delta)),
+                                sc_add(sc_mul(delta, delta), dc));
                             ++reference_index;
                             ++iteration;
-                            const FloatExpComplex replay_total = fec_add(
-                                context.fast_orbit[static_cast<size_t>(reference_index)], delta);
-                            const FloatExp replay_norm_squared = fec_norm_squared(replay_total);
-                            if (fe_compare(replay_norm_squared, escape_squared) > 0) {
-                                output[index] = smooth_escape_float_exp(iteration, replay_norm_squared);
+                            replay_total = sc_add(
+                                context.fast_orbit_scaled[static_cast<size_t>(reference_index)], delta);
+                            replay_norm = sc_norm_squared(replay_total);
+                            if (sc_outside_escape(replay_norm)) {
+                                output[index] = smooth_escape_scaled(iteration, replay_norm);
                                 escaped = true;
                                 break;
                             }
                         }
                         if (escaped) break;
+                        total = replay_total;
+                        total_norm = replay_norm;
+                        have_total = true;
+                    } else {
+                        total = endpoint;
+                        total_norm = endpoint_norm;
+                        have_total = true;
                     }
                     continue;
                 }
@@ -801,11 +1158,11 @@ void render_bla(
                 // One exact perturbation step.  The expression is written as
                 // 2*Z*delta + delta^2 + delta_c, but the symmetric product
                 // keeps the same operation count as a complex multiply.
-                const FloatExpComplex reference =
-                    context.fast_orbit[static_cast<size_t>(reference_index)];
-                delta = fec_add(
-                    fec_add(fec_mul(reference, delta), fec_mul(delta, reference)),
-                    fec_add(fec_mul(delta, delta), dc));
+                const ScaledComplex reference =
+                    context.fast_orbit_scaled[static_cast<size_t>(reference_index)];
+                delta = sc_add(
+                    sc_double(sc_mul(reference, delta)),
+                    sc_add(sc_mul(delta, delta), dc));
                 ++reference_index;
                 ++iteration;
             }
@@ -836,12 +1193,14 @@ int fractal_colourise(
     double phase,
     double vocal,
     double instrumental,
+    double pitch,
     int threads
 ) {
     try {
         if (!field || !output || width <= 0 || height <= 0 || max_iter <= 0) {
             throw std::runtime_error("invalid native colour dimensions or palette");
         }
+        (void)instrumental;
         const PaletteBasis& basis = colour_basis_for(max_iter);
         const int palette_size = static_cast<int>(basis.cosine.size());
         // Match the float32 indexing used by the Python fallback.  A double
@@ -849,17 +1208,12 @@ int fractal_colourise(
         // bin, which is visible as a several-level RGB difference.
         const float index_scale = static_cast<float>(palette_size - 1)
             / static_cast<float>(max_iter);
-        const double split = 0.7 + 3.0 * vocal * vocal;
-        const double brightness = 0.65 + 0.35 * instrumental;
-        const double red_cos = std::cos(phase);
-        const double red_sin = std::sin(phase);
-        const double green_cos = std::cos(phase + split * 0.35);
-        const double green_sin = std::sin(phase + split * 0.35);
-        const double blue_cos = std::cos(phase + split);
-        const double blue_sin = std::sin(phase + split);
-        const double red_gain = (150.0 + 80.0 * vocal) * brightness;
-        const double green_gain = 180.0 * brightness;
-        const double blue_gain = 210.0 * brightness;
+        const double vocal_mix = std::clamp(vocal, 0.0, 1.0);
+        const double split = 0.7 + 0.45 * vocal_mix * vocal_mix;
+        const double brightness = 0.88 + 0.06 * vocal_mix;
+        const double pattern_cos = std::cos(phase + split);
+        const double pattern_sin = std::sin(phase + split);
+        const std::array<double, 3> base = pitch_base_colour(pitch);
         const int pixel_count = width * height;
 
 #ifdef _OPENMP
@@ -881,12 +1235,11 @@ int fractal_colourise(
                 palette_size - 1);
             const double cosine = basis.cosine[static_cast<size_t>(palette_index)];
             const double sine = basis.sine[static_cast<size_t>(palette_index)];
-            const double red_wave = cosine * red_cos + sine * red_sin;
-            const double green_wave = cosine * green_cos + sine * green_sin;
-            const double blue_wave = cosine * blue_cos + sine * blue_sin;
-            rgb[0] = colour_byte((0.5 - 0.5 * red_wave) * red_gain);
-            rgb[1] = colour_byte((0.5 - 0.5 * green_wave) * green_gain);
-            rgb[2] = colour_byte((0.5 - 0.5 * blue_wave) * blue_gain);
+            const double contour = 0.82 + (0.08 + 0.12 * vocal_mix) * (
+                0.5 - 0.5 * (cosine * pattern_cos + sine * pattern_sin));
+            rgb[0] = colour_byte(base[0] * contour * brightness * 255.0);
+            rgb[1] = colour_byte(base[1] * contour * brightness * 255.0);
+            rgb[2] = colour_byte(base[2] * contour * brightness * 255.0);
         }
         set_error("");
         return 0;
@@ -908,6 +1261,7 @@ int fractal_crop_colourise(
     double phase,
     double vocal,
     double instrumental,
+    double pitch,
     int threads
 ) {
     try {
@@ -916,6 +1270,7 @@ int fractal_crop_colourise(
             || !std::isfinite(zoom_factor) || zoom_factor <= 0.0) {
             throw std::runtime_error("invalid native crop/colour dimensions or palette");
         }
+        (void)instrumental;
         zoom_factor = std::max(zoom_factor, 1.0);
         const double inverse_zoom = 1.0 / zoom_factor;
         const double crop_width = static_cast<double>(source_width) * inverse_zoom;
@@ -926,17 +1281,30 @@ int fractal_crop_colourise(
         const int palette_size = static_cast<int>(basis.cosine.size());
         const float index_scale = static_cast<float>(palette_size - 1)
             / static_cast<float>(max_iter);
-        const double split = 0.7 + 3.0 * vocal * vocal;
-        const double brightness = 0.65 + 0.35 * instrumental;
-        const double red_cos = std::cos(phase);
-        const double red_sin = std::sin(phase);
-        const double green_cos = std::cos(phase + split * 0.35);
-        const double green_sin = std::sin(phase + split * 0.35);
-        const double blue_cos = std::cos(phase + split);
-        const double blue_sin = std::sin(phase + split);
-        const double red_gain = (150.0 + 80.0 * vocal) * brightness;
-        const double green_gain = 180.0 * brightness;
-        const double blue_gain = 210.0 * brightness;
+        const double vocal_mix = std::clamp(vocal, 0.0, 1.0);
+        const double split = 0.7 + 0.45 * vocal_mix * vocal_mix;
+        const double brightness = 0.88 + 0.06 * vocal_mix;
+        const double pattern_cos = std::cos(phase + split);
+        const double pattern_sin = std::sin(phase + split);
+        const std::array<double, 3> base = pitch_base_colour(pitch);
+
+        // The horizontal crop mapping is identical for every output row.
+        // Compute the floor/clamp work once instead of repeating it for every
+        // pixel in the inner loop.
+        std::vector<int> x0_map(static_cast<size_t>(output_width));
+        std::vector<int> x1_map(static_cast<size_t>(output_width));
+        std::vector<double> x_fraction_map(static_cast<size_t>(output_width));
+        for (int output_x = 0; output_x < output_width; ++output_x) {
+            double source_x = left
+                + (static_cast<double>(output_x) + 0.5) * crop_width
+                    / static_cast<double>(output_width)
+                - 0.5;
+            source_x = std::clamp(source_x, 0.0, static_cast<double>(source_width - 1));
+            const int x0 = static_cast<int>(std::floor(source_x));
+            x0_map[static_cast<size_t>(output_x)] = x0;
+            x1_map[static_cast<size_t>(output_x)] = std::min(x0 + 1, source_width - 1);
+            x_fraction_map[static_cast<size_t>(output_x)] = source_x - static_cast<double>(x0);
+        }
 
 #ifdef _OPENMP
         if (threads > 0) omp_set_num_threads(threads);
@@ -951,21 +1319,19 @@ int fractal_crop_colourise(
             const int y0 = static_cast<int>(std::floor(source_y));
             const int y1 = std::min(y0 + 1, source_height - 1);
             const double y_fraction = source_y - static_cast<double>(y0);
+            const float* top_row = source + static_cast<size_t>(y0) * source_width;
+            const float* bottom_row = source + static_cast<size_t>(y1) * source_width;
             for (int output_x = 0; output_x < output_width; ++output_x) {
-                double source_x = left
-                    + (static_cast<double>(output_x) + 0.5) * crop_width
-                        / static_cast<double>(output_width)
-                    - 0.5;
-                source_x = std::clamp(source_x, 0.0, static_cast<double>(source_width - 1));
-                const int x0 = static_cast<int>(std::floor(source_x));
-                const int x1 = std::min(x0 + 1, source_width - 1);
-                const double x_fraction = source_x - static_cast<double>(x0);
+                const size_t x_index = static_cast<size_t>(output_x);
+                const int x0 = x0_map[x_index];
+                const int x1 = x1_map[x_index];
+                const double x_fraction = x_fraction_map[x_index];
                 const double top_value =
-                    static_cast<double>(source[y0 * source_width + x0]) * (1.0 - x_fraction)
-                    + static_cast<double>(source[y0 * source_width + x1]) * x_fraction;
+                    static_cast<double>(top_row[x0]) * (1.0 - x_fraction)
+                    + static_cast<double>(top_row[x1]) * x_fraction;
                 const double bottom_value =
-                    static_cast<double>(source[y1 * source_width + x0]) * (1.0 - x_fraction)
-                    + static_cast<double>(source[y1 * source_width + x1]) * x_fraction;
+                    static_cast<double>(bottom_row[x0]) * (1.0 - x_fraction)
+                    + static_cast<double>(bottom_row[x1]) * x_fraction;
                 const float smooth = static_cast<float>(
                     top_value * (1.0 - y_fraction) + bottom_value * y_fraction);
                 std::uint8_t* rgb = output + static_cast<size_t>(
@@ -981,12 +1347,11 @@ int fractal_crop_colourise(
                     static_cast<int>(smooth * index_scale), 0, palette_size - 1);
                 const double cosine = basis.cosine[static_cast<size_t>(palette_index)];
                 const double sine = basis.sine[static_cast<size_t>(palette_index)];
-                const double red_wave = cosine * red_cos + sine * red_sin;
-                const double green_wave = cosine * green_cos + sine * green_sin;
-                const double blue_wave = cosine * blue_cos + sine * blue_sin;
-                rgb[0] = colour_byte((0.5 - 0.5 * red_wave) * red_gain);
-                rgb[1] = colour_byte((0.5 - 0.5 * green_wave) * green_gain);
-                rgb[2] = colour_byte((0.5 - 0.5 * blue_wave) * blue_gain);
+                const double contour = 0.82 + (0.08 + 0.12 * vocal_mix) * (
+                    0.5 - 0.5 * (cosine * pattern_cos + sine * pattern_sin));
+                rgb[0] = colour_byte(base[0] * contour * brightness * 255.0);
+                rgb[1] = colour_byte(base[1] * contour * brightness * 255.0);
+                rgb[2] = colour_byte(base[2] * contour * brightness * 255.0);
             }
         }
         set_error("");
@@ -1043,7 +1408,8 @@ int render_mandelbrot_reference(
             throw std::runtime_error("invalid native render dimensions or handle");
         }
         auto* context = static_cast<ReferenceContext*>(handle);
-        if (max_iter <= 0 || max_iter >= static_cast<int>(context->fast_orbit.size())) {
+        if (max_iter <= 0
+            || max_iter >= static_cast<int>(context->fast_orbit_scaled.size())) {
             throw std::runtime_error("render iteration count exceeds prepared reference");
         }
         // series_order selects the active polynomial degree.  Values above

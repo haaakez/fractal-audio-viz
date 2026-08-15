@@ -12,6 +12,7 @@ import visualizer
 
 
 def main() -> None:
+    np = visualizer._require_numpy()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--height", type=int, default=256)
@@ -19,11 +20,17 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=20000)
     parser.add_argument("--renderer", choices=("auto", "native", "python"), default="auto")
     parser.add_argument("--threads", type=int, default=0)
+    parser.add_argument("--series-order", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument("--series-block", type=int, default=256)
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if min(args.width, args.height, args.iterations, args.repeat) <= 0:
         raise SystemExit("width, height, iterations, and repeat must be positive")
+    if args.threads < 0:
+        raise SystemExit("threads cannot be negative")
+    if not 2 <= args.series_block <= 4096:
+        raise SystemExit("series-block must be between 2 and 4096")
 
     log_zoom = visualizer._zoom_log(args.zoom)
     native_reference = None
@@ -34,8 +41,8 @@ def main() -> None:
             visualizer.DEFAULT_Y_CENTER,
             args.iterations,
             log_zoom,
-            3,
-            6.0,
+            args.series_order,
+            12.0,
         )
     timings = []
     try:
@@ -51,8 +58,8 @@ def main() -> None:
                 args.renderer,
                 args.threads,
                 native_reference,
-                3,
-                256,
+                args.series_order,
+                args.series_block,
             )
             elapsed = time.perf_counter() - started
             timings.append(elapsed)
@@ -66,7 +73,7 @@ def main() -> None:
             "seconds": timings,
             "best_seconds": min(timings),
             "pixels_per_second": args.width * args.height / min(timings),
-            "finite_fraction": float((field == field).mean()),
+            "finite_fraction": float(np.isfinite(field).mean()),
         }
         if args.json:
             print(json.dumps(result, indent=2))

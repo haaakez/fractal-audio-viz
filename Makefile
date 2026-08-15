@@ -21,7 +21,7 @@ all: mandelbrot.so
 mandelbrot.so: renderer.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(OPENMP_FLAGS) -shared -o $@ $< $(MPFR_LIBS)
 
-test:
+test: mandelbrot.so
 	python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 benchmark: mandelbrot.so
