@@ -159,15 +159,15 @@ class NativeRendererTests(unittest.TestCase):
         finally:
             self.library.fractal_destroy_reference(handle)
 
-    def test_native_pitch_colour_is_neutral_at_average(self):
+    def test_native_pitch_rotates_legacy_two_hue_gradient(self):
         width = height = 2
         field_type = ctypes.c_float * (width * height)
         output_type = ctypes.c_uint8 * (width * height * 3)
         field = field_type(0.0, 25.0, 50.0, 100.0)
-        neutral = output_type()
+        baseline = output_type()
         low = output_type()
         high = output_type()
-        for pitch, output in ((0.5, neutral), (0.0, low), (1.0, high)):
+        for pitch, output in ((0.5, baseline), (0.0, low), (1.0, high)):
             status = self.library.fractal_colourise(
                 field,
                 output,
@@ -181,8 +181,10 @@ class NativeRendererTests(unittest.TestCase):
                 2,
             )
             self.assertEqual(status, 0, self.library.fractal_last_error())
-        self.assertLessEqual(abs(int(neutral[0]) - int(neutral[1])), 1)
-        self.assertLessEqual(abs(int(neutral[1]) - int(neutral[2])), 1)
+        baseline_pixels = [tuple(baseline[index:index + 3]) for index in range(0, len(baseline), 3)]
+        self.assertTrue(any(max(pixel) - min(pixel) > 20 for pixel in baseline_pixels))
+        self.assertNotEqual(bytes(baseline), bytes(low))
+        self.assertNotEqual(bytes(baseline), bytes(high))
         self.assertNotEqual(bytes(low), bytes(high))
 
     def test_native_atlas_compositor_blends_central_child(self):

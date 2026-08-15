@@ -89,25 +89,22 @@ class AnimationTests(unittest.TestCase):
             self.assertTrue(np.isfinite(rgb).all())
         self.assertIs(visualizer._custom_palette("fire"), visualizer._custom_palette("fire"))
 
-    def test_pitch_is_grey_at_average_and_moves_around_the_hue_wheel(self):
+    def test_pitch_rotates_legacy_two_hue_gradient(self):
         field = np.linspace(0.0, 100.0, 64 * 64, dtype=np.float32).reshape(64, 64)
-        neutral = visualizer._colourise(field, 100, 0.0, 0.5, 0.8, 0.5)
+        baseline = visualizer._colourise(field, 100, 0.0, 0.5, 0.8, 0.5)
         low = visualizer._colourise(field, 100, 0.0, 0.5, 0.8, 0.0)
         high = visualizer._colourise(field, 100, 0.0, 0.5, 0.8, 1.0)
-        self.assertLessEqual(
-            int(np.max(np.abs(neutral[..., 0].astype(np.int16) - neutral[..., 1].astype(np.int16)))),
-            1,
+        channel_spread = np.max(
+            baseline.astype(np.int16).max(axis=-1)
+            - baseline.astype(np.int16).min(axis=-1)
         )
-        self.assertLessEqual(
-            int(np.max(np.abs(neutral[..., 1].astype(np.int16) - neutral[..., 2].astype(np.int16)))),
-            1,
-        )
+        self.assertGreater(int(channel_spread), 20)
+        self.assertEqual(visualizer._pitch_hue_angle(0.5), 0.0)
+        self.assertLess(visualizer._pitch_hue_angle(0.0), 0.0)
+        self.assertGreater(visualizer._pitch_hue_angle(1.0), 0.0)
         self.assertFalse(np.array_equal(low, high))
-        low_hue, low_saturation = visualizer._pitch_colour_controls(0.0)
-        high_hue, high_saturation = visualizer._pitch_colour_controls(1.0)
-        self.assertGreater(low_saturation, 0.7)
-        self.assertGreater(high_saturation, 0.7)
-        self.assertNotAlmostEqual(low_hue, high_hue, places=3)
+        self.assertFalse(np.array_equal(baseline, low))
+        self.assertFalse(np.array_equal(baseline, high))
 
     def test_crop_factor_is_clamped_to_native_source(self):
         field = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)

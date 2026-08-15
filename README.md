@@ -59,12 +59,12 @@ approximately 1000×1000 source fields. This costs more memory and fractal
 work, but prevents the repeated 4×/8× enlargement that causes visible
 keyframe seams.
 
-The default `aurora` colour path is pitch-relative: the song's robust average
-pitch is neutral grey, lower and higher notes move in opposite directions
-around a full hue wheel, and a slow attack/release response keeps the gradient
-from strobing. Vocals modulate the gradient gently; instrumental energy owns
-the zoom. When separation confidence is insufficient, the full mix drives both
-controls as a deliberate fallback.
+The default `aurora` colour path keeps the original two-anchor blue/yellow
+gradient. The song's robust average pitch leaves those hues unchanged; lower
+and higher notes rotate both anchors in opposite hue directions. Vocals
+modulate the gradient, while instrumental energy owns the zoom. When separation
+confidence is insufficient, the full mix drives both controls as a deliberate
+fallback.
 
 Audio separation uses Demucs when available in `--separation auto`. If Demucs
 cannot produce reliable stems, the full mix drives both zoom and colour. Use

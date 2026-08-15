@@ -43,10 +43,15 @@ struct PaletteBasis {
     std::vector<float> sine;
 };
 
+struct AuroraPalette {
+    std::vector<std::array<std::uint8_t, 3>> rgb;
+};
+
 // The colourizer is called from Python's calling thread, while OpenMP only
 // parallelises its pixel loop.  Thread-local storage therefore gives each
 // caller a reusable LUT without locks or cross-renderer interference.
 thread_local PaletteBasis palette_basis;
+thread_local AuroraPalette aurora_palette;
 
 void set_error(const std::string& message) {
     std::lock_guard<std::mutex> lock(error_mutex);
@@ -76,35 +81,83 @@ inline std::uint8_t colour_byte(double value) {
     return static_cast<std::uint8_t>(std::clamp(value, 0.0, 255.0));
 }
 
-std::array<double, 3> pitch_base_colour(double pitch) {
-    const double signed_pitch = std::clamp(2.0 * (pitch - 0.5), -1.0, 1.0);
-    const double distance = std::abs(signed_pitch);
-    const double t = std::clamp((distance - 0.08) / 0.92, 0.0, 1.0);
-    const double saturation = 0.82 * t * t * (3.0 - 2.0 * t);
-    double hue = std::fmod(0.58 + 0.49 * signed_pitch, 1.0);
-    if (hue < 0.0) hue += 1.0;
+constexpr double TWO_PI = 6.283185307179586476925286766559005768;
+// Keep the old blue/yellow gradient at the median pitch.  A full-range pitch
+// deviation rotates it by about 58 degrees, enough to move the two anchors
+// through neighbouring hues without destroying their separation.
+constexpr double PITCH_HUE_SWING_TURNS = 0.16;
 
-    const double sector_position = hue * 6.0;
-    const int sector = static_cast<int>(std::floor(sector_position)) % 6;
-    const double fraction = sector_position - std::floor(sector_position);
-    const double value = 1.0;
-    const double p = value * (1.0 - saturation);
-    const double q = value * (1.0 - saturation * fraction);
-    const double t_value = value * (1.0 - saturation * (1.0 - fraction));
-    const std::array<std::array<double, 3>, 6> hsv_rgb = {{
-        {{value, t_value, p}},
-        {{q, value, p}},
-        {{p, value, t_value}},
-        {{p, q, value}},
-        {{t_value, p, value}},
-        {{value, p, q}},
-    }};
-    const auto chromatic = hsv_rgb[static_cast<size_t>(sector)];
+double pitch_hue_angle(double pitch) {
+    const double signed_pitch = std::clamp(2.0 * (pitch - 0.5), -1.0, 1.0);
+    return signed_pitch * PITCH_HUE_SWING_TURNS * TWO_PI;
+}
+
+std::array<double, 3> rotate_hue_rgb(
+    const std::array<double, 3>& rgb,
+    double cosine,
+    double sine
+) {
+    // Rotate chroma in YIQ space. This preserves the old channel-wave
+    // luminance while moving both of its characteristic hues together.
+    const double y = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+    const double i = 0.596 * rgb[0] - 0.275 * rgb[1] - 0.321 * rgb[2];
+    const double q = 0.212 * rgb[0] - 0.523 * rgb[1] + 0.311 * rgb[2];
+    const double rotated_i = i * cosine - q * sine;
+    const double rotated_q = i * sine + q * cosine;
     return {
-        0.58 * (1.0 - saturation) + chromatic[0] * saturation,
-        0.58 * (1.0 - saturation) + chromatic[1] * saturation,
-        0.58 * (1.0 - saturation) + chromatic[2] * saturation,
+        y + 0.956 * rotated_i + 0.621 * rotated_q,
+        y - 0.272 * rotated_i - 0.647 * rotated_q,
+        y - 1.106 * rotated_i + 1.703 * rotated_q,
     };
+}
+
+const AuroraPalette& aurora_palette_for(
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch
+) {
+    const PaletteBasis& basis = colour_basis_for(max_iter);
+    const int palette_size = static_cast<int>(basis.cosine.size());
+    aurora_palette.rgb.resize(static_cast<size_t>(palette_size));
+
+    const double vocal_mix = std::clamp(vocal, 0.0, 1.0);
+    const double instrumental_mix = std::clamp(instrumental, 0.0, 1.0);
+    const double split = 0.7 + 3.0 * vocal_mix * vocal_mix;
+    const double brightness = 0.65 + 0.35 * instrumental_mix;
+    const double red_cos = std::cos(phase);
+    const double red_sin = std::sin(phase);
+    const double green_cos = std::cos(phase + split * 0.35);
+    const double green_sin = std::sin(phase + split * 0.35);
+    const double blue_cos = std::cos(phase + split);
+    const double blue_sin = std::sin(phase + split);
+    const double red_gain = (150.0 + 80.0 * vocal_mix) * brightness;
+    const double green_gain = 180.0 * brightness;
+    const double blue_gain = 210.0 * brightness;
+    const double hue_angle = pitch_hue_angle(pitch);
+    const bool rotate = std::abs(hue_angle) > 1.0e-15;
+    const double hue_cos = rotate ? std::cos(hue_angle) : 1.0;
+    const double hue_sin = rotate ? std::sin(hue_angle) : 0.0;
+
+    for (int index = 0; index < palette_size; ++index) {
+        const double cosine = basis.cosine[static_cast<size_t>(index)];
+        const double sine = basis.sine[static_cast<size_t>(index)];
+        const std::array<double, 3> original = {{
+            (0.5 - 0.5 * (cosine * red_cos + sine * red_sin)) * red_gain,
+            (0.5 - 0.5 * (cosine * green_cos + sine * green_sin)) * green_gain,
+            (0.5 - 0.5 * (cosine * blue_cos + sine * blue_sin)) * blue_gain,
+        }};
+        const std::array<double, 3> colour = rotate
+            ? rotate_hue_rgb(original, hue_cos, hue_sin)
+            : original;
+        aurora_palette.rgb[static_cast<size_t>(index)] = {{
+            colour_byte(colour[0]),
+            colour_byte(colour[1]),
+            colour_byte(colour[2]),
+        }};
+    }
+    return aurora_palette;
 }
 
 struct BilinearAxis {
@@ -171,13 +224,8 @@ inline float sample_bilinear_mapped(
 inline void write_colour_pixel(
     float smooth,
     int source_max_iter,
-    const PaletteBasis& basis,
+    const AuroraPalette& palette,
     float palette_index_scale,
-    double pattern_cos,
-    double pattern_sin,
-    double vocal_mix,
-    double brightness,
-    const std::array<double, 3>& base,
     std::uint8_t* destination
 ) {
     if (!std::isfinite(smooth)
@@ -187,18 +235,15 @@ inline void write_colour_pixel(
         destination[2] = 0;
         return;
     }
-    const int palette_size = static_cast<int>(basis.cosine.size());
+    const int palette_size = static_cast<int>(palette.rgb.size());
     const int palette_index = std::clamp(
         static_cast<int>(smooth * palette_index_scale),
         0,
         palette_size - 1);
-    const double cosine = basis.cosine[static_cast<size_t>(palette_index)];
-    const double sine = basis.sine[static_cast<size_t>(palette_index)];
-    const double contour = 0.82 + (0.08 + 0.12 * vocal_mix) * (
-        0.5 - 0.5 * (cosine * pattern_cos + sine * pattern_sin));
-    destination[0] = colour_byte(base[0] * contour * brightness * 255.0);
-    destination[1] = colour_byte(base[1] * contour * brightness * 255.0);
-    destination[2] = colour_byte(base[2] * contour * brightness * 255.0);
+    const auto& colour = palette.rgb[static_cast<size_t>(palette_index)];
+    destination[0] = colour[0];
+    destination[1] = colour[1];
+    destination[2] = colour[2];
 }
 
 long double parse_zoom(const char* text) {
@@ -1354,20 +1399,14 @@ int fractal_colourise(
         if (!field || !output || width <= 0 || height <= 0 || max_iter <= 0) {
             throw std::runtime_error("invalid native colour dimensions or palette");
         }
-        (void)instrumental;
-        const PaletteBasis& basis = colour_basis_for(max_iter);
-        const int palette_size = static_cast<int>(basis.cosine.size());
+        const AuroraPalette& palette = aurora_palette_for(
+            max_iter, phase, vocal, instrumental, pitch);
+        const int palette_size = static_cast<int>(palette.rgb.size());
         // Match the float32 indexing used by the Python fallback.  A double
         // product can occasionally select the adjacent 65k-entry palette
         // bin, which is visible as a several-level RGB difference.
         const float index_scale = static_cast<float>(palette_size - 1)
             / static_cast<float>(max_iter);
-        const double vocal_mix = std::clamp(vocal, 0.0, 1.0);
-        const double split = 0.7 + 0.45 * vocal_mix * vocal_mix;
-        const double brightness = 0.88 + 0.06 * vocal_mix;
-        const double pattern_cos = std::cos(phase + split);
-        const double pattern_sin = std::sin(phase + split);
-        const std::array<double, 3> base = pitch_base_colour(pitch);
         const int pixel_count = width * height;
 
 #ifdef _OPENMP
@@ -1387,13 +1426,10 @@ int fractal_colourise(
                 static_cast<int>(smooth * index_scale),
                 0,
                 palette_size - 1);
-            const double cosine = basis.cosine[static_cast<size_t>(palette_index)];
-            const double sine = basis.sine[static_cast<size_t>(palette_index)];
-            const double contour = 0.82 + (0.08 + 0.12 * vocal_mix) * (
-                0.5 - 0.5 * (cosine * pattern_cos + sine * pattern_sin));
-            rgb[0] = colour_byte(base[0] * contour * brightness * 255.0);
-            rgb[1] = colour_byte(base[1] * contour * brightness * 255.0);
-            rgb[2] = colour_byte(base[2] * contour * brightness * 255.0);
+            const auto& colour = palette.rgb[static_cast<size_t>(palette_index)];
+            rgb[0] = colour[0];
+            rgb[1] = colour[1];
+            rgb[2] = colour[2];
         }
         set_error("");
         return 0;
@@ -1424,24 +1460,17 @@ int fractal_crop_colourise(
             || !std::isfinite(zoom_factor) || zoom_factor <= 0.0) {
             throw std::runtime_error("invalid native crop/colour dimensions or palette");
         }
-        (void)instrumental;
         zoom_factor = std::max(zoom_factor, 1.0);
         const double inverse_zoom = 1.0 / zoom_factor;
         const double crop_width = static_cast<double>(source_width) * inverse_zoom;
         const double crop_height = static_cast<double>(source_height) * inverse_zoom;
         const double left = (static_cast<double>(source_width) - crop_width) * 0.5;
         const double top = (static_cast<double>(source_height) - crop_height) * 0.5;
-        const PaletteBasis& basis = colour_basis_for(max_iter);
-        const int palette_size = static_cast<int>(basis.cosine.size());
+        const AuroraPalette& palette = aurora_palette_for(
+            max_iter, phase, vocal, instrumental, pitch);
+        const int palette_size = static_cast<int>(palette.rgb.size());
         const float index_scale = static_cast<float>(palette_size - 1)
             / static_cast<float>(max_iter);
-        const double vocal_mix = std::clamp(vocal, 0.0, 1.0);
-        const double split = 0.7 + 0.45 * vocal_mix * vocal_mix;
-        const double brightness = 0.88 + 0.06 * vocal_mix;
-        const double pattern_cos = std::cos(phase + split);
-        const double pattern_sin = std::sin(phase + split);
-        const std::array<double, 3> base = pitch_base_colour(pitch);
-
         // The horizontal crop mapping is identical for every output row.
         // Compute the floor/clamp work once instead of repeating it for every
         // pixel in the inner loop.
@@ -1499,13 +1528,10 @@ int fractal_crop_colourise(
                 }
                 const int palette_index = std::clamp(
                     static_cast<int>(smooth * index_scale), 0, palette_size - 1);
-                const double cosine = basis.cosine[static_cast<size_t>(palette_index)];
-                const double sine = basis.sine[static_cast<size_t>(palette_index)];
-                const double contour = 0.82 + (0.08 + 0.12 * vocal_mix) * (
-                    0.5 - 0.5 * (cosine * pattern_cos + sine * pattern_sin));
-                rgb[0] = colour_byte(base[0] * contour * brightness * 255.0);
-                rgb[1] = colour_byte(base[1] * contour * brightness * 255.0);
-                rgb[2] = colour_byte(base[2] * contour * brightness * 255.0);
+                const auto& colour = palette.rgb[static_cast<size_t>(palette_index)];
+                rgb[0] = colour[0];
+                rgb[1] = colour[1];
+                rgb[2] = colour[2];
             }
         }
         set_error("");
@@ -1551,18 +1577,12 @@ int fractal_atlas_colourise(
         if (use_child && (child_width <= 0 || child_height <= 0 || child_max_iter <= 0)) {
             throw std::runtime_error("invalid native atlas child tile");
         }
-        (void)instrumental;
         const int effective_palette_iter = std::max(
             1,
             std::max(palette_max_iter, std::max(parent_max_iter, child_max_iter)));
-        const PaletteBasis& basis = colour_basis_for(effective_palette_iter);
-        const double vocal_mix = std::clamp(vocal, 0.0, 1.0);
-        const double split = 0.7 + 0.45 * vocal_mix * vocal_mix;
-        const double brightness = 0.88 + 0.06 * vocal_mix;
-        const double pattern_cos = std::cos(phase + split);
-        const double pattern_sin = std::sin(phase + split);
-        const std::array<double, 3> base = pitch_base_colour(pitch);
-        const int effective_palette_size = static_cast<int>(basis.cosine.size());
+        const AuroraPalette& palette = aurora_palette_for(
+            effective_palette_iter, phase, vocal, instrumental, pitch);
+        const int effective_palette_size = static_cast<int>(palette.rgb.size());
         const float palette_index_scale = static_cast<float>(effective_palette_size - 1)
             / static_cast<float>(effective_palette_iter);
         const int visible_child_width = use_child
@@ -1630,13 +1650,8 @@ int fractal_atlas_colourise(
                 write_colour_pixel(
                     smooth,
                     parent_max_iter,
-                    basis,
+                    palette,
                     palette_index_scale,
-                    pattern_cos,
-                    pattern_sin,
-                    vocal_mix,
-                    brightness,
-                    base,
                     destination);
             }
         };
@@ -1660,13 +1675,8 @@ int fractal_atlas_colourise(
                     write_colour_pixel(
                         smooth,
                         child_max_iter,
-                        basis,
+                        palette,
                         palette_index_scale,
-                        pattern_cos,
-                        pattern_sin,
-                        vocal_mix,
-                        brightness,
-                        base,
                         destination);
                 }
                 continue;
@@ -1701,24 +1711,14 @@ int fractal_atlas_colourise(
                 write_colour_pixel(
                     parent_smooth,
                     parent_max_iter,
-                    basis,
+                    palette,
                     palette_index_scale,
-                    pattern_cos,
-                    pattern_sin,
-                    vocal_mix,
-                    brightness,
-                    base,
                     parent_rgb);
                 write_colour_pixel(
                     child_smooth,
                     child_max_iter,
-                    basis,
+                    palette,
                     palette_index_scale,
-                    pattern_cos,
-                    pattern_sin,
-                    vocal_mix,
-                    brightness,
-                    base,
                     child_rgb);
                 const float alpha = feather >= 2
                     ? std::min(

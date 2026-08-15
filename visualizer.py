@@ -399,8 +399,8 @@ def _frame_pitch(samples: Any, sample_rate: int, fps: int) -> Any:
 
     YIN is deliberately used instead of a raw spectral centroid: the latter
     follows cymbals and broadband transients as if they were notes.  Invalid
-    or unvoiced windows use the median detected pitch, producing a stable
-    neutral colour rather than sudden blue/yellow jumps.
+    or unvoiced windows use the median detected pitch, producing the stable
+    median-pitch gradient rather than sudden blue/yellow jumps.
     """
 
     np = _require_numpy()
@@ -439,9 +439,9 @@ def _frame_pitch(samples: Any, sample_rate: int, fps: int) -> Any:
 def _relative_pitch(values: Any) -> Any:
     """Centre pitch around the song's robust average for colour control.
 
-    The returned 0.0..1.0 value is deliberately centred at 0.5.  A pitch
-    equal to the song median therefore has zero chroma and renders grey;
-    higher and lower notes travel in opposite directions around the hue wheel.
+    The returned 0.0..1.0 value is deliberately centred at 0.5. A pitch equal
+    to the song median leaves the legacy gradient unchanged; higher and lower
+    notes rotate its two hues in opposite directions.
     Log-frequency pitch is already perceptual, so a robust deviation scale is
     more stable than treating Hz as a linear distance.
     """
@@ -1738,42 +1738,38 @@ def _palette_basis(max_iter: int) -> tuple[Any, Any, float]:
     return np.cos(angle), np.sin(angle), (palette_size - 1) / max(float(max_iter), 1.0)
 
 
-def _pitch_colour_controls(pitch: float) -> tuple[float, float]:
-    """Return a signed full-wheel hue and restrained chroma for pitch."""
+def _pitch_hue_angle(pitch: float) -> float:
+    """Return the hue rotation applied to the legacy blue/yellow palette."""
 
     np = _require_numpy()
     signed = float(np.clip(2.0 * (float(pitch) - 0.5), -1.0, 1.0))
-    distance = abs(signed)
-    # Keep ordinary notes close to neutral grey and reserve strong chroma for
-    # notes that are meaningfully above or below the song's pitch centre.
-    t = float(np.clip((distance - 0.08) / 0.92, 0.0, 1.0))
-    saturation = 0.82 * t * t * (3.0 - 2.0 * t)
-    # A signed deviation travels in opposite directions around nearly the
-    # entire wheel.  0.49 avoids making the two extreme endpoints identical
-    # after wrapping at hue 0/1.
-    hue = (0.58 + 0.49 * signed) % 1.0
-    return hue, saturation
+    # Median pitch leaves the old palette unchanged. Extremes rotate it by
+    # roughly 58 degrees, preserving the two distinct gradient anchors.
+    return signed * 0.16 * (2.0 * math.pi)
 
 
-def _hsv_to_rgb(hue: float, saturation: float, value: float = 1.0) -> Any:
-    """Convert one scalar HSV colour to a float32 RGB triplet."""
+def _rotate_hue_rgb(palette: Any, pitch: float) -> Any:
+    """Rotate a palette's chroma in YIQ while preserving its luminance."""
 
     np = _require_numpy()
-    h = (float(hue) % 1.0) * 6.0
-    sector = int(math.floor(h))
-    fraction = h - sector
-    p = value * (1.0 - saturation)
-    q = value * (1.0 - saturation * fraction)
-    t = value * (1.0 - saturation * (1.0 - fraction))
-    colours = (
-        (value, t, p),
-        (q, value, p),
-        (p, value, t),
-        (p, q, value),
-        (t, p, value),
-        (value, p, q),
-    )
-    return np.asarray(colours[sector % 6], dtype=np.float32)
+    angle = _pitch_hue_angle(pitch)
+    if abs(angle) <= 1.0e-15:
+        return palette
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    red = palette[:, 0]
+    green = palette[:, 1]
+    blue = palette[:, 2]
+    luminance = 0.299 * red + 0.587 * green + 0.114 * blue
+    in_phase = 0.596 * red - 0.275 * green - 0.321 * blue
+    quadrature = 0.212 * red - 0.523 * green + 0.311 * blue
+    rotated_i = in_phase * cosine - quadrature * sine
+    rotated_q = in_phase * sine + quadrature * cosine
+    return np.stack((
+        luminance + 0.956 * rotated_i + 0.621 * rotated_q,
+        luminance - 0.272 * rotated_i - 0.647 * rotated_q,
+        luminance - 1.106 * rotated_i + 1.703 * rotated_q,
+    ), axis=1)
 
 
 def _colourise(
@@ -1786,28 +1782,22 @@ def _colourise(
 ) -> Any:
     np = _require_numpy()
     inside = field >= max_iter - 0.5
-    # Colour changes every video frame, but it only depends on the smooth
-    # iteration value.  Precomputing sin/cos(angle) once per keyframe lets a
-    # frame rotate the palette with just six scalar trig calls, rather than
-    # evaluating three 65k-element cosine arrays every time.
+    # Restore the original three phase-offset channel waves. They produce the
+    # characteristic blue/yellow gradient; pitch rotates both hues together.
     cosine_basis, sine_basis, scale = _palette_basis(int(max_iter))
-    pitch_hue, pitch_saturation = _pitch_colour_controls(pitch)
-    split = 0.7 + 0.45 * vocal * vocal
-    # Instrumental energy owns zoom. Keep colour luminance restrained so a
-    # beat cannot turn the entire frame into a white/black flash.
-    vocal_mix = float(np.clip(vocal, 0.0, 1.0))
-    brightness = 0.88 + 0.06 * vocal_mix
-    pattern_angle = phase + split
-    wave = cosine_basis * math.cos(pattern_angle) + sine_basis * math.sin(pattern_angle)
-    contour = 0.82 + (0.08 + 0.12 * vocal_mix) * (0.5 - 0.5 * wave)
-    chromatic = _hsv_to_rgb(pitch_hue, pitch_saturation)
-    grey = np.asarray((0.58, 0.58, 0.58), dtype=np.float32)
-    base = grey * (1.0 - pitch_saturation) + chromatic * pitch_saturation
-    palette = np.clip(
-        contour[:, None] * base[None, :] * brightness * 255.0,
-        0.0,
-        255.0,
-    ).astype(np.uint8)
+    split = 0.7 + 3.0 * float(vocal) * float(vocal)
+    brightness = 0.65 + 0.35 * float(instrumental)
+    red_wave = cosine_basis * math.cos(phase) + sine_basis * math.sin(phase)
+    green_wave = cosine_basis * math.cos(phase + split * 0.35) \
+        + sine_basis * math.sin(phase + split * 0.35)
+    blue_wave = cosine_basis * math.cos(phase + split) \
+        + sine_basis * math.sin(phase + split)
+    palette = np.empty((cosine_basis.size, 3), dtype=np.float32)
+    palette[:, 0] = np.clip((0.5 - 0.5 * red_wave)
+                            * (150.0 + 80.0 * float(vocal)) * brightness, 0.0, 255.0)
+    palette[:, 1] = np.clip((0.5 - 0.5 * green_wave) * 180.0 * brightness, 0.0, 255.0)
+    palette[:, 2] = np.clip((0.5 - 0.5 * blue_wave) * 210.0 * brightness, 0.0, 255.0)
+    palette = np.clip(_rotate_hue_rgb(palette, pitch), 0.0, 255.0).astype(np.uint8)
     palette_indices = np.clip(field * scale, 0, palette.shape[0] - 1).astype(np.intp)
     rgb = palette[palette_indices]
     rgb[inside] = 0
