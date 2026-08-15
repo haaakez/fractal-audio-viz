@@ -410,6 +410,10 @@ inline ScaledComplex sc_double(const ScaledComplex& value) {
     return {value.real, value.imag, value.exponent + 1};
 }
 
+inline bool sc_finite(const ScaledComplex& value) noexcept {
+    return std::isfinite(value.real) && std::isfinite(value.imag);
+}
+
 struct ScaledNorm {
     double mantissa = 0.0;
     int exponent = 0;
@@ -1495,7 +1499,9 @@ void render_bla(
                     // A block that approaches the escape boundary is replayed
                     // one iteration at a time so smooth colouring does not
                     // acquire broad BLA-sized bands.
-                    if (sc_compare_norm(endpoint_norm, ScaledNorm{0.75, 2}) >= 0) {
+                    if (!sc_finite(delta)
+                        || !sc_finite(endpoint)
+                        || sc_compare_norm(endpoint_norm, ScaledNorm{0.75, 2}) >= 0) {
                         delta = previous_delta;
                         reference_index = previous_reference_index;
                         iteration = previous_iteration;
@@ -1512,6 +1518,11 @@ void render_bla(
                             replay_total = sc_add(
                                 context.fast_orbit_scaled[static_cast<size_t>(reference_index)], delta);
                             replay_norm = sc_norm_squared(replay_total);
+                            if (!sc_finite(delta) || !sc_finite(replay_total)) {
+                                output[index] = static_cast<float>(max_iter);
+                                escaped = true;
+                                break;
+                            }
                             if (sc_outside_escape(replay_norm)) {
                                 output[index] = smooth_escape_scaled(iteration, replay_norm);
                                 escaped = true;
