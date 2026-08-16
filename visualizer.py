@@ -81,7 +81,7 @@ DEFAULT_Y_CENTER = (
 # renderer from silently reusing an old, under-resolved .npy keyframe.
 KEYFRAME_CACHE_SCHEMA = "bla-keyframe-blend-colour-v6"
 AUDIO_CACHE_SCHEMA = "audio-controls-v5-dynamics-pitch"
-ATLAS_CACHE_SCHEMA = "nested-atlas-v4-adaptive-local-references"
+ATLAS_CACHE_SCHEMA = "nested-atlas-v5-spatial-recovery"
 
 # A single reference is normally ideal, but at deep zoom a frame-sized tile
 # can contain a narrow boundary that is much farther from that reference than
@@ -1428,6 +1428,70 @@ def _atlas_local_reference_centres(
         return result
 
 
+def _spatial_recover_field(
+    local_field: Any,
+    fallback_field: Optional[Any] = None,
+) -> tuple[Any, int]:
+    """Fill deadline-marked pixels without creating a constant rectangle.
+
+    ``fallback_field`` should be the same world-space region from a cheaper
+    source, normally the central crop of the parent atlas tile. Any remaining
+    holes are propagated from finite eight-neighbour samples. A completely
+    unresolved field is rejected so callers can use their ordinary global
+    reference fallback instead of silently producing a fake coloured block.
+    """
+
+    np = _require_numpy()
+    result = np.asarray(local_field, dtype=np.float32).copy()
+    if result.ndim != 2 or result.size == 0:
+        raise ValueError("spatial recovery requires a non-empty 2-D field")
+    missing_before = ~np.isfinite(result)
+    if not missing_before.any():
+        return result, 0
+
+    if fallback_field is not None:
+        fallback = np.asarray(fallback_field, dtype=np.float32)
+        if fallback.shape != result.shape:
+            raise ValueError("spatial recovery fallback shape does not match the field")
+        fallback_finite = np.isfinite(fallback)
+        use_fallback = missing_before & fallback_finite
+        result[use_fallback] = fallback[use_fallback]
+
+    shape = result.shape
+    if not np.isfinite(result).all():
+        # A damaged/partial parent should not reintroduce a flat rectangle.
+        # Propagate nearby finite values inward with an eight-neighbour
+        # average; this is only a last-resort edge repair for pixels
+        # unavailable in both native passes.
+        for _ in range(max(shape)):
+            finite = np.isfinite(result)
+            if finite.all():
+                break
+            padded = np.pad(
+                result,
+                1,
+                mode="constant",
+                constant_values=np.nan,
+            )
+            total = np.zeros(shape, dtype=np.float32)
+            count = np.zeros(shape, dtype=np.float32)
+            for dy in range(3):
+                for dx in range(3):
+                    if dx == 1 and dy == 1:
+                        continue
+                    neighbour = padded[dy:dy + shape[0], dx:dx + shape[1]]
+                    valid = np.isfinite(neighbour)
+                    total[valid] += neighbour[valid]
+                    count[valid] += 1.0
+            fillable = ~finite & (count > 0.0)
+            if not fillable.any():
+                break
+            result[fillable] = total[fillable] / count[fillable]
+    if not np.isfinite(result).all():
+        raise RuntimeError("adaptive local reference has no spatially valid recovery")
+    return result, int(missing_before.sum())
+
+
 def _atlas_local_reference_field(
     *,
     render_width: int,
@@ -1441,6 +1505,9 @@ def _atlas_local_reference_field(
     renderer: str,
     native_threads: int,
     native_library: Any,
+    fallback_field: Optional[Any] = None,
+    fallback_zoom_factor: float = 2.0,
+    fallback_max_iter: Optional[int] = None,
 ) -> Optional[Any]:
     """Render a deep tile with an adaptive secondary-reference grid.
 
@@ -1450,8 +1517,10 @@ def _atlas_local_reference_field(
     Only those cells are recursively split into four smaller reference views;
     easy cells are never rendered again. The final subdivision gets a bounded
     exact perturbation retry with BLA disabled. A tile-level deadline prevents
-    a pathological cluster from consuming the whole render; only pixels that
-    still cannot finish are filled from their local finite samples.
+    a pathological cluster from consuming the whole render. If it fires,
+    unresolved pixels are recovered from the already-rendered parent tile at
+    the matching world-space crop, keeping the result spatially continuous
+    instead of painting a whole cell with one median iteration value.
 
     ``None`` means that the ordinary single-reference path should be used.
     """
@@ -1483,6 +1552,12 @@ def _atlas_local_reference_field(
     )
     centres_by_divisions = {initial_divisions: initial_cells}
     field = np.full((render_height, render_width), np.nan, dtype=np.float32)
+    fallback_array = None
+    if fallback_field is not None:
+        fallback_array = np.asarray(fallback_field, dtype=np.float32)
+        if fallback_array.ndim != 2 or fallback_array.size == 0:
+            raise ValueError("atlas recovery fallback must be a non-empty 2-D field")
+    parent_fallback = None
     previous_cycle_setting = os.environ.get("FRACTAL_STRICT_CYCLE")
     previous_budget_setting = os.environ.get("FRACTAL_TIME_BUDGET_MS")
     previous_bla_setting = os.environ.get("FRACTAL_DISABLE_BLA")
@@ -1599,6 +1674,36 @@ def _atlas_local_reference_field(
     recovered_pixels = 0
     tile_deadline = time.monotonic() + ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS / 1000.0
 
+    def parent_fallback_view() -> Any:
+        nonlocal parent_fallback
+        if parent_fallback is not None:
+            return parent_fallback
+        if fallback_array is None:
+            return None
+        # A child atlas tile is one fixed zoom factor narrower than its
+        # parent. Resample the parent's central crop once, lazily, only when
+        # the deadline/recovery path is actually needed.
+        parent_fallback = np.asarray(
+            _crop_and_resize(
+                fallback_array,
+                render_width,
+                render_height,
+                max(float(fallback_zoom_factor), 1.0),
+                "bilinear",
+            ),
+            dtype=np.float32,
+        )
+        if fallback_max_iter is not None:
+            # Interior pixels in the parent are encoded at its iteration cap.
+            # Translate that sentinel to the current tile's cap instead of
+            # turning parent interiors into a false coloured escape band.
+            parent_fallback = np.where(
+                parent_fallback >= float(fallback_max_iter) - 0.5,
+                float(max_iter),
+                parent_fallback,
+            ).astype(np.float32, copy=False)
+        return parent_fallback
+
     def complete_with_recovery(
         cell: tuple[int, int, int, int, str, str],
         local_field: Optional[Any] = None,
@@ -1610,21 +1715,11 @@ def _atlas_local_reference_field(
             local_field = np.full(shape, np.nan, dtype=np.float32)
         else:
             local_field = np.asarray(local_field, dtype=np.float32).copy()
-        finite = np.isfinite(local_field)
-        if not finite.all():
-            samples = local_field[finite]
-            if samples.size == 0:
-                fill_value = min(
-                    float(max_iter) - 1.0,
-                    float(max_iter) * 0.90,
-                )
-            else:
-                fill_value = float(np.median(samples))
-                # Keep a recovered unresolved pixel visibly distinct from a
-                # true interior result, which is encoded at max_iter.
-                fill_value = min(fill_value, float(max_iter) - 1.0)
-            recovered_pixels += int((~finite).sum())
-            local_field[~finite] = fill_value
+        fallback = parent_fallback_view()
+        fallback_values = None if fallback is None else fallback[y0:y1, x0:x1]
+        local_field, recovered = _spatial_recover_field(local_field, fallback_values)
+        if recovered:
+            recovered_pixels += recovered
             recovered_cells += 1
         field[y0:y1, x0:x1] = local_field
 
@@ -1670,7 +1765,8 @@ def _atlas_local_reference_field(
 
             # A cell this small no longer benefits from more references. Run
             # one bounded exact retry with BLA disabled. Truly pathological
-            # pixels are recovered locally instead of blocking the atlas.
+            # pixels are recovered from the parent field instead of blocking
+            # the atlas with a flat synthetic value.
             if time.monotonic() >= tile_deadline:
                 complete_with_recovery(cell, local_field)
                 completed_cells += 1
@@ -1694,7 +1790,7 @@ def _atlas_local_reference_field(
                 f"  Adaptive local references completed {completed_cells} cells "
                 f"after refining {refined_cells} hard cells"
                 + (
-                    f"; recovered {recovered_pixels} unresolved pixels"
+                    f"; spatially recovered {recovered_pixels} unresolved pixels"
                     if recovered_cells else ""
                 )
                 + ".",
@@ -1733,6 +1829,9 @@ def _atlas_tile_field(
     native_reference: Any,
     native_threads: int,
     native_library: Any = None,
+    fallback_field: Optional[Any] = None,
+    fallback_zoom_factor: float = 2.0,
+    fallback_max_iter: Optional[int] = None,
     durable_cache: bool = False,
     cache_evictor: Optional["_CacheEvictor"] = None,
 ) -> Any:
@@ -1783,6 +1882,9 @@ def _atlas_tile_field(
                 renderer=renderer,
                 native_threads=native_threads,
                 native_library=native_library,
+                fallback_field=fallback_field,
+                fallback_zoom_factor=fallback_zoom_factor,
+                fallback_max_iter=fallback_max_iter,
             )
         except RuntimeError as error:
             # Secondary references are an optimization layer.  A transient
@@ -2114,6 +2216,12 @@ def _render_video_atlas(
         if level in tile_cache:
             return tile_cache[level]
         started = time.perf_counter()
+        parent_field = tile_cache.get(level - 1)
+        parent_max_iter = (
+            tile_iterations.get(level - 1)
+            if parent_field is not None
+            else None
+        )
         tile_cache[level] = _atlas_tile_field(
             cache_dir=cache_dir,
             cache_identity=cache_identity,
@@ -2130,6 +2238,9 @@ def _render_video_atlas(
             native_reference=native_reference,
             native_threads=native_threads,
             native_library=native_library,
+            fallback_field=parent_field,
+            fallback_zoom_factor=factor,
+            fallback_max_iter=parent_max_iter,
             durable_cache=durable_cache,
             cache_evictor=cache_evictor,
         )

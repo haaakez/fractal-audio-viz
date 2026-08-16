@@ -192,12 +192,29 @@ class AnimationTests(unittest.TestCase):
             - baseline.astype(np.int16).min(axis=-1)
         )
         self.assertGreater(int(channel_spread), 20)
+        self.assertGreater(int(np.unique(baseline.reshape(-1, 3), axis=0).shape[0]), 32)
         self.assertEqual(visualizer._pitch_hue_angle(0.5), 0.0)
         self.assertLess(visualizer._pitch_hue_angle(0.0), 0.0)
         self.assertGreater(visualizer._pitch_hue_angle(1.0), 0.0)
         self.assertFalse(np.array_equal(low, high))
         self.assertFalse(np.array_equal(baseline, low))
         self.assertFalse(np.array_equal(baseline, high))
+
+    def test_spatial_recovery_preserves_fallback_structure(self):
+        local = np.full((6, 6), np.nan, dtype=np.float32)
+        fallback = np.arange(36, dtype=np.float32).reshape(6, 6)
+        recovered, count = visualizer._spatial_recover_field(local, fallback)
+        self.assertEqual(count, 36)
+        self.assertTrue(np.isfinite(recovered).all())
+        np.testing.assert_array_equal(recovered, fallback)
+
+    def test_spatial_recovery_does_not_flat_fill_partial_holes(self):
+        local = np.arange(49, dtype=np.float32).reshape(7, 7)
+        local[2:5, 2:5] = np.nan
+        recovered, count = visualizer._spatial_recover_field(local)
+        self.assertEqual(count, 9)
+        self.assertTrue(np.isfinite(recovered).all())
+        self.assertGreater(int(np.unique(recovered[2:5, 2:5]).size), 1)
 
     def test_crop_factor_is_clamped_to_native_source(self):
         field = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)

@@ -157,11 +157,13 @@ split again, up to a 32x32 grid. Each view gets a high-precision reference at
 its own centre. This prevents one narrow near-parabolic feature from making
 the whole tile fall back to a pathological tail while keeping easy tiles
 cheap. A final small-cell retry is bounded, and an atlas tile deadline
-prevents one unresolved feature from stopping the complete video; only pixels
-that still miss both limits use a local finite-value recovery. The split also
-handles odd source sizes such as the 125x125 tile produced by a 500x500 render
-with `--fractal-scale 0.25`; the cache namespace is versioned so older
-single-reference atlas fields are not reused.
+prevents one unresolved feature from stopping the complete video. Pixels that
+still miss both limits are recovered from the parent's central world-space
+crop, with neighbourhood interpolation only as a last resort; they are never
+replaced by one constant iteration value that would create a rectangular
+colour block. The split also handles odd source sizes such as the 125x125 tile
+produced by a 500x500 render with `--fractal-scale 0.25`; the cache namespace
+is versioned so older single-reference atlas fields are not reused.
 
 Keyframe fields are cached by renderer identity, absolute zoom, dimensions,
 centre, iteration budget and approximation settings. Cache writes and final
