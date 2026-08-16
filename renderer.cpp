@@ -68,9 +68,14 @@ struct RenderStats {
     std::uint64_t cycle_inside = 0;
     std::uint64_t double_tail_pixels = 0;
     std::uint64_t bla_disabled_pixels = 0;
+    std::uint64_t tail_steps = 0;
+    std::uint64_t max_tail_steps = 0;
+    std::uint64_t tail_rebases = 0;
+    std::uint64_t tail_rebase_fallbacks = 0;
+    std::uint64_t max_pixel_iterations = 0;
 };
 
-constexpr int RENDER_STATS_FIELDS = 11;
+constexpr int RENDER_STATS_FIELDS = 16;
 
 std::atomic<bool> render_stats_enabled{false};
 std::mutex stats_mutex;
@@ -95,6 +100,11 @@ int copy_render_stats(std::uint64_t* values, int capacity) {
     values[8] = last_render_stats.cycle_inside;
     values[9] = last_render_stats.double_tail_pixels;
     values[10] = last_render_stats.bla_disabled_pixels;
+    values[11] = last_render_stats.tail_steps;
+    values[12] = last_render_stats.max_tail_steps;
+    values[13] = last_render_stats.tail_rebases;
+    values[14] = last_render_stats.tail_rebase_fallbacks;
+    values[15] = last_render_stats.max_pixel_iterations;
     return RENDER_STATS_FIELDS;
 }
 
@@ -985,7 +995,14 @@ void render_direct(
         y_coordinates[static_cast<size_t>(py)] = center_imag + y_offset;
     }
 #ifdef _OPENMP
-    if (threads > 0) omp_set_num_threads(threads);
+    if (threads > 0) {
+        // A requested team size is a performance contract for this native
+        // renderer.  Some libgomp environments enable dynamic teams and can
+        // silently collapse a deep render to one worker after it sees uneven
+        // work; that is exactly the wrong choice for a pathological tile.
+        omp_set_dynamic(0);
+        omp_set_num_threads(threads);
+    }
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int py = 0; py < height; ++py) {
@@ -1374,7 +1391,7 @@ FloatExp parse_zoom_float_exp(const char* text, mpfr_prec_t precision_bits) {
 }
 
 template <bool CollectStats>
-void render_scaled_double_tail(
+bool render_scaled_double_tail(
     float& output,
     const ScaledComplex& dc,
     const ReferenceContext& context,
@@ -1384,6 +1401,12 @@ void render_scaled_double_tail(
     ScaledComplex delta,
     RenderStats* stats
 ) {
+    constexpr int MAX_TAIL_REBASES = 64;
+    // A normal 960x540 probe at this location already needs about 4.6k
+    // double-tail steps for its slowest pixel. Keep the emergency ceiling
+    // above the supported video iteration range so ordinary tails do not
+    // take the slower restart path.
+    constexpr int MAX_TAIL_STEPS = 65536;
     const double dc_real = sc_to_double(dc);
     const double dc_imag = std::ldexp(dc.imag, dc.exponent);
     double delta_real = sc_to_double(delta);
@@ -1394,6 +1417,8 @@ void render_scaled_double_tail(
     int cycle_power = 1;
     int cycle_length = 0;
     int tail_steps = 0;
+    int tail_iterations = 0;
+    int tail_rebases = 0;
     bool cycle_ready = false;
     while (iteration < max_iter
         && reference_index >= 0
@@ -1410,6 +1435,11 @@ void render_scaled_double_tail(
         delta_imag = linear_imag + square_imag + dc_imag;
         ++reference_index;
         ++iteration;
+        if (++tail_iterations > MAX_TAIL_STEPS) {
+            if constexpr (CollectStats) ++stats->tail_rebase_fallbacks;
+            output = static_cast<float>(iteration);
+            return true;
+        }
         if constexpr (CollectStats) {
             ++stats->logical_iterations;
             ++stats->exact_steps;
@@ -1419,7 +1449,7 @@ void render_scaled_double_tail(
             // interior pixel.  Returning the iteration as a coloured escape
             // is safer than silently turning the pixel black.
             output = static_cast<float>(iteration);
-            return;
+            return false;
         }
         const double total_real =
             context.orbit_real_double[static_cast<size_t>(reference_index)] + delta_real;
@@ -1429,13 +1459,13 @@ void render_scaled_double_tail(
         if (!std::isfinite(total_real) || !std::isfinite(total_imag)
             || !std::isfinite(magnitude_squared)) {
             output = static_cast<float>(iteration);
-            return;
+            return false;
         }
         if (magnitude_squared > 4.0) {
             const double magnitude = std::sqrt(std::max(magnitude_squared, 4.0000001));
             output = static_cast<float>(static_cast<double>(iteration)
                 - std::log(std::log(magnitude)) / static_cast<double>(LOG_TWO));
-            return;
+            return false;
         }
         const double delta_magnitude_squared =
             delta_real * delta_real + delta_imag * delta_imag;
@@ -1462,9 +1492,9 @@ void render_scaled_double_tail(
                     + cycle_delta_imag * cycle_delta_imag;
                 if (iteration >= 512
                     && magnitude_squared < 3.0
-                    && cycle_distance_squared
-                        <= 1.0e-24 * std::max(1.0, magnitude_squared)) {
-                    return;
+                        && cycle_distance_squared
+                        <= 1.0e-18 * std::max(1.0, magnitude_squared)) {
+                    return false;
                 }
                 ++cycle_length;
                 if (cycle_length >= cycle_power) {
@@ -1481,6 +1511,12 @@ void render_scaled_double_tail(
             reference_index = 0;
             tail_steps = 0;
             cycle_ready = false;
+            if constexpr (CollectStats) ++stats->tail_rebases;
+            if (++tail_rebases > MAX_TAIL_REBASES) {
+                if constexpr (CollectStats) ++stats->tail_rebase_fallbacks;
+                output = static_cast<float>(iteration);
+                return true;
+            }
         }
     }
     if (iteration < max_iter) {
@@ -1488,6 +1524,7 @@ void render_scaled_double_tail(
         // budget.  Do not misclassify the unresolved pixel as an interior.
         output = static_cast<float>(iteration);
     }
+    return false;
 }
 
 template <bool CollectStats>
@@ -1560,7 +1597,10 @@ void render_bla_impl(
     // keeps --stats safe when a caller requests more threads than the runtime
     // default, while the normal render still pays no allocation cost.
 #ifdef _OPENMP
-    if (threads > 0) omp_set_num_threads(threads);
+    if (threads > 0) {
+        omp_set_dynamic(0);
+        omp_set_num_threads(threads);
+    }
 #endif
     std::vector<RenderStats> thread_stats;
     if constexpr (CollectStats) {
@@ -1571,9 +1611,15 @@ void render_bla_impl(
         thread_stats.resize(static_cast<size_t>(worker_count));
     }
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1)
+    // Deep zoom cost is highly non-uniform: a single hard filament can make
+    // one row take orders of magnitude longer than its neighbours.  A row is
+    // therefore too coarse a unit of work.  Use small contiguous pixel
+    // chunks so the expensive pixels are redistributed among all workers.
+#pragma omp parallel for schedule(dynamic, 64)
 #endif
-    for (int py = 0; py < height; ++py) {
+    for (int linear_pixel = 0; linear_pixel < width * height; ++linear_pixel) {
+        const int py = linear_pixel / width;
+        const int px = linear_pixel - py * width;
         RenderStats* stats = nullptr;
         if constexpr (CollectStats) {
 #ifdef _OPENMP
@@ -1583,7 +1629,6 @@ void render_bla_impl(
 #endif
         }
         const FloatExp& y_offset = y_offsets[static_cast<size_t>(py)];
-        for (int px = 0; px < width; ++px) {
             if constexpr (CollectStats) ++stats->pixels;
             const FloatExp& x_offset = x_offsets[static_cast<size_t>(px)];
             const ScaledComplex dc = ScaledComplex::from_float_exp(x_offset, y_offset);
@@ -1641,7 +1686,7 @@ void render_bla_impl(
                             sc_sub(total, cycle_tortoise));
                         const int scale_exponent = std::max(total_norm.exponent, 0);
                         if (cycle_distance.mantissa == 0.0
-                            || cycle_distance.exponent <= scale_exponent - 78) {
+                            || cycle_distance.exponent <= scale_exponent - 60) {
                             if constexpr (CollectStats) ++stats->cycle_inside;
                             output[index] = static_cast<float>(max_iter);
                             escaped = true;
@@ -1697,11 +1742,32 @@ void render_bla_impl(
                 // available. The old early branch skipped this lookup and
                 // needlessly converted otherwise reusable late-orbit blocks
                 // into thousands of scalar exact iterations.
-                if ((map_length <= 0 || reference_index + map_length > max_iter)
+                if (!pixel_disable_bla
+                    && (map_length <= 0 || reference_index + map_length > max_iter)
                     && delta_norm.exponent > -90) {
                     if constexpr (CollectStats) ++stats->double_tail_pixels;
-                    render_scaled_double_tail<CollectStats>(output[index], dc, context, max_iter,
-                                       iteration, reference_index, delta, stats);
+                    const int tail_start_iteration = iteration;
+                    const bool tail_pathological = render_scaled_double_tail<CollectStats>(
+                        output[index], dc, context, max_iter,
+                        iteration, reference_index, delta, stats);
+                    if constexpr (CollectStats) {
+                        const std::uint64_t tail_steps = static_cast<std::uint64_t>(
+                            std::max(0, iteration - tail_start_iteration));
+                        stats->tail_steps += tail_steps;
+                        stats->max_tail_steps = std::max(stats->max_tail_steps, tail_steps);
+                    }
+                    if (tail_pathological) {
+                        // A long tail that keeps rebasing is a perturbation
+                        // glitch, not evidence that the pixel is interior.
+                        // Restart from the original dc and use the slower but
+                        // bounded scaled-exact recurrence for this pixel.
+                        delta = dc;
+                        reference_index = 1;
+                        iteration = 1;
+                        have_total = false;
+                        pixel_disable_bla = true;
+                        continue;
+                    }
                     escaped = true;
                     break;
                 }
@@ -1822,7 +1888,11 @@ void render_bla_impl(
                 }
             }
             if (!escaped) output[index] = static_cast<float>(max_iter);
-        }
+            if constexpr (CollectStats) {
+                stats->max_pixel_iterations = std::max(
+                    stats->max_pixel_iterations,
+                    static_cast<std::uint64_t>(std::max(0, iteration)));
+            }
     }
 
     if constexpr (CollectStats) {
@@ -1839,6 +1909,13 @@ void render_bla_impl(
             total.cycle_inside += local.cycle_inside;
             total.double_tail_pixels += local.double_tail_pixels;
             total.bla_disabled_pixels += local.bla_disabled_pixels;
+            total.tail_steps += local.tail_steps;
+            total.max_tail_steps = std::max(total.max_tail_steps, local.max_tail_steps);
+            total.tail_rebases += local.tail_rebases;
+            total.tail_rebase_fallbacks += local.tail_rebase_fallbacks;
+            total.max_pixel_iterations = std::max(
+                total.max_pixel_iterations,
+                local.max_pixel_iterations);
         }
         *stats_out = total;
     }

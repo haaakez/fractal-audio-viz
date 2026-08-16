@@ -38,11 +38,16 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
             args.iteration_cap,
         )
         reference_started = time.perf_counter()
+        reference_log_zoom = (
+            args.reference_zoom_log
+            if args.reference_zoom_log is not None
+            else log_zoom
+        )
         native_library, reference = visualizer._create_native_reference(
             args.x_center,
             args.y_center,
             reference_iter,
-            log_zoom,
+            reference_log_zoom,
             args.series_order,
             12.0,
         )
@@ -114,6 +119,11 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
         "origin_log10": origin,
         "step_log10": step,
         "reference_seconds": reference_seconds,
+        "reference_zoom_log10": (
+            args.reference_zoom_log
+            if args.reference_zoom_log is not None
+            else log_zoom
+        ),
         "total_seconds": float(np.sum(timings)),
         "mean_seconds": float(np.mean(timings)),
         "median_seconds": float(np.median(timings)),
@@ -171,13 +181,25 @@ def main() -> None:
         help="benchmark one field, the native atlas output pass, or every atlas level",
     )
     parser.add_argument("--zoom", default="1e100")
+    parser.add_argument(
+        "--zoom-log",
+        type=float,
+        default=None,
+        help="exact base-10 log10 zoom; useful for benchmarking one atlas level",
+    )
+    parser.add_argument(
+        "--reference-zoom-log",
+        type=float,
+        default=None,
+        help="reference precision zoom for a field probe; defaults to the rendered zoom",
+    )
     parser.add_argument("--iterations", type=int, default=20000)
     parser.add_argument("--x-center", default=visualizer.DEFAULT_X_CENTER)
     parser.add_argument("--y-center", default=visualizer.DEFAULT_Y_CENTER)
     parser.add_argument("--renderer", choices=("auto", "native", "python"), default="auto")
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--series-order", type=int, choices=(1, 2, 3), default=3)
-    parser.add_argument("--series-block", type=int, default=4096)
+    parser.add_argument("--series-block", type=int, default=256)
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument(
         "--keyframe-factor",
@@ -213,7 +235,15 @@ def main() -> None:
     if args.iteration_cap < args.iteration_base:
         raise SystemExit("iteration-cap must be at least iteration-base")
 
-    log_zoom = visualizer._zoom_log(args.zoom)
+    if args.zoom_log is not None:
+        if not np.isfinite(args.zoom_log) or args.zoom_log < 0.0:
+            raise SystemExit("zoom-log must be a finite non-negative number")
+        log_zoom = float(args.zoom_log)
+    else:
+        log_zoom = visualizer._zoom_log(args.zoom)
+    if args.reference_zoom_log is not None:
+        if not np.isfinite(args.reference_zoom_log) or args.reference_zoom_log < log_zoom:
+            raise SystemExit("reference-zoom-log must be finite and at least zoom-log")
     if args.stage == "atlas":
         _atlas_sweep(args, np, log_zoom)
         return
@@ -287,11 +317,25 @@ def main() -> None:
     stats_supported = False
     if args.renderer != "python" and log_zoom >= 12.0:
         reference_started = time.perf_counter()
+        reference_log_zoom = (
+            args.reference_zoom_log
+            if args.reference_zoom_log is not None
+            else log_zoom
+        )
+        reference_iterations = max(
+            args.iterations,
+            visualizer.max_iterations(
+                reference_log_zoom,
+                args.iteration_base,
+                args.iterations_per_decade,
+                args.iteration_cap,
+            ),
+        )
         native_library, native_reference = visualizer._create_native_reference(
             args.x_center,
             args.y_center,
-            args.iterations,
-            log_zoom,
+            reference_iterations,
+            reference_log_zoom,
             args.series_order,
             12.0,
         )
@@ -330,6 +374,7 @@ def main() -> None:
             "y_center": args.y_center,
             "repeat": args.repeat,
             "reference_seconds": reference_seconds,
+            "reference_zoom_log10": reference_log_zoom,
             "seconds": timings,
             "best_seconds": min(timings),
             "best_with_reference_seconds": reference_seconds + min(timings),

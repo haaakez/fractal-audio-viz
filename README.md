@@ -83,12 +83,20 @@ reference/BLA setup separately from repeated pixel-render timings:
 
 ```sh
 python3 benchmark.py --renderer native --zoom 1e100 \
-  --width 256 --height 256 --iterations 20000 --series-block 4096 --repeat 2
+  --width 256 --height 256 --iterations 20000 --series-block 256 --repeat 2
 ```
 
 It reports deep field-render time, pixels per second, reference setup time,
 and a one-shot total including that setup. To measure the separate
 output-stage bottleneck, use:
+
+For an exact atlas-level probe, use a reference matching the final zoom:
+
+```sh
+python3 benchmark.py --renderer native --zoom-log 64.721449 \
+  --reference-zoom-log 100 --width 960 --height 540 \
+  --iterations 32895 --series-block 256 --threads 6 --repeat 1 --stats
+```
 
 ```sh
 python3 benchmark.py --stage compositor --renderer native \
@@ -132,10 +140,11 @@ the mathematically equivalent linear branch; it restores the requested
 higher-order series near the escape boundary. A conservative scaled Brent
 cycle check terminates settled interior pixels without mistaking ordinary
 boundary transients for interiors. Degree-three maps remain capped at 256
-iterations per map. Linear maps use a validated 1024-step deep tier and a
-4096-step ultra-deep tier below e60 for the bundled e12 reference; shallower
-frames automatically clamp to the safer tier. `--series-block` defaults to
-4096, but explicit lower values remain useful for conservative comparisons.
+iterations per map. Long linear BLA blocks can be faster at benign locations
+but can amplify perturbation glitches near the bundled deep-zoom centre.
+`--series-block` defaults to the conservative 256-step tier for video
+rendering; larger values remain available for controlled benchmarks and
+known-stable locations.
 
 Keyframe fields are cached by renderer identity, absolute zoom, dimensions,
 centre, iteration budget and approximation settings. Cache writes and final

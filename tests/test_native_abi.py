@@ -124,14 +124,14 @@ class NativeRendererTests(unittest.TestCase):
             3,
         )
         self.assertTrue(handle, self.library.fractal_last_error())
-        values = (ctypes.c_uint64 * 11)()
+        values = (ctypes.c_uint64 * 16)()
         try:
             self.library.fractal_set_stats_enabled(1)
             status = self.library.render_mandelbrot_reference(
                 output, width, height, b"1e30", handle, 800, 2, 3, 1024
             )
             self.assertEqual(status, 0, self.library.fractal_last_error())
-            self.assertEqual(self.library.fractal_get_last_stats(values, 11), 11)
+            self.assertEqual(self.library.fractal_get_last_stats(values, 16), 16)
             self.assertEqual(values[0], width * height)
             self.assertGreater(values[1], 0)
             self.assertGreater(values[2], 0)

@@ -99,6 +99,11 @@ NATIVE_STATS_FIELDS = (
     "cycle_inside",
     "double_tail_pixels",
     "bla_disabled_pixels",
+    "tail_steps",
+    "max_tail_steps",
+    "tail_rebases",
+    "tail_rebase_fallbacks",
+    "max_pixel_iterations",
 )
 
 
@@ -1089,7 +1094,7 @@ def render_fractal(
     native_threads: int = 0,
     native_reference: Any = None,
     series_order: int = 3,
-    series_block: int = 4096,
+    series_block: int = 256,
 ) -> Any:
     """Render with the C-ABI backend, falling back to the Python backend."""
 
@@ -2883,8 +2888,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--series-block",
         type=int,
-        default=4096,
-        help="requested BLA block length (cubic cap 256; ultra-deep linear cap 4096)",
+        default=256,
+        help=(
+            "requested BLA block length; 256 is the safe default for deep video tiles; "
+            "larger values can be faster at benign locations but may amplify glitches"
+        ),
     )
     parser.add_argument(
         "--renderer",
