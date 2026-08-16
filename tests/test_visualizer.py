@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 
 try:
@@ -11,6 +12,70 @@ import visualizer
 
 
 class AnimationTests(unittest.TestCase):
+    def test_deep_local_reference_geometry_supports_odd_tiles(self):
+        centres = visualizer._atlas_local_reference_centres(
+            125,
+            125,
+            4000.25,
+            visualizer.DEFAULT_X_CENTER,
+            visualizer.DEFAULT_Y_CENTER,
+        )
+        self.assertEqual(len(centres), 4)
+        self.assertEqual(
+            [(x0, x1, y0, y1) for x0, x1, y0, y1, _, _ in centres],
+            [(0, 62, 0, 62), (62, 125, 0, 62),
+             (0, 62, 62, 125), (62, 125, 62, 125)],
+        )
+        self.assertTrue(all(
+            Decimal(x).is_finite() and Decimal(y).is_finite()
+            for _, _, _, _, x, y in centres
+        ))
+
+    def test_deep_local_references_match_single_reference_field(self):
+        library = visualizer._get_native_library()
+        if library is None:
+            raise unittest.SkipTest("native renderer is unavailable")
+        width = height = 96
+        max_iter = 1800
+        library, reference = visualizer._create_native_reference(
+            visualizer.DEFAULT_X_CENTER,
+            visualizer.DEFAULT_Y_CENTER,
+            max_iter,
+            40.0,
+            3,
+            40.0,
+        )
+        try:
+            single = visualizer.render_fractal(
+                width,
+                height,
+                40.0,
+                visualizer.DEFAULT_X_CENTER,
+                visualizer.DEFAULT_Y_CENTER,
+                max_iter,
+                "native",
+                2,
+                reference,
+                3,
+                256,
+            )
+        finally:
+            library.fractal_destroy_reference(reference)
+        local = visualizer._atlas_local_reference_field(
+            render_width=width,
+            render_height=height,
+            log10_zoom=40.0,
+            x_center=visualizer.DEFAULT_X_CENTER,
+            y_center=visualizer.DEFAULT_Y_CENTER,
+            max_iter=max_iter,
+            series_order=3,
+            series_block=256,
+            renderer="native",
+            native_threads=2,
+            native_library=library,
+        )
+        np.testing.assert_allclose(local, single, rtol=0.0, atol=1.0e-3)
+
     def test_atlas_memory_cache_is_bounded_in_both_directions(self):
         tiles = {level: object() for level in range(7)}
         visualizer._trim_atlas_memory_cache(tiles, 2)

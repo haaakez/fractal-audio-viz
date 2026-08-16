@@ -98,6 +98,10 @@ python3 benchmark.py --renderer native --zoom-log 64.721449 \
   --iterations 32895 --series-block 256 --threads 6 --repeat 1 --stats
 ```
 
+Add `--local-references` to exercise the production deep-tile fallback used
+by the atlas renderer; without it this command deliberately measures one
+global reference only.
+
 ```sh
 python3 benchmark.py --stage compositor --renderer native \
   --width 1920 --height 1080 --threads 6 --repeat 3
@@ -145,6 +149,19 @@ but can amplify perturbation glitches near the bundled deep-zoom centre.
 `--series-block` defaults to the conservative 256-step tier for video
 rendering; larger values remain available for controlled benchmarks and
 known-stable locations.
+
+At log10 zooms of 40 and deeper, sufficiently large native atlas tiles use an
+adaptive Kalles-style secondary-reference fallback: the source tile starts as
+a small local grid and only a cell that exceeds a short native deadline is
+split again, up to a 32x32 grid. Each view gets a high-precision reference at
+its own centre. This prevents one narrow near-parabolic feature from making
+the whole tile fall back to a pathological tail while keeping easy tiles
+cheap. A final small-cell retry is bounded, and an atlas tile deadline
+prevents one unresolved feature from stopping the complete video; only pixels
+that still miss both limits use a local finite-value recovery. The split also
+handles odd source sizes such as the 125x125 tile produced by a 500x500 render
+with `--fractal-scale 0.25`; the cache namespace is versioned so older
+single-reference atlas fields are not reused.
 
 Keyframe fields are cached by renderer identity, absolute zoom, dimensions,
 centre, iteration budget and approximation settings. Cache writes and final

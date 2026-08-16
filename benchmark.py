@@ -54,6 +54,7 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
         reference_seconds = time.perf_counter() - reference_started
         stats_supported = (
             args.stats
+            and not args.local_references
             and visualizer._native_set_stats_enabled(native_library, True)
         )
 
@@ -69,19 +70,36 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
                 args.iteration_cap,
             )
             started = time.perf_counter()
-            field = visualizer.render_fractal(
-                args.width,
-                args.height,
-                tile_log,
-                args.x_center,
-                args.y_center,
-                tile_iter,
-                args.renderer,
-                args.threads,
-                reference,
-                args.series_order,
-                args.series_block,
-            )
+            if args.local_references:
+                field = visualizer._atlas_local_reference_field(
+                    render_width=args.width,
+                    render_height=args.height,
+                    log10_zoom=tile_log,
+                    x_center=args.x_center,
+                    y_center=args.y_center,
+                    max_iter=tile_iter,
+                    series_order=args.series_order,
+                    series_block=args.series_block,
+                    renderer=args.renderer,
+                    native_threads=args.threads,
+                    native_library=native_library,
+                )
+            else:
+                field = None
+            if field is None:
+                field = visualizer.render_fractal(
+                    args.width,
+                    args.height,
+                    tile_log,
+                    args.x_center,
+                    args.y_center,
+                    tile_iter,
+                    args.renderer,
+                    args.threads,
+                    reference,
+                    args.series_order,
+                    args.series_block,
+                )
             elapsed = time.perf_counter() - started
             record = {
                 "level": level,
@@ -114,6 +132,8 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
         "width": args.width,
         "height": args.height,
         "max_zoom": args.zoom,
+        "max_zoom_log10": log_zoom,
+        "local_references": bool(args.local_references),
         "keyframe_factor": args.keyframe_factor,
         "levels": len(records),
         "origin_log10": origin,
@@ -145,7 +165,7 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
         return
     slowest = sorted(records, key=lambda record: record["seconds"], reverse=True)[:5]
     print(
-        f"atlas sweep {args.width}x{args.height} to {args.zoom}: "
+        f"atlas sweep {args.width}x{args.height} to 10^{log_zoom:.6f}: "
         f"{len(records)} levels, total {result['total_seconds']:.3f}s, "
         f"median {result['median_seconds']:.3f}s, "
         f"p95 {result['p95_seconds']:.3f}s, "
@@ -200,6 +220,14 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--series-order", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--series-block", type=int, default=256)
+    parser.add_argument(
+        "--local-references",
+        action="store_true",
+        help=(
+            "use the production adaptive secondary-reference path for "
+            "deep fields; useful for atlas bottleneck measurements"
+        ),
+    )
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument(
         "--keyframe-factor",
@@ -314,6 +342,7 @@ def main() -> None:
     native_reference = None
     native_library = None
     reference_seconds = 0.0
+    reference_log_zoom = None
     stats_supported = False
     if args.renderer != "python" and log_zoom >= 12.0:
         reference_started = time.perf_counter()
@@ -348,19 +377,36 @@ def main() -> None:
     try:
         for _ in range(args.repeat):
             started = time.perf_counter()
-            field = visualizer.render_fractal(
-                args.width,
-                args.height,
-                log_zoom,
-                args.x_center,
-                args.y_center,
-                args.iterations,
-                args.renderer,
-                args.threads,
-                native_reference,
-                args.series_order,
-                args.series_block,
-            )
+            if args.local_references:
+                field = visualizer._atlas_local_reference_field(
+                    render_width=args.width,
+                    render_height=args.height,
+                    log10_zoom=log_zoom,
+                    x_center=args.x_center,
+                    y_center=args.y_center,
+                    max_iter=args.iterations,
+                    series_order=args.series_order,
+                    series_block=args.series_block,
+                    renderer=args.renderer,
+                    native_threads=args.threads,
+                    native_library=native_library,
+                )
+            else:
+                field = None
+            if field is None:
+                field = visualizer.render_fractal(
+                    args.width,
+                    args.height,
+                    log_zoom,
+                    args.x_center,
+                    args.y_center,
+                    args.iterations,
+                    args.renderer,
+                    args.threads,
+                    native_reference,
+                    args.series_order,
+                    args.series_block,
+                )
             elapsed = time.perf_counter() - started
             timings.append(elapsed)
         result = {
@@ -369,6 +415,8 @@ def main() -> None:
             "width": args.width,
             "height": args.height,
             "zoom": args.zoom,
+            "zoom_log10": log_zoom,
+            "local_references": bool(args.local_references),
             "iterations": args.iterations,
             "x_center": args.x_center,
             "y_center": args.y_center,
@@ -387,7 +435,7 @@ def main() -> None:
             print(json.dumps(result, indent=2))
         else:
             print(
-                f"{args.width}x{args.height} at {args.zoom}: "
+                f"{args.width}x{args.height} at 10^{log_zoom:.6f}: "
                 f"best {result['best_seconds']:.3f}s, "
                 f"{result['pixels_per_second']:.1f} pixels/s; "
                 f"reference setup {reference_seconds:.3f}s, "

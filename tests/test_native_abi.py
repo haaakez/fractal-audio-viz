@@ -139,6 +139,44 @@ class NativeRendererTests(unittest.TestCase):
             self.library.fractal_set_stats_enabled(0)
             self.library.fractal_destroy_reference(handle)
 
+    def test_opt_in_time_budget_marks_unfinished_pixels(self):
+        """A pathological deep cell must return control to the atlas splitter."""
+
+        width = height = 8
+        max_iter = 30000
+        output_type = ctypes.c_float * (width * height)
+        output = output_type()
+        x_center = (
+            b"-1.711030826576984823314722728180246694222252112777834549259732560022287905717123892927883662257081287304281205446785464750361251745"
+        )
+        y_center = (
+            b"0.000001509818957972609043170877177447547323633361751210706181530872644435995661269979265353802853564243259051551728584671844401805"
+        )
+        handle = self.library.fractal_create_reference(
+            x_center,
+            y_center,
+            b"9.6389560487384802e+66",
+            max_iter,
+            1024,
+            3,
+        )
+        self.assertTrue(handle, self.library.fractal_last_error())
+        old_budget = os.environ.get("FRACTAL_TIME_BUDGET_MS")
+        os.environ["FRACTAL_TIME_BUDGET_MS"] = "1"
+        try:
+            status = self.library.render_mandelbrot_reference(
+                output, width, height, b"9.6389560487384802e+66",
+                handle, max_iter, 1, 3, 256
+            )
+        finally:
+            if old_budget is None:
+                os.environ.pop("FRACTAL_TIME_BUDGET_MS", None)
+            else:
+                os.environ["FRACTAL_TIME_BUDGET_MS"] = old_budget
+            self.library.fractal_destroy_reference(handle)
+        self.assertEqual(status, 0, self.library.fractal_last_error())
+        self.assertTrue(any(math.isnan(value) for value in output))
+
     def test_bla_matches_exact_perturbation(self):
         width = height = 24
         output_type = ctypes.c_float * (width * height)

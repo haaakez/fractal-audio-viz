@@ -81,7 +81,22 @@ DEFAULT_Y_CENTER = (
 # renderer from silently reusing an old, under-resolved .npy keyframe.
 KEYFRAME_CACHE_SCHEMA = "bla-keyframe-blend-colour-v6"
 AUDIO_CACHE_SCHEMA = "audio-controls-v5-dynamics-pitch"
-ATLAS_CACHE_SCHEMA = "nested-atlas-v2"
+ATLAS_CACHE_SCHEMA = "nested-atlas-v4-adaptive-local-references"
+
+# A single reference is normally ideal, but at deep zoom a frame-sized tile
+# can contain a narrow boundary that is much farther from that reference than
+# the rest of the image.  The native renderer then spends most of its time in
+# exact/replayed tails. Large deep tiles start with four local views and split
+# only the cells whose render exceeds a short native deadline. This keeps MPFR
+# setup and memory proportional to the genuinely difficult part of a tile.
+ATLAS_LOCAL_REFERENCE_MIN_LOG = 40.0
+ATLAS_LOCAL_REFERENCE_MIN_DIMENSION = 96
+ATLAS_LOCAL_REFERENCE_MAX_DIVISIONS = 32
+ATLAS_LOCAL_REFERENCE_MIN_BUDGET_MS = 200
+ATLAS_LOCAL_REFERENCE_MAX_BUDGET_MS = 4000
+ATLAS_LOCAL_REFERENCE_MS_PER_PIXEL = 0.05
+ATLAS_LOCAL_REFERENCE_FINAL_BUDGET_MS = 750
+ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS = 30_000
 
 _native_library: Any = None
 _native_checked = False
@@ -1342,6 +1357,365 @@ def _atlas_tile_path(
     return cache_dir / f"atlas-tile-{cache_key}.npy"
 
 
+def _atlas_local_reference_centres(
+    render_width: int,
+    render_height: int,
+    log10_zoom: float,
+    x_center: str,
+    y_center: str,
+    divisions: int = 2,
+) -> list[tuple[int, int, int, int, str, str]]:
+    """Return exact Decimal centres for a regular tile subdivision.
+
+    The native viewport maps pixel centres as
+    ``(pixel - (size - 1) / 2) / size``.  Computing the quadrant centre with
+    integer numerators preserves that mapping when a parent tile is replaced
+    by equal-ish views at their corresponding per-cell zoom. Binary floats
+    cannot express the offsets once the zoom passes roughly 1e308, so only
+    the small geometry fractions are floats; the scale and centre arithmetic
+    stay in Decimal at a precision derived from the requested depth.
+    """
+
+    if divisions < 2:
+        raise ValueError("local-reference subdivision needs at least 2 divisions")
+    if render_width < 2 * divisions or render_height < 2 * divisions:
+        raise ValueError("local-reference tile is too small for its subdivision")
+    if not math.isfinite(log10_zoom):
+        raise ValueError("tile zoom must be finite")
+
+    precision = max(
+        96,
+        _decimal_precision(x_center, y_center, log10_zoom) + 48,
+    )
+    x_splits = [
+        (index * render_width // divisions, (index + 1) * render_width // divisions)
+        for index in range(divisions)
+    ]
+    y_splits = [
+        (index * render_height // divisions, (index + 1) * render_height // divisions)
+        for index in range(divisions)
+    ]
+    with localcontext() as context:
+        context.prec = precision
+        exponent = math.floor(log10_zoom)
+        fractional_exponent = log10_zoom - exponent
+        # 10**fractional_exponent is bounded in [1, 10), so this conversion
+        # remains safe even when the integer exponent is several thousand.
+        zoom_mantissa = Decimal(str(10.0 ** fractional_exponent))
+        inverse_zoom = Decimal(1).scaleb(-exponent) / zoom_mantissa
+        view_height = Decimal("2.8") * inverse_zoom
+        view_width = view_height * Decimal(render_width) / Decimal(render_height)
+        base_x = Decimal(x_center)
+        base_y = Decimal(y_center)
+        denominator_x = Decimal(2 * render_width)
+        denominator_y = Decimal(2 * render_height)
+        result: list[tuple[int, int, int, int, str, str]] = []
+        for y0, y1 in y_splits:
+            centre_y_numerator = y0 + y1 - 1
+            y_fraction = (
+                Decimal(render_height - 1 - centre_y_numerator)
+                / denominator_y
+            )
+            local_y = base_y + view_height * y_fraction
+            for x0, x1 in x_splits:
+                centre_x_numerator = x0 + x1 - 1
+                x_fraction = (
+                    Decimal(centre_x_numerator - (render_width - 1))
+                    / denominator_x
+                )
+                local_x = base_x + view_width * x_fraction
+                result.append((x0, x1, y0, y1, str(local_x), str(local_y)))
+        return result
+
+
+def _atlas_local_reference_field(
+    *,
+    render_width: int,
+    render_height: int,
+    log10_zoom: float,
+    x_center: str,
+    y_center: str,
+    max_iter: int,
+    series_order: int,
+    series_block: int,
+    renderer: str,
+    native_threads: int,
+    native_library: Any,
+) -> Optional[Any]:
+    """Render a deep tile with an adaptive secondary-reference grid.
+
+    The first pass uses four nearby references. A narrow parabolic feature
+    can still make one of those cells pathological, so the native renderer
+    accepts a short, opt-in deadline and marks unfinished pixels with NaN.
+    Only those cells are recursively split into four smaller reference views;
+    easy cells are never rendered again. The final subdivision gets a bounded
+    exact perturbation retry with BLA disabled. A tile-level deadline prevents
+    a pathological cluster from consuming the whole render; only pixels that
+    still cannot finish are filled from their local finite samples.
+
+    ``None`` means that the ordinary single-reference path should be used.
+    """
+
+    if renderer not in {"auto", "native"} or native_library is None:
+        return None
+    if log10_zoom < ATLAS_LOCAL_REFERENCE_MIN_LOG:
+        return None
+    if (
+        render_width < ATLAS_LOCAL_REFERENCE_MIN_DIMENSION
+        or render_height < ATLAS_LOCAL_REFERENCE_MIN_DIMENSION
+    ):
+        return None
+
+    np = _require_numpy()
+    # At ultra-deep levels the feature scale can be much narrower than a
+    # quadrant. Start one level finer there; at ordinary deep levels the
+    # cheaper 2x2 probe still catches the usual boundary cliff.
+    initial_divisions = 4 if log10_zoom >= 80.0 else 2
+    if render_width < 2 * initial_divisions or render_height < 2 * initial_divisions:
+        return None
+    initial_cells = _atlas_local_reference_centres(
+        render_width,
+        render_height,
+        log10_zoom,
+        x_center,
+        y_center,
+        initial_divisions,
+    )
+    centres_by_divisions = {initial_divisions: initial_cells}
+    field = np.full((render_height, render_width), np.nan, dtype=np.float32)
+    previous_cycle_setting = os.environ.get("FRACTAL_STRICT_CYCLE")
+    previous_budget_setting = os.environ.get("FRACTAL_TIME_BUDGET_MS")
+    previous_bla_setting = os.environ.get("FRACTAL_DISABLE_BLA")
+    # A local reference can sit in an attracting basin while a nearby pixel
+    # is still a very late escape.  Use the native strict Brent mode here: it
+    # waits longer and requires a much tighter recurrence than the throughput
+    # mode, while keeping BLA and normal escape checks enabled.
+    os.environ["FRACTAL_STRICT_CYCLE"] = "1"
+    print(
+        f"  Using adaptive local native references for deep tile "
+        f"({_zoom_label(log10_zoom)}).",
+        flush=True,
+    )
+
+    def budget_ms(cell_width: int, cell_height: int) -> int:
+        estimate = int(
+            math.ceil(
+                cell_width
+                * cell_height
+                * ATLAS_LOCAL_REFERENCE_MS_PER_PIXEL
+            )
+        )
+        return max(
+            ATLAS_LOCAL_REFERENCE_MIN_BUDGET_MS,
+            min(ATLAS_LOCAL_REFERENCE_MAX_BUDGET_MS, estimate),
+        )
+
+    def child_cells(cell: tuple[int, int, int, int, str, str], divisions: int):
+        x0, x1, y0, y1, _, _ = cell
+        next_divisions = divisions * 2
+        all_children = centres_by_divisions.get(next_divisions)
+        if all_children is None:
+            all_children = _atlas_local_reference_centres(
+                render_width,
+                render_height,
+                log10_zoom,
+                x_center,
+                y_center,
+                next_divisions,
+            )
+            centres_by_divisions[next_divisions] = all_children
+        return [
+            candidate
+            for candidate in all_children
+            if candidate[0] >= x0
+            and candidate[1] <= x1
+            and candidate[2] >= y0
+            and candidate[3] <= y1
+        ]
+
+    def render_cell(
+        cell: tuple[int, int, int, int, str, str],
+        divisions: int,
+        final_retry: bool = False,
+    ) -> Any:
+        x0, x1, y0, y1, local_x, local_y = cell
+        local_log_zoom = log10_zoom + math.log10(
+            render_height / float(y1 - y0)
+        )
+        _, reference = _create_native_reference(
+            local_x,
+            local_y,
+            max_iter,
+            local_log_zoom,
+            series_order,
+            local_log_zoom,
+        )
+        cell_previous_budget = os.environ.get("FRACTAL_TIME_BUDGET_MS")
+        cell_previous_bla = os.environ.get("FRACTAL_DISABLE_BLA")
+        try:
+            if final_retry:
+                os.environ["FRACTAL_TIME_BUDGET_MS"] = str(
+                    ATLAS_LOCAL_REFERENCE_FINAL_BUDGET_MS
+                )
+                os.environ["FRACTAL_DISABLE_BLA"] = "1"
+            else:
+                os.environ["FRACTAL_TIME_BUDGET_MS"] = str(
+                    budget_ms(x1 - x0, y1 - y0)
+                )
+                if cell_previous_bla is None:
+                    os.environ.pop("FRACTAL_DISABLE_BLA", None)
+            return np.asarray(
+                render_fractal(
+                    x1 - x0,
+                    y1 - y0,
+                    local_log_zoom,
+                    local_x,
+                    local_y,
+                    max_iter,
+                    "native",
+                    native_threads,
+                    reference,
+                    series_order,
+                    series_block,
+                ),
+                dtype=np.float32,
+            )
+        finally:
+            native_library.fractal_destroy_reference(reference)
+            if cell_previous_budget is None:
+                os.environ.pop("FRACTAL_TIME_BUDGET_MS", None)
+            else:
+                os.environ["FRACTAL_TIME_BUDGET_MS"] = cell_previous_budget
+            if cell_previous_bla is None:
+                os.environ.pop("FRACTAL_DISABLE_BLA", None)
+            else:
+                os.environ["FRACTAL_DISABLE_BLA"] = cell_previous_bla
+
+    pending = [(cell, initial_divisions) for cell in initial_cells]
+    completed_cells = 0
+    refined_cells = 0
+    final_retries = 0
+    recovered_cells = 0
+    recovered_pixels = 0
+    tile_deadline = time.monotonic() + ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS / 1000.0
+
+    def complete_with_recovery(
+        cell: tuple[int, int, int, int, str, str],
+        local_field: Optional[Any] = None,
+    ) -> None:
+        nonlocal recovered_cells, recovered_pixels
+        x0, x1, y0, y1, _, _ = cell
+        shape = (y1 - y0, x1 - x0)
+        if local_field is None:
+            local_field = np.full(shape, np.nan, dtype=np.float32)
+        else:
+            local_field = np.asarray(local_field, dtype=np.float32).copy()
+        finite = np.isfinite(local_field)
+        if not finite.all():
+            samples = local_field[finite]
+            if samples.size == 0:
+                fill_value = min(
+                    float(max_iter) - 1.0,
+                    float(max_iter) * 0.90,
+                )
+            else:
+                fill_value = float(np.median(samples))
+                # Keep a recovered unresolved pixel visibly distinct from a
+                # true interior result, which is encoded at max_iter.
+                fill_value = min(fill_value, float(max_iter) - 1.0)
+            recovered_pixels += int((~finite).sum())
+            local_field[~finite] = fill_value
+            recovered_cells += 1
+        field[y0:y1, x0:x1] = local_field
+
+    try:
+        while pending:
+            cell, divisions = pending.pop()
+            x0, x1, y0, y1, _, _ = cell
+            if time.monotonic() >= tile_deadline:
+                complete_with_recovery(cell)
+                for pending_cell, _ in pending:
+                    complete_with_recovery(pending_cell)
+                pending.clear()
+                completed_cells += 1
+                break
+            local_field = render_cell(cell, divisions)
+            if local_field.shape != (y1 - y0, x1 - x0):
+                raise RuntimeError("native local reference returned an invalid tile shape")
+            if np.isfinite(local_field).all():
+                field[y0:y1, x0:x1] = local_field
+                completed_cells += 1
+                continue
+
+            if divisions < ATLAS_LOCAL_REFERENCE_MAX_DIVISIONS:
+                if time.monotonic() >= tile_deadline:
+                    complete_with_recovery(cell, local_field)
+                    completed_cells += 1
+                    for pending_cell, _ in pending:
+                        complete_with_recovery(pending_cell)
+                    pending.clear()
+                    break
+                children = child_cells(cell, divisions)
+                if len(children) != 4:
+                    raise RuntimeError("local reference subdivision did not produce four children")
+                pending.extend((child, divisions * 2) for child in children)
+                refined_cells += 1
+                if refined_cells <= 4 or refined_cells % 16 == 0:
+                    print(
+                        f"  Refining {x1 - x0}x{y1 - y0} deep cell "
+                        f"at {divisions}x{divisions} grid ({len(pending)} pending).",
+                        flush=True,
+                    )
+                continue
+
+            # A cell this small no longer benefits from more references. Run
+            # one bounded exact retry with BLA disabled. Truly pathological
+            # pixels are recovered locally instead of blocking the atlas.
+            if time.monotonic() >= tile_deadline:
+                complete_with_recovery(cell, local_field)
+                completed_cells += 1
+                for pending_cell, _ in pending:
+                    complete_with_recovery(pending_cell)
+                pending.clear()
+                break
+            final_retries += 1
+            if final_retries <= 4 or final_retries % 16 == 0:
+                print(
+                    f"  Final exact retry for {x1 - x0}x{y1 - y0} deep cell.",
+                    flush=True,
+                )
+            local_field = render_cell(cell, divisions, final_retry=True)
+            complete_with_recovery(cell, local_field)
+            completed_cells += 1
+        if not np.isfinite(field).all():
+            raise RuntimeError("adaptive local reference render left unresolved pixels")
+        if refined_cells or recovered_cells:
+            print(
+                f"  Adaptive local references completed {completed_cells} cells "
+                f"after refining {refined_cells} hard cells"
+                + (
+                    f"; recovered {recovered_pixels} unresolved pixels"
+                    if recovered_cells else ""
+                )
+                + ".",
+                flush=True,
+            )
+        return field
+    finally:
+        if previous_cycle_setting is None:
+            os.environ.pop("FRACTAL_STRICT_CYCLE", None)
+        else:
+            os.environ["FRACTAL_STRICT_CYCLE"] = previous_cycle_setting
+        if previous_budget_setting is None:
+            os.environ.pop("FRACTAL_TIME_BUDGET_MS", None)
+        else:
+            os.environ["FRACTAL_TIME_BUDGET_MS"] = previous_budget_setting
+        if previous_bla_setting is None:
+            os.environ.pop("FRACTAL_DISABLE_BLA", None)
+        else:
+            os.environ["FRACTAL_DISABLE_BLA"] = previous_bla_setting
+
+
 def _atlas_tile_field(
     *,
     cache_dir: Optional[Path],
@@ -1358,6 +1732,7 @@ def _atlas_tile_field(
     renderer: str,
     native_reference: Any,
     native_threads: int,
+    native_library: Any = None,
     durable_cache: bool = False,
     cache_evictor: Optional["_CacheEvictor"] = None,
 ) -> Any:
@@ -1393,19 +1768,46 @@ def _atlas_tile_field(
         f"iterations {max_iter}",
         flush=True,
     )
-    field = render_fractal(
-        render_width,
-        render_height,
-        log_zoom,
-        x_center,
-        y_center,
-        max_iter,
-        renderer,
-        native_threads,
-        native_reference,
-        series_order,
-        series_block,
-    )
+    field = None
+    if native_library is not None:
+        try:
+            field = _atlas_local_reference_field(
+                render_width=render_width,
+                render_height=render_height,
+                log10_zoom=log_zoom,
+                x_center=x_center,
+                y_center=y_center,
+                max_iter=max_iter,
+                series_order=series_order,
+                series_block=series_block,
+                renderer=renderer,
+                native_threads=native_threads,
+                native_library=native_library,
+            )
+        except RuntimeError as error:
+            # Secondary references are an optimization layer.  A transient
+            # MPFR/native allocation failure must not make an otherwise
+            # renderable tile fail; retry through the already prepared global
+            # reference instead.
+            print(
+                f"  Local references unavailable ({error}); "
+                "using the global reference.",
+                flush=True,
+            )
+    if field is None:
+        field = render_fractal(
+            render_width,
+            render_height,
+            log_zoom,
+            x_center,
+            y_center,
+            max_iter,
+            renderer,
+            native_threads,
+            native_reference,
+            series_order,
+            series_block,
+        )
     if cache_path is not None:
         _atomic_save_field(cache_path, field, durable=durable_cache)
         if cache_evictor is not None:
@@ -1727,6 +2129,7 @@ def _render_video_atlas(
             renderer=active_renderer,
             native_reference=native_reference,
             native_threads=native_threads,
+            native_library=native_library,
             durable_cache=durable_cache,
             cache_evictor=cache_evictor,
         )

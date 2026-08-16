@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -1377,6 +1378,26 @@ void build_bla(ReferenceContext& context) {
 
 #ifdef FRACTAL_HAVE_MPFR
 
+struct RenderTimeBudget {
+    bool enabled = false;
+    std::chrono::steady_clock::time_point deadline{};
+    std::atomic<bool> exceeded{false};
+};
+
+inline bool render_time_budget_expired(
+    RenderTimeBudget* budget,
+    std::uint32_t& budget_ticks
+) {
+    if (!budget || !budget->enabled) return false;
+    if ((budget_ticks++ & 255U) != 0U) return false;
+    if (budget->exceeded.load(std::memory_order_relaxed)) return true;
+    if (std::chrono::steady_clock::now() >= budget->deadline) {
+        budget->exceeded.store(true, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
 FloatExp parse_zoom_float_exp(const char* text, mpfr_prec_t precision_bits) {
     mpfr_t value;
     mpfr_init2(value, precision_bits);
@@ -1399,6 +1420,11 @@ bool render_scaled_double_tail(
     int& iteration,
     int& reference_index,
     ScaledComplex delta,
+    bool disable_cycle_detection,
+    bool strict_cycle_detection,
+    RenderTimeBudget* time_budget,
+    std::uint32_t& budget_ticks,
+    bool& deadline_abort,
     RenderStats* stats
 ) {
     constexpr int MAX_TAIL_REBASES = 64;
@@ -1423,6 +1449,11 @@ bool render_scaled_double_tail(
     while (iteration < max_iter
         && reference_index >= 0
         && reference_index + 1 < static_cast<int>(context.orbit_real_double.size())) {
+        if (render_time_budget_expired(time_budget, budget_ticks)) {
+            output = std::numeric_limits<float>::quiet_NaN();
+            deadline_abort = true;
+            return false;
+        }
         const double reference_real =
             context.orbit_real_double[static_cast<size_t>(reference_index)];
         const double reference_imag =
@@ -1467,7 +1498,9 @@ bool render_scaled_double_tail(
             delta_real * delta_real + delta_imag * delta_imag;
 
         ++tail_steps;
-        if (tail_steps >= 64 && (tail_steps & 31) == 0) {
+        if (!disable_cycle_detection
+            && tail_steps >= 64
+            && (tail_steps & 31) == 0) {
             // Brent-style cycle detection is deliberately conservative: it
             // only runs after a long bounded tail and requires a near-exact
             // recurrence well inside the escape circle. Sample the tail at
@@ -1486,10 +1519,12 @@ bool render_scaled_double_tail(
                 const double cycle_distance_squared =
                     cycle_delta_real * cycle_delta_real
                     + cycle_delta_imag * cycle_delta_imag;
-                if (iteration >= 512
+                const int cycle_minimum_iteration = strict_cycle_detection ? 2048 : 512;
+                const double cycle_tolerance = strict_cycle_detection ? 1.0e-24 : 1.0e-18;
+                if (iteration >= cycle_minimum_iteration
                     && magnitude_squared < 3.0
-                        && cycle_distance_squared
-                        <= 1.0e-18 * std::max(1.0, magnitude_squared)) {
+                    && cycle_distance_squared
+                        <= cycle_tolerance * std::max(1.0, magnitude_squared)) {
                     return false;
                 }
                 ++cycle_length;
@@ -1546,6 +1581,23 @@ void render_bla_impl(
         fe_compare(current_input_radius, context.bla.input_radius) <= 0;
     const bool disable_bla = !bla_radius_covers_view
         || std::getenv("FRACTAL_DISABLE_BLA") != nullptr;
+    const bool disable_cycle_detection =
+        std::getenv("FRACTAL_DISABLE_CYCLE") != nullptr;
+    const bool strict_cycle_detection =
+        std::getenv("FRACTAL_STRICT_CYCLE") != nullptr;
+    const int cycle_minimum_iteration = strict_cycle_detection ? 2048 : 512;
+    const int cycle_exponent_margin = strict_cycle_detection ? 78 : 60;
+    RenderTimeBudget render_budget;
+    if (const char* budget_text = std::getenv("FRACTAL_TIME_BUDGET_MS")) {
+        char* end = nullptr;
+        const long budget_ms = std::strtol(budget_text, &end, 10);
+        if (end != budget_text && *end == '\0' && budget_ms > 0) {
+            render_budget.enabled = true;
+            render_budget.deadline = std::chrono::steady_clock::now()
+                + std::chrono::milliseconds(budget_ms);
+        }
+    }
+    RenderTimeBudget* time_budget = render_budget.enabled ? &render_budget : nullptr;
     const bool use_deep_linear =
         fe_compare(current_input_radius, context.bla.deep_input_radius) <= 0;
     const FloatExp ultra_deep_input_radius = fe_mul(
@@ -1641,8 +1693,15 @@ void render_bla_impl(
             int cycle_length = 0;
             bool cycle_ready = false;
             bool pixel_disable_bla = false;
+            std::uint32_t budget_ticks = 0;
+            bool deadline_abort = false;
 
             while (iteration < max_iter) {
+                if (render_time_budget_expired(time_budget, budget_ticks)) {
+                    output[index] = std::numeric_limits<float>::quiet_NaN();
+                    deadline_abort = true;
+                    break;
+                }
                 if (reference_index < 0
                     || reference_index >= static_cast<int>(context.fast_orbit_scaled.size())) {
                     output[index] = static_cast<float>(iteration);
@@ -1669,7 +1728,8 @@ void render_bla_impl(
                 // to the exact/BLA work. A match requires roughly 2^-80
                 // relative state error and a comfortably bounded orbit; this
                 // is intentionally stricter than a visual similarity test.
-                if (iteration >= 512
+                if (!disable_cycle_detection
+                    && iteration >= cycle_minimum_iteration
                     && (iteration & 31) == 0
                     && sc_compare_norm(total_norm, ScaledNorm{0.75, 2}) < 0) {
                     if (!cycle_ready) {
@@ -1682,7 +1742,7 @@ void render_bla_impl(
                             sc_sub(total, cycle_tortoise));
                         const int scale_exponent = std::max(total_norm.exponent, 0);
                         if (cycle_distance.mantissa == 0.0
-                            || cycle_distance.exponent <= scale_exponent - 60) {
+                            || cycle_distance.exponent <= scale_exponent - cycle_exponent_margin) {
                             if constexpr (CollectStats) ++stats->cycle_inside;
                             output[index] = static_cast<float>(max_iter);
                             escaped = true;
@@ -1705,6 +1765,48 @@ void render_bla_impl(
                     delta = total;
                     reference_index = 0;
                     continue;
+                }
+
+                if (context.bla.map_end > 1
+                    && reference_index >= context.bla.map_end) {
+                    // The MPFR reference itself has escaped.  Continuing to
+                    // express a nearby orbit as Z + delta after that point
+                    // can force every BLA lookup into a pathological replay
+                    // tail.  Switch to the mathematically identical direct
+                    // recurrence from the current total, using z_1 as the
+                    // exact reference parameter c_ref and adding dc once.
+                    // This is still scaled arithmetic, so it remains valid
+                    // when the centre is far beyond double precision.
+                    const ScaledComplex parameter = sc_add(
+                        context.fast_orbit_scaled[1],
+                        dc);
+                    while (iteration < max_iter) {
+                        if (render_time_budget_expired(time_budget, budget_ticks)) {
+                            output[index] = std::numeric_limits<float>::quiet_NaN();
+                            deadline_abort = true;
+                            break;
+                        }
+                        total = sc_add(
+                            sc_mul(total, total),
+                            parameter);
+                        ++iteration;
+                        if constexpr (CollectStats) {
+                            ++stats->logical_iterations;
+                            ++stats->exact_steps;
+                        }
+                        total_norm = sc_norm_squared(total);
+                        if (sc_outside_escape(total_norm)) {
+                            output[index] = smooth_escape_scaled(iteration, total_norm);
+                            escaped = true;
+                            break;
+                        }
+                    }
+                    if (deadline_abort) break;
+                    if (!escaped) {
+                        output[index] = static_cast<float>(max_iter);
+                        escaped = true;
+                    }
+                    break;
                 }
 
                 const FloatExp delta_norm_float{delta_norm.mantissa, delta_norm.exponent};
@@ -1745,7 +1847,11 @@ void render_bla_impl(
                     const int tail_start_iteration = iteration;
                     const bool tail_pathological = render_scaled_double_tail<CollectStats>(
                         output[index], dc, context, max_iter,
-                        iteration, reference_index, delta, stats);
+                        iteration, reference_index, delta,
+                        disable_cycle_detection, strict_cycle_detection,
+                        time_budget, budget_ticks, deadline_abort,
+                        stats);
+                    if (deadline_abort) break;
                     if constexpr (CollectStats) {
                         const std::uint64_t tail_steps = static_cast<std::uint64_t>(
                             std::max(0, iteration - tail_start_iteration));
@@ -1817,6 +1923,11 @@ void render_bla_impl(
                         ScaledNorm replay_norm{};
                         bool retry_without_bla = false;
                         for (int replay = 0; replay < map_length && iteration < max_iter; ++replay) {
+                            if (render_time_budget_expired(time_budget, budget_ticks)) {
+                                output[index] = std::numeric_limits<float>::quiet_NaN();
+                                deadline_abort = true;
+                                break;
+                            }
                             const ScaledComplex reference =
                                 context.fast_orbit_scaled[static_cast<size_t>(reference_index)];
                             delta = sc_add(
@@ -1841,6 +1952,7 @@ void render_bla_impl(
                                 break;
                             }
                         }
+                        if (deadline_abort) break;
                         if (escaped) break;
                         if (retry_without_bla) {
                             delta = previous_delta;
@@ -1883,7 +1995,7 @@ void render_bla_impl(
                     ++stats->exact_steps;
                 }
             }
-            if (!escaped) output[index] = static_cast<float>(max_iter);
+            if (!escaped && !deadline_abort) output[index] = static_cast<float>(max_iter);
             if constexpr (CollectStats) {
                 stats->max_pixel_iterations = std::max(
                     stats->max_pixel_iterations,
