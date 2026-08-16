@@ -95,6 +95,21 @@ python3 benchmark.py --stage compositor --renderer native \
   --width 1920 --height 1080 --threads 6 --repeat 3
 ```
 
+The one-field benchmark is not representative of a complete nested zoom: the
+deep renderer has different BLA tiers at different depths. Sweep every atlas
+level without writing cache files or encoding video with:
+
+```sh
+python3 benchmark.py --stage atlas --renderer native \
+  --width 128 --height 128 --zoom 1e100 --threads 6 \
+  --stats --json > atlas-benchmark.json
+```
+
+This reports total, median, p95, and worst tile time. `--stats` adds native
+BLA/fallback counters and is intended for diagnosis; omit it for the least
+perturbed timing. An e100 factor-two sweep contains 334 source levels, so use
+a small resolution while locating slow depth bands.
+
 Pass `--x-center` and `--y-center` to benchmark a different deep-zoom target;
 the defaults use the bundled centre.
 
@@ -125,8 +140,10 @@ frames automatically clamp to the safer tier. `--series-block` defaults to
 Keyframe fields are cached by renderer identity, absolute zoom, dimensions,
 centre, iteration budget and approximation settings. Cache writes and final
 video writes are atomic, so interrupted renders do not replace a completed
-output with a partial file. `--cache-limit-mb` uses incremental LRU eviction;
-with its default value of zero, cache growth remains intentionally unlimited.
+output with a partial file. Normal cache writes do not wait on storage flushes;
+use `--durable-cache` when surviving a sudden power loss matters more than
+throughput. `--cache-limit-mb` uses incremental LRU eviction; with its default
+value of zero, cache growth remains intentionally unlimited.
 
 Re-running the same command with the same cache directory resumes at the
 completed absolute keyframes and reuses the audio analysis. The final video

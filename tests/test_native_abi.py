@@ -97,9 +97,47 @@ class NativeRendererTests(unittest.TestCase):
             ctypes.c_int,
         ]
         library.render_mandelbrot_reference.restype = ctypes.c_int
+        if hasattr(library, "fractal_set_stats_enabled"):
+            library.fractal_set_stats_enabled.argtypes = [ctypes.c_int]
+            library.fractal_set_stats_enabled.restype = None
+            library.fractal_get_last_stats.argtypes = [
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.c_int,
+            ]
+            library.fractal_get_last_stats.restype = ctypes.c_int
 
     def test_abi_version(self):
         self.assertEqual(self.library.fractal_abi_version(), 8)
+
+    def test_opt_in_render_stats_report_bla_work(self):
+        if not hasattr(self.library, "fractal_set_stats_enabled"):
+            raise unittest.SkipTest("native render statistics are unavailable")
+        width = height = 8
+        output_type = ctypes.c_float * (width * height)
+        output = output_type()
+        handle = self.library.fractal_create_reference(
+            b"-1.7110308265769848",
+            b"0.00000150981895797",
+            b"1e6",
+            800,
+            768,
+            3,
+        )
+        self.assertTrue(handle, self.library.fractal_last_error())
+        values = (ctypes.c_uint64 * 11)()
+        try:
+            self.library.fractal_set_stats_enabled(1)
+            status = self.library.render_mandelbrot_reference(
+                output, width, height, b"1e30", handle, 800, 2, 3, 1024
+            )
+            self.assertEqual(status, 0, self.library.fractal_last_error())
+            self.assertEqual(self.library.fractal_get_last_stats(values, 11), 11)
+            self.assertEqual(values[0], width * height)
+            self.assertGreater(values[1], 0)
+            self.assertGreater(values[2], 0)
+        finally:
+            self.library.fractal_set_stats_enabled(0)
+            self.library.fractal_destroy_reference(handle)
 
     def test_bla_matches_exact_perturbation(self):
         width = height = 24
@@ -314,6 +352,44 @@ class NativeRendererTests(unittest.TestCase):
                     os.environ["FRACTAL_DISABLE_BLA"] = old_value
             self.assertEqual(status, 0, self.library.fractal_last_error())
             self.assertLessEqual(max(abs(a - b) for a, b in zip(with_reference, exact)), 1e-3)
+        finally:
+            self.library.fractal_destroy_reference(handle)
+
+    def test_wider_bla_radius_matches_exact_deep_tail(self):
+        """The throughput-oriented deep radius must not change escape bands."""
+
+        width = height = 6
+        max_iter = 6000
+        output_type = ctypes.c_float * (width * height)
+        with_reference = output_type()
+        exact = output_type()
+        handle = self.library.fractal_create_reference(
+            b"-1.7110308265769848",
+            b"0.00000150981895797",
+            b"1e12",
+            max_iter,
+            768,
+            3,
+        )
+        self.assertTrue(handle, self.library.fractal_last_error())
+        try:
+            status = self.library.render_mandelbrot_reference(
+                with_reference, width, height, b"1e40", handle, max_iter, 1, 3, 4096
+            )
+            self.assertEqual(status, 0, self.library.fractal_last_error())
+            old_value = os.environ.get("FRACTAL_DISABLE_BLA")
+            os.environ["FRACTAL_DISABLE_BLA"] = "1"
+            try:
+                status = self.library.render_mandelbrot_reference(
+                    exact, width, height, b"1e40", handle, max_iter, 1, 3, 4096
+                )
+            finally:
+                if old_value is None:
+                    os.environ.pop("FRACTAL_DISABLE_BLA", None)
+                else:
+                    os.environ["FRACTAL_DISABLE_BLA"] = old_value
+            self.assertEqual(status, 0, self.library.fractal_last_error())
+            self.assertLessEqual(max(abs(a - b) for a, b in zip(with_reference, exact)), 2e-3)
         finally:
             self.library.fractal_destroy_reference(handle)
 

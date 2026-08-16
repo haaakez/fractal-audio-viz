@@ -87,6 +87,20 @@ _native_library: Any = None
 _native_checked = False
 _native_notice_printed = False
 
+NATIVE_STATS_FIELDS = (
+    "pixels",
+    "logical_iterations",
+    "bla_blocks",
+    "linear_blocks",
+    "cubic_blocks",
+    "exact_steps",
+    "replay_steps",
+    "bla_retries",
+    "cycle_inside",
+    "double_tail_pixels",
+    "bla_disabled_pixels",
+)
+
 
 def _field_renderer_cache_identity(renderer: str) -> str:
     """Return a content-based cache namespace for the active field renderer."""
@@ -223,6 +237,15 @@ def _get_native_library() -> Any:
                 ctypes.c_int,
             ]
             library.render_mandelbrot.restype = ctypes.c_int
+            if hasattr(library, "fractal_set_stats_enabled"):
+                library.fractal_set_stats_enabled.argtypes = [ctypes.c_int]
+                library.fractal_set_stats_enabled.restype = None
+            if hasattr(library, "fractal_get_last_stats"):
+                library.fractal_get_last_stats.argtypes = [
+                    ctypes.POINTER(ctypes.c_uint64),
+                    ctypes.c_int,
+                ]
+                library.fractal_get_last_stats.restype = ctypes.c_int
             _native_library = library
             return library
         except OSError:
@@ -230,6 +253,28 @@ def _get_native_library() -> Any:
             # Python implementation from running.
             continue
     return None
+
+
+def _native_set_stats_enabled(library: Any, enabled: bool) -> bool:
+    setter = getattr(library, "fractal_set_stats_enabled", None)
+    if setter is None:
+        return False
+    setter(1 if enabled else 0)
+    return True
+
+
+def _native_get_stats(library: Any) -> Optional[dict[str, int]]:
+    getter = getattr(library, "fractal_get_last_stats", None)
+    if getter is None:
+        return None
+    values = (ctypes.c_uint64 * len(NATIVE_STATS_FIELDS))()
+    count = int(getter(values, len(NATIVE_STATS_FIELDS)))
+    if count != len(NATIVE_STATS_FIELDS):
+        return None
+    return {
+        name: int(values[index])
+        for index, name in enumerate(NATIVE_STATS_FIELDS)
+    }
 
 
 @dataclass
@@ -1308,6 +1353,7 @@ def _atlas_tile_field(
     renderer: str,
     native_reference: Any,
     native_threads: int,
+    durable_cache: bool = False,
     cache_evictor: Optional["_CacheEvictor"] = None,
 ) -> Any:
     """Load or render one reusable tile in the fixed zoom atlas."""
@@ -1356,7 +1402,7 @@ def _atlas_tile_field(
         series_block,
     )
     if cache_path is not None:
-        _atomic_save_field(cache_path, field)
+        _atomic_save_field(cache_path, field, durable=durable_cache)
         if cache_evictor is not None:
             cache_evictor.observe(cache_path)
         try:
@@ -1608,6 +1654,7 @@ def _render_video_atlas(
     palette: str,
     cache_dir: Optional[Path],
     cache_limit_mb: float,
+    durable_cache: bool,
     cache_identity: str,
 ) -> None:
     """Render a song through a fixed nested tile atlas.
@@ -1675,6 +1722,7 @@ def _render_video_atlas(
             renderer=active_renderer,
             native_reference=native_reference,
             native_threads=native_threads,
+            durable_cache=durable_cache,
             cache_evictor=cache_evictor,
         )
         tile_seconds += time.perf_counter() - started
@@ -2000,8 +2048,14 @@ def _crop_and_colourise_native(
     return rgb
 
 
-def _atomic_save_field(path: Path, field: Any) -> None:
-    """Write a keyframe without leaving a half-written cache entry."""
+def _atomic_save_field(path: Path, field: Any, *, durable: bool = False) -> None:
+    """Write a keyframe atomically, optionally forcing it to stable storage.
+
+    Atomic replacement is sufficient for normal resume behaviour and avoids a
+    blocking fsync for every multi-megabyte atlas tile. ``durable`` is an
+    explicit opt-in for users who need cache entries to survive a sudden power
+    loss rather than merely an interrupted process.
+    """
 
     np = _require_numpy()
     temporary = None
@@ -2012,7 +2066,8 @@ def _atomic_save_field(path: Path, field: Any) -> None:
             temporary = Path(handle.name)
             np.save(handle, np.asarray(field, dtype=np.float32), allow_pickle=False)
             handle.flush()
-            os.fsync(handle.fileno())
+            if durable:
+                os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
         if temporary is not None and temporary.exists():
@@ -2137,6 +2192,7 @@ def _keyframe_field(
     series_block: int,
     native_reference: Any,
     native_threads: int,
+    durable_cache: bool = False,
     cache_evictor: Optional[_CacheEvictor] = None,
 ) -> Any:
     """Load or render one absolute-zoom field, with an atomic cache."""
@@ -2184,7 +2240,7 @@ def _keyframe_field(
         series_block,
     )
     if cache_path is not None:
-        _atomic_save_field(cache_path, field)
+        _atomic_save_field(cache_path, field, durable=durable_cache)
         if cache_evictor is not None:
             cache_evictor.observe(cache_path)
     return np.asarray(field, dtype=np.float32)
@@ -2304,6 +2360,7 @@ def render_video(
     video_codec: str = "libx264",
     crf: int = 18,
     keyframe_mode: str = "atlas",
+    durable_cache: bool = False,
 ) -> None:
     np = _require_numpy()
     if shutil.which("ffmpeg") is None:
@@ -2477,6 +2534,7 @@ def render_video(
                 palette=palette,
                 cache_dir=cache_dir,
                 cache_limit_mb=cache_limit_mb,
+                durable_cache=durable_cache,
                 cache_identity=_field_renderer_cache_identity(active_renderer),
             )
         finally:
@@ -2535,6 +2593,7 @@ def render_video(
                     series_block=series_block,
                     native_reference=native_reference,
                     native_threads=native_threads,
+                    durable_cache=durable_cache,
                     cache_evictor=cache_evictor,
                 )
                 field_source_zoom = chunk_log_zoom
@@ -2585,6 +2644,7 @@ def render_video(
                         series_block=series_block,
                         native_reference=native_reference,
                         native_threads=native_threads,
+                        durable_cache=durable_cache,
                         cache_evictor=cache_evictor,
                     )
                     _prune_cache(cache_dir, cache_limit_mb, cache_evictor)
@@ -2886,6 +2946,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional maximum cache size in MB; 0 keeps all cache entries",
     )
     parser.add_argument(
+        "--durable-cache",
+        action="store_true",
+        help="fsync each cache tile before replacement; slower but safer after power loss",
+    )
+    parser.add_argument(
         "--estimate",
         action="store_true",
         help="analyse audio and print keyframe workload without rendering",
@@ -3030,6 +3095,7 @@ def main() -> None:
         args.codec,
         args.crf,
         args.keyframe_mode,
+        args.durable_cache,
     )
     print(f"Done -> {args.output}")
 

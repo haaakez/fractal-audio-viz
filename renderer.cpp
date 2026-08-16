@@ -4,6 +4,7 @@
 // without knowing its C++ types.
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cerrno>
 #include <cstdint>
@@ -50,6 +51,52 @@ struct PaletteBasis {
 struct AuroraPalette {
     std::vector<std::array<std::uint8_t, 3>> rgb;
 };
+
+// These counters are intentionally opt-in.  A normal render pays only for
+// one predictable null-pointer branch at the points where a diagnostic event
+// is recorded; the per-thread arrays and aggregation are allocated only when
+// the benchmark explicitly enables statistics.
+struct RenderStats {
+    std::uint64_t pixels = 0;
+    std::uint64_t logical_iterations = 0;
+    std::uint64_t bla_blocks = 0;
+    std::uint64_t linear_blocks = 0;
+    std::uint64_t cubic_blocks = 0;
+    std::uint64_t exact_steps = 0;
+    std::uint64_t replay_steps = 0;
+    std::uint64_t bla_retries = 0;
+    std::uint64_t cycle_inside = 0;
+    std::uint64_t double_tail_pixels = 0;
+    std::uint64_t bla_disabled_pixels = 0;
+};
+
+constexpr int RENDER_STATS_FIELDS = 11;
+
+std::atomic<bool> render_stats_enabled{false};
+std::mutex stats_mutex;
+RenderStats last_render_stats;
+
+void publish_render_stats(const RenderStats& stats) {
+    std::lock_guard<std::mutex> lock(stats_mutex);
+    last_render_stats = stats;
+}
+
+int copy_render_stats(std::uint64_t* values, int capacity) {
+    if (!values || capacity < RENDER_STATS_FIELDS) return -1;
+    std::lock_guard<std::mutex> lock(stats_mutex);
+    values[0] = last_render_stats.pixels;
+    values[1] = last_render_stats.logical_iterations;
+    values[2] = last_render_stats.bla_blocks;
+    values[3] = last_render_stats.linear_blocks;
+    values[4] = last_render_stats.cubic_blocks;
+    values[5] = last_render_stats.exact_steps;
+    values[6] = last_render_stats.replay_steps;
+    values[7] = last_render_stats.bla_retries;
+    values[8] = last_render_stats.cycle_inside;
+    values[9] = last_render_stats.double_tail_pixels;
+    values[10] = last_render_stats.bla_disabled_pixels;
+    return RENDER_STATS_FIELDS;
+}
 
 // The colourizer is called from Python's calling thread, while OpenMP only
 // parallelises its pixel loop.  Thread-local storage therefore gives each
@@ -170,7 +217,8 @@ struct BilinearAxis {
     std::vector<float> weight;
 };
 
-BilinearAxis make_bilinear_axis(
+void fill_bilinear_axis(
+    BilinearAxis& axis,
     int source_size,
     int destination_size,
     double zoom_factor
@@ -184,7 +232,6 @@ BilinearAxis make_bilinear_axis(
     const double left = (static_cast<double>(source_size) - crop_size) * 0.5;
     const double step = crop_size / static_cast<double>(destination_size);
 
-    BilinearAxis axis;
     axis.index0.resize(static_cast<size_t>(destination_size));
     axis.index1.resize(static_cast<size_t>(destination_size));
     axis.weight.resize(static_cast<size_t>(destination_size));
@@ -199,8 +246,25 @@ BilinearAxis make_bilinear_axis(
         axis.weight[static_cast<size_t>(destination)] =
             static_cast<float>(source - static_cast<double>(index0));
     }
-    return axis;
 }
+
+// Atlas and crop colourisation are called once per video frame.  Keep the
+// coordinate maps in thread-local storage so changing the zoom reuses their
+// capacity instead of allocating several vectors for every frame.  The maps
+// are still fully regenerated, so this is allocation-only optimization.
+struct BilinearWorkspace {
+    BilinearAxis parent_x_axis;
+    BilinearAxis parent_y_axis;
+    BilinearAxis child_x_axis;
+    BilinearAxis child_y_axis;
+    std::vector<int> crop_x0;
+    std::vector<int> crop_x1;
+    std::vector<double> crop_x_fraction;
+    std::vector<float> child_edge_x;
+    std::vector<float> child_edge_y;
+};
+
+thread_local BilinearWorkspace bilinear_workspace;
 
 inline float sample_bilinear_mapped(
     const float* source,
@@ -903,20 +967,31 @@ void render_direct(
     const double width_span = height_span * static_cast<double>(width) / static_cast<double>(height);
     const double center_real = static_cast<double>(x_center);
     const double center_imag = static_cast<double>(y_center);
+    // Pixel coordinates are shared by every row/column. Keeping the final c
+    // coordinates out of the inner orbit loop removes one multiply and one
+    // add per pixel from every shallow atlas tile.
+    std::vector<double> x_coordinates(static_cast<size_t>(width));
+    std::vector<double> y_coordinates(static_cast<size_t>(height));
+    for (int px = 0; px < width; ++px) {
+        const double x_offset =
+            (static_cast<double>(px) - static_cast<double>(width - 1) / 2.0)
+            * width_span / static_cast<double>(width);
+        x_coordinates[static_cast<size_t>(px)] = center_real + x_offset;
+    }
+    for (int py = 0; py < height; ++py) {
+        const double y_offset =
+            (static_cast<double>(height - 1) / 2.0 - static_cast<double>(py))
+            * height_span / static_cast<double>(height);
+        y_coordinates[static_cast<size_t>(py)] = center_imag + y_offset;
+    }
 #ifdef _OPENMP
     if (threads > 0) omp_set_num_threads(threads);
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int py = 0; py < height; ++py) {
-        const double y_offset =
-            (static_cast<double>(height - 1) / 2.0 - static_cast<double>(py))
-            * height_span / static_cast<double>(height);
+        const double cy = y_coordinates[static_cast<size_t>(py)];
         for (int px = 0; px < width; ++px) {
-            const double x_offset =
-                (static_cast<double>(px) - static_cast<double>(width - 1) / 2.0)
-                * width_span / static_cast<double>(width);
-            const double cx = center_real + x_offset;
-            const double cy = center_imag + y_offset;
+            const double cx = x_coordinates[static_cast<size_t>(px)];
             const double q = (cx - 0.25) * (cx - 0.25) + cy * cy;
             const bool in_cardioid = q * (q + cx - 0.25) <= 0.25 * cy * cy;
             const bool in_bulb = (cx + 1.0) * (cx + 1.0) + cy * cy <= 0.0625;
@@ -1150,10 +1225,13 @@ void build_bla(ReferenceContext& context) {
     // that is merely visually plausible is not enough at a keyframe seam.
     // The endpoint guard below replays maps that approach escape, but it
     // cannot detect a map that has already crossed into the wrong basin.
-    // Keep the radius near Kalles' double-precision glitch budget (about
-    // 2^-43) instead of the old 1e-8 visual-only bound.
+    // Keep the radius near Kalles' double-precision perturbation budget
+    // (about 2^-38) instead of the old 1e-8 visual-only bound. The endpoint
+    // escape/replay guard below still rejects blocks that approach the
+    // boundary, while the wider radius avoids a severe e40--e60 throughput
+    // cliff when the perturbation enters the ordinary-double range.
     const FloatExp tolerance = FloatExp::from_long_double(
-        std::ldexp(1.0L, -43));
+        std::ldexp(1.0L, -38));
     for (int start = 1; start <= base_count; ++start) {
         const FloatExpComplex& reference = context.fast_orbit[static_cast<size_t>(start)];
         const FloatExp reference_magnitude = fe_sqrt(fec_norm_squared(reference));
@@ -1295,6 +1373,7 @@ FloatExp parse_zoom_float_exp(const char* text, mpfr_prec_t precision_bits) {
     return result;
 }
 
+template <bool CollectStats>
 void render_scaled_double_tail(
     float& output,
     const ScaledComplex& dc,
@@ -1302,7 +1381,8 @@ void render_scaled_double_tail(
     int max_iter,
     int& iteration,
     int& reference_index,
-    ScaledComplex delta
+    ScaledComplex delta,
+    RenderStats* stats
 ) {
     const double dc_real = sc_to_double(dc);
     const double dc_imag = std::ldexp(dc.imag, dc.exponent);
@@ -1330,6 +1410,10 @@ void render_scaled_double_tail(
         delta_imag = linear_imag + square_imag + dc_imag;
         ++reference_index;
         ++iteration;
+        if constexpr (CollectStats) {
+            ++stats->logical_iterations;
+            ++stats->exact_steps;
+        }
         if (!std::isfinite(delta_real) || !std::isfinite(delta_imag)) {
             // A non-finite tail is a numerical escape/glitch, not proof of an
             // interior pixel.  Returning the iteration as a coloured escape
@@ -1357,12 +1441,13 @@ void render_scaled_double_tail(
             delta_real * delta_real + delta_imag * delta_imag;
 
         ++tail_steps;
-        if (tail_steps >= 64) {
+        if (tail_steps >= 64 && (tail_steps & 31) == 0) {
             // Brent-style cycle detection is deliberately conservative: it
             // only runs after a long bounded tail and requires a near-exact
-            // recurrence well inside the escape circle. This lets attracting
-            // interior pixels finish early without turning a transient
-            // boundary revisit into a false black classification.
+            // recurrence well inside the escape circle. Sample the tail at
+            // the same cadence as the scaled path; checking every iteration
+            // made this fallback disproportionately expensive without adding
+            // useful precision for an audio frame.
             if (!cycle_ready) {
                 tortoise_real = total_real;
                 tortoise_imag = total_imag;
@@ -1405,7 +1490,8 @@ void render_scaled_double_tail(
     }
 }
 
-void render_bla(
+template <bool CollectStats>
+void render_bla_impl(
     float* __restrict output,
     int width,
     int height,
@@ -1414,7 +1500,8 @@ void render_bla(
     int max_iter,
     int threads,
     int series_order,
-    int series_block
+    int series_block,
+    RenderStats* stats_out
 ) {
     const FloatExp zoom = parse_zoom_float_exp(zoom_text, context.precision_bits);
     const FloatExp inverse_zoom = fe_div(FloatExp::from_parts(1.0, 0), zoom);
@@ -1469,13 +1556,35 @@ void render_bla(
         x_offsets[static_cast<size_t>(px)] = fe_mul(view_width, x_fraction);
     }
 
+    // Set the requested team size before sizing the diagnostic slots. This
+    // keeps --stats safe when a caller requests more threads than the runtime
+    // default, while the normal render still pays no allocation cost.
 #ifdef _OPENMP
     if (threads > 0) omp_set_num_threads(threads);
+#endif
+    std::vector<RenderStats> thread_stats;
+    if constexpr (CollectStats) {
+        int worker_count = 1;
+#ifdef _OPENMP
+        worker_count = std::max(1, omp_get_max_threads());
+#endif
+        thread_stats.resize(static_cast<size_t>(worker_count));
+    }
+#ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
     for (int py = 0; py < height; ++py) {
+        RenderStats* stats = nullptr;
+        if constexpr (CollectStats) {
+#ifdef _OPENMP
+            stats = &thread_stats[static_cast<size_t>(omp_get_thread_num())];
+#else
+            stats = &thread_stats[0];
+#endif
+        }
         const FloatExp& y_offset = y_offsets[static_cast<size_t>(py)];
         for (int px = 0; px < width; ++px) {
+            if constexpr (CollectStats) ++stats->pixels;
             const FloatExp& x_offset = x_offsets[static_cast<size_t>(px)];
             const ScaledComplex dc = ScaledComplex::from_float_exp(x_offset, y_offset);
             const int index = py * width + px;
@@ -1533,6 +1642,7 @@ void render_bla(
                         const int scale_exponent = std::max(total_norm.exponent, 0);
                         if (cycle_distance.mantissa == 0.0
                             || cycle_distance.exponent <= scale_exponent - 78) {
+                            if constexpr (CollectStats) ++stats->cycle_inside;
                             output[index] = static_cast<float>(max_iter);
                             escaped = true;
                             break;
@@ -1554,19 +1664,6 @@ void render_bla(
                     delta = total;
                     reference_index = 0;
                     continue;
-                }
-
-                // A normal double keeps roughly 53 significant bits.  Once
-                // |delta| is above about 2^-45, its evolution has ample
-                // headroom above double rounding noise, so the hot tail can
-                // use ordinary complex doubles without discarding visible
-                // pixel differences.  The previous 2^-22 threshold left
-                // many e12--e14 frames in the much slower FloatExp loop.
-                if (delta_norm.exponent > -90) {
-                    render_scaled_double_tail(output[index], dc, context, max_iter,
-                                       iteration, reference_index, delta);
-                    escaped = true;
-                    break;
                 }
 
                 const FloatExp delta_norm_float{delta_norm.mantissa, delta_norm.exponent};
@@ -1594,7 +1691,29 @@ void render_bla(
                 const int map_length = linear_step != nullptr
                     ? linear_step->length
                     : (step != nullptr ? step->length : 0);
+                // A normal double keeps roughly 53 significant bits. Once
+                // the perturbation is large enough for a double tail, prefer
+                // that compact fallback only when no validated BLA block is
+                // available. The old early branch skipped this lookup and
+                // needlessly converted otherwise reusable late-orbit blocks
+                // into thousands of scalar exact iterations.
+                if ((map_length <= 0 || reference_index + map_length > max_iter)
+                    && delta_norm.exponent > -90) {
+                    if constexpr (CollectStats) ++stats->double_tail_pixels;
+                    render_scaled_double_tail<CollectStats>(output[index], dc, context, max_iter,
+                                       iteration, reference_index, delta, stats);
+                    escaped = true;
+                    break;
+                }
                 if (map_length > 0 && reference_index + map_length <= max_iter) {
+                    if constexpr (CollectStats) {
+                        ++stats->bla_blocks;
+                        if (linear_step != nullptr) {
+                            ++stats->linear_blocks;
+                        } else {
+                            ++stats->cubic_blocks;
+                        }
+                    }
                     const ScaledComplex previous_delta = delta;
                     const int previous_reference_index = reference_index;
                     const int previous_iteration = iteration;
@@ -1620,6 +1739,10 @@ void render_bla(
                         delta = previous_delta;
                         reference_index = previous_reference_index;
                         iteration = previous_iteration;
+                        if constexpr (CollectStats) {
+                            ++stats->bla_retries;
+                            if (!pixel_disable_bla) ++stats->bla_disabled_pixels;
+                        }
                         pixel_disable_bla = true;
                         have_total = false;
                         continue;
@@ -1639,6 +1762,10 @@ void render_bla(
                                 sc_add(sc_mul(delta, delta), dc));
                             ++reference_index;
                             ++iteration;
+                            if constexpr (CollectStats) {
+                                ++stats->replay_steps;
+                                ++stats->logical_iterations;
+                            }
                             replay_total = sc_add(
                                 context.fast_orbit_scaled[static_cast<size_t>(reference_index)], delta);
                             replay_norm = sc_norm_squared(replay_total);
@@ -1657,6 +1784,10 @@ void render_bla(
                             delta = previous_delta;
                             reference_index = previous_reference_index;
                             iteration = previous_iteration;
+                            if constexpr (CollectStats) {
+                                ++stats->bla_retries;
+                                if (!pixel_disable_bla) ++stats->bla_disabled_pixels;
+                            }
                             pixel_disable_bla = true;
                             have_total = false;
                             continue;
@@ -1668,6 +1799,9 @@ void render_bla(
                         total = endpoint;
                         total_norm = endpoint_norm;
                         have_total = true;
+                        if constexpr (CollectStats) {
+                            stats->logical_iterations += static_cast<std::uint64_t>(map_length);
+                        }
                     }
                     continue;
                 }
@@ -1682,9 +1816,31 @@ void render_bla(
                     sc_add(sc_mul(delta, delta), dc));
                 ++reference_index;
                 ++iteration;
+                if constexpr (CollectStats) {
+                    ++stats->logical_iterations;
+                    ++stats->exact_steps;
+                }
             }
             if (!escaped) output[index] = static_cast<float>(max_iter);
         }
+    }
+
+    if constexpr (CollectStats) {
+        RenderStats total;
+        for (const RenderStats& local : thread_stats) {
+            total.pixels += local.pixels;
+            total.logical_iterations += local.logical_iterations;
+            total.bla_blocks += local.bla_blocks;
+            total.linear_blocks += local.linear_blocks;
+            total.cubic_blocks += local.cubic_blocks;
+            total.exact_steps += local.exact_steps;
+            total.replay_steps += local.replay_steps;
+            total.bla_retries += local.bla_retries;
+            total.cycle_inside += local.cycle_inside;
+            total.double_tail_pixels += local.double_tail_pixels;
+            total.bla_disabled_pixels += local.bla_disabled_pixels;
+        }
+        *stats_out = total;
     }
 }
 
@@ -1695,6 +1851,14 @@ void render_bla(
 extern "C" {
 
 int fractal_abi_version() { return ABI_VERSION; }
+
+void fractal_set_stats_enabled(int enabled) {
+    render_stats_enabled.store(enabled != 0, std::memory_order_relaxed);
+}
+
+int fractal_get_last_stats(std::uint64_t* values, int capacity) {
+    return copy_render_stats(values, capacity);
+}
 
 const char* fractal_last_error() {
     std::lock_guard<std::mutex> lock(error_mutex);
@@ -1792,9 +1956,13 @@ int fractal_crop_colourise(
         // The horizontal crop mapping is identical for every output row.
         // Compute the floor/clamp work once instead of repeating it for every
         // pixel in the inner loop.
-        std::vector<int> x0_map(static_cast<size_t>(output_width));
-        std::vector<int> x1_map(static_cast<size_t>(output_width));
-        std::vector<double> x_fraction_map(static_cast<size_t>(output_width));
+        BilinearWorkspace& workspace = bilinear_workspace;
+        std::vector<int>& x0_map = workspace.crop_x0;
+        std::vector<int>& x1_map = workspace.crop_x1;
+        std::vector<double>& x_fraction_map = workspace.crop_x_fraction;
+        x0_map.resize(static_cast<size_t>(output_width));
+        x1_map.resize(static_cast<size_t>(output_width));
+        x_fraction_map.resize(static_cast<size_t>(output_width));
         for (int output_x = 0; output_x < output_width; ++output_x) {
             double source_x = left
                 + (static_cast<double>(output_x) + 0.5) * crop_width
@@ -1923,22 +2091,23 @@ int fractal_atlas_colourise(
         // and four source indices for every pixel. At 4K that dominated the
         // otherwise cheap colour pass. These compact maps are per-frame and
         // are reused for every row below.
-        BilinearAxis parent_x_axis;
-        BilinearAxis parent_y_axis;
+        BilinearWorkspace& workspace = bilinear_workspace;
+        BilinearAxis& parent_x_axis = workspace.parent_x_axis;
+        BilinearAxis& parent_y_axis = workspace.parent_y_axis;
         if (!full_child) {
-            parent_x_axis = make_bilinear_axis(parent_width, output_width, parent_zoom);
-            parent_y_axis = make_bilinear_axis(parent_height, output_height, parent_zoom);
+            fill_bilinear_axis(parent_x_axis, parent_width, output_width, parent_zoom);
+            fill_bilinear_axis(parent_y_axis, parent_height, output_height, parent_zoom);
         }
-        BilinearAxis child_x_axis;
-        BilinearAxis child_y_axis;
+        BilinearAxis& child_x_axis = workspace.child_x_axis;
+        BilinearAxis& child_y_axis = workspace.child_y_axis;
         if (use_child) {
             const int child_destination_width = full_child ? output_width : visible_child_width;
             const int child_destination_height = full_child ? output_height : visible_child_height;
-            child_x_axis = make_bilinear_axis(child_width, child_destination_width, 1.0);
-            child_y_axis = make_bilinear_axis(child_height, child_destination_height, 1.0);
+            fill_bilinear_axis(child_x_axis, child_width, child_destination_width, 1.0);
+            fill_bilinear_axis(child_y_axis, child_height, child_destination_height, 1.0);
         }
-        std::vector<float> child_edge_x;
-        std::vector<float> child_edge_y;
+        std::vector<float>& child_edge_x = workspace.child_edge_x;
+        std::vector<float>& child_edge_y = workspace.child_edge_y;
         if (use_child && !full_child && feather >= 2) {
             child_edge_x.resize(static_cast<size_t>(visible_child_width));
             child_edge_y.resize(static_cast<size_t>(visible_child_height));
@@ -2010,13 +2179,6 @@ int fractal_atlas_colourise(
             for (int output_x = child_left; output_x < child_right; ++output_x) {
                 const int child_x = output_x - child_left;
                 const int child_y = output_y - child_top;
-                const float parent_smooth = sample_bilinear_mapped(
-                    parent,
-                    parent_width,
-                    parent_x_axis,
-                    parent_y_axis,
-                    output_x,
-                    output_y);
                 const float child_smooth = sample_bilinear_mapped(
                     child,
                     child_width,
@@ -2031,10 +2193,50 @@ int fractal_atlas_colourise(
                     : 1.0F;
                 std::uint8_t* destination = output + static_cast<size_t>(
                     output_y * output_width + output_x) * 3U;
-                const bool parent_inside = !std::isfinite(parent_smooth)
-                    || parent_smooth >= static_cast<float>(parent_max_iter) - 0.5F;
                 const bool child_inside = !std::isfinite(child_smooth)
                     || child_smooth >= static_cast<float>(child_max_iter) - 0.5F;
+                // Away from the feather band the child completely replaces
+                // the parent.  Avoid sampling the parent for those pixels;
+                // only an interior child still needs the parent as a
+                // fallback for a mismatched escape classification.
+                if (alpha >= 0.999999F) {
+                    if (!child_inside) {
+                        write_colour_pixel(
+                            child_smooth,
+                            effective_palette_iter,
+                            palette,
+                            palette_index_scale,
+                            destination);
+                        continue;
+                    }
+                    const float parent_smooth = sample_bilinear_mapped(
+                        parent,
+                        parent_width,
+                        parent_x_axis,
+                        parent_y_axis,
+                        output_x,
+                        output_y);
+                    const bool parent_inside = !std::isfinite(parent_smooth)
+                        || parent_smooth >= static_cast<float>(parent_max_iter) - 0.5F;
+                    write_colour_pixel(
+                        parent_inside
+                            ? static_cast<float>(effective_palette_iter)
+                            : parent_smooth,
+                        effective_palette_iter,
+                        palette,
+                        palette_index_scale,
+                        destination);
+                    continue;
+                }
+                const float parent_smooth = sample_bilinear_mapped(
+                    parent,
+                    parent_width,
+                    parent_x_axis,
+                    parent_y_axis,
+                    output_x,
+                    output_y);
+                const bool parent_inside = !std::isfinite(parent_smooth)
+                    || parent_smooth >= static_cast<float>(parent_max_iter) - 0.5F;
                 const float blended_smooth = parent_inside && child_inside
                     ? static_cast<float>(effective_palette_iter)
                     : parent_inside
@@ -2127,8 +2329,15 @@ int render_mandelbrot_reference(
 #endif
         if (zoom_log10 >= 6.0L) {
 #ifdef FRACTAL_HAVE_MPFR
-            render_bla(output, width, height, zoom_text, *context, max_iter, threads,
-                       series_order, series_block);
+            RenderStats stats;
+            if (render_stats_enabled.load(std::memory_order_relaxed)) {
+                render_bla_impl<true>(output, width, height, zoom_text, *context, max_iter,
+                                      threads, series_order, series_block, &stats);
+                publish_render_stats(stats);
+            } else {
+                render_bla_impl<false>(output, width, height, zoom_text, *context, max_iter,
+                                       threads, series_order, series_block, nullptr);
+            }
 #else
             (void)zoom;
             throw std::runtime_error("deep rendering requires MPFR/GMP; rebuild with make");
