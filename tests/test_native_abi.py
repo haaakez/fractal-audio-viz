@@ -510,8 +510,8 @@ class NativeRendererTests(unittest.TestCase):
         differences = [abs(actual - reference) for actual, reference in zip(native, expected)]
         self.assertLessEqual(max(differences), 0.02)
 
-    def test_adaptive_deep_series_matches_mpmath_at_e30(self):
-        """Exercise the cheap linear BLA branch at a genuinely deep view."""
+    def test_adaptive_deep_series_matches_mpmath_at_e30_and_e100(self):
+        """Exercise the linear BLA branches against an independent oracle."""
 
         if mp is None:
             raise unittest.SkipTest("mpmath is unavailable")
@@ -530,51 +530,57 @@ class NativeRendererTests(unittest.TestCase):
             3,
         )
         self.assertTrue(handle, self.library.fractal_last_error())
+        native_by_zoom = {}
         try:
-            status = self.library.render_mandelbrot_reference(
-                output,
-                width,
-                height,
-                b"1e30",
-                handle,
-                max_iter,
-                4,
-                3,
-                256,
-            )
-            self.assertEqual(status, 0, self.library.fractal_last_error())
-            native = list(output)
+            for zoom_text in (b"1e30", b"1e100"):
+                status = self.library.render_mandelbrot_reference(
+                    output,
+                    width,
+                    height,
+                    zoom_text,
+                    handle,
+                    max_iter,
+                    4,
+                    3,
+                    4096,
+                )
+                self.assertEqual(status, 0, self.library.fractal_last_error())
+                native_by_zoom[zoom_text] = list(output)
         finally:
             self.library.fractal_destroy_reference(handle)
 
-        with mp.workdps(160):
-            centre_real = mp.mpf(x_text)
-            centre_imag = mp.mpf(y_text)
-            zoom = mp.mpf("1e30")
-            height_span = mp.mpf("2.8") / zoom
-            width_span = height_span * width / height
-            expected = []
-            for pixel_y in range(height):
-                y_offset = (mp.mpf(height - 1) / 2 - pixel_y) * height_span / height
-                for pixel_x in range(width):
-                    x_offset = (mp.mpf(pixel_x) - mp.mpf(width - 1) / 2) * width_span / width
-                    c = mp.mpc(centre_real + x_offset, centre_imag + y_offset)
-                    z = mp.mpc(0, 0)
-                    value = mp.mpf(max_iter)
-                    for iteration in range(max_iter):
-                        z = z * z + c
-                        magnitude_squared = z.real * z.real + z.imag * z.imag
-                        if magnitude_squared > 4:
-                            value = (
-                                iteration
-                                + 1
-                                - mp.log(mp.log(mp.sqrt(magnitude_squared))) / mp.log(2)
-                            )
-                            break
-                    expected.append(float(value))
+        for zoom_text, decimal_precision in ((b"1e30", 160), (b"1e100", 240)):
+            with mp.workdps(decimal_precision):
+                centre_real = mp.mpf(x_text)
+                centre_imag = mp.mpf(y_text)
+                zoom = mp.mpf(zoom_text.decode())
+                height_span = mp.mpf("2.8") / zoom
+                width_span = height_span * width / height
+                expected = []
+                for pixel_y in range(height):
+                    y_offset = (mp.mpf(height - 1) / 2 - pixel_y) * height_span / height
+                    for pixel_x in range(width):
+                        x_offset = (mp.mpf(pixel_x) - mp.mpf(width - 1) / 2) * width_span / width
+                        c = mp.mpc(centre_real + x_offset, centre_imag + y_offset)
+                        z = mp.mpc(0, 0)
+                        value = mp.mpf(max_iter)
+                        for iteration in range(max_iter):
+                            z = z * z + c
+                            magnitude_squared = z.real * z.real + z.imag * z.imag
+                            if magnitude_squared > 4:
+                                value = (
+                                    iteration
+                                    + 1
+                                    - mp.log(mp.log(mp.sqrt(magnitude_squared))) / mp.log(2)
+                                )
+                                break
+                        expected.append(float(value))
 
-        differences = [abs(actual - reference) for actual, reference in zip(native, expected)]
-        self.assertLessEqual(max(differences), 0.03)
+            differences = [
+                abs(actual - reference)
+                for actual, reference in zip(native_by_zoom[zoom_text], expected)
+            ]
+            self.assertLessEqual(max(differences), 0.03)
 
 
 if __name__ == "__main__":

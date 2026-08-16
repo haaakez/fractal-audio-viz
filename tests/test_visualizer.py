@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 try:
     import numpy as np
@@ -9,6 +11,28 @@ import visualizer
 
 
 class AnimationTests(unittest.TestCase):
+    def test_atlas_memory_cache_is_bounded_in_both_directions(self):
+        tiles = {level: object() for level in range(7)}
+        visualizer._trim_atlas_memory_cache(tiles, 2)
+        self.assertEqual(set(tiles), {1, 2, 3})
+        tiles.update({0: object(), 4: object(), 5: object()})
+        visualizer._trim_atlas_memory_cache(tiles, 4)
+        self.assertEqual(set(tiles), {3, 4, 5})
+
+    def test_cache_evictor_is_incremental_and_protects_active_tiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            paths = [cache_dir / f"atlas-tile-{index}.npy" for index in range(4)]
+            for path in paths:
+                path.write_bytes(b"01234567")
+            limit_mb = 16.0 / (1024.0 * 1024.0)
+            evictor = visualizer._CacheEvictor(cache_dir, limit_mb)
+            evictor.prune({paths[-1]})
+            remaining = [path for path in paths if path.exists()]
+            self.assertIn(paths[-1], remaining)
+            self.assertLessEqual(sum(path.stat().st_size for path in remaining), 16)
+            self.assertTrue(evictor._scanned)
+
     def test_zoom_plan_has_default_pullback_and_reaches_end(self):
         instrumental = np.asarray([0.0, 0.1, 1.0, 0.0, 0.8, 0.0], dtype=np.float32)
         zooms = visualizer._zoom_plan(instrumental, "1", "1e12", punch=3.0)
@@ -47,13 +71,17 @@ class AnimationTests(unittest.TestCase):
     def test_atlas_compositor_uses_child_only_in_central_region(self):
         parent = np.zeros((8, 8), dtype=np.float32)
         child = np.ones((8, 8), dtype=np.float32)
-        original = visualizer._colour_frame
+        original = visualizer._colourise_view
 
-        def fake_colour(field, output_width, output_height, *args):
-            value = 20 if float(field[0, 0]) > 0.5 else 10
-            return np.full((output_height, output_width, 3), value, dtype=np.uint8)
+        def fake_colour(view, *args):
+            output_height, output_width = view.shape
+            value = 20 if float(view[view.shape[0] // 2, view.shape[1] // 2]) > 0.5 else 10
+            result = np.full((output_height, output_width, 3), value, dtype=np.uint8)
+            result[view < 0.5] = 10
+            result[view > 0.5] = 20
+            return result
 
-        visualizer._colour_frame = fake_colour
+        visualizer._colourise_view = fake_colour
         try:
             result = visualizer._atlas_colour_frame(
                 parent,
@@ -74,7 +102,7 @@ class AnimationTests(unittest.TestCase):
                 0.5,
             )
         finally:
-            visualizer._colour_frame = original
+            visualizer._colourise_view = original
         self.assertEqual(result.shape, (32, 32, 3))
         self.assertEqual(result.dtype, np.uint8)
         self.assertEqual(int(result[0, 0, 0]), 10)

@@ -108,7 +108,9 @@ def main() -> None:
 
     native_reference = None
     native_library = None
+    reference_seconds = 0.0
     if args.renderer != "python" and log_zoom >= 12.0:
+        reference_started = time.perf_counter()
         native_library, native_reference = visualizer._create_native_reference(
             args.x_center,
             args.y_center,
@@ -117,6 +119,7 @@ def main() -> None:
             args.series_order,
             12.0,
         )
+        reference_seconds = time.perf_counter() - reference_started
     timings = []
     try:
         for _ in range(args.repeat):
@@ -146,8 +149,10 @@ def main() -> None:
             "x_center": args.x_center,
             "y_center": args.y_center,
             "repeat": args.repeat,
+            "reference_seconds": reference_seconds,
             "seconds": timings,
             "best_seconds": min(timings),
+            "best_with_reference_seconds": reference_seconds + min(timings),
             "pixels_per_second": args.width * args.height / min(timings),
             "finite_fraction": float(np.isfinite(field).mean()),
         }
@@ -157,7 +162,9 @@ def main() -> None:
             print(
                 f"{args.width}x{args.height} at {args.zoom}: "
                 f"best {result['best_seconds']:.3f}s, "
-                f"{result['pixels_per_second']:.1f} pixels/s"
+                f"{result['pixels_per_second']:.1f} pixels/s; "
+                f"reference setup {reference_seconds:.3f}s, "
+                f"one-shot total {result['best_with_reference_seconds']:.3f}s"
             )
     finally:
         if native_reference is not None and native_library is not None:

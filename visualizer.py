@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import heapq
 import importlib.util
 import math
 import os
@@ -80,7 +81,7 @@ DEFAULT_Y_CENTER = (
 # renderer from silently reusing an old, under-resolved .npy keyframe.
 KEYFRAME_CACHE_SCHEMA = "bla-keyframe-blend-colour-v6"
 AUDIO_CACHE_SCHEMA = "audio-controls-v5-dynamics-pitch"
-ATLAS_CACHE_SCHEMA = "nested-atlas-v1"
+ATLAS_CACHE_SCHEMA = "nested-atlas-v2"
 
 _native_library: Any = None
 _native_checked = False
@@ -1250,6 +1251,14 @@ def _atlas_level_for_zoom(log_zoom: float, origin: float, step: float, level_cou
     return max(0, min(level, level_count))
 
 
+def _trim_atlas_memory_cache(tile_cache: dict[int, Any], active_level: int) -> None:
+    """Keep only the parent/current/child tiles needed around a level."""
+
+    for old_level in tuple(tile_cache):
+        if abs(old_level - active_level) > 1:
+            del tile_cache[old_level]
+
+
 def _atlas_tile_path(
     cache_dir: Optional[Path],
     cache_identity: str,
@@ -1299,6 +1308,7 @@ def _atlas_tile_field(
     renderer: str,
     native_reference: Any,
     native_threads: int,
+    cache_evictor: Optional["_CacheEvictor"] = None,
 ) -> Any:
     """Load or render one reusable tile in the fixed zoom atlas."""
 
@@ -1320,6 +1330,8 @@ def _atlas_tile_field(
         try:
             cached = np.load(cache_path, mmap_mode="r", allow_pickle=False)
             if cached.shape == (render_height, render_width):
+                if cache_evictor is not None:
+                    cache_evictor.touch(cache_path)
                 print(f"Using cached atlas tile {level} ({cache_path.name}).", flush=True)
                 return cached
         except (OSError, ValueError):
@@ -1345,6 +1357,8 @@ def _atlas_tile_field(
     )
     if cache_path is not None:
         _atomic_save_field(cache_path, field)
+        if cache_evictor is not None:
+            cache_evictor.observe(cache_path)
         try:
             return np.load(cache_path, mmap_mode="r", allow_pickle=False)
         except (OSError, ValueError):
@@ -1459,67 +1473,78 @@ def _atlas_colour_frame(
             native_library,
             pitch,
         )
-    parent_rgb = _colour_frame(
-        parent,
-        output_width,
-        output_height,
-        max(float(parent_zoom), 1.0),
-        parent_iter,
-        phase,
-        vocal,
-        instrumental,
-        native_library,
-        native_threads,
-        resample,
-        palette_name,
-        pitch,
+    parent_view = np.array(
+        _crop_and_resize(
+            parent,
+            output_width,
+            output_height,
+            max(float(parent_zoom), 1.0),
+            resample,
+        ),
+        dtype=np.float32,
+        copy=True,
     )
     if child is None or child_iter is None or child_fraction <= 0.0:
-        return parent_rgb
+        return _colourise_view(
+            parent_view,
+            parent_iter,
+            phase,
+            vocal,
+            instrumental,
+            native_library,
+            native_threads,
+            palette_name,
+            pitch,
+        )
     child_fraction = min(float(child_fraction), 1.0)
     if child_fraction >= 0.999999:
-        return _colour_frame(
+        child_view = _crop_and_resize(
             child,
             output_width,
             output_height,
             1.0,
+            resample,
+        )
+        return _colourise_view(
+            child_view,
             child_iter,
             phase,
             vocal,
             instrumental,
             native_library,
             native_threads,
-            resample,
             palette_name,
             pitch,
         )
 
     child_width = max(1, int(round(output_width * child_fraction)))
     child_height = max(1, int(round(output_height * child_fraction)))
-    child_rgb = _colour_frame(
+    child_view = _crop_and_resize(
         child,
         child_width,
         child_height,
         1.0,
-        child_iter,
-        phase,
-        vocal,
-        instrumental,
-        native_library,
-        native_threads,
         resample,
-        palette_name,
-        pitch,
     )
     left = (output_width - child_width) // 2
     top = (output_height - child_height) // 2
     right = left + child_width
     bottom = top + child_height
-    region = parent_rgb[top:bottom, left:right]
+    region = parent_view[top:bottom, left:right]
     feather = min(16, child_width // 8, child_height // 8)
     if feather < 2:
-        region[...] = child_rgb
-        return parent_rgb
+        region[...] = child_view
+        return _colourise_view(
+            parent_view,
+            max(int(parent_iter), int(child_iter)),
+            phase,
+            vocal,
+            instrumental,
+            native_library,
+            native_threads,
+            palette_name,
+            pitch,
+        )
 
     yy, xx = np.ogrid[:child_height, :child_width]
     edge_distance = np.minimum(
@@ -1527,12 +1552,32 @@ def _atlas_colour_frame(
         np.minimum(child_width - 1 - xx, child_height - 1 - yy),
     )
     alpha = np.clip(edge_distance.astype(np.float32) / float(feather), 0.0, 1.0)
+    parent_inside = ~np.isfinite(region) | (region >= float(parent_iter) - 0.5)
+    child_inside = ~np.isfinite(child_view) | (child_view >= float(child_iter) - 0.5)
     blended = (
-        region.astype(np.float32) * (1.0 - alpha[..., None])
-        + child_rgb.astype(np.float32) * alpha[..., None]
+        region.astype(np.float32) * (1.0 - alpha)
+        + child_view.astype(np.float32) * alpha
     )
-    region[...] = np.asarray(np.rint(blended), dtype=np.uint8)
-    return parent_rgb
+    blended = np.where(parent_inside & ~child_inside, child_view, blended)
+    blended = np.where(child_inside & ~parent_inside, region, blended)
+    effective_iter = max(int(parent_iter), int(child_iter))
+    blended = np.where(
+        parent_inside & child_inside,
+        float(effective_iter),
+        blended,
+    )
+    region[...] = np.asarray(blended, dtype=np.float32)
+    return _colourise_view(
+        parent_view,
+        effective_iter,
+        phase,
+        vocal,
+        instrumental,
+        native_library,
+        native_threads,
+        palette_name,
+        pitch,
+    )
 
 
 def _render_video_atlas(
@@ -1570,7 +1615,8 @@ def _render_video_atlas(
     The old renderer tied source fields to audio-dependent chunk boundaries.
     This path ties them only to absolute logarithmic zoom, so a tile is
     rendered once and can be reused by every camera path through the same
-    centre. Only two adjacent tiles are retained in memory.
+    centre. A bounded three-tile window is retained in memory so both forward
+    and audio-driven reverse zooms remain cheap.
     """
 
     np = _require_numpy()
@@ -1586,6 +1632,7 @@ def _render_video_atlas(
 
     tile_cache: dict[int, Any] = {}
     tile_iterations: dict[int, int] = {}
+    cache_evictor = _CacheEvictor(cache_dir, cache_limit_mb)
     tile_seconds = 0.0
 
     def tile_log(level: int) -> float:
@@ -1628,9 +1675,29 @@ def _render_video_atlas(
             renderer=active_renderer,
             native_reference=native_reference,
             native_threads=native_threads,
+            cache_evictor=cache_evictor,
         )
         tile_seconds += time.perf_counter() - started
-        _prune_cache(cache_dir, cache_limit_mb)
+        protected_paths: set[Path] = set()
+        if active_level is not None and cache_dir is not None:
+            for protected_level in range(active_level - 1, active_level + 2):
+                if 0 <= protected_level <= level_count:
+                    protected_path = _atlas_tile_path(
+                        cache_dir,
+                        cache_identity,
+                        render_width,
+                        render_height,
+                        protected_level,
+                        tile_log(protected_level),
+                        x_center,
+                        y_center,
+                        tile_iter(protected_level),
+                        series_order,
+                        series_block,
+                    )
+                    if protected_path is not None:
+                        protected_paths.add(protected_path)
+        _prune_cache(cache_dir, cache_limit_mb, cache_evictor, protected_paths)
         return tile_cache[level]
 
     process = None
@@ -1656,9 +1723,7 @@ def _render_video_atlas(
                 get_tile(level)
                 if level < level_count:
                     get_tile(level + 1)
-                for old_level in tuple(tile_cache):
-                    if old_level < level - 1:
-                        del tile_cache[old_level]
+                _trim_atlas_memory_cache(tile_cache, level)
 
             parent_log = tile_log(level)
             parent = get_tile(level)
@@ -1957,6 +2022,106 @@ def _atomic_save_field(path: Path, field: Any) -> None:
                 pass
 
 
+class _CacheEvictor:
+    """Maintain a cheap incremental LRU index for generated cache files.
+
+    The old implementation rescanned and sorted the entire cache directory
+    after every tile.  That is harmless for a handful of preview files but
+    becomes quadratic for a deep atlas.  This index scans existing files once,
+    then updates a heap as files are loaded or written.
+    """
+
+    _PATTERNS = ("keyframe-*.npy", "atlas-tile-*.npy", "audio-*.npz")
+
+    def __init__(self, cache_dir: Optional[Path], limit_mb: float) -> None:
+        self.cache_dir = cache_dir
+        self.limit_bytes = (
+            int(limit_mb * 1024 * 1024)
+            if cache_dir is not None and limit_mb > 0.0
+            else 0
+        )
+        self._entries: dict[Path, tuple[int, int]] = {}
+        self._heap: list[tuple[int, Path]] = []
+        self._total_bytes = 0
+        self._sequence = 0
+        self._scanned = False
+
+    @property
+    def enabled(self) -> bool:
+        return self.cache_dir is not None and self.limit_bytes > 0
+
+    def _next_sequence(self) -> int:
+        self._sequence += 1
+        return self._sequence
+
+    def _scan_once(self) -> None:
+        if self._scanned or not self.enabled:
+            return
+        self._scanned = True
+        assert self.cache_dir is not None
+        for pattern in self._PATTERNS:
+            for path in self.cache_dir.glob(pattern):
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+                sequence = self._next_sequence()
+                self._entries[path] = (size, sequence)
+                self._total_bytes += size
+                heapq.heappush(self._heap, (sequence, path))
+
+    def observe(self, path: Path) -> None:
+        if not self.enabled:
+            return
+        self._scan_once()
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        previous = self._entries.get(path)
+        if previous is not None:
+            self._total_bytes -= previous[0]
+        sequence = self._next_sequence()
+        self._entries[path] = (size, sequence)
+        self._total_bytes += size
+        heapq.heappush(self._heap, (sequence, path))
+
+    def touch(self, path: Path) -> None:
+        """Mark a valid cache hit as recently used without rewriting it."""
+
+        self.observe(path)
+
+    def prune(self, protected: Optional[set[Path]] = None) -> None:
+        if not self.enabled:
+            return
+        self._scan_once()
+        if self._total_bytes <= self.limit_bytes:
+            return
+        protected = protected or set()
+
+        deferred: list[tuple[int, Path]] = []
+        while self._total_bytes > self.limit_bytes and self._heap:
+            sequence, path = heapq.heappop(self._heap)
+            current = self._entries.get(path)
+            if current is None or current[1] != sequence:
+                continue
+            if path in protected:
+                deferred.append((sequence, path))
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Do not spin on an undeletable entry during this render.
+                deferred.append((sequence, path))
+                break
+            self._total_bytes -= current[0]
+            self._entries.pop(path, None)
+        for item in deferred:
+            heapq.heappush(self._heap, item)
+
+
 def _keyframe_field(
     *,
     cache_dir: Optional[Path],
@@ -1972,6 +2137,7 @@ def _keyframe_field(
     series_block: int,
     native_reference: Any,
     native_threads: int,
+    cache_evictor: Optional[_CacheEvictor] = None,
 ) -> Any:
     """Load or render one absolute-zoom field, with an atomic cache."""
 
@@ -1997,6 +2163,8 @@ def _keyframe_field(
         try:
             cached = np.load(cache_path, allow_pickle=False)
             if cached.shape == (render_height, render_width):
+                if cache_evictor is not None:
+                    cache_evictor.touch(cache_path)
                 print(f"Using cached keyframe {cache_path.name}.", flush=True)
                 return np.asarray(cached, dtype=np.float32)
         except (OSError, ValueError):
@@ -2017,33 +2185,50 @@ def _keyframe_field(
     )
     if cache_path is not None:
         _atomic_save_field(cache_path, field)
+        if cache_evictor is not None:
+            cache_evictor.observe(cache_path)
     return np.asarray(field, dtype=np.float32)
 
 
-def _prune_cache(cache_dir: Optional[Path], limit_mb: float) -> None:
-    """Optionally bound cache growth, only within the explicitly chosen dir."""
+def _prune_cache(
+    cache_dir: Optional[Path],
+    limit_mb: float,
+    evictor: Optional[_CacheEvictor] = None,
+    protected: Optional[set[Path]] = None,
+) -> None:
+    """Optionally bound cache growth through an incremental eviction index."""
 
-    if cache_dir is None or limit_mb <= 0.0:
-        return
-    limit_bytes = int(limit_mb * 1024 * 1024)
-    files = [
-        path
-        for pattern in ("keyframe-*.npy", "atlas-tile-*.npy", "audio-*.npz")
-        for path in cache_dir.glob(pattern)
-        if path.is_file()
-    ]
-    total = sum(path.stat().st_size for path in files)
-    if total <= limit_bytes:
-        return
-    for path in sorted(files, key=lambda item: item.stat().st_mtime):
-        if total <= limit_bytes:
-            break
-        try:
-            size = path.stat().st_size
-            path.unlink()
-            total -= size
-        except OSError:
-            continue
+    active = evictor or _CacheEvictor(cache_dir, limit_mb)
+    active.prune(protected or set())
+
+
+def _colourise_view(
+    view: Any,
+    max_iter: int,
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    native_library: Any,
+    native_threads: int,
+    palette_name: str,
+    pitch: float,
+) -> Any:
+    """Colour an already-resampled scalar iteration field."""
+
+    if native_library is not None and palette_name == "aurora":
+        return _colourise_native(
+            view,
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            native_threads,
+            native_library,
+            pitch,
+        )
+    if palette_name != "aurora":
+        return _colourise_custom(view, max_iter, phase, vocal, instrumental, palette_name, pitch)
+    return _colourise(view, max_iter, phase, vocal, instrumental, pitch)
 
 
 def _colour_frame(
@@ -2076,20 +2261,17 @@ def _colour_frame(
             pitch,
         )
     view = _crop_and_resize(field, output_width, output_height, zoom_factor, resample)
-    if native_library is not None and palette_name == "aurora":
-        return _colourise_native(
-            view,
-            max_iter,
-            phase,
-            vocal,
-            instrumental,
-            native_threads,
-            native_library,
-            pitch,
-        )
-    if palette_name != "aurora":
-        return _colourise_custom(view, max_iter, phase, vocal, instrumental, palette_name, pitch)
-    return _colourise(view, max_iter, phase, vocal, instrumental, pitch)
+    return _colourise_view(
+        view,
+        max_iter,
+        phase,
+        vocal,
+        instrumental,
+        native_library,
+        native_threads,
+        palette_name,
+        pitch,
+    )
 
 
 def render_video(
@@ -2311,6 +2493,7 @@ def render_video(
     render_started = time.perf_counter()
     keyframe_seconds = 0.0
     frame_seconds = 0.0
+    cache_evictor = _CacheEvictor(cache_dir, cache_limit_mb)
 
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE)
@@ -2352,11 +2535,12 @@ def render_video(
                     series_block=series_block,
                     native_reference=native_reference,
                     native_threads=native_threads,
+                    cache_evictor=cache_evictor,
                 )
                 field_source_zoom = chunk_log_zoom
                 field_max_zoom = chunk_max_zoom
                 field_iter = current_iter
-                _prune_cache(cache_dir, cache_limit_mb)
+                _prune_cache(cache_dir, cache_limit_mb, cache_evictor)
             else:
                 # The preceding chunk rendered this field ahead of time for
                 # a transition. Promote it in memory instead of rendering or
@@ -2401,8 +2585,9 @@ def render_video(
                         series_block=series_block,
                         native_reference=native_reference,
                         native_threads=native_threads,
+                        cache_evictor=cache_evictor,
                     )
-                    _prune_cache(cache_dir, cache_limit_mb)
+                    _prune_cache(cache_dir, cache_limit_mb, cache_evictor)
                 else:
                     next_log_zoom = None
                     next_max_zoom = None

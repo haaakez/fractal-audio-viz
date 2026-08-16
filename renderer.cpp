@@ -310,6 +310,16 @@ struct FloatExp {
     bool zero() const { return mantissa == 0.0; }
 };
 
+inline int saturating_exponent(long long value) noexcept {
+    if (value > static_cast<long long>(std::numeric_limits<int>::max())) {
+        return std::numeric_limits<int>::max();
+    }
+    if (value < static_cast<long long>(std::numeric_limits<int>::min())) {
+        return std::numeric_limits<int>::min();
+    }
+    return static_cast<int>(value);
+}
+
 // A complex value represented with one shared binary exponent.  The two
 // components of a perturbation normally have comparable magnitudes, so a
 // shared exponent avoids normalizing real and imaginary parts separately in
@@ -349,7 +359,8 @@ struct ScaledComplex {
         (void)std::frexp(magnitude, &shift);
         real = std::ldexp(real, -shift);
         imag = std::ldexp(imag, -shift);
-        exponent += shift;
+        exponent = saturating_exponent(
+            static_cast<long long>(exponent) + static_cast<long long>(shift));
     }
 
     static ScaledComplex from_float_exp(const FloatExp& real_part, const FloatExp& imag_part) {
@@ -376,8 +387,11 @@ inline ScaledComplex sc_add(const ScaledComplex& a, const ScaledComplex& b) {
         larger = &b;
         smaller = &a;
     }
-    const int difference = larger->exponent - smaller->exponent;
-    if (difference > 60) return *larger;
+    const long long exponent_difference =
+        static_cast<long long>(larger->exponent)
+        - static_cast<long long>(smaller->exponent);
+    if (exponent_difference > 60) return *larger;
+    const int difference = static_cast<int>(exponent_difference);
     ScaledComplex result{
         larger->real + std::ldexp(smaller->real, -difference),
         larger->imag + std::ldexp(smaller->imag, -difference),
@@ -400,7 +414,8 @@ inline ScaledComplex sc_mul(const ScaledComplex& a, const ScaledComplex& b) {
     ScaledComplex result{
         a.real * b.real - a.imag * b.imag,
         a.real * b.imag + a.imag * b.real,
-        a.exponent + b.exponent,
+        saturating_exponent(
+            static_cast<long long>(a.exponent) + static_cast<long long>(b.exponent)),
     };
     result.normalize();
     return result;
@@ -410,7 +425,11 @@ inline ScaledComplex sc_double(const ScaledComplex& value) {
     if (value.real == 0.0 && value.imag == 0.0) return {};
     // Multiplication by two is exact in this representation and does not
     // need another mantissa normalization.
-    return {value.real, value.imag, value.exponent + 1};
+    return {
+        value.real,
+        value.imag,
+        saturating_exponent(static_cast<long long>(value.exponent) + 1),
+    };
 }
 
 inline bool sc_finite(const ScaledComplex& value) noexcept {
@@ -423,18 +442,41 @@ struct ScaledNorm {
 };
 
 inline ScaledNorm sc_norm_squared(const ScaledComplex& value) {
+    if (!sc_finite(value)) {
+        return {std::numeric_limits<double>::infinity(),
+                std::numeric_limits<int>::max()};
+    }
     const double norm = value.real * value.real + value.imag * value.imag;
     if (norm == 0.0) return {};
+    if (!std::isfinite(norm)) {
+        return {std::numeric_limits<double>::infinity(),
+                std::numeric_limits<int>::max()};
+    }
+    const long long squared_exponent = 2LL * static_cast<long long>(value.exponent);
     if (norm >= 1.0) {
-        return {norm * 0.5, value.exponent * 2 + 1};
+        const long long exponent = squared_exponent + 1;
+        if (exponent > std::numeric_limits<int>::max()) {
+            return {std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<int>::max()};
+        }
+        return {norm * 0.5, static_cast<int>(exponent)};
     }
     if (norm < 0.5) {
-        return {norm * 2.0, value.exponent * 2 - 1};
+        const long long exponent = squared_exponent - 1;
+        if (exponent < std::numeric_limits<int>::min()) return {};
+        return {norm * 2.0, static_cast<int>(exponent)};
     }
-    return {norm, value.exponent * 2};
+    if (squared_exponent > std::numeric_limits<int>::max()) {
+        return {std::numeric_limits<double>::infinity(),
+                std::numeric_limits<int>::max()};
+    }
+    if (squared_exponent < std::numeric_limits<int>::min()) return {};
+    return {norm, static_cast<int>(squared_exponent)};
 }
 
 inline int sc_compare_norm(const ScaledNorm& a, const ScaledNorm& b) {
+    if (!std::isfinite(a.mantissa)) return std::isfinite(b.mantissa) ? 1 : 0;
+    if (!std::isfinite(b.mantissa)) return -1;
     if (a.mantissa == 0.0 && b.mantissa == 0.0) return 0;
     if (a.mantissa == 0.0) return -1;
     if (b.mantissa == 0.0) return 1;
@@ -568,6 +610,8 @@ inline int fe_compare(const FloatExp& a, const FloatExp& b) {
     // is not a numeric magnitude. Handle it before comparing exponents;
     // otherwise 0 would compare larger than tiny positive values and a
     // zero-radius BLA map would be accepted as if it had radius one.
+    if (!a.finite()) return b.finite() ? 1 : 0;
+    if (!b.finite()) return -1;
     if (a.mantissa == 0.0) return b.mantissa == 0.0 ? 0 : -1;
     if (b.mantissa == 0.0) return 1;
     if (a.mantissa < 0.0 && b.mantissa >= 0.0) return -1;
@@ -653,7 +697,21 @@ struct LinearBlaBuilderStep {
     int length = 1;
 };
 
+inline bool fec_finite(const FloatExpComplex& value) noexcept {
+    return value.real.finite() && value.imag.finite();
+}
+
 FastBlaStep compact_bla_step(const BlaStep& step) {
+    const bool finite = step.radius_squared.finite()
+        && fec_finite(step.A)
+        && fec_finite(step.B)
+        && fec_finite(step.C)
+        && fec_finite(step.D)
+        && fec_finite(step.E)
+        && fec_finite(step.F)
+        && fec_finite(step.G)
+        && fec_finite(step.H)
+        && fec_finite(step.I);
     FastBlaStep result{
         {
         ScaledComplex::from_float_exp(step.A.real, step.A.imag),
@@ -666,17 +724,20 @@ FastBlaStep compact_bla_step(const BlaStep& step) {
         ScaledComplex::from_float_exp(step.H.real, step.H.imag),
         ScaledComplex::from_float_exp(step.I.real, step.I.imag),
         },
-        step.radius_squared,
+        finite ? step.radius_squared : FloatExp{0.0, 0},
         step.length,
     };
     return result;
 }
 
 LinearBlaStep compact_linear_bla_step(const LinearBlaBuilderStep& step) {
+    const bool finite = step.radius_squared.finite()
+        && fec_finite(step.A)
+        && fec_finite(step.B);
     return {
         ScaledComplex::from_float_exp(step.A.real, step.A.imag),
         ScaledComplex::from_float_exp(step.B.real, step.B.imag),
-        step.radius_squared,
+        finite ? step.radius_squared : FloatExp{0.0, 0},
         step.length,
     };
 }
@@ -752,7 +813,7 @@ struct BlaLevels {
         const FloatExp& delta_norm_squared,
         int max_length
     ) const noexcept {
-        if (start <= 0 || max_length <= 0) return nullptr;
+        if (start <= 0 || max_length <= 0 || !delta_norm_squared.finite()) return nullptr;
         const int base_count = levels.empty() ? 0 : static_cast<int>(levels[0].size());
         if (start > base_count) return nullptr;
         int highest_level = highest_level_for_length(max_length);
@@ -770,7 +831,8 @@ struct BlaLevels {
             const int index = offset >> level;
             if (index >= static_cast<int>(levels[level].size())) continue;
             const FastBlaStep& candidate = levels[level][static_cast<size_t>(index)];
-            if (fe_compare(delta_norm_squared, candidate.radius_squared) < 0) {
+            if (candidate.radius_squared.finite()
+                && fe_compare(delta_norm_squared, candidate.radius_squared) < 0) {
                 return &candidate;
             }
         }
@@ -784,7 +846,7 @@ struct BlaLevels {
         bool deep
     ) const noexcept {
         const auto& available_levels = deep ? deep_linear_levels : linear_levels;
-        if (start <= 0 || max_length <= 0) return nullptr;
+        if (start <= 0 || max_length <= 0 || !delta_norm_squared.finite()) return nullptr;
         const int base_count = available_levels.empty()
             ? 0 : static_cast<int>(available_levels[0].size());
         if (start > base_count) return nullptr;
@@ -799,7 +861,8 @@ struct BlaLevels {
             const int index = offset >> level;
             if (index >= static_cast<int>(available_levels[level].size())) continue;
             const LinearBlaStep& candidate = available_levels[level][static_cast<size_t>(index)];
-            if (fe_compare(delta_norm_squared, candidate.radius_squared) < 0) {
+            if (candidate.radius_squared.finite()
+                && fe_compare(delta_norm_squared, candidate.radius_squared) < 0) {
                 return &candidate;
             }
         }
@@ -1267,11 +1330,23 @@ void render_scaled_double_tail(
         delta_imag = linear_imag + square_imag + dc_imag;
         ++reference_index;
         ++iteration;
+        if (!std::isfinite(delta_real) || !std::isfinite(delta_imag)) {
+            // A non-finite tail is a numerical escape/glitch, not proof of an
+            // interior pixel.  Returning the iteration as a coloured escape
+            // is safer than silently turning the pixel black.
+            output = static_cast<float>(iteration);
+            return;
+        }
         const double total_real =
             context.orbit_real_double[static_cast<size_t>(reference_index)] + delta_real;
         const double total_imag =
             context.orbit_imag_double[static_cast<size_t>(reference_index)] + delta_imag;
         const double magnitude_squared = total_real * total_real + total_imag * total_imag;
+        if (!std::isfinite(total_real) || !std::isfinite(total_imag)
+            || !std::isfinite(magnitude_squared)) {
+            output = static_cast<float>(iteration);
+            return;
+        }
         if (magnitude_squared > 4.0) {
             const double magnitude = std::sqrt(std::max(magnitude_squared, 4.0000001));
             output = static_cast<float>(static_cast<double>(iteration)
@@ -1322,6 +1397,11 @@ void render_scaled_double_tail(
             tail_steps = 0;
             cycle_ready = false;
         }
+    }
+    if (iteration < max_iter) {
+        // The compact reference tail ended before the requested iteration
+        // budget.  Do not misclassify the unresolved pixel as an interior.
+        output = static_cast<float>(iteration);
     }
 }
 
@@ -1410,11 +1490,12 @@ void render_bla(
             int cycle_power = 1;
             int cycle_length = 0;
             bool cycle_ready = false;
+            bool pixel_disable_bla = false;
 
             while (iteration < max_iter) {
                 if (reference_index < 0
                     || reference_index >= static_cast<int>(context.fast_orbit_scaled.size())) {
-                    output[index] = static_cast<float>(max_iter);
+                    output[index] = static_cast<float>(iteration);
                     escaped = true;
                     break;
                 }
@@ -1496,7 +1577,7 @@ void render_bla(
                         : approximation_order;
                 const LinearBlaStep* linear_step = nullptr;
                 const FastBlaStep* step = nullptr;
-                if (!disable_bla) {
+                if (!disable_bla && !pixel_disable_bla) {
                     if (effective_order <= 1) {
                         linear_step = context.bla.lookup_linear(
                             reference_index,
@@ -1531,14 +1612,25 @@ void render_bla(
                     // A block that approaches the escape boundary is replayed
                     // one iteration at a time so smooth colouring does not
                     // acquire broad BLA-sized bands.
-                    if (!sc_finite(delta)
-                        || !sc_finite(endpoint)
-                        || sc_compare_norm(endpoint_norm, ScaledNorm{0.75, 2}) >= 0) {
+                    if (!sc_finite(delta) || !sc_finite(endpoint)) {
+                        // A bad approximation must be retried from the same
+                        // state with BLA disabled for this pixel.  Previously
+                        // this path could write max_iter and create a large
+                        // false black region.
+                        delta = previous_delta;
+                        reference_index = previous_reference_index;
+                        iteration = previous_iteration;
+                        pixel_disable_bla = true;
+                        have_total = false;
+                        continue;
+                    }
+                    if (sc_compare_norm(endpoint_norm, ScaledNorm{0.75, 2}) >= 0) {
                         delta = previous_delta;
                         reference_index = previous_reference_index;
                         iteration = previous_iteration;
                         ScaledComplex replay_total{};
                         ScaledNorm replay_norm{};
+                        bool retry_without_bla = false;
                         for (int replay = 0; replay < map_length && iteration < max_iter; ++replay) {
                             const ScaledComplex reference =
                                 context.fast_orbit_scaled[static_cast<size_t>(reference_index)];
@@ -1551,8 +1643,7 @@ void render_bla(
                                 context.fast_orbit_scaled[static_cast<size_t>(reference_index)], delta);
                             replay_norm = sc_norm_squared(replay_total);
                             if (!sc_finite(delta) || !sc_finite(replay_total)) {
-                                output[index] = static_cast<float>(max_iter);
-                                escaped = true;
+                                retry_without_bla = true;
                                 break;
                             }
                             if (sc_outside_escape(replay_norm)) {
@@ -1562,6 +1653,14 @@ void render_bla(
                             }
                         }
                         if (escaped) break;
+                        if (retry_without_bla) {
+                            delta = previous_delta;
+                            reference_index = previous_reference_index;
+                            iteration = previous_iteration;
+                            pixel_disable_bla = true;
+                            have_total = false;
+                            continue;
+                        }
                         total = replay_total;
                         total_norm = replay_norm;
                         have_total = true;
@@ -1925,20 +2024,6 @@ int fractal_atlas_colourise(
                     child_y_axis,
                     child_x,
                     child_y);
-                std::uint8_t parent_rgb[3];
-                std::uint8_t child_rgb[3];
-                write_colour_pixel(
-                    parent_smooth,
-                    parent_max_iter,
-                    palette,
-                    palette_index_scale,
-                    parent_rgb);
-                write_colour_pixel(
-                    child_smooth,
-                    child_max_iter,
-                    palette,
-                    palette_index_scale,
-                    child_rgb);
                 const float alpha = feather >= 2
                     ? std::min(
                         child_edge_x[static_cast<size_t>(child_x)],
@@ -1946,12 +2031,27 @@ int fractal_atlas_colourise(
                     : 1.0F;
                 std::uint8_t* destination = output + static_cast<size_t>(
                     output_y * output_width + output_x) * 3U;
-                const double inverse_alpha = 1.0 - static_cast<double>(alpha);
-                for (int channel = 0; channel < 3; ++channel) {
-                    destination[channel] = colour_byte(
-                        static_cast<double>(parent_rgb[channel]) * inverse_alpha
-                        + static_cast<double>(child_rgb[channel]) * static_cast<double>(alpha));
-                }
+                const bool parent_inside = !std::isfinite(parent_smooth)
+                    || parent_smooth >= static_cast<float>(parent_max_iter) - 0.5F;
+                const bool child_inside = !std::isfinite(child_smooth)
+                    || child_smooth >= static_cast<float>(child_max_iter) - 0.5F;
+                const float blended_smooth = parent_inside && child_inside
+                    ? static_cast<float>(effective_palette_iter)
+                    : parent_inside
+                        ? child_smooth
+                        : child_inside
+                            ? parent_smooth
+                            : parent_smooth * (1.0F - alpha) + child_smooth * alpha;
+                // Blend the scalar iteration field before colourisation. RGB
+                // blending mixed two independently indexed hues and produced
+                // a visible seam whenever adjacent tiles had different
+                // iteration budgets.
+                write_colour_pixel(
+                    blended_smooth,
+                    effective_palette_iter,
+                    palette,
+                    palette_index_scale,
+                    destination);
             }
             render_parent_span(output_y, child_right, output_width);
         }

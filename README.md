@@ -51,6 +51,8 @@ nested tiles. Each frame is composed from two adjacent tiles, so the centre
 keeps native resolution while the outer region is reused from the parent.
 The ladder is independent of audio timing and its absolute tiles can be
 reused by later renders with the same centre, scale and numerical settings.
+Only the parent/current/child window is retained in memory, including when
+the audio path briefly zooms backwards.
 Use `--keyframe-mode legacy` only for visual regression against the previous
 full-field chunk renderer.
 
@@ -76,15 +78,17 @@ Python palette path.
 
 ## Benchmark
 
-The benchmark does not decode audio or encode video:
+The benchmark does not decode audio or encode video. Field benchmarks report
+reference/BLA setup separately from repeated pixel-render timings:
 
 ```sh
 python3 benchmark.py --renderer native --zoom 1e100 \
   --width 256 --height 256 --iterations 20000 --series-block 4096 --repeat 2
 ```
 
-It reports deep field-render time and pixels per second. To measure the
-separate output-stage bottleneck, use:
+It reports deep field-render time, pixels per second, reference setup time,
+and a one-shot total including that setup. To measure the separate
+output-stage bottleneck, use:
 
 ```sh
 python3 benchmark.py --stage compositor --renderer native \
@@ -121,7 +125,8 @@ frames automatically clamp to the safer tier. `--series-block` defaults to
 Keyframe fields are cached by renderer identity, absolute zoom, dimensions,
 centre, iteration budget and approximation settings. Cache writes and final
 video writes are atomic, so interrupted renders do not replace a completed
-output with a partial file.
+output with a partial file. `--cache-limit-mb` uses incremental LRU eviction;
+with its default value of zero, cache growth remains intentionally unlimited.
 
 Re-running the same command with the same cache directory resumes at the
 completed absolute keyframes and reuses the audio analysis. The final video
