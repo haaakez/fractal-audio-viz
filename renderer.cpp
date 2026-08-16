@@ -1444,20 +1444,16 @@ bool render_scaled_double_tail(
             ++stats->logical_iterations;
             ++stats->exact_steps;
         }
-        if (!std::isfinite(delta_real) || !std::isfinite(delta_imag)) {
-            // A non-finite tail is a numerical escape/glitch, not proof of an
-            // interior pixel.  Returning the iteration as a coloured escape
-            // is safer than silently turning the pixel black.
-            output = static_cast<float>(iteration);
-            return false;
-        }
         const double total_real =
             context.orbit_real_double[static_cast<size_t>(reference_index)] + delta_real;
         const double total_imag =
             context.orbit_imag_double[static_cast<size_t>(reference_index)] + delta_imag;
         const double magnitude_squared = total_real * total_real + total_imag * total_imag;
-        if (!std::isfinite(total_real) || !std::isfinite(total_imag)
-            || !std::isfinite(magnitude_squared)) {
+        if (!std::isfinite(magnitude_squared)) {
+            // A non-finite tail is a numerical escape/glitch, not proof of an
+            // interior pixel.  Returning the iteration as a coloured escape
+            // is safer than silently turning the pixel black.  Checking the
+            // norm covers non-finite real/imaginary components as well.
             output = static_cast<float>(iteration);
             return false;
         }
