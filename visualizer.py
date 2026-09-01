@@ -43,21 +43,28 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
+from collections import deque
 import hashlib
 import heapq
 import importlib.util
 import math
 import os
+import queue
+import random
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
+
+from deep_zoom_points import DEEP_ZOOM_POINTS, DEEP_ZOOM_POINTS_BY_SLUG, DeepZoomPoint
 
 
 # Do this before importing numerical libraries.  It helps BLAS-backed NumPy
@@ -79,15 +86,15 @@ DEFAULT_Y_CENTER = (
 # Fields are expensive, so they can be cached; their cache identity must
 # change when native numerical behaviour changes.  This prevents a new
 # renderer from silently reusing an old, under-resolved .npy keyframe.
-KEYFRAME_CACHE_SCHEMA = "bla-keyframe-blend-colour-v6"
-AUDIO_CACHE_SCHEMA = "audio-controls-v5-dynamics-pitch"
-ATLAS_CACHE_SCHEMA = "nested-atlas-v5-spatial-recovery"
+KEYFRAME_CACHE_SCHEMA = "raw-field-series-v10-bla38-tiered"
+AUDIO_CACHE_SCHEMA = "audio-controls-v9-slow-flow-tail"
+ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v10-bla38-aligned-tiered"
 
 # A single reference is normally ideal, but at deep zoom a frame-sized tile
 # can contain a narrow boundary that is much farther from that reference than
-# the rest of the image.  The native renderer then spends most of its time in
-# exact/replayed tails. Large deep tiles start with four local views and split
-# only the cells whose render exceeds a short native deadline. This keeps MPFR
+# the rest of the image. The native renderer then spends most of its time in
+# exact/replayed tails. Large deep tiles start with one bounded shared pass and
+# split only connected regions whose pixels remain unresolved. This keeps MPFR
 # setup and memory proportional to the genuinely difficult part of a tile.
 ATLAS_LOCAL_REFERENCE_MIN_LOG = 40.0
 ATLAS_LOCAL_REFERENCE_MIN_DIMENSION = 96
@@ -97,6 +104,29 @@ ATLAS_LOCAL_REFERENCE_MAX_BUDGET_MS = 4000
 ATLAS_LOCAL_REFERENCE_MS_PER_PIXEL = 0.05
 ATLAS_LOCAL_REFERENCE_FINAL_BUDGET_MS = 750
 ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS = 30_000
+ATLAS_PROGRESS_INTERVAL_SECONDS = 20.0
+ENCODER_BACKPRESSURE_NOTICE_SECONDS = 10.0
+
+# These are the original visualizer's liquid-gradient constants.  Keep the
+# numerical field independent from them: the atlas stores raw iteration data,
+# so the same expensive deep render can be recoloured without being rebuilt.
+AURORA_BAND_THICKNESS = 0.15
+# The original liquid engine peaked at 60 radians/second.  Keep its response
+# shape, but halve the rate so the colour movement is calmer during a render.
+AURORA_FLOW_SPEED = 30.0
+# A completely silent tail must not turn the video into a frozen still.  This
+# small carrier keeps the liquid field moving while the audio envelope still
+# controls the energetic part of the flow.
+AURORA_MIN_FLOW_FRACTION = 0.08
+AURORA_COLOUR_SPLIT = 5.0
+AURORA_GREEN_SPLIT = 0.4
+
+# A deep-zoom centre is part of the numerical input, not merely a display
+# preference.  Keep a guard band beyond the requested zoom so the supplied
+# decimal does not become the dominant uncertainty in the viewport.  The
+# bundled centre has 129 fractional decimal places: that is ample for the
+# tested e100 path, but it is not a faithful e150/e4000 Kalles target.
+CENTER_PRECISION_GUARD_DIGITS = 16
 
 _native_library: Any = None
 _native_checked = False
@@ -120,6 +150,99 @@ NATIVE_STATS_FIELDS = (
     "tail_rebase_fallbacks",
     "max_pixel_iterations",
 )
+NATIVE_EXTENDED_STATS_FIELDS = NATIVE_STATS_FIELDS + (
+    "series_pixels",
+    "series_jumps",
+    "glitch_count",
+    "unresolved_pixels",
+    "deadline_aborts",
+    "secondary_references",
+    "render_ns",
+) + tuple(f"bla_length_bin_{index}" for index in range(16))
+
+
+class NativeRenderOptions(ctypes.Structure):
+    """Versioned per-call controls for the native C ABI."""
+
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("strict", ctypes.c_int32),
+        ("allow_recovery", ctypes.c_int32),
+        ("time_budget_ms", ctypes.c_int32),
+        ("disable_bla", ctypes.c_int32),
+        ("disable_cycle", ctypes.c_int32),
+        ("strict_cycle", ctypes.c_int32),
+        ("series_min_terms", ctypes.c_int32),
+        ("series_max_terms", ctypes.c_int32),
+        ("max_bla_length", ctypes.c_int32),
+        ("max_linear_bla_length", ctypes.c_int32),
+        ("backend", ctypes.c_int32),
+        ("reserved", ctypes.c_int32 * 3),
+    ]
+
+    def __init__(
+        self,
+        *,
+        strict: bool = True,
+        allow_recovery: bool = False,
+        time_budget_ms: int = 0,
+        disable_bla: bool = False,
+        disable_cycle: bool = False,
+        strict_cycle: bool = False,
+        series_min_terms: int = 8,
+        series_max_terms: int = 32,
+        max_bla_length: int = 256,
+        max_linear_bla_length: int = 4096,
+        backend: int = 0,
+    ) -> None:
+        super().__init__()
+        self.struct_size = ctypes.sizeof(self)
+        self.version = 1
+        self.strict = int(strict)
+        self.allow_recovery = int(allow_recovery)
+        self.time_budget_ms = int(time_budget_ms)
+        self.disable_bla = int(disable_bla)
+        self.disable_cycle = int(disable_cycle)
+        self.strict_cycle = int(strict_cycle)
+        self.series_min_terms = int(series_min_terms)
+        self.series_max_terms = int(series_max_terms)
+        self.max_bla_length = int(max_bla_length)
+        self.max_linear_bla_length = int(max_linear_bla_length)
+        self.backend = int(backend)
+
+
+NATIVE_BACKEND_NAMES = {
+    "scalar": 0,
+    "avx2": 1,
+    "opencl": 2,
+}
+
+
+def _native_backend_id(name: str, library: Any) -> int:
+    """Resolve a user-facing backend name against the loaded ABI."""
+
+    if name == "auto":
+        # AVX2 is a low-overhead CPU choice for shallow/direct frames. OpenCL
+        # is opt-in because a CPU OpenCL ICD can be slower than OpenMP and
+        # deep frames intentionally stay on the validated CPU path.
+        if library is not None and hasattr(library, "fractal_backend_capabilities"):
+            return 1 if int(library.fractal_backend_capabilities()) & 2 else 0
+        return 0
+    try:
+        backend = NATIVE_BACKEND_NAMES[name]
+    except KeyError as error:
+        raise ValueError(f"unknown native backend: {name}") from error
+    if library is None or not hasattr(library, "fractal_backend_capabilities"):
+        raise RuntimeError("native backend capabilities are unavailable")
+    capabilities = int(library.fractal_backend_capabilities())
+    required_bit = 1 << backend
+    if not capabilities & required_bit:
+        raise RuntimeError(
+            f"native backend {name} is unavailable in this build/device "
+            f"(capabilities bitmask {capabilities})"
+        )
+    return backend
 
 
 def _field_renderer_cache_identity(renderer: str) -> str:
@@ -166,8 +289,10 @@ def _get_native_library() -> Any:
             if not hasattr(library, "fractal_abi_version"):
                 continue
             library.fractal_abi_version.restype = ctypes.c_int
-            if library.fractal_abi_version() != 8:
+            if library.fractal_abi_version() != 10:
                 continue
+            if hasattr(library, "fractal_backend_capabilities"):
+                library.fractal_backend_capabilities.restype = ctypes.c_int
             library.fractal_last_error.restype = ctypes.c_char_p
             library.fractal_colourise.argtypes = [
                 ctypes.POINTER(ctypes.c_float),
@@ -182,6 +307,18 @@ def _get_native_library() -> Any:
                 ctypes.c_int,
             ]
             library.fractal_colourise.restype = ctypes.c_int
+            if hasattr(library, "fractal_crop_field"):
+                library.fractal_crop_field.argtypes = [
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_double,
+                    ctypes.c_int,
+                ]
+                library.fractal_crop_field.restype = ctypes.c_int
             library.fractal_crop_colourise.argtypes = [
                 ctypes.POINTER(ctypes.c_float),
                 ctypes.c_int,
@@ -230,8 +367,31 @@ def _get_native_library() -> Any:
                 ctypes.c_int,
             ]
             library.fractal_create_reference.restype = ctypes.c_void_p
+            if hasattr(library, "fractal_create_reference_reusable"):
+                library.fractal_create_reference_reusable.argtypes = [
+                    ctypes.c_char_p,
+                    ctypes.c_char_p,
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                ]
+                library.fractal_create_reference_reusable.restype = ctypes.c_void_p
+            if hasattr(library, "fractal_clone_reference"):
+                library.fractal_clone_reference.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                ]
+                library.fractal_clone_reference.restype = ctypes.c_void_p
             library.fractal_destroy_reference.argtypes = [ctypes.c_void_p]
             library.fractal_destroy_reference.restype = None
+            if hasattr(library, "fractal_get_reference_stats"):
+                library.fractal_get_reference_stats.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_uint64),
+                    ctypes.c_int,
+                ]
+                library.fractal_get_reference_stats.restype = ctypes.c_int
             library.render_mandelbrot_reference.argtypes = [
                 ctypes.POINTER(ctypes.c_float),
                 ctypes.c_int,
@@ -244,6 +404,36 @@ def _get_native_library() -> Any:
                 ctypes.c_int,
             ]
             library.render_mandelbrot_reference.restype = ctypes.c_int
+            if hasattr(library, "fractal_render_mandelbrot_reference_ex"):
+                library.fractal_render_mandelbrot_reference_ex.argtypes = [
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.POINTER(NativeRenderOptions),
+                ]
+                library.fractal_render_mandelbrot_reference_ex.restype = ctypes.c_int
+            if hasattr(library, "fractal_render_points"):
+                library.fractal_render_points.argtypes = [
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.POINTER(ctypes.c_double),
+                    ctypes.POINTER(ctypes.c_double),
+                    ctypes.POINTER(ctypes.c_int32),
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.POINTER(NativeRenderOptions),
+                ]
+                library.fractal_render_points.restype = ctypes.c_int
             library.render_mandelbrot.argtypes = [
                 ctypes.POINTER(ctypes.c_float),
                 ctypes.c_int,
@@ -257,6 +447,21 @@ def _get_native_library() -> Any:
                 ctypes.c_int,
             ]
             library.render_mandelbrot.restype = ctypes.c_int
+            if hasattr(library, "render_mandelbrot_ex"):
+                library.render_mandelbrot_ex.argtypes = [
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_char_p,
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.POINTER(NativeRenderOptions),
+                ]
+                library.render_mandelbrot_ex.restype = ctypes.c_int
             if hasattr(library, "fractal_set_stats_enabled"):
                 library.fractal_set_stats_enabled.argtypes = [ctypes.c_int]
                 library.fractal_set_stats_enabled.restype = None
@@ -266,6 +471,12 @@ def _get_native_library() -> Any:
                     ctypes.c_int,
                 ]
                 library.fractal_get_last_stats.restype = ctypes.c_int
+            if hasattr(library, "fractal_get_last_stats_ex"):
+                library.fractal_get_last_stats_ex.argtypes = [
+                    ctypes.POINTER(ctypes.c_uint64),
+                    ctypes.c_int,
+                ]
+                library.fractal_get_last_stats_ex.restype = ctypes.c_int
             _native_library = library
             return library
         except OSError:
@@ -284,17 +495,226 @@ def _native_set_stats_enabled(library: Any, enabled: bool) -> bool:
 
 
 def _native_get_stats(library: Any) -> Optional[dict[str, int]]:
-    getter = getattr(library, "fractal_get_last_stats", None)
+    getter = getattr(library, "fractal_get_last_stats_ex", None)
+    fields = NATIVE_EXTENDED_STATS_FIELDS
+    if getter is None:
+        getter = getattr(library, "fractal_get_last_stats", None)
+        fields = NATIVE_STATS_FIELDS
     if getter is None:
         return None
-    values = (ctypes.c_uint64 * len(NATIVE_STATS_FIELDS))()
-    count = int(getter(values, len(NATIVE_STATS_FIELDS)))
-    if count != len(NATIVE_STATS_FIELDS):
-        return None
+    values = (ctypes.c_uint64 * len(fields))()
+    count = int(getter(values, len(fields)))
+    # Older libraries accept the legacy field count; current libraries expose
+    # the extended histogram through the versioned entry point.
+    if count != len(fields):
+        if len(fields) == len(NATIVE_EXTENDED_STATS_FIELDS):
+            return None
+        if count != len(NATIVE_STATS_FIELDS):
+            return None
     return {
         name: int(values[index])
-        for index, name in enumerate(NATIVE_STATS_FIELDS)
+        for index, name in enumerate(fields)
     }
+
+
+def _crop_field_native(
+    field: Any,
+    output_width: int,
+    output_height: int,
+    zoom_factor: float,
+    library: Any,
+    threads: int,
+) -> Any:
+    """Reproject raw iteration data without converting it to RGB."""
+
+    np = _require_numpy()
+    cropper = getattr(library, "fractal_crop_field", None)
+    if cropper is None:
+        raise RuntimeError("native raw-field reprojection is unavailable")
+    source = np.ascontiguousarray(field, dtype=np.float32)
+    if source.ndim != 2:
+        raise ValueError("raw-field reprojection requires a 2-D field")
+    output = np.empty((output_height, output_width), dtype=np.float32)
+    status = cropper(
+        source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(source.shape[1]),
+        int(source.shape[0]),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(output_width),
+        int(output_height),
+        float(zoom_factor),
+        int(threads),
+    )
+    if status != 0:
+        message = library.fractal_last_error() or b"unknown native raw-field reprojection error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
+def _scaled_log10_radius(log10_radius: float) -> tuple[float, int]:
+    """Represent 10**log10_radius as a normalized mantissa and binary exponent."""
+
+    if not math.isfinite(log10_radius):
+        raise ValueError("exponential-map radius must be finite")
+    log2_radius = float(log10_radius) * math.log2(10.0)
+    exponent = math.floor(log2_radius)
+    mantissa = math.pow(2.0, log2_radius - exponent)
+    mantissa, shift = math.frexp(mantissa)
+    return float(mantissa), int(exponent + shift)
+
+
+def render_exponential_field(
+    *,
+    radial_samples: int,
+    angular_samples: int,
+    min_log10_radius: float,
+    max_log10_radius: float,
+    x_center: str,
+    y_center: str,
+    max_iter: int,
+    series_order: int = 3,
+    series_block: int = 64,
+    native_threads: int = 0,
+    native_reference: Any = None,
+    render_options: Optional[NativeRenderOptions] = None,
+) -> Any:
+    """Render a raw log-polar/exponential-map field.
+
+    Rows are uniformly spaced in log10 radius and columns are uniformly
+    spaced in angle.  The returned array is scalar iteration data, never
+    RGB.  This is an opt-in building block for a GUI or a long zoom master;
+    the normal command-line renderer continues to use the nested atlas until
+    an exp-map has passed the same oracle suite at the requested sampling
+    density.
+    """
+
+    np = _require_numpy()
+    library = _get_native_library()
+    if library is None or not hasattr(library, "fractal_render_points"):
+        raise RuntimeError("native point renderer is unavailable; run `make`")
+    if radial_samples <= 1 or angular_samples <= 3:
+        raise ValueError("exponential-map sampling grid is too small")
+    if max_log10_radius <= min_log10_radius:
+        raise ValueError("exponential-map radius range must be increasing")
+    if native_reference is None:
+        # The reference viewport radius is 2.8 / zoom.  Choose it from the
+        # largest radius in the map so every point stays inside the BLA/series
+        # validation domain.
+        reference_log = math.log10(2.8) - float(max_log10_radius)
+        _, native_reference = _create_native_reference(
+            x_center,
+            y_center,
+            max_iter,
+            reference_log,
+            series_order,
+            reference_log,
+        )
+        owns_reference = True
+    else:
+        owns_reference = False
+
+    count = int(radial_samples) * int(angular_samples)
+    real = np.empty(count, dtype=np.float64)
+    imag = np.empty(count, dtype=np.float64)
+    exponents = np.empty(count, dtype=np.int32)
+    radius_step = (float(max_log10_radius) - float(min_log10_radius)) / radial_samples
+    angle_step = 2.0 * math.pi / angular_samples
+    for radial in range(radial_samples):
+        log_radius = float(min_log10_radius) + (radial + 0.5) * radius_step
+        mantissa, exponent = _scaled_log10_radius(log_radius)
+        begin = radial * angular_samples
+        end = begin + angular_samples
+        angles = angle_step * (np.arange(angular_samples, dtype=np.float64) + 0.5)
+        real[begin:end] = mantissa * np.cos(angles)
+        imag[begin:end] = mantissa * np.sin(angles)
+        exponents[begin:end] = exponent
+
+    output = np.empty(count, dtype=np.float32)
+    options = render_options or NativeRenderOptions()
+    try:
+        status = library.fractal_render_points(
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            count,
+            b"1e0",
+            real.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            imag.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            exponents.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            native_reference,
+            max_iter,
+            native_threads,
+            series_order,
+            series_block,
+            ctypes.byref(options),
+        )
+        if status != 0:
+            message = library.fractal_last_error() or b"unknown native exponential-map renderer error"
+            raise RuntimeError(message.decode("utf-8", errors="replace"))
+    finally:
+        if owns_reference:
+            library.fractal_destroy_reference(native_reference)
+    return output.reshape((radial_samples, angular_samples))
+
+
+def reproject_exponential_field(
+    field: Any,
+    *,
+    min_log10_radius: float,
+    max_log10_radius: float,
+    log10_zoom: float,
+    output_width: int,
+    output_height: int,
+    max_iter: int,
+) -> Any:
+    """Reproject a raw exp-map into one centred rectangular view."""
+
+    np = _require_numpy()
+    source = np.asarray(field, dtype=np.float32)
+    if source.ndim != 2 or source.shape[0] < 2 or source.shape[1] < 4:
+        raise ValueError("invalid exponential-map field")
+    if max_log10_radius <= min_log10_radius:
+        raise ValueError("exponential-map radius range must be increasing")
+    y_fraction = (
+        (float(output_height - 1) / 2.0 - np.arange(output_height, dtype=np.float64))
+        / float(output_height)
+    )
+    x_fraction = (
+        (np.arange(output_width, dtype=np.float64) - float(output_width - 1) / 2.0)
+        / float(output_width)
+    )
+    xx, yy = np.meshgrid(x_fraction, y_fraction)
+    radius_fraction = np.hypot(xx, yy)
+    valid = radius_fraction > 0.0
+    log_radius = np.full(radius_fraction.shape, float(min_log10_radius), dtype=np.float64)
+    log_radius[valid] = (
+        math.log10(2.8)
+        - float(log10_zoom)
+        + np.log10(radius_fraction[valid])
+    )
+    radial_position = (
+        (log_radius - float(min_log10_radius))
+        / (float(max_log10_radius) - float(min_log10_radius))
+        * source.shape[0]
+        - 0.5
+    )
+    angular_position = (
+        (np.arctan2(yy, xx) % (2.0 * math.pi))
+        / (2.0 * math.pi)
+        * source.shape[1]
+        - 0.5
+    ) % source.shape[1]
+    r0 = np.clip(np.floor(radial_position).astype(np.int64), 0, source.shape[0] - 1)
+    r1 = np.clip(r0 + 1, 0, source.shape[0] - 1)
+    rw = np.clip(radial_position - np.floor(radial_position), 0.0, 1.0)
+    a0 = np.floor(angular_position).astype(np.int64) % source.shape[1]
+    a1 = (a0 + 1) % source.shape[1]
+    aw = angular_position - np.floor(angular_position)
+    top = source[r0, a0] * (1.0 - aw) + source[r0, a1] * aw
+    bottom = source[r1, a0] * (1.0 - aw) + source[r1, a1] * aw
+    result = (top * (1.0 - rw) + bottom * rw).astype(np.float32)
+    result[~valid] = float(max_iter)
+    outside = (log_radius < min_log10_radius) | (log_radius > max_log10_radius)
+    result[outside & valid] = float(max_iter)
+    return result
 
 
 @dataclass
@@ -305,6 +725,11 @@ class AudioFeatures:
     instrumental: Any
     phase: Any
     pitch: Any
+    # The vocal/full-mix driver used by the original liquid gradient.  Keep it
+    # separate from the attack/release-shaped control used for zoom decisions:
+    # percentile clamping is useful for stable punches, but it can flatten a
+    # perfectly usable quiet vocal passage into a grey three-channel palette.
+    gradient: Any
     frame_count: int
 
 
@@ -378,6 +803,7 @@ def _atomic_save_features(path: Path, features: AudioFeatures) -> None:
                 instrumental=np.asarray(features.instrumental, dtype=np.float32),
                 phase=np.asarray(features.phase, dtype=np.float32),
                 pitch=np.asarray(features.pitch, dtype=np.float32),
+                gradient=np.asarray(features.gradient, dtype=np.float32),
                 frame_count=np.asarray(features.frame_count, dtype=np.int64),
             )
             handle.flush()
@@ -559,6 +985,22 @@ def _normalise(values: Any) -> Any:
     return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)
 
 
+def _normalise_minmax(values: Any) -> Any:
+    """Normalize a flow control with the original visualizer's full range."""
+
+    np = _require_numpy()
+    values = np.nan_to_num(
+        np.asarray(values, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    if values.size == 0:
+        return values
+    low = float(np.min(values))
+    high = float(np.max(values))
+    if high <= low + 1.0e-12:
+        return np.zeros_like(values)
+    return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)
+
+
 def _smooth(values: Any, radius: int) -> Any:
     np = _require_numpy()
     if radius <= 1 or values.size < 3:
@@ -673,6 +1115,7 @@ def analyse_audio(
                 instrumental = np.asarray(cached["instrumental"], dtype=np.float32)
                 phase = np.asarray(cached["phase"], dtype=np.float32)
                 pitch = np.asarray(cached["pitch"], dtype=np.float32)
+                gradient = np.asarray(cached["gradient"], dtype=np.float32)
                 frame_count = int(cached["frame_count"])
             if (
                 frame_count > 0
@@ -680,9 +1123,10 @@ def analyse_audio(
                 and instrumental.shape == (frame_count,)
                 and phase.shape == (frame_count,)
                 and pitch.shape == (frame_count,)
+                and gradient.shape == (frame_count,)
             ):
                 print(f"Using cached audio controls {cache_path.name}.")
-                return AudioFeatures(vocal, instrumental, phase, pitch, frame_count)
+                return AudioFeatures(vocal, instrumental, phase, pitch, gradient, frame_count)
         except (OSError, KeyError, ValueError):
             pass
 
@@ -715,6 +1159,16 @@ def analyse_audio(
     else:
         vocal_signal = _resample_features(vocal_rms, frame_count, fps, sample_rate)
         instrumental_signal = _resample_features(instrumental_rms, frame_count, fps, sample_rate)
+    # Preserve the first visualizer's liquid control independently from the
+    # attack/release controls used for camera motion.  Its recipe was simply
+    # min/max normalization followed by a short four-frame moving average.
+    # The robust zoom normalizer intentionally clips outliers, which is good
+    # for punch stability but made low-level full-mix/vocal passages collapse
+    # to one phase split and appear grey.
+    if stems is None and separation != "spectral":
+        gradient = _smooth(_normalise_minmax(full_mix_rms), 4)
+    else:
+        gradient = _smooth(_normalise_minmax(vocal_signal), 4)
     full_mix = _envelope_follow(
         _smooth(_normalise(full_mix_rms), 5), fps, attack, release
     )
@@ -751,27 +1205,201 @@ def analyse_audio(
         vocal = full_mix
         instrumental = full_mix
         print("No reliable vocal/instrument split; full-song energy drives gradient and zoom.")
-    # Phase is a gentle spatial drift, not a strobe.  The old coefficient
-    # advanced the pattern by one radian per frame at peak vocals, which is
-    # nearly ten full visual cycles per second at 60 FPS.
-    phase_rate = 0.02 + 0.58 * (vocal.astype(np.float64) ** 2.2)
+    # Match the original visualizer's liquid engine.  ``vocal`` is already
+    # attack/release smoothed, so the phase velocity changes continuously even
+    # though the original peak rate is intentionally energetic.  When source
+    # separation is unavailable ``vocal`` is the full-song envelope above, so
+    # a normal one-file render still gets the same flowing gradient.
+    flow_strength = np.clip(gradient.astype(np.float64), 0.0, 1.0) ** 2.5
+    phase_rate = AURORA_FLOW_SPEED * (
+        AURORA_MIN_FLOW_FRACTION
+        + (1.0 - AURORA_MIN_FLOW_FRACTION) * flow_strength
+    )
     phase = np.cumsum(phase_rate / max(float(fps), 1.0)).astype(np.float32)
-    features = AudioFeatures(vocal, instrumental, phase, pitch, frame_count)
+    features = AudioFeatures(vocal, instrumental, phase, pitch, gradient, frame_count)
     if cache_path is not None:
         _atomic_save_features(cache_path, features)
     return features
 
 
+def _fractional_decimal_places(value: str) -> int:
+    """Return the decimal place of the least-significant supplied digit.
+
+    Counting the digits after a literal ``.`` is wrong for scientific input:
+    ``1.23e-4`` specifies a value to the 1e-6 place.  ``Decimal`` preserves
+    that information without converting a deep coordinate through binary
+    floating point.
+    """
+
+    try:
+        decimal_value = Decimal(str(value).strip())
+    except Exception:
+        return 0
+    if not decimal_value.is_finite():
+        return 0
+    exponent = decimal_value.as_tuple().exponent
+    return max(0, -int(exponent))
+
+
+def _center_precision_budget(
+    x_center: str,
+    y_center: str,
+    log10_zoom: float,
+) -> tuple[int, int]:
+    """Return ``(available, required)`` decimal places for a deep centre.
+
+    This is deliberately a diagnostic, not a claim that a short decimal is
+    mathematically invalid.  A short decimal can be an intentional exact
+    point; it simply cannot represent a separately discovered Kalles target
+    whose omitted digits matter at the requested scale.
+    """
+
+    available = min(
+        _fractional_decimal_places(x_center),
+        _fractional_decimal_places(y_center),
+    )
+    required = max(0, int(math.ceil(max(0.0, float(log10_zoom))))) + CENTER_PRECISION_GUARD_DIGITS
+    return available, required
+
+
+def _center_precision_error(
+    x_center: str,
+    y_center: str,
+    log10_zoom: float,
+) -> Optional[str]:
+    available, required = _center_precision_budget(x_center, y_center, log10_zoom)
+    if available >= required:
+        return None
+    return (
+        f"center coordinates provide only {available} fractional decimal places, "
+        f"but max zoom 10^{float(log10_zoom):.3f} requires at least {required} "
+        f"for a stable deep target (including a {CENTER_PRECISION_GUARD_DIGITS}-digit guard). "
+        "This can produce a legitimate-looking black interior while following a "
+        "different path from the intended Kalles target. Supply the full-precision "
+        "--x-center and --y-center exported by Kalles, or lower --max-zoom. "
+        "Use --allow-underspecified-center only for an explicitly exploratory render."
+    )
+
+
+def _deep_point_max_log10_zoom(point: DeepZoomPoint) -> float:
+    """Return the depth supported by both the source and stored digits."""
+
+    available = min(
+        _fractional_decimal_places(point.x),
+        _fractional_decimal_places(point.y),
+    )
+    return min(
+        float(point.source_log10_zoom),
+        float(max(0, available - CENTER_PRECISION_GUARD_DIGITS)),
+    )
+
+
+def _validate_center_text(value: str, label: str) -> str:
+    text = str(value).strip()
+    try:
+        parsed = Decimal(text)
+    except Exception as error:
+        raise ValueError(f"invalid {label} coordinate: {value}") from error
+    if not parsed.is_finite():
+        raise ValueError(f"{label} coordinate must be finite")
+    return text
+
+
+def _resolve_render_point(
+    *,
+    point_spec: Optional[str],
+    random_point: bool,
+    x_center: Optional[str],
+    y_center: Optional[str],
+    random_seed: Optional[int],
+    max_log_zoom: float,
+) -> tuple[str, str, Optional[DeepZoomPoint]]:
+    """Resolve preset, random, comma-pair, or legacy x/y CLI input."""
+
+    if random_point and point_spec is not None:
+        raise ValueError("use either --random-point or --point, not both")
+    if (random_point or point_spec is not None) and (
+        x_center is not None or y_center is not None
+    ):
+        raise ValueError("--point/--random-point cannot be combined with --x-center/--y-center")
+    if (x_center is None) != (y_center is None):
+        raise ValueError("--x-center and --y-center must be supplied together")
+
+    if point_spec is not None and not point_spec.strip():
+        raise ValueError("--point cannot be empty")
+    spec = "random" if random_point else (point_spec.strip() if point_spec is not None else None)
+    if spec is None:
+        if x_center is None:
+            return DEFAULT_X_CENTER, DEFAULT_Y_CENTER, None
+        return (
+            _validate_center_text(x_center, "real"),
+            _validate_center_text(y_center, "imaginary"),
+            None,
+        )
+
+    if spec.casefold() == "random":
+        candidates = [
+            point
+            for point in DEEP_ZOOM_POINTS
+            if _deep_point_max_log10_zoom(point) + 1.0e-9 >= float(max_log_zoom)
+            and (
+                float(max_log_zoom) < 150.0
+                or point.screened_log10_zoom <= float(max_log_zoom) + 1.0e-9
+            )
+        ]
+        if not candidates:
+            deepest = max(
+                (_deep_point_max_log10_zoom(point) for point in DEEP_ZOOM_POINTS),
+                default=0.0,
+            )
+            raise ValueError(
+                f"no curated point safely supports 10^{float(max_log_zoom):.3f}; "
+                f"the stored catalogue currently reaches about 10^{deepest:.0f}"
+            )
+        chooser = random.SystemRandom() if random_seed is None else random.Random(random_seed)
+        selected = chooser.choice(candidates)
+        return selected.x, selected.y, selected
+
+    preset = DEEP_ZOOM_POINTS_BY_SLUG.get(spec.casefold())
+    if preset is not None:
+        supported = _deep_point_max_log10_zoom(preset)
+        if supported + 1.0e-9 < float(max_log_zoom):
+            raise ValueError(
+                f"point '{preset.slug}' is stored safely through about 10^{supported:.0f}, "
+                f"below requested 10^{float(max_log_zoom):.3f}"
+            )
+        return preset.x, preset.y, preset
+
+    parts = [part.strip() for part in spec.split(",")]
+    if len(parts) == 2 and all(parts):
+        return (
+            _validate_center_text(parts[0], "real"),
+            _validate_center_text(parts[1], "imaginary"),
+            None,
+        )
+    raise ValueError(
+        f"unknown point '{spec}'; use --list-points, 'random', or REAL,IMAG"
+    )
+
+
+def _print_deep_zoom_points() -> None:
+    print(f"Curated deep-zoom points ({len(DEEP_ZOOM_POINTS)}):")
+    for point in DEEP_ZOOM_POINTS:
+        supported = _deep_point_max_log10_zoom(point)
+        derived = f", conjugate of {point.conjugate_of}" if point.conjugate_of else ""
+        print(
+            f"  {point.slug:<27} safe to ~1e{supported:.0f}  "
+            f"{point.name} [{point.source_name}{derived}]"
+        )
+
+
 def _decimal_precision(x_center: str, y_center: str, log10_zoom: float) -> int:
-    def fractional_digits(value: str) -> int:
-        value = value.lower().split("e", 1)[0]
-        return len(value.split(".", 1)[1]) if "." in value else 0
 
     return max(
         50,
         32 + int(math.ceil(max(0.0, log10_zoom))),
-        fractional_digits(x_center),
-        fractional_digits(y_center),
+        _fractional_decimal_places(x_center),
+        _fractional_decimal_places(y_center),
     )
 
 
@@ -1002,6 +1630,7 @@ def _render_native(
     y_center: str,
     max_iter: int,
     native_threads: int,
+    render_options: Optional[NativeRenderOptions] = None,
 ) -> Any:
     np = _require_numpy()
     library = _get_native_library()
@@ -1015,18 +1644,35 @@ def _render_native(
         int(_decimal_precision(x_center, y_center, log10_zoom) * math.log2(10.0)) + 32,
     )
     use_perturbation = int(log10_zoom >= 12.0)
-    status = library.render_mandelbrot(
-        output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        width,
-        height,
-        zoom_text,
-        x_center.encode("ascii"),
-        y_center.encode("ascii"),
-        max_iter,
-        precision_bits,
-        use_perturbation,
-        native_threads,
-    )
+    options = render_options or NativeRenderOptions()
+    ex_renderer = getattr(library, "render_mandelbrot_ex", None)
+    if ex_renderer is not None:
+        status = ex_renderer(
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            width,
+            height,
+            zoom_text,
+            x_center.encode("ascii"),
+            y_center.encode("ascii"),
+            max_iter,
+            precision_bits,
+            use_perturbation,
+            native_threads,
+            ctypes.byref(options),
+        )
+    else:
+        status = library.render_mandelbrot(
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            width,
+            height,
+            zoom_text,
+            x_center.encode("ascii"),
+            y_center.encode("ascii"),
+            max_iter,
+            precision_bits,
+            use_perturbation,
+            native_threads,
+        )
     if status != 0:
         message = library.fractal_last_error() or b"unknown native renderer error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
@@ -1040,8 +1686,16 @@ def _create_native_reference(
     log10_zoom: float,
     series_order: int,
     bla_log10_zoom: Optional[float] = None,
+    image_series_order: int = 32,
+    reusable: bool = False,
 ) -> tuple[Any, Any]:
-    """Prepare one reusable native reference orbit and BLA table."""
+    """Prepare one reusable native reference orbit and BLA table.
+
+    ``series_order`` is the degree of the per-pixel BLA map (1--3 in the
+    public CLI).  The image-wide series is a separate polynomial and benefits
+    from the full validated 8--32 term range, so references default to 32
+    image-series terms without changing the BLA degree selected by callers.
+    """
 
     library = _get_native_library()
     if library is None:
@@ -1050,18 +1704,120 @@ def _create_native_reference(
         256,
         int(_decimal_precision(x_center, y_center, log10_zoom) * math.log2(10.0)) + 32,
     )
-    handle = library.fractal_create_reference(
+    creator = (
+        getattr(library, "fractal_create_reference_reusable", None)
+        if reusable
+        else None
+    ) or library.fractal_create_reference
+    handle = creator(
         x_center.encode("ascii"),
         y_center.encode("ascii"),
         _zoom_text(log10_zoom if bla_log10_zoom is None else bla_log10_zoom),
         max_iter,
         precision_bits,
-        series_order,
+        max(8, min(32, int(image_series_order))),
     )
     if not handle:
         message = library.fractal_last_error() or b"unknown native reference error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
     return library, handle
+
+
+def _clone_native_reference(
+    library: Any,
+    root_reference: Any,
+    bla_log10_zoom: float,
+) -> Any:
+    """Build a radius-specific BLA tier while reusing one MPFR orbit."""
+
+    clone = getattr(library, "fractal_clone_reference", None)
+    if clone is None:
+        raise RuntimeError("native reference tier cloning is unavailable")
+    handle = clone(root_reference, _zoom_text(bla_log10_zoom))
+    if not handle:
+        message = library.fractal_last_error() or b"unknown native reference clone error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return handle
+
+
+def _native_reference_tier_logs(
+    max_log_zoom: float,
+    atlas_step: Optional[float] = None,
+) -> list[float]:
+    """Return BLA input-radius tiers needed by one render.
+
+    A BLA hierarchy is not globally valid just because its reference orbit is
+    long enough. Its input radius is part of the numerical contract. The old
+    renderer built one hierarchy at e12 and reused it at e80/e100; that was
+    correct only after expensive fallback work and could manufacture a black
+    interior. Use decade-bucketed tiers instead: each tile selects the
+    nearest prepared radius below it, keeping maps long without allocating a
+    reference for every atlas level. When the atlas step is known, move each
+    decade tier to the first atlas boundary at or below that decade. This
+    matters because a tile is a complete factor-sized interval: a tier
+    beginning at exactly 10^80 is too narrow for the tile whose lower edge is
+    just below 10^80.
+
+    ``atlas_step`` is optional to keep this helper useful to callers that do
+    not have an atlas geometry. The render path supplies the actual
+    log10(keyframe-factor) step.
+    """
+
+    maximum = float(max_log_zoom)
+    if not math.isfinite(maximum) or maximum < 12.0:
+        return []
+    starts = [12.0]
+    if maximum <= 32.0:
+        return starts
+    decade_starts = [
+        float(value) for value in range(40, int(maximum) + 1, 10)
+    ]
+    if atlas_step is not None:
+        step = float(atlas_step)
+        if not math.isfinite(step) or step <= 0.0:
+            raise ValueError("atlas_step must be a finite positive value")
+        # Atlas origins are integer multiples of the step, so a zero-origin
+        # floor gives the same boundaries for every render path.
+        decade_starts = [
+            math.floor(value / step) * step for value in decade_starts
+        ]
+    starts.extend(decade_starts)
+    # Give the final atlas level a radius-specific tier. It is cheap compared
+    # with the movie and avoids making the last, deepest tile use a needlessly
+    # conservative e.g. e80 table when the target is e100.
+    if maximum > starts[-1] + 1.0e-9:
+        starts.append(maximum)
+    return sorted(set(starts))
+
+
+def _select_native_reference(
+    references: list[tuple[float, Any]],
+    log_zoom: float,
+) -> Any:
+    """Select the deepest reference whose BLA bound starts before a tile."""
+
+    selected = None
+    for start_log, reference in references:
+        if float(log_zoom) + 1.0e-9 < start_log:
+            break
+        selected = reference
+    return selected
+
+
+def _native_get_reference_stats(library: Any, handle: Any) -> Optional[dict[str, int]]:
+    getter = getattr(library, "fractal_get_reference_stats", None)
+    if getter is None:
+        return None
+    values = (ctypes.c_uint64 * 5)()
+    if int(getter(handle, values, 5)) != 5:
+        return None
+    return {
+        "reference_ns": int(values[0]),
+        "series_ns": int(values[1]),
+        "bla_ns": int(values[2]),
+        "series_iteration": int(values[3]),
+        "series_order": int(values[4]),
+    }
 
 
 def _render_native_reference(
@@ -1073,6 +1829,7 @@ def _render_native_reference(
     native_reference: Any,
     series_order: int,
     series_block: int,
+    render_options: Optional[NativeRenderOptions] = None,
 ) -> Any:
     np = _require_numpy()
     library = _get_native_library()
@@ -1081,19 +1838,171 @@ def _render_native_reference(
 
     output = np.empty((height, width), dtype=np.float32)
     zoom_text = _zoom_text(log10_zoom)
-    status = library.render_mandelbrot_reference(
+    options = render_options or NativeRenderOptions()
+    ex_renderer = getattr(library, "fractal_render_mandelbrot_reference_ex", None)
+    if ex_renderer is not None:
+        status = ex_renderer(
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            width,
+            height,
+            zoom_text,
+            native_reference,
+            max_iter,
+            native_threads,
+            series_order,
+            series_block,
+            ctypes.byref(options),
+        )
+    else:
+        status = library.render_mandelbrot_reference(
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            width,
+            height,
+            zoom_text,
+            native_reference,
+            max_iter,
+            native_threads,
+            series_order,
+            series_block,
+        )
+    if status != 0:
+        message = library.fractal_last_error() or b"unknown native renderer error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
+def _decimal_to_scaled(value: Decimal) -> tuple[float, int]:
+    """Convert a high-precision Decimal to the native mantissa/exponent form."""
+
+    if not value.is_finite():
+        raise ValueError("scaled Decimal value must be finite")
+    if value.is_zero():
+        return 0.0, 0
+    sign = -1.0 if value.is_signed() else 1.0
+    magnitude = abs(value)
+    decimal_exponent = magnitude.adjusted()
+    decimal_mantissa = float(magnitude.scaleb(-decimal_exponent))
+    if not math.isfinite(decimal_mantissa) or decimal_mantissa <= 0.0:
+        raise ValueError("scaled Decimal mantissa is not representable")
+    log2_value = (
+        math.log2(decimal_mantissa)
+        + float(decimal_exponent) * math.log2(10.0)
+    )
+    binary_exponent = math.floor(log2_value)
+    fractional = (
+        float(decimal_exponent) * math.log2(10.0)
+        + math.log2(decimal_mantissa)
+        - binary_exponent
+    )
+    normalized = decimal_mantissa * (2.0 ** fractional)
+    mantissa, shift = math.frexp(normalized)
+    return sign * float(mantissa), int(binary_exponent + shift)
+
+
+def _render_native_reference_points(
+    *,
+    render_width: int,
+    render_height: int,
+    log10_zoom: float,
+    cell: tuple[int, int, int, int],
+    probe: tuple[int, int],
+    x_center: str,
+    y_center: str,
+    reference_x: str,
+    reference_y: str,
+    max_iter: int,
+    native_threads: int,
+    native_library: Any,
+    native_reference: Any,
+    series_order: int,
+    series_block: int,
+    render_options: NativeRenderOptions,
+) -> Any:
+    """Render exact global pixels around a probe-centred secondary reference.
+
+    The point ABI accepts arbitrary scaled perturbations.  Using it here is
+    both cheaper than rendering a padded local canvas and, importantly,
+    avoids assuming that a probe-centred reference is aligned with the
+    centre of an even-sized or non-square connected glitch box.
+    """
+
+    np = _require_numpy()
+    if not hasattr(native_library, "fractal_render_points"):
+        raise RuntimeError("native point renderer is unavailable")
+    x0, x1, y0, y1 = cell
+    probe_x, probe_y = probe
+    if not (0 <= x0 < x1 <= render_width and 0 <= y0 < y1 <= render_height):
+        raise ValueError("invalid point-render cell")
+    if not (x0 <= probe_x < x1 and y0 <= probe_y < y1):
+        raise ValueError("point-render probe is outside its cell")
+
+    precision = max(
+        96,
+        _decimal_precision(x_center, y_center, log10_zoom) + 48,
+        _decimal_precision(reference_x, reference_y, log10_zoom) + 48,
+    )
+    with localcontext() as context:
+        context.prec = precision
+        exponent = math.floor(log10_zoom)
+        fractional_exponent = log10_zoom - exponent
+        zoom_mantissa = Decimal(str(10.0 ** fractional_exponent))
+        inverse_zoom = Decimal(1).scaleb(-exponent) / zoom_mantissa
+        view_height = Decimal("2.8") * inverse_zoom
+        view_width = view_height * Decimal(render_width) / Decimal(render_height)
+        step_x = view_width / Decimal(render_width)
+        step_y = view_height / Decimal(render_height)
+        step_x_mantissa, step_x_exponent = _decimal_to_scaled(step_x)
+        step_y_mantissa, step_y_exponent = _decimal_to_scaled(step_y)
+
+    width = x1 - x0
+    height = y1 - y0
+    x_delta = np.arange(x0, x1, dtype=np.float64) - float(probe_x)
+    y_delta = float(probe_y) - np.arange(y0, y1, dtype=np.float64)
+    real_values = np.broadcast_to(
+        step_x_mantissa * x_delta[None, :],
+        (height, width),
+    ).copy()
+    imag_values = np.broadcast_to(
+        step_y_mantissa * y_delta[:, None],
+        (height, width),
+    ).copy()
+    real_mantissa, real_shift = np.frexp(real_values)
+    imag_mantissa, imag_shift = np.frexp(imag_values)
+    real_exponent = real_shift.astype(np.int32, copy=False) + int(step_x_exponent)
+    imag_exponent = imag_shift.astype(np.int32, copy=False) + int(step_y_exponent)
+    common_exponent = np.maximum(real_exponent, imag_exponent)
+    real_mantissa = np.ldexp(
+        real_mantissa,
+        real_exponent.astype(np.int64) - common_exponent.astype(np.int64),
+    )
+    imag_mantissa = np.ldexp(
+        imag_mantissa,
+        imag_exponent.astype(np.int64) - common_exponent.astype(np.int64),
+    )
+    output = np.empty((height, width), dtype=np.float32)
+    options = render_options
+    status = native_library.fractal_render_points(
         output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        width,
-        height,
-        zoom_text,
+        width * height,
+        _zoom_text(log10_zoom),
+        np.ascontiguousarray(real_mantissa, dtype=np.float64).ravel().ctypes.data_as(
+            ctypes.POINTER(ctypes.c_double)
+        ),
+        np.ascontiguousarray(imag_mantissa, dtype=np.float64).ravel().ctypes.data_as(
+            ctypes.POINTER(ctypes.c_double)
+        ),
+        np.ascontiguousarray(common_exponent, dtype=np.int32).ravel().ctypes.data_as(
+            ctypes.POINTER(ctypes.c_int32)
+        ),
         native_reference,
         max_iter,
         native_threads,
         series_order,
         series_block,
+        ctypes.byref(options),
     )
     if status != 0:
-        message = library.fractal_last_error() or b"unknown native renderer error"
+        message = native_library.fractal_last_error() or b"unknown native point renderer error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
     return output
 
@@ -1110,6 +2019,7 @@ def render_fractal(
     native_reference: Any = None,
     series_order: int = 3,
     series_block: int = 256,
+    render_options: Optional[NativeRenderOptions] = None,
 ) -> Any:
     """Render with the C-ABI backend, falling back to the Python backend."""
 
@@ -1132,10 +2042,20 @@ def render_fractal(
                     native_reference,
                     series_order,
                     series_block,
+                    render_options,
                 )
             if log10_zoom >= 12.0 and native_reference is None:
                 raise RuntimeError("deep native rendering needs a prepared reference")
-            return _render_native(width, height, log10_zoom, x_center, y_center, max_iter, native_threads)
+            return _render_native(
+                width,
+                height,
+                log10_zoom,
+                x_center,
+                y_center,
+                max_iter,
+                native_threads,
+                render_options,
+            )
         except RuntimeError as error:
             if renderer == "native" or log10_zoom >= 12.0:
                 raise
@@ -1209,7 +2129,15 @@ def _zoom_plan(
         cumulative = np.concatenate(([0.0], np.cumsum(drive[:-1])))
         total = max(float(np.sum(drive[:-1])), 1.0e-6) if drive.size > 1 else 1.0
     planned = start_log + span * cumulative / total
-    return np.clip(planned, start_log, max_log)
+    # Clipping creates a real still frame whenever a loud passage reaches the
+    # ceiling before the final sample.  Fold the signed path at both bounds
+    # instead, matching the old live renderer's direction reversal while
+    # keeping every frame inside the requested zoom interval.  The final
+    # sample has cumulative == total, so it still lands exactly on max_zoom.
+    period = 2.0 * span
+    folded = np.mod(planned - start_log, period)
+    bounded = np.where(folded <= span, folded, period - folded)
+    return start_log + bounded
 
 
 def _crop_and_resize(
@@ -1428,6 +2356,115 @@ def _atlas_local_reference_centres(
         return result
 
 
+def _atlas_local_reference_cell(
+    render_width: int,
+    render_height: int,
+    log10_zoom: float,
+    x_center: str,
+    y_center: str,
+    cell: tuple[int, int, int, int],
+    probe: Optional[tuple[int, int]] = None,
+) -> tuple[int, int, int, int, str, str, float]:
+    """Compute one exact local view for an arbitrary glitch-cell rectangle."""
+
+    x0, x1, y0, y1 = cell
+    if not (0 <= x0 < x1 <= render_width and 0 <= y0 < y1 <= render_height):
+        raise ValueError("invalid local-reference cell")
+    precision = max(96, _decimal_precision(x_center, y_center, log10_zoom) + 48)
+    with localcontext() as context:
+        context.prec = precision
+        exponent = math.floor(log10_zoom)
+        fractional_exponent = log10_zoom - exponent
+        zoom_mantissa = Decimal(str(10.0 ** fractional_exponent))
+        inverse_zoom = Decimal(1).scaleb(-exponent) / zoom_mantissa
+        view_height = Decimal("2.8") * inverse_zoom
+        view_width = view_height * Decimal(render_width) / Decimal(render_height)
+        base_x = Decimal(x_center)
+        base_y = Decimal(y_center)
+        if probe is None:
+            x_numerator = Decimal(x0 + x1 - 1) - Decimal(render_width - 1)
+            y_numerator = Decimal(render_height - 1 - (y0 + y1 - 1))
+        else:
+            probe_x, probe_y = probe
+            if not (x0 <= probe_x < x1 and y0 <= probe_y < y1):
+                raise ValueError("glitch probe is outside its reference cell")
+            # Keep the local view scale based on the failed region, while
+            # placing the high-precision reference on an actual failed pixel
+            # rather than on the centre of a sparse bounding box.
+            x_numerator = Decimal(2 * probe_x) - Decimal(render_width - 1)
+            y_numerator = Decimal(render_height - 1) - Decimal(2 * probe_y)
+        x_fraction = x_numerator / (Decimal(2) * Decimal(render_width))
+        y_fraction = y_numerator / (Decimal(2) * Decimal(render_height))
+        local_x = base_x + view_width * x_fraction
+        local_y = base_y + view_height * y_fraction
+    scale = max(
+        render_width / float(x1 - x0),
+        render_height / float(y1 - y0),
+    )
+    local_log_zoom = float(log10_zoom) + math.log10(scale)
+    return x0, x1, y0, y1, str(local_x), str(local_y), local_log_zoom
+
+
+def _unresolved_regions(mask: Any) -> list[tuple[int, int, int, int, int, int, int]]:
+    """Return ``(box, count, probe)`` regions, largest unresolved first."""
+
+    np = _require_numpy()
+    unresolved = np.asarray(mask, dtype=bool)
+    if unresolved.ndim != 2:
+        raise ValueError("unresolved mask must be two-dimensional")
+    height, width = unresolved.shape
+    visited = np.zeros_like(unresolved, dtype=bool)
+    regions: list[tuple[int, int, int, int, int, int, int]] = []
+    for seed_y, seed_x in zip(*np.nonzero(unresolved)):
+        if visited[seed_y, seed_x]:
+            continue
+        queue_cells = deque([(int(seed_y), int(seed_x))])
+        visited[seed_y, seed_x] = True
+        x0 = x1 = int(seed_x)
+        y0 = y1 = int(seed_y)
+        count = 0
+        sum_x = 0
+        sum_y = 0
+        while queue_cells:
+            y, x = queue_cells.pop()
+            count += 1
+            sum_x += x
+            sum_y += y
+            x0 = min(x0, x)
+            x1 = max(x1, x)
+            y0 = min(y0, y)
+            y1 = max(y1, y)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    neighbour_y = y + dy
+                    neighbour_x = x + dx
+                    if (
+                        0 <= neighbour_y < height
+                        and 0 <= neighbour_x < width
+                        and unresolved[neighbour_y, neighbour_x]
+                        and not visited[neighbour_y, neighbour_x]
+                    ):
+                        visited[neighbour_y, neighbour_x] = True
+                        queue_cells.append((neighbour_y, neighbour_x))
+        # Include a one-pixel validation halo. It lets the local reference
+        # prove the approximation at the boundary of the failed region too.
+        probe_x = int(round(sum_x / max(count, 1)))
+        probe_y = int(round(sum_y / max(count, 1)))
+        regions.append((
+            max(0, x0 - 1),
+            min(width, x1 + 2),
+            max(0, y0 - 1),
+            min(height, y1 + 2),
+            count,
+            probe_x,
+            probe_y,
+        ))
+    regions.sort(key=lambda region: region[4], reverse=True)
+    return regions
+
+
 def _spatial_recover_field(
     local_field: Any,
     fallback_field: Optional[Any] = None,
@@ -1492,6 +2529,370 @@ def _spatial_recover_field(
     return result, int(missing_before.sum())
 
 
+def _atlas_glitch_reference_field(
+    *,
+    render_width: int,
+    render_height: int,
+    log10_zoom: float,
+    x_center: str,
+    y_center: str,
+    max_iter: int,
+    series_order: int,
+    series_block: int,
+    native_threads: int,
+    native_library: Any,
+    native_backend: int,
+    native_reference: Any,
+    fallback_field: Optional[Any],
+    fallback_zoom_factor: float,
+    fallback_max_iter: Optional[int],
+    allow_recovery: bool,
+    diagnostics: Optional[dict[str, int]] = None,
+) -> Any:
+    """Render a tile, refining only pixels that the shared reference cannot solve.
+
+    The shared reference gets one whole-image pass.  A strict native timeout
+    reports unresolved pixels as NaN; connected NaN regions are then used as
+    the exact centres of secondary references.  This makes the expensive
+    reference count proportional to real perturbation glitches rather than to
+    an arbitrary 2x2/4x4 grid.  Quality modes never copy parent/interpolated
+    values: a remaining unresolved region raises instead.
+    """
+
+    np = _require_numpy()
+    field = np.full((render_height, render_width), np.nan, dtype=np.float32)
+    fallback_array = None
+    if fallback_field is not None:
+        fallback_array = np.asarray(fallback_field, dtype=np.float32)
+        if fallback_array.ndim != 2 or fallback_array.size == 0:
+            raise ValueError("glitch recovery fallback must be a non-empty field")
+    parent_fallback = None
+    if fallback_array is not None:
+        parent_fallback = np.asarray(
+            _crop_and_resize(
+                fallback_array,
+                render_width,
+                render_height,
+                max(float(fallback_zoom_factor), 1.0),
+                "bilinear",
+            ),
+            dtype=np.float32,
+        )
+        if fallback_max_iter is not None:
+            parent_fallback = np.where(
+                parent_fallback >= float(fallback_max_iter) - 0.5,
+                float(max_iter),
+                parent_fallback,
+            ).astype(np.float32, copy=False)
+
+    def budget_ms(
+        cell_width: int,
+        cell_height: int,
+        final_retry: bool = False,
+        whole_tile: bool = False,
+    ) -> int:
+        if final_retry:
+            # Quality output must not convert a hard pixel into a parent
+            # sample merely because a diagnostic deadline was too short. The
+            # final selected glitch is a bounded exact perturbation job
+            # (max_iter is finite), so let it finish. Draft keeps its short
+            # deadline and may use labelled spatial recovery.
+            return 0 if not allow_recovery else ATLAS_LOCAL_REFERENCE_FINAL_BUDGET_MS
+        estimate = int(
+            math.ceil(
+                cell_width
+                * cell_height
+                * ATLAS_LOCAL_REFERENCE_MS_PER_PIXEL
+            )
+        )
+        # Keep the initial pass short and bounded. Its unresolved mask is a
+        # work queue, not a quality fallback; local references then spend
+        # their budget only where the shared pass ran out of time.
+        # The initial shared pass is deliberately a short bounded work-queue
+        # pass; local references spend time only on its actual unresolved
+        # regions. ``whole_tile`` remains an explicit argument to make that
+        # policy visible at the call site and for future budget tiers.
+        floor = ATLAS_LOCAL_REFERENCE_MIN_BUDGET_MS
+        return max(
+            floor,
+            min(
+                ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS,
+                max(estimate, floor),
+            ),
+        )
+
+    def render_with_reference(
+        width: int,
+        height: int,
+        centre_x: str,
+        centre_y: str,
+        local_log_zoom: float,
+        reference: Any,
+        *,
+        final_retry: bool = False,
+    ) -> Any:
+        options = NativeRenderOptions(
+            # Keep native output strict even for draft mode. Draft recovery
+            # belongs to this Python layer; native sentinel iteration values
+            # would hide the actual glitch mask and prevent refinement.
+            strict=True,
+            allow_recovery=False,
+            time_budget_ms=budget_ms(width, height, final_retry),
+            disable_bla=final_retry,
+            strict_cycle=True,
+            backend=native_backend,
+        )
+        return np.asarray(
+            render_fractal(
+                width,
+                height,
+                local_log_zoom,
+                centre_x,
+                centre_y,
+                max_iter,
+                "native",
+                native_threads,
+                reference,
+                series_order,
+                series_block,
+                options,
+            ),
+            dtype=np.float32,
+        )
+
+    def render_points_with_reference(
+        cell: tuple[int, int, int, int],
+        probe: tuple[int, int],
+        local_x: str,
+        local_y: str,
+        local_log_zoom: float,
+        reference: Any,
+        *,
+        final_retry: bool = False,
+    ) -> Any:
+        options = NativeRenderOptions(
+            strict=True,
+            allow_recovery=False,
+            time_budget_ms=budget_ms(
+                cell[1] - cell[0],
+                cell[3] - cell[2],
+                final_retry,
+            ),
+            disable_bla=final_retry,
+            strict_cycle=True,
+            backend=native_backend,
+        )
+        return np.asarray(
+            _render_native_reference_points(
+                render_width=render_width,
+                render_height=render_height,
+                log10_zoom=log10_zoom,
+                cell=cell,
+                probe=probe,
+                x_center=x_center,
+                y_center=y_center,
+                reference_x=local_x,
+                reference_y=local_y,
+                max_iter=max_iter,
+                native_threads=native_threads,
+                native_library=native_library,
+                native_reference=reference,
+                series_order=series_order,
+                series_block=series_block,
+                render_options=options,
+            ),
+            dtype=np.float32,
+        )
+
+    def recover(cell: tuple[int, int, int, int], local_field: Any) -> None:
+        if not allow_recovery:
+            raise RuntimeError(
+                "strict atlas render encountered unresolved pixels in a "
+                "glitch-driven secondary reference"
+            )
+        x0, x1, y0, y1 = cell
+        local = np.asarray(local_field, dtype=np.float32).copy()
+        fallback = None if parent_fallback is None else parent_fallback[y0:y1, x0:x1]
+        if fallback is None:
+            existing = field[y0:y1, x0:x1]
+            fallback = existing if np.isfinite(existing).any() else None
+        local, _ = _spatial_recover_field(local, fallback)
+        field[y0:y1, x0:x1] = local
+
+    print(
+        f"  Using glitch-driven shared reference for deep tile "
+        f"({_zoom_label(log10_zoom)}).",
+        flush=True,
+    )
+    shared_options = NativeRenderOptions(
+        strict=True,
+        allow_recovery=False,
+        time_budget_ms=budget_ms(render_width, render_height, whole_tile=True),
+        strict_cycle=True,
+        backend=native_backend,
+    )
+    shared_field = np.asarray(
+        render_fractal(
+            render_width,
+            render_height,
+            log10_zoom,
+            x_center,
+            y_center,
+            max_iter,
+            "native",
+            native_threads,
+            native_reference,
+            series_order,
+            series_block,
+            shared_options,
+        ),
+        dtype=np.float32,
+    )
+    finite = np.isfinite(shared_field)
+    field[finite] = shared_field[finite]
+    unresolved = ~finite
+    if diagnostics is not None:
+        diagnostics.update({
+            "initial_unresolved_pixels": int(unresolved.sum()),
+            "initial_regions": 0,
+            "secondary_references": 0,
+            "refined_regions": 0,
+            "recovered_pixels": 0,
+            "final_unresolved_pixels": 0,
+        })
+    if not unresolved.any():
+        return field
+
+    regions = _unresolved_regions(unresolved)
+    if diagnostics is not None:
+        diagnostics["initial_regions"] = len(regions)
+    pending: list[tuple[tuple[int, int, int, int], int, int, tuple[int, int]]] = [
+        ((x0, x1, y0, y1), 0, count, (probe_x, probe_y))
+        for x0, x1, y0, y1, count, probe_x, probe_y in regions
+    ]
+    max_depth = int(math.log2(ATLAS_LOCAL_REFERENCE_MAX_DIVISIONS))
+    minimum_cell = 8
+    secondary_references = 0
+    refined_regions = 0
+    recovered_pixels = 0
+    tile_deadline = (
+        time.monotonic() + ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS / 1000.0
+        if allow_recovery else float("inf")
+    )
+
+    while pending:
+        cell, depth, _, probe = pending.pop()
+        x0, x1, y0, y1 = cell
+        if x1 <= x0 or y1 <= y0:
+            continue
+        if time.monotonic() >= tile_deadline:
+            # The deadline is enabled only in draft mode. Strict quality
+            # renders continue until every selected glitch is resolved or a
+            # native call reports an unresolved tail.
+            recover(cell, np.full((y1 - y0, x1 - x0), np.nan, dtype=np.float32))
+            recovered_pixels += (x1 - x0) * (y1 - y0)
+            continue
+
+        geometry = _atlas_local_reference_cell(
+            render_width,
+            render_height,
+            log10_zoom,
+            x_center,
+            y_center,
+            cell,
+            probe,
+        )
+        _, _, _, _, local_x, local_y, local_log_zoom = geometry
+        local_library, local_reference = _create_native_reference(
+            local_x,
+            local_y,
+            max_iter,
+            local_log_zoom,
+            series_order,
+            local_log_zoom,
+        )
+        secondary_references += 1
+        if diagnostics is not None:
+            diagnostics["secondary_references"] = secondary_references
+        try:
+            local_field = render_points_with_reference(
+                cell,
+                probe,
+                local_x,
+                local_y,
+                local_log_zoom,
+                local_reference,
+            )
+            local_finite = np.isfinite(local_field)
+            local_view = field[y0:y1, x0:x1]
+            local_view[local_finite] = local_field[local_finite]
+            if local_finite.all():
+                continue
+
+            local_regions = _unresolved_regions(~local_finite)
+            can_split = (
+                depth < max_depth
+                and max(x1 - x0, y1 - y0) > minimum_cell
+            )
+            if can_split:
+                refined_regions += 1
+                if diagnostics is not None:
+                    diagnostics["refined_regions"] = refined_regions
+                next_pending = []
+                for lx0, lx1, ly0, ly1, count, probe_x, probe_y in local_regions:
+                    global_region = (x0 + lx0, x0 + lx1, y0 + ly0, y0 + ly1)
+                    global_probe = (x0 + probe_x, y0 + probe_y)
+                    next_pending.append(
+                        (global_region, depth + 1, count, global_probe)
+                    )
+                # `_unresolved_regions` is largest-first; the stack pops the
+                # last item, so reverse it to process the largest glitch first
+                # and keep the queue bounded by actual components.
+                pending.extend(reversed(next_pending))
+                continue
+
+            # One exact scaled retry is the final quality-preserving recovery.
+            # It still returns NaN on a deadline; strict modes then fail rather
+            # than turning the unresolved tail into a flat rectangle.
+            local_retry = render_points_with_reference(
+                cell,
+                probe,
+                local_x,
+                local_y,
+                local_log_zoom,
+                local_reference,
+                final_retry=True,
+            )
+            retry_finite = np.isfinite(local_retry)
+            local_view[retry_finite] = local_retry[retry_finite]
+            if not retry_finite.all():
+                recover(cell, local_retry)
+        finally:
+            local_library.fractal_destroy_reference(local_reference)
+
+    if not np.isfinite(field).all():
+        if allow_recovery and parent_fallback is not None:
+            field, recovered = _spatial_recover_field(field, parent_fallback)
+            recovered_pixels += recovered
+        else:
+            unresolved_count = int((~np.isfinite(field)).sum())
+            raise RuntimeError(
+                f"strict atlas render left {unresolved_count} unresolved pixels "
+                "after glitch-driven references"
+            )
+    if diagnostics is not None:
+        diagnostics["recovered_pixels"] = recovered_pixels
+        diagnostics["final_unresolved_pixels"] = int((~np.isfinite(field)).sum())
+    print(
+        f"  Glitch-driven references: {secondary_references} secondary, "
+        f"{len(regions)} initial regions, {refined_regions} refined regions"
+        + (f", {recovered_pixels} draft-recovered pixels" if recovered_pixels else "")
+        + ".",
+        flush=True,
+    )
+    return field
+
+
 def _atlas_local_reference_field(
     *,
     render_width: int,
@@ -1505,22 +2906,23 @@ def _atlas_local_reference_field(
     renderer: str,
     native_threads: int,
     native_library: Any,
+    native_backend: int = 0,
+    native_reference: Any = None,
     fallback_field: Optional[Any] = None,
     fallback_zoom_factor: float = 2.0,
     fallback_max_iter: Optional[int] = None,
+    allow_recovery: bool = False,
+    diagnostics: Optional[dict[str, int]] = None,
 ) -> Optional[Any]:
     """Render a deep tile with an adaptive secondary-reference grid.
 
-    The first pass uses four nearby references. A narrow parabolic feature
-    can still make one of those cells pathological, so the native renderer
-    accepts a short, opt-in deadline and marks unfinished pixels with NaN.
-    Only those cells are recursively split into four smaller reference views;
-    easy cells are never rendered again. The final subdivision gets a bounded
-    exact perturbation retry with BLA disabled. A tile-level deadline prevents
-    a pathological cluster from consuming the whole render. If it fires,
-    unresolved pixels are recovered from the already-rendered parent tile at
-    the matching world-space crop, keeping the result spatially continuous
-    instead of painting a whole cell with one median iteration value.
+    With a shared reference, the first pass is a bounded native work queue and
+    only connected unresolved regions receive probe-centred secondary
+    references. Those regions are rendered through the point ABI, so the
+    global pixel coordinates remain exact even for odd, rectangular boxes.
+    The compatibility path without a shared reference retains the older local
+    grid. Draft mode may recover a deadline tail from a parent crop; quality
+    modes reject unresolved pixels instead of fabricating a rectangle.
 
     ``None`` means that the ordinary single-reference path should be used.
     """
@@ -1529,6 +2931,26 @@ def _atlas_local_reference_field(
         return None
     if log10_zoom < ATLAS_LOCAL_REFERENCE_MIN_LOG:
         return None
+    if native_reference is not None:
+        return _atlas_glitch_reference_field(
+            render_width=render_width,
+            render_height=render_height,
+            log10_zoom=log10_zoom,
+            x_center=x_center,
+            y_center=y_center,
+            max_iter=max_iter,
+            series_order=series_order,
+            series_block=series_block,
+            native_threads=native_threads,
+            native_library=native_library,
+            native_backend=native_backend,
+            native_reference=native_reference,
+            fallback_field=fallback_field,
+            fallback_zoom_factor=fallback_zoom_factor,
+            fallback_max_iter=fallback_max_iter,
+            allow_recovery=allow_recovery,
+            diagnostics=diagnostics,
+        )
     if (
         render_width < ATLAS_LOCAL_REFERENCE_MIN_DIMENSION
         or render_height < ATLAS_LOCAL_REFERENCE_MIN_DIMENSION
@@ -1558,14 +2980,6 @@ def _atlas_local_reference_field(
         if fallback_array.ndim != 2 or fallback_array.size == 0:
             raise ValueError("atlas recovery fallback must be a non-empty 2-D field")
     parent_fallback = None
-    previous_cycle_setting = os.environ.get("FRACTAL_STRICT_CYCLE")
-    previous_budget_setting = os.environ.get("FRACTAL_TIME_BUDGET_MS")
-    previous_bla_setting = os.environ.get("FRACTAL_DISABLE_BLA")
-    # A local reference can sit in an attracting basin while a nearby pixel
-    # is still a very late escape.  Use the native strict Brent mode here: it
-    # waits longer and requires a much tighter recurrence than the throughput
-    # mode, while keeping BLA and normal escape checks enabled.
-    os.environ["FRACTAL_STRICT_CYCLE"] = "1"
     print(
         f"  Using adaptive local native references for deep tile "
         f"({_zoom_label(log10_zoom)}).",
@@ -1625,20 +3039,19 @@ def _atlas_local_reference_field(
             series_order,
             local_log_zoom,
         )
-        cell_previous_budget = os.environ.get("FRACTAL_TIME_BUDGET_MS")
-        cell_previous_bla = os.environ.get("FRACTAL_DISABLE_BLA")
         try:
-            if final_retry:
-                os.environ["FRACTAL_TIME_BUDGET_MS"] = str(
+            render_options = NativeRenderOptions(
+                strict=not allow_recovery,
+                allow_recovery=allow_recovery,
+                time_budget_ms=(
                     ATLAS_LOCAL_REFERENCE_FINAL_BUDGET_MS
-                )
-                os.environ["FRACTAL_DISABLE_BLA"] = "1"
-            else:
-                os.environ["FRACTAL_TIME_BUDGET_MS"] = str(
-                    budget_ms(x1 - x0, y1 - y0)
-                )
-                if cell_previous_bla is None:
-                    os.environ.pop("FRACTAL_DISABLE_BLA", None)
+                    if final_retry
+                    else budget_ms(x1 - x0, y1 - y0)
+                ),
+                disable_bla=final_retry,
+                strict_cycle=True,
+                backend=native_backend,
+            )
             return np.asarray(
                 render_fractal(
                     x1 - x0,
@@ -1652,19 +3065,12 @@ def _atlas_local_reference_field(
                     reference,
                     series_order,
                     series_block,
+                    render_options,
                 ),
                 dtype=np.float32,
             )
         finally:
             native_library.fractal_destroy_reference(reference)
-            if cell_previous_budget is None:
-                os.environ.pop("FRACTAL_TIME_BUDGET_MS", None)
-            else:
-                os.environ["FRACTAL_TIME_BUDGET_MS"] = cell_previous_budget
-            if cell_previous_bla is None:
-                os.environ.pop("FRACTAL_DISABLE_BLA", None)
-            else:
-                os.environ["FRACTAL_DISABLE_BLA"] = cell_previous_bla
 
     pending = [(cell, initial_divisions) for cell in initial_cells]
     completed_cells = 0
@@ -1672,7 +3078,10 @@ def _atlas_local_reference_field(
     final_retries = 0
     recovered_cells = 0
     recovered_pixels = 0
-    tile_deadline = time.monotonic() + ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS / 1000.0
+    tile_deadline = (
+        time.monotonic() + ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS / 1000.0
+        if allow_recovery else float("inf")
+    )
 
     def parent_fallback_view() -> Any:
         nonlocal parent_fallback
@@ -1709,6 +3118,11 @@ def _atlas_local_reference_field(
         local_field: Optional[Any] = None,
     ) -> None:
         nonlocal recovered_cells, recovered_pixels
+        if not allow_recovery:
+            raise RuntimeError(
+                "strict atlas render encountered unresolved pixels; "
+                "increase native precision/iteration budget or use --quality draft"
+            )
         x0, x1, y0, y1, _, _ = cell
         shape = (y1 - y0, x1 - x0)
         if local_field is None:
@@ -1723,8 +3137,7 @@ def _atlas_local_reference_field(
             recovered_cells += 1
         field[y0:y1, x0:x1] = local_field
 
-    try:
-        while pending:
+    while pending:
             cell, divisions = pending.pop()
             x0, x1, y0, y1, _, _ = cell
             if time.monotonic() >= tile_deadline:
@@ -1783,33 +3196,20 @@ def _atlas_local_reference_field(
             local_field = render_cell(cell, divisions, final_retry=True)
             complete_with_recovery(cell, local_field)
             completed_cells += 1
-        if not np.isfinite(field).all():
-            raise RuntimeError("adaptive local reference render left unresolved pixels")
-        if refined_cells or recovered_cells:
-            print(
-                f"  Adaptive local references completed {completed_cells} cells "
-                f"after refining {refined_cells} hard cells"
-                + (
-                    f"; spatially recovered {recovered_pixels} unresolved pixels"
-                    if recovered_cells else ""
-                )
-                + ".",
-                flush=True,
+    if not np.isfinite(field).all():
+        raise RuntimeError("adaptive local reference render left unresolved pixels")
+    if refined_cells or recovered_cells:
+        print(
+            f"  Adaptive local references completed {completed_cells} cells "
+            f"after refining {refined_cells} hard cells"
+            + (
+                f"; spatially recovered {recovered_pixels} unresolved pixels"
+                if recovered_cells else ""
             )
-        return field
-    finally:
-        if previous_cycle_setting is None:
-            os.environ.pop("FRACTAL_STRICT_CYCLE", None)
-        else:
-            os.environ["FRACTAL_STRICT_CYCLE"] = previous_cycle_setting
-        if previous_budget_setting is None:
-            os.environ.pop("FRACTAL_TIME_BUDGET_MS", None)
-        else:
-            os.environ["FRACTAL_TIME_BUDGET_MS"] = previous_budget_setting
-        if previous_bla_setting is None:
-            os.environ.pop("FRACTAL_DISABLE_BLA", None)
-        else:
-            os.environ["FRACTAL_DISABLE_BLA"] = previous_bla_setting
+            + ".",
+            flush=True,
+        )
+    return field
 
 
 def _atlas_tile_field(
@@ -1829,9 +3229,11 @@ def _atlas_tile_field(
     native_reference: Any,
     native_threads: int,
     native_library: Any = None,
+    native_backend: int = 0,
     fallback_field: Optional[Any] = None,
     fallback_zoom_factor: float = 2.0,
     fallback_max_iter: Optional[int] = None,
+    allow_recovery: bool = False,
     durable_cache: bool = False,
     cache_evictor: Optional["_CacheEvictor"] = None,
 ) -> Any:
@@ -1867,49 +3269,83 @@ def _atlas_tile_field(
         f"iterations {max_iter}",
         flush=True,
     )
-    field = None
-    if native_library is not None:
-        try:
-            field = _atlas_local_reference_field(
-                render_width=render_width,
-                render_height=render_height,
-                log10_zoom=log_zoom,
-                x_center=x_center,
-                y_center=y_center,
-                max_iter=max_iter,
-                series_order=series_order,
-                series_block=series_block,
-                renderer=renderer,
-                native_threads=native_threads,
-                native_library=native_library,
-                fallback_field=fallback_field,
-                fallback_zoom_factor=fallback_zoom_factor,
-                fallback_max_iter=fallback_max_iter,
-            )
-        except RuntimeError as error:
-            # Secondary references are an optimization layer.  A transient
-            # MPFR/native allocation failure must not make an otherwise
-            # renderable tile fail; retry through the already prepared global
-            # reference instead.
+    tile_started = time.monotonic()
+    watchdog_stop = threading.Event()
+
+    def tile_watchdog() -> None:
+        while not watchdog_stop.wait(ATLAS_PROGRESS_INTERVAL_SECONDS):
+            elapsed = time.monotonic() - tile_started
             print(
-                f"  Local references unavailable ({error}); "
-                "using the global reference.",
+                f"  Still rendering atlas tile {level} "
+                f"({_zoom_label(log_zoom)}); {elapsed:.0f}s elapsed "
+                "(native deep reference work is active).",
                 flush=True,
             )
-    if field is None:
-        field = render_fractal(
-            render_width,
-            render_height,
-            log_zoom,
-            x_center,
-            y_center,
-            max_iter,
-            renderer,
-            native_threads,
-            native_reference,
-            series_order,
-            series_block,
-        )
+
+    watchdog = threading.Thread(
+        target=tile_watchdog,
+        name=f"atlas-tile-watchdog-{level}",
+        daemon=True,
+    )
+    watchdog.start()
+    try:
+        field = None
+        if native_library is not None:
+            try:
+                field = _atlas_local_reference_field(
+                    render_width=render_width,
+                    render_height=render_height,
+                    log10_zoom=log_zoom,
+                    x_center=x_center,
+                    y_center=y_center,
+                    max_iter=max_iter,
+                    series_order=series_order,
+                    series_block=series_block,
+                    renderer=renderer,
+                    native_threads=native_threads,
+                    native_library=native_library,
+                    native_backend=native_backend,
+                    native_reference=native_reference,
+                    fallback_field=fallback_field,
+                    fallback_zoom_factor=fallback_zoom_factor,
+                    fallback_max_iter=fallback_max_iter,
+                    allow_recovery=allow_recovery,
+                )
+            except RuntimeError as error:
+                if not allow_recovery:
+                    raise
+                # Secondary references are an optimization layer.  A transient
+                # MPFR/native allocation failure must not make an otherwise
+                # renderable tile fail; retry through the already prepared global
+                # reference instead.
+                print(
+                    f"  Local references unavailable ({error}); "
+                    "using the global reference.",
+                    flush=True,
+                )
+        if field is None:
+            field = render_fractal(
+                render_width,
+                render_height,
+                log_zoom,
+                x_center,
+                y_center,
+                max_iter,
+                renderer,
+                native_threads,
+                native_reference,
+                series_order,
+                series_block,
+                NativeRenderOptions(backend=native_backend),
+            )
+    finally:
+        watchdog_stop.set()
+        watchdog.join(timeout=1.0)
+    print(
+        f"  Completed atlas tile {level} in "
+        f"{time.monotonic() - tile_started:.2f}s.",
+        flush=True,
+    )
     if cache_path is not None:
         _atomic_save_field(cache_path, field, durable=durable_cache)
         if cache_evictor is not None:
@@ -2153,10 +3589,12 @@ def _render_video_atlas(
     iteration_cap: int,
     active_renderer: str,
     native_library: Any,
-    native_reference: Any,
+    native_references: list[tuple[float, Any]],
     native_threads: int,
+    native_backend: int,
     series_order: int,
     series_block: int,
+    allow_recovery: bool,
     render_width: int,
     render_height: int,
     resample: str,
@@ -2190,6 +3628,12 @@ def _render_video_atlas(
     tile_iterations: dict[int, int] = {}
     cache_evictor = _CacheEvictor(cache_dir, cache_limit_mb)
     tile_seconds = 0.0
+    tile_futures: dict[int, Future[Any]] = {}
+    future_started: dict[int, float] = {}
+    prefetch_executor = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="fractal-field")
+        if cache_limit_mb <= 0.0 else None
+    )
 
     def tile_log(level: int) -> float:
         return origin + step * float(level)
@@ -2209,20 +3653,21 @@ def _render_video_atlas(
         tile_iterations[level] = value
         return value
 
-    def get_tile(level: int) -> Any:
-        nonlocal tile_seconds
+    def render_tile(
+        level: int,
+        parent_field: Any = None,
+        parent_max_iter: Optional[int] = None,
+    ) -> Any:
         if level < 0 or level > level_count:
             return None
-        if level in tile_cache:
-            return tile_cache[level]
-        started = time.perf_counter()
-        parent_field = tile_cache.get(level - 1)
-        parent_max_iter = (
-            tile_iterations.get(level - 1)
-            if parent_field is not None
-            else None
-        )
-        tile_cache[level] = _atlas_tile_field(
+        if parent_field is None:
+            parent_field = tile_cache.get(level - 1)
+            parent_max_iter = (
+                tile_iterations.get(level - 1)
+                if parent_field is not None
+                else None
+            )
+        field = _atlas_tile_field(
             cache_dir=cache_dir,
             cache_identity=cache_identity,
             render_width=render_width,
@@ -2235,16 +3680,49 @@ def _render_video_atlas(
             series_order=series_order,
             series_block=series_block,
             renderer=active_renderer,
-            native_reference=native_reference,
+            native_reference=_select_native_reference(
+                native_references,
+                tile_log(level),
+            ),
             native_threads=native_threads,
             native_library=native_library,
+            native_backend=native_backend,
             fallback_field=parent_field,
             fallback_zoom_factor=factor,
             fallback_max_iter=parent_max_iter,
+            allow_recovery=allow_recovery,
             durable_cache=durable_cache,
             cache_evictor=cache_evictor,
         )
-        tile_seconds += time.perf_counter() - started
+        return field
+
+    def get_tile(level: int) -> Any:
+        nonlocal tile_seconds
+        if level < 0 or level > level_count:
+            return None
+        if level in tile_cache:
+            return tile_cache[level]
+        future = tile_futures.pop(level, None)
+        if future is not None:
+            started_waiting = time.monotonic()
+            while True:
+                try:
+                    field = future.result(timeout=ATLAS_PROGRESS_INTERVAL_SECONDS)
+                    break
+                except FutureTimeout:
+                    waited = time.monotonic() - started_waiting
+                    print(
+                        f"  Waiting for prefetched atlas tile {level}; "
+                        f"{waited:.0f}s elapsed.",
+                        flush=True,
+                    )
+            started = future_started.pop(level, time.perf_counter())
+            tile_seconds += time.perf_counter() - started
+        else:
+            started = time.perf_counter()
+            field = render_tile(level)
+            tile_seconds += time.perf_counter() - started
+        tile_cache[level] = field
         protected_paths: set[Path] = set()
         if active_level is not None and cache_dir is not None:
             for protected_level in range(active_level - 1, active_level + 2):
@@ -2267,12 +3745,89 @@ def _render_video_atlas(
         _prune_cache(cache_dir, cache_limit_mb, cache_evictor, protected_paths)
         return tile_cache[level]
 
+    def prefetch_tile(level: int) -> None:
+        if prefetch_executor is None or level < 0 or level > level_count:
+            return
+        if level in tile_cache or level in tile_futures:
+            return
+        parent_field = tile_cache.get(level - 1)
+        if parent_field is None:
+            return
+        future_started[level] = time.perf_counter()
+        tile_futures[level] = prefetch_executor.submit(
+            render_tile,
+            level,
+            parent_field,
+            tile_iterations.get(level - 1),
+        )
+
     process = None
+    encoder_queue: Optional[queue.Queue[Any]] = None
+    encoder_thread: Optional[threading.Thread] = None
+    encoder_errors: list[BaseException] = []
+    last_backpressure_notice = 0.0
     frame_seconds = 0.0
+    encoder_seconds = 0.0
     render_started = time.perf_counter()
     active_level = None
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE)
+        assert process.stdin is not None
+        encoder_queue = queue.Queue(maxsize=3)
+        encoder_stream = process.stdin
+
+        def encoder_worker() -> None:
+            try:
+                while True:
+                    frame = encoder_queue.get()
+                    try:
+                        if frame is None:
+                            return
+                        encoder_stream.write(frame)
+                    finally:
+                        encoder_queue.task_done()
+            except BaseException as error:  # surfaced by the producer thread
+                encoder_errors.append(error)
+
+        encoder_thread = threading.Thread(
+            target=encoder_worker,
+            name="fractal-encoder-writer",
+            daemon=True,
+        )
+        encoder_thread.start()
+
+        def enqueue_frame(frame: Any) -> None:
+            nonlocal last_backpressure_notice
+            assert encoder_queue is not None
+            contiguous = np.ascontiguousarray(frame, dtype=np.uint8)
+            while True:
+                if encoder_errors:
+                    raise RuntimeError("FFmpeg writer failed") from encoder_errors[0]
+                if process is not None:
+                    return_code = process.poll()
+                    if return_code is not None:
+                        raise RuntimeError(
+                            f"ffmpeg exited with status {return_code} while "
+                            "the render queue was still receiving frames"
+                        )
+                try:
+                    # A bounded queue prevents a fast compositor from
+                    # retaining an entire 4K movie in RAM while still
+                    # allowing the encoder and native field producer to run
+                    # concurrently.
+                    encoder_queue.put(memoryview(contiguous), timeout=0.5)
+                    return
+                except queue.Full:
+                    now = time.monotonic()
+                    if now - last_backpressure_notice >= ENCODER_BACKPRESSURE_NOTICE_SECONDS:
+                        print(
+                            "  Encoder backpressure: native/compositor is "
+                            "waiting for FFmpeg to drain the frame queue.",
+                            flush=True,
+                        )
+                        last_backpressure_notice = now
+                    continue
+
         for frame_index in range(total_frames):
             frame_started = time.perf_counter()
             frame_log_zoom = float(zooms[frame_index])
@@ -2290,6 +3845,7 @@ def _render_video_atlas(
                 get_tile(level)
                 if level < level_count:
                     get_tile(level + 1)
+                prefetch_tile(level + 2)
                 _trim_atlas_memory_cache(tile_cache, level)
 
             parent_log = tile_log(level)
@@ -2300,7 +3856,7 @@ def _render_video_atlas(
             parent_max_iter = tile_iter(level)
             child_max_iter = tile_iter(level + 1) if child is not None else None
             phase = float(features.phase[frame_index])
-            vocal = float(features.vocal[frame_index])
+            gradient = float(features.gradient[frame_index])
             instrumental = float(features.instrumental[frame_index])
             pitch = float(features.pitch[frame_index])
             rgb = _atlas_colour_frame(
@@ -2313,7 +3869,7 @@ def _render_video_atlas(
                 parent_max_iter,
                 child_max_iter,
                 phase,
-                vocal,
+                gradient,
                 instrumental,
                 native_library,
                 native_threads,
@@ -2321,13 +3877,20 @@ def _render_video_atlas(
                 palette,
                 pitch,
             )
-            assert process.stdin is not None
-            process.stdin.write(np.ascontiguousarray(rgb, dtype=np.uint8))
+            enqueue_frame(rgb)
             frame_seconds += time.perf_counter() - frame_started
             if frame_index % max(1, fps * 5) == 0:
                 print(f"  encoded {100.0 * frame_index / total_frames:5.1f}%")
 
-        assert process.stdin is not None
+        encoder_started = time.perf_counter()
+        assert encoder_queue is not None
+        encoder_queue.put(None)
+        encoder_queue.join()
+        if encoder_thread is not None:
+            encoder_thread.join()
+        encoder_seconds += time.perf_counter() - encoder_started
+        if encoder_errors:
+            raise RuntimeError("FFmpeg writer failed") from encoder_errors[0]
         process.stdin.close()
         process.stdin = None
         return_code = process.wait()
@@ -2336,8 +3899,9 @@ def _render_video_atlas(
         os.replace(temporary_output, output_path)
         elapsed = time.perf_counter() - render_started
         print(
-            f"Atlas timing: tiles {tile_seconds:.2f}s, frame/crop/pipe "
-            f"{frame_seconds:.2f}s, total {elapsed:.2f}s.",
+            f"Atlas timing: tiles {tile_seconds:.2f}s, frame/reproject/queue "
+            f"{frame_seconds:.2f}s, encoder drain {encoder_seconds:.2f}s, "
+            f"total {elapsed:.2f}s.",
             flush=True,
         )
     except BrokenPipeError as exc:
@@ -2352,11 +3916,133 @@ def _render_video_atlas(
             process.wait()
         raise
     finally:
+        if encoder_queue is not None and encoder_thread is not None and encoder_thread.is_alive():
+            try:
+                encoder_queue.put(None, timeout=0.5)
+            except queue.Full:
+                pass
+            encoder_thread.join(timeout=2.0)
+        if prefetch_executor is not None:
+            prefetch_executor.shutdown(wait=True, cancel_futures=True)
         if temporary_output.exists():
             try:
                 temporary_output.unlink()
             except OSError:
                 pass
+
+
+def _ffmpeg_encoder_names() -> set[str]:
+    """Return encoders advertised by the local FFmpeg, if queryable."""
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return set()
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    names: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] and not parts[0].startswith("#"):
+            names.add(parts[1])
+    return names
+
+
+@lru_cache(maxsize=2)
+def _vaapi_encoder_usable(device: str = "/dev/dri/renderD128") -> bool:
+    """Probe the complete upload/encode path, not just FFmpeg's name list."""
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None or not Path(device).exists():
+        return False
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-vaapi_device",
+                device,
+                "-f",
+                "lavfi",
+                "-i",
+                "color=black:s=128x128:d=0.05",
+                "-vf",
+                "format=nv12,hwupload",
+                "-c:v",
+                "h264_vaapi",
+                "-qp",
+                "24",
+                "-f",
+                "null",
+                "-",
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _select_video_encoder(
+    requested: str,
+    video_preset: str,
+    crf: int,
+) -> tuple[str, str, list[str]]:
+    """Resolve ``auto`` without making a render depend on unavailable hardware."""
+
+    if requested == "h264_vaapi":
+        if not _vaapi_encoder_usable():
+            raise RuntimeError(
+                "h264_vaapi was requested, but /dev/dri/renderD128 failed its encode probe"
+            )
+        return requested, "", ["-qp", str(crf)]
+    if requested != "auto":
+        return requested, video_preset, ["-crf", str(crf)]
+    available = _ffmpeg_encoder_names()
+    candidates: list[tuple[str, bool]] = []
+    if shutil.which("nvidia-smi") is not None:
+        candidates.append(("h264_nvenc", True))
+    if Path("/dev/dri/renderD128").exists():
+        candidates.extend([
+            ("h264_qsv", True),
+            ("h264_vaapi", True),
+        ])
+    if sys.platform == "darwin":
+        candidates.append(("h264_videotoolbox", True))
+    for encoder, compatible_rate_control in candidates:
+        if encoder not in available or not compatible_rate_control:
+            continue
+        if encoder == "h264_nvenc":
+            nvenc_presets = {
+                "ultrafast": "p1",
+                "superfast": "p2",
+                "veryfast": "p3",
+                "faster": "p4",
+                "fast": "p5",
+                "medium": "p6",
+                "slow": "p7",
+            }
+            return encoder, nvenc_presets.get(video_preset, "p3"), [
+                "-cq", str(crf), "-rc", "vbr",
+            ]
+        if encoder == "h264_vaapi":
+            if not _vaapi_encoder_usable():
+                continue
+            return encoder, "", ["-qp", str(crf)]
+        return encoder, video_preset, ["-crf", str(crf)]
+    return "libx264", video_preset, ["-crf", str(crf)]
 
 
 @lru_cache(maxsize=8)
@@ -2366,7 +4052,7 @@ def _palette_basis(max_iter: int) -> tuple[Any, Any, float]:
     np = _require_numpy()
     palette_size = min(65536, max(4096, int(max_iter) * 4))
     palette_field = np.linspace(0.0, float(max_iter), palette_size, dtype=np.float32)
-    angle = np.asarray(0.19 * palette_field, dtype=np.float32)
+    angle = np.asarray(AURORA_BAND_THICKNESS * palette_field, dtype=np.float32)
     return np.cos(angle), np.sin(angle), (palette_size - 1) / max(float(max_iter), 1.0)
 
 
@@ -2414,21 +4100,28 @@ def _colourise(
 ) -> Any:
     np = _require_numpy()
     inside = field >= max_iter - 0.5
-    # Restore the original three phase-offset channel waves. They produce the
-    # characteristic blue/yellow gradient; pitch rotates both hues together.
+    # This is the original three-wave liquid gradient.  The field is a smooth
+    # iteration count, so each channel is exactly
+    #   0.5 - 0.5*cos(band_thickness*field - phase_channel).
+    # Pitch rotates both anchors together; it does not replace the flowing
+    # field gradient.
     cosine_basis, sine_basis, scale = _palette_basis(int(max_iter))
-    split = 0.7 + 3.0 * float(vocal) * float(vocal)
-    brightness = 0.65 + 0.35 * float(instrumental)
+    split = AURORA_COLOUR_SPLIT * float(np.clip(vocal, 0.0, 1.0)) ** 2.0
     red_wave = cosine_basis * math.cos(phase) + sine_basis * math.sin(phase)
-    green_wave = cosine_basis * math.cos(phase + split * 0.35) \
-        + sine_basis * math.sin(phase + split * 0.35)
+    green_wave = cosine_basis * math.cos(phase + split * AURORA_GREEN_SPLIT) \
+        + sine_basis * math.sin(phase + split * AURORA_GREEN_SPLIT)
     blue_wave = cosine_basis * math.cos(phase + split) \
         + sine_basis * math.sin(phase + split)
     palette = np.empty((cosine_basis.size, 3), dtype=np.float32)
-    palette[:, 0] = np.clip((0.5 - 0.5 * red_wave)
-                            * (150.0 + 80.0 * float(vocal)) * brightness, 0.0, 255.0)
-    palette[:, 1] = np.clip((0.5 - 0.5 * green_wave) * 180.0 * brightness, 0.0, 255.0)
-    palette[:, 2] = np.clip((0.5 - 0.5 * blue_wave) * 210.0 * brightness, 0.0, 255.0)
+    palette[:, 0] = np.clip(
+        (0.5 - 0.5 * red_wave) * 140.0, 0.0, 255.0
+    )
+    palette[:, 1] = np.clip(
+        (0.5 - 0.5 * green_wave) * 140.0, 0.0, 255.0
+    )
+    palette[:, 2] = np.clip(
+        (0.5 - 0.5 * blue_wave) * 140.0, 0.0, 255.0
+    )
     palette = np.clip(_rotate_hue_rgb(palette, pitch), 0.0, 255.0).astype(np.uint8)
     palette_indices = np.clip(field * scale, 0, palette.shape[0] - 1).astype(np.intp)
     rgb = palette[palette_indices]
@@ -2711,6 +4404,7 @@ def _keyframe_field(
     series_block: int,
     native_reference: Any,
     native_threads: int,
+    render_options: Optional[NativeRenderOptions] = None,
     durable_cache: bool = False,
     cache_evictor: Optional[_CacheEvictor] = None,
 ) -> Any:
@@ -2757,6 +4451,7 @@ def _keyframe_field(
         native_reference,
         series_order,
         series_block,
+        render_options,
     )
     if cache_path is not None:
         _atomic_save_field(cache_path, field, durable=durable_cache)
@@ -2876,14 +4571,37 @@ def render_video(
     quality: str = "balanced",
     palette: str = "aurora",
     cache_limit_mb: float = 0.0,
-    video_codec: str = "libx264",
+    video_codec: str = "auto",
     crf: int = 18,
     keyframe_mode: str = "atlas",
     durable_cache: bool = False,
+    native_backend: str = "auto",
 ) -> None:
     np = _require_numpy()
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required to encode the video, but it was not found on PATH")
+    selected_codec, selected_preset, rate_control = _select_video_encoder(
+        video_codec,
+        video_preset,
+        crf,
+    )
+    if selected_codec == "h264_vaapi" and (
+        width < 128
+        or height < 128
+        or width > 4096
+        or height > 4096
+        or width % 2
+        or height % 2
+    ):
+        if video_codec != "auto":
+            raise RuntimeError(
+                "h264_vaapi requires even dimensions between 128 and 4096 pixels"
+            )
+        selected_codec, selected_preset, rate_control = _select_video_encoder(
+            "libx264",
+            video_preset,
+            crf,
+        )
 
     if keyframe_mode not in {"atlas", "legacy"}:
         raise ValueError(f"unknown keyframe mode: {keyframe_mode}")
@@ -2893,7 +4611,7 @@ def render_video(
         # supersampling instead of rendering every tile at factor squared.
         quality_settings = {
             "draft": (max(fractal_scale, 0.5), 0.0),
-            "balanced": (max(fractal_scale, 1.0), 0.0),
+            "balanced": (max(fractal_scale, 0.5), 0.0),
             "quality": (max(fractal_scale, 1.0), 0.0),
             "extreme": (max(fractal_scale, 1.25), 0.0),
         }
@@ -2909,6 +4627,10 @@ def render_video(
     if quality not in quality_settings:
         raise ValueError(f"unknown quality preset: {quality}")
     source_scale, transition_fraction = quality_settings[quality]
+    # Parent crops and neighbour interpolation are useful for a fast preview
+    # but cannot be part of a quality master: they are exactly the source of
+    # the rectangular/deep-black artefacts seen in earlier renders.
+    allow_recovery = quality == "draft"
     cpu_count = max(2, os.cpu_count() or 2)
     if native_threads == 0:
         native_threads = max(1, (cpu_count * 2) // 3)
@@ -2919,12 +4641,14 @@ def render_video(
     temporary_output = output_path.with_name(
         f".{output_path.stem}.rendering-{os.getpid()}{output_path.suffix}"
     )
+    using_vaapi = selected_codec == "h264_vaapi"
     command = [
         "ffmpeg",
         "-y",
         "-nostdin",
         "-loglevel",
         "error",
+        *(["-vaapi_device", "/dev/dri/renderD128"] if using_vaapi else []),
         "-f",
         "rawvideo",
         "-vcodec",
@@ -2943,19 +4667,22 @@ def render_video(
         "0:v:0",
         "-map",
         "1:a:0",
+        *(["-vf", "format=nv12,hwupload"] if using_vaapi else []),
         "-c:v",
-        video_codec,
-        "-preset",
-        video_preset,
-        "-threads",
-        str(encoder_threads),
-        "-crf",
-        str(crf),
-        "-pix_fmt",
-        "yuv420p",
+        selected_codec,
+        *([] if using_vaapi else ["-preset", selected_preset]),
+        *([] if using_vaapi else ["-threads", str(encoder_threads)]),
+        *rate_control,
+        *([] if using_vaapi else ["-pix_fmt", "yuv420p"]),
         "-c:a",
         "aac",
-        "-shortest",
+        # The decoded sample count is rounded up to a video frame.  Padding
+        # the audio covers that sub-frame amount, while the explicit output
+        # duration below prevents AAC padding from creating a frozen tail.
+        "-af",
+        "apad",
+        "-t",
+        f"{features.frame_count / max(float(fps), 1.0):.9f}",
         "-movflags",
         "+faststart",
         str(temporary_output),
@@ -2967,16 +4694,29 @@ def render_video(
     chunks = list(_zoom_chunks(zooms, keyframe_factor)) if keyframe_mode == "legacy" else []
 
     native_library = None
-    native_reference = None
+    native_references: list[tuple[float, Any]] = []
     active_renderer = renderer
     max_log_zoom = float(np.max(zooms))
+    native_backend_id = 0
+    native_render_options = NativeRenderOptions()
     if renderer != "python":
         native_library = _get_native_library()
         if native_library is None:
+            if native_backend != "auto":
+                raise RuntimeError(
+                    f"native backend {native_backend} was requested, but the native library is unavailable"
+                )
             if renderer == "native":
                 raise RuntimeError("native renderer is unavailable; run `make` inside `nix-shell`")
             active_renderer = "python"
-        elif float(np.max(zooms)) >= 12.0:
+        else:
+            native_backend_id = _native_backend_id(native_backend, native_library)
+            native_render_options = NativeRenderOptions(backend=native_backend_id)
+            if native_backend_id == 2 and max_log_zoom >= 6.0:
+                raise RuntimeError(
+                    "--native-backend opencl currently supports only direct zooms below 1e6"
+                )
+        if native_library is not None and float(np.max(zooms)) >= 12.0:
             reference_iter = max(
                 max_iterations(
                     float(np.max(zooms)),
@@ -2987,26 +4727,133 @@ def render_video(
                 iteration_base,
             )
             try:
-                # Python routes frames below 12 decades through the direct
-                # native path. Size the reusable BLA bound from the first
-                # frame that actually uses this reference, not an unnecessarily
-                # shallow e6 viewport that would make composition too
-                # conservative.
-                bla_start_log = max(12.0, float(np.min(zooms)))
-                _, native_reference = _create_native_reference(
+                reference_logs = _native_reference_tier_logs(
+                    max_log_zoom,
+                    math.log10(max(1.05, float(keyframe_factor))),
+                )
+                clone_tiers = (
+                    len(reference_logs) > 1
+                    and hasattr(native_library, "fractal_create_reference_reusable")
+                    and hasattr(native_library, "fractal_clone_reference")
+                )
+                reference_setup_started = time.perf_counter()
+
+                def record_reference(
+                    tier_index: int,
+                    bla_start_log: float,
+                    reference: Any,
+                    reused_orbit: bool,
+                ) -> None:
+                    native_references.append((bla_start_log, reference))
+                    print(
+                        f"Prepared native reference tier {tier_index}/{len(reference_logs)} "
+                        f"(BLA starts at {_zoom_label(bla_start_log)}, "
+                        f"{reference_iter} iterations"
+                        + (", shared MPFR orbit" if reused_orbit else "")
+                        + ").",
+                        flush=True,
+                    )
+                    reference_stats = _native_get_reference_stats(native_library, reference)
+                    if reference_stats is not None:
+                        print(
+                            "Native setup timing: reference "
+                            f"{reference_stats['reference_ns'] / 1.0e9:.3f}s, series "
+                            f"{reference_stats['series_ns'] / 1.0e9:.3f}s, BLA "
+                            f"{reference_stats['bla_ns'] / 1.0e9:.3f}s; "
+                            f"series jump {reference_stats['series_iteration']} "
+                            f"({reference_stats['series_order']} terms).",
+                            flush=True,
+                        )
+
+                _, root_reference = _create_native_reference(
                     x_center,
                     y_center,
                     reference_iter,
-                    float(np.max(zooms)),
+                    max_log_zoom,
                     series_order,
-                    bla_start_log,
+                    reference_logs[0],
+                    reusable=clone_tiers,
                 )
+                record_reference(1, reference_logs[0], root_reference, False)
+
+                if clone_tiers:
+                    setup_workers = max(
+                        1,
+                        min(len(reference_logs) - 1, native_threads, cpu_count),
+                    )
+                    print(
+                        f"Preparing {len(reference_logs) - 1} radius-specific BLA tiers "
+                        f"on {setup_workers} setup workers.",
+                        flush=True,
+                    )
+
+                    def clone_tier(bla_start_log: float) -> tuple[Any, Optional[RuntimeError]]:
+                        try:
+                            return (
+                                _clone_native_reference(
+                                    native_library,
+                                    root_reference,
+                                    bla_start_log,
+                                ),
+                                None,
+                            )
+                        except RuntimeError as error:
+                            return None, error
+
+                    with ThreadPoolExecutor(
+                        max_workers=setup_workers,
+                        thread_name_prefix="fractal-reference",
+                    ) as reference_executor:
+                        clone_results = list(
+                            reference_executor.map(clone_tier, reference_logs[1:])
+                        )
+                    for tier_index, (bla_start_log, clone_result) in enumerate(
+                        zip(reference_logs[1:], clone_results),
+                        start=2,
+                    ):
+                        reference, clone_error = clone_result
+                        reused_orbit = clone_error is None
+                        if clone_error is not None:
+                            print(
+                                f"Native tier clone unavailable ({clone_error}); "
+                                "rebuilding this tier.",
+                                flush=True,
+                            )
+                            _, reference = _create_native_reference(
+                                x_center,
+                                y_center,
+                                reference_iter,
+                                max_log_zoom,
+                                series_order,
+                                bla_start_log,
+                            )
+                        record_reference(
+                            tier_index,
+                            bla_start_log,
+                            reference,
+                            reused_orbit,
+                        )
+                else:
+                    for tier_index, bla_start_log in enumerate(reference_logs[1:], start=2):
+                        _, reference = _create_native_reference(
+                            x_center,
+                            y_center,
+                            reference_iter,
+                            max_log_zoom,
+                            series_order,
+                            bla_start_log,
+                        )
+                        record_reference(tier_index, bla_start_log, reference, False)
                 print(
-                    f"Prepared native reference orbit ({reference_iter} iterations, "
-                    f"scaled perturbation + BLA, max zoom {_zoom_label(float(np.max(zooms)))}).",
+                    f"Prepared {len(native_references)} depth-safe native reference "
+                    f"tier(s) in {time.perf_counter() - reference_setup_started:.2f}s, "
+                    f"max zoom {_zoom_label(max_log_zoom)}.",
                     flush=True,
                 )
             except RuntimeError as error:
+                for _, reference in native_references:
+                    native_library.fractal_destroy_reference(reference)
+                native_references.clear()
                 if renderer == "native" or float(np.max(zooms)) > 300.0:
                     raise
                 print(f"Native deep reference unavailable ({error}); using Python fallback.")
@@ -3020,7 +4867,9 @@ def render_video(
         f"{_keyframe_count(zooms, keyframe_factor) if keyframe_mode == 'legacy' else _atlas_geometry(zooms, keyframe_factor)[2] + 1}; "
         f"mode: {keyframe_mode}; "
         f"field renderer: {active_renderer}; "
-        f"native threads: {native_threads}; encoder threads: {encoder_threads}",
+        f"native backend: {native_backend if native_library is not None else 'python'}; "
+        f"native threads: {native_threads}; encoder: {selected_codec}; "
+        f"encoder threads: {encoder_threads}",
         flush=True,
     )
 
@@ -3043,10 +4892,12 @@ def render_video(
                 iteration_cap=iteration_cap,
                 active_renderer=active_renderer,
                 native_library=native_library,
-                native_reference=native_reference,
+                native_references=native_references,
                 native_threads=native_threads,
+                native_backend=native_backend_id,
                 series_order=series_order,
                 series_block=series_block,
+                allow_recovery=allow_recovery,
                 render_width=render_width,
                 render_height=render_height,
                 resample=resample,
@@ -3057,8 +4908,9 @@ def render_video(
                 cache_identity=_field_renderer_cache_identity(active_renderer),
             )
         finally:
-            if native_reference is not None and native_library is not None:
-                native_library.fractal_destroy_reference(native_reference)
+            if native_library is not None:
+                for _, reference in native_references:
+                    native_library.fractal_destroy_reference(reference)
             if temporary_output.exists():
                 try:
                     temporary_output.unlink()
@@ -3110,8 +4962,12 @@ def render_video(
                     max_iter=current_iter,
                     series_order=series_order,
                     series_block=series_block,
-                    native_reference=native_reference,
+                    native_reference=_select_native_reference(
+                        native_references,
+                        chunk_log_zoom,
+                    ),
                     native_threads=native_threads,
+                    render_options=native_render_options,
                     durable_cache=durable_cache,
                     cache_evictor=cache_evictor,
                 )
@@ -3161,8 +5017,12 @@ def render_video(
                         max_iter=next_iter,
                         series_order=series_order,
                         series_block=series_block,
-                        native_reference=native_reference,
+                        native_reference=_select_native_reference(
+                            native_references,
+                            next_log_zoom,
+                        ),
                         native_threads=native_threads,
+                        render_options=native_render_options,
                         durable_cache=durable_cache,
                         cache_evictor=cache_evictor,
                     )
@@ -3177,7 +5037,7 @@ def render_video(
                 frame_log_zoom = float(zooms[frame_index])
                 relative_zoom = 10.0 ** (frame_log_zoom - chunk_log_zoom)
                 phase = float(features.phase[frame_index])
-                vocal = float(features.vocal[frame_index])
+                gradient = float(features.gradient[frame_index])
                 instrumental = float(features.instrumental[frame_index])
                 pitch = float(features.pitch[frame_index])
                 rgb = _colour_frame(
@@ -3187,7 +5047,7 @@ def render_video(
                     relative_zoom,
                     current_iter,
                     phase,
-                    vocal,
+                    gradient,
                     instrumental,
                     native_library,
                     native_threads,
@@ -3218,7 +5078,7 @@ def render_video(
                             next_relative_zoom,
                             next_iter,
                             phase,
-                            vocal,
+                            gradient,
                             instrumental,
                             native_library,
                             native_threads,
@@ -3281,8 +5141,9 @@ def render_video(
             process.wait()
         raise
     finally:
-        if native_reference is not None and native_library is not None:
-            native_library.fractal_destroy_reference(native_reference)
+        if native_library is not None:
+            for _, reference in native_references:
+                native_library.fractal_destroy_reference(reference)
         if temporary_output.exists():
             try:
                 temporary_output.unlink()
@@ -3340,13 +5201,53 @@ def build_parser() -> argparse.ArgumentParser:
         default="atlas",
         help="use reusable nested tiles (atlas) or the previous full-field chunk renderer",
     )
-    parser.add_argument("--x-center", default=DEFAULT_X_CENTER)
-    parser.add_argument("--y-center", default=DEFAULT_Y_CENTER)
+    parser.add_argument(
+        "--point",
+        default=None,
+        help=(
+            "curated point slug, 'random', or an exact REAL,IMAG pair "
+            "(for a negative pair use --point=-0.7,0.1)"
+        ),
+    )
+    parser.add_argument(
+        "--random-point",
+        action="store_true",
+        help="choose a curated point that safely supports --max-zoom",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="make random point selection reproducible",
+    )
+    parser.add_argument(
+        "--list-points",
+        action="store_true",
+        help="list the curated deep-zoom catalogue and exit",
+    )
+    parser.add_argument(
+        "--x-center",
+        default=None,
+        help="exact custom real coordinate; requires --y-center",
+    )
+    parser.add_argument(
+        "--y-center",
+        default=None,
+        help="exact custom imaginary coordinate; requires --x-center",
+    )
     parser.add_argument("--base-zoom", default="1.0", help="starting zoom, e.g. 1e0")
     parser.add_argument(
         "--max-zoom",
         default="1e32",
         help="final zoom; native scaled arithmetic supports decimal exponents up to about 9800",
+    )
+    parser.add_argument(
+        "--allow-underspecified-center",
+        action="store_true",
+        help=(
+            "allow a deep render when the supplied centre has too few decimal places; "
+            "for exploratory output only, because the path may differ from the intended target"
+        ),
     )
     parser.add_argument(
         "--iteration-base",
@@ -3421,6 +5322,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="OpenMP threads for the native renderer; 0 uses the runtime default",
     )
     parser.add_argument(
+        "--native-backend",
+        choices=("auto", "scalar", "avx2", "opencl"),
+        default="auto",
+        help=(
+            "native field backend: auto selects AVX2 when available; opencl is "
+            "an opt-in direct/shallow preview backend"
+        ),
+    )
+    parser.add_argument(
         "--video-preset",
         choices=("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"),
         default="ultrafast",
@@ -3428,8 +5338,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--codec",
-        default="libx264",
-        help="FFmpeg video encoder name, for example libx264, libx265, or a hardware encoder",
+        default="auto",
+        help=(
+            "FFmpeg video encoder name, or auto to detect a usable NVENC/QSV/"
+            "VAAPI/VideoToolbox encoder and otherwise use libx264"
+        ),
     )
     parser.add_argument(
         "--crf",
@@ -3493,6 +5406,37 @@ def main() -> None:
         raise SystemExit("max-zoom must be greater than or equal to base-zoom")
     if max_log > 9800.0:
         raise SystemExit("max-zoom is beyond the native scaled-exponent range; use a zoom below 1e9800")
+    if args.list_points:
+        _print_deep_zoom_points()
+        return
+    try:
+        args.x_center, args.y_center, selected_point = _resolve_render_point(
+            point_spec=args.point,
+            random_point=args.random_point,
+            x_center=args.x_center,
+            y_center=args.y_center,
+            random_seed=args.random_seed,
+            max_log_zoom=max_log,
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if selected_point is not None:
+        selection_kind = (
+            "Random point"
+            if args.random_point
+            or (args.point is not None and args.point.casefold() == "random")
+            else "Point"
+        )
+        print(
+            f"{selection_kind}: {selected_point.name} ({selected_point.slug}); "
+            f"catalogue depth ~1e{_deep_point_max_log10_zoom(selected_point):.0f}.",
+            flush=True,
+        )
+    center_error = _center_precision_error(args.x_center, args.y_center, max_log)
+    if center_error is not None:
+        if not args.allow_underspecified_center:
+            raise SystemExit(center_error)
+        print(f"WARNING: {center_error}", file=sys.stderr, flush=True)
     finite_options = (
         ("render-scale", args.render_scale),
         ("fractal-scale", args.fractal_scale),
@@ -3563,7 +5507,7 @@ def main() -> None:
         if args.keyframe_mode == "atlas":
             estimate_scale = {
                 "draft": max(args.fractal_scale, 0.5),
-                "balanced": max(args.fractal_scale, 1.0),
+                "balanced": max(args.fractal_scale, 0.5),
                 "quality": max(args.fractal_scale, 1.0),
                 "extreme": max(args.fractal_scale, 1.25),
             }[args.quality]
@@ -3618,6 +5562,7 @@ def main() -> None:
         args.crf,
         args.keyframe_mode,
         args.durable_cache,
+        args.native_backend,
     )
     print(f"Done -> {args.output}")
 

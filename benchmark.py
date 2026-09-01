@@ -24,11 +24,28 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
             raise SystemExit("the native renderer is unavailable; run make first")
     else:
         native_library = visualizer._get_native_library() if args.renderer == "auto" else None
+    backend_library = native_library
+    if args.renderer != "python" and backend_library is None:
+        backend_library = visualizer._get_native_library()
+    native_backend = (
+        visualizer._native_backend_id(args.backend, backend_library)
+        if args.renderer != "python"
+        else 0
+    )
+    render_options = visualizer.NativeRenderOptions(
+        backend=native_backend,
+        # The prepared image series is order 8--32. Requiring 32 terms is a
+        # deliberate, ABI-safe way to disable it for an apples-to-apples
+        # pure-BLA comparison without adding a second native entry point.
+        series_min_terms=32 if args.disable_series else 8,
+        series_max_terms=32,
+    )
 
     zooms = np.asarray([0.0, log_zoom], dtype=np.float64)
     origin, step, level_count = visualizer._atlas_geometry(zooms, args.keyframe_factor)
     reference = None
     reference_seconds = 0.0
+    reference_stats = None
     stats_supported = False
     if native_library is not None and log_zoom >= 12.0:
         reference_iter = visualizer.max_iterations(
@@ -50,8 +67,10 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
             reference_log_zoom,
             args.series_order,
             12.0,
+            image_series_order=8 if args.disable_series else 32,
         )
         reference_seconds = time.perf_counter() - reference_started
+        reference_stats = visualizer._native_get_reference_stats(native_library, reference)
         stats_supported = (
             args.stats
             and not args.local_references
@@ -70,6 +89,7 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
                 args.iteration_cap,
             )
             started = time.perf_counter()
+            glitch_diagnostics = {} if args.local_references else None
             if args.local_references:
                 field = visualizer._atlas_local_reference_field(
                     render_width=args.width,
@@ -83,6 +103,9 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
                     renderer=args.renderer,
                     native_threads=args.threads,
                     native_library=native_library,
+                    native_backend=native_backend,
+                    native_reference=reference,
+                    diagnostics=glitch_diagnostics,
                 )
             else:
                 field = None
@@ -99,6 +122,7 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
                     reference,
                     args.series_order,
                     args.series_block,
+                    render_options,
                 )
             elapsed = time.perf_counter() - started
             record = {
@@ -111,6 +135,8 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
             }
             if stats_supported:
                 record["stats"] = visualizer._native_get_stats(native_library)
+            if glitch_diagnostics:
+                record["glitch_diagnostics"] = dict(glitch_diagnostics)
             records.append(record)
             del field
             if args.verbose:
@@ -144,6 +170,9 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
             if args.reference_zoom_log is not None
             else log_zoom
         ),
+        "reference_stats": reference_stats,
+        "native_backend": args.backend,
+        "image_series": not args.disable_series,
         "total_seconds": float(np.sum(timings)),
         "mean_seconds": float(np.mean(timings)),
         "median_seconds": float(np.median(timings)),
@@ -158,7 +187,7 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
     if stats_records:
         result["stats_totals"] = {
             name: int(sum(int(stats.get(name, 0)) for stats in stats_records))
-            for name in visualizer.NATIVE_STATS_FIELDS
+            for name in visualizer.NATIVE_EXTENDED_STATS_FIELDS
         }
     if args.json:
         print(json.dumps(result, indent=2))
@@ -172,6 +201,15 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
         f"worst {result['worst_seconds']:.3f}s; "
         f"reference setup {reference_seconds:.3f}s"
     )
+    if reference_stats is not None:
+        print(
+            "reference stages: "
+            f"orbit {reference_stats['reference_ns'] / 1.0e9:.3f}s, "
+            f"series {reference_stats['series_ns'] / 1.0e9:.3f}s, "
+            f"BLA {reference_stats['bla_ns'] / 1.0e9:.3f}s, "
+            f"jump {reference_stats['series_iteration']} "
+            f"({reference_stats['series_order']} terms)"
+        )
     print("slowest levels:")
     for record in slowest:
         print(
@@ -217,8 +255,19 @@ def main() -> None:
     parser.add_argument("--x-center", default=visualizer.DEFAULT_X_CENTER)
     parser.add_argument("--y-center", default=visualizer.DEFAULT_Y_CENTER)
     parser.add_argument("--renderer", choices=("auto", "native", "python"), default="auto")
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "scalar", "avx2", "opencl"),
+        default="auto",
+        help="native backend selection; OpenCL is direct/shallow only",
+    )
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--series-order", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument(
+        "--disable-series",
+        action="store_true",
+        help="disable the validated image-wide series for a pure-BLA comparison",
+    )
     parser.add_argument("--series-block", type=int, default=256)
     parser.add_argument(
         "--local-references",
@@ -343,6 +392,7 @@ def main() -> None:
     native_library = None
     reference_seconds = 0.0
     reference_log_zoom = None
+    reference_stats = None
     stats_supported = False
     if args.renderer != "python" and log_zoom >= 12.0:
         reference_started = time.perf_counter()
@@ -367,16 +417,36 @@ def main() -> None:
             reference_log_zoom,
             args.series_order,
             12.0,
+            image_series_order=8 if args.disable_series else 32,
         )
         reference_seconds = time.perf_counter() - reference_started
+        reference_stats = visualizer._native_get_reference_stats(
+            native_library, native_reference
+        )
         stats_supported = (
             args.stats
             and visualizer._native_set_stats_enabled(native_library, True)
         )
+    backend_library = native_library
+    if args.renderer != "python" and backend_library is None:
+        backend_library = visualizer._get_native_library()
+    native_backend = (
+        visualizer._native_backend_id(args.backend, backend_library)
+        if args.renderer != "python"
+        else 0
+    )
+    render_options = visualizer.NativeRenderOptions(
+        backend=native_backend,
+        series_min_terms=32 if args.disable_series else 8,
+        series_max_terms=32,
+    )
+    if native_backend == 2 and log_zoom >= 6.0:
+        raise SystemExit("--backend opencl only supports direct zooms below 1e6")
     timings = []
     try:
         for _ in range(args.repeat):
             started = time.perf_counter()
+            glitch_diagnostics = {} if args.local_references else None
             if args.local_references:
                 field = visualizer._atlas_local_reference_field(
                     render_width=args.width,
@@ -390,6 +460,9 @@ def main() -> None:
                     renderer=args.renderer,
                     native_threads=args.threads,
                     native_library=native_library,
+                    native_backend=native_backend,
+                    native_reference=native_reference,
+                    diagnostics=glitch_diagnostics,
                 )
             else:
                 field = None
@@ -406,6 +479,7 @@ def main() -> None:
                     native_reference,
                     args.series_order,
                     args.series_block,
+                    render_options,
                 )
             elapsed = time.perf_counter() - started
             timings.append(elapsed)
@@ -423,12 +497,17 @@ def main() -> None:
             "repeat": args.repeat,
             "reference_seconds": reference_seconds,
             "reference_zoom_log10": reference_log_zoom,
+            "reference_stats": reference_stats,
+            "native_backend": args.backend,
+            "image_series": not args.disable_series,
             "seconds": timings,
             "best_seconds": min(timings),
             "best_with_reference_seconds": reference_seconds + min(timings),
             "pixels_per_second": args.width * args.height / min(timings),
             "finite_fraction": float(np.isfinite(field).mean()),
         }
+        if glitch_diagnostics:
+            result["glitch_diagnostics"] = dict(glitch_diagnostics)
         if stats_supported:
             result["stats"] = visualizer._native_get_stats(native_library)
         if args.json:
@@ -441,6 +520,24 @@ def main() -> None:
                 f"reference setup {reference_seconds:.3f}s, "
                 f"one-shot total {result['best_with_reference_seconds']:.3f}s"
             )
+            if reference_stats is not None:
+                print(
+                    "reference stages: "
+                    f"orbit {reference_stats['reference_ns'] / 1.0e9:.3f}s, "
+                    f"series {reference_stats['series_ns'] / 1.0e9:.3f}s, "
+                    f"BLA {reference_stats['bla_ns'] / 1.0e9:.3f}s, "
+                    f"jump {reference_stats['series_iteration']} "
+                    f"({reference_stats['series_order']} terms)"
+                )
+            if stats_supported and isinstance(result.get("stats"), dict):
+                stats = result["stats"]
+                print(
+                    "field stats: "
+                    f"exact {stats['exact_steps']}, replay {stats['replay_steps']}, "
+                    f"BLA {stats['bla_blocks']}, glitches {stats['glitch_count']}, "
+                    f"unresolved {stats['unresolved_pixels']}, "
+                    f"native {stats['render_ns'] / 1.0e9:.3f}s"
+                )
     finally:
         if stats_supported and native_library is not None:
             visualizer._native_set_stats_enabled(native_library, False)

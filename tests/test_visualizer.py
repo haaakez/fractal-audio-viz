@@ -1,7 +1,9 @@
 import unittest
 import tempfile
+import math
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 try:
     import numpy as np
@@ -12,6 +14,207 @@ import visualizer
 
 
 class AnimationTests(unittest.TestCase):
+    def test_fractional_decimal_places_respect_scientific_notation(self):
+        self.assertEqual(visualizer._fractional_decimal_places("1.23e-4"), 6)
+        self.assertEqual(visualizer._fractional_decimal_places("-1.2300"), 4)
+        self.assertEqual(visualizer._fractional_decimal_places("12e3"), 0)
+
+    def test_deep_center_precision_guard_catches_e150_bundled_center(self):
+        available, required = visualizer._center_precision_budget(
+            visualizer.DEFAULT_X_CENTER,
+            visualizer.DEFAULT_Y_CENTER,
+            100.0,
+        )
+        self.assertEqual(available, 129)
+        self.assertEqual(required, 116)
+        self.assertIsNone(
+            visualizer._center_precision_error(
+                visualizer.DEFAULT_X_CENTER,
+                visualizer.DEFAULT_Y_CENTER,
+                100.0,
+            )
+        )
+        available, required = visualizer._center_precision_budget(
+            visualizer.DEFAULT_X_CENTER,
+            visualizer.DEFAULT_Y_CENTER,
+            150.0,
+        )
+        self.assertEqual(available, 129)
+        self.assertEqual(required, 166)
+        self.assertIn(
+            "full-precision --x-center and --y-center",
+            visualizer._center_precision_error(
+                visualizer.DEFAULT_X_CENTER,
+                visualizer.DEFAULT_Y_CENTER,
+                150.0,
+            ),
+        )
+
+    def test_curated_point_catalogue_has_at_least_twenty_e150_locations(self):
+        points = visualizer.DEEP_ZOOM_POINTS
+        self.assertGreaterEqual(len(points), 20)
+        self.assertEqual(len({point.slug for point in points}), len(points))
+        self.assertGreaterEqual(
+            sum(point.conjugate_of is None for point in points),
+            14,
+        )
+        self.assertTrue(
+            all(visualizer._deep_point_max_log10_zoom(point) >= 150.0 for point in points)
+        )
+
+    def test_random_point_is_reproducible_and_filtered_for_e150(self):
+        first = visualizer._resolve_render_point(
+            point_spec="random",
+            random_point=False,
+            x_center=None,
+            y_center=None,
+            random_seed=417,
+            max_log_zoom=150.0,
+        )
+        second = visualizer._resolve_render_point(
+            point_spec=None,
+            random_point=True,
+            x_center=None,
+            y_center=None,
+            random_seed=417,
+            max_log_zoom=150.0,
+        )
+        self.assertEqual(first, second)
+        self.assertIsNotNone(first[2])
+        self.assertLessEqual(first[2].screened_log10_zoom, 150.0)
+        self.assertIsNone(visualizer._center_precision_error(first[0], first[1], 150.0))
+
+    def test_point_accepts_exact_custom_pair_and_rejects_conflicts(self):
+        x, y, preset = visualizer._resolve_render_point(
+            point_spec="-0.743643887037151, 0.131825904205330",
+            random_point=False,
+            x_center=None,
+            y_center=None,
+            random_seed=None,
+            max_log_zoom=12.0,
+        )
+        self.assertEqual(x, "-0.743643887037151")
+        self.assertEqual(y, "0.131825904205330")
+        self.assertIsNone(preset)
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            visualizer._resolve_render_point(
+                point_spec="oldwooddish",
+                random_point=False,
+                x_center="-0.7",
+                y_center="0.1",
+                random_seed=None,
+                max_log_zoom=12.0,
+            )
+
+    def test_preset_rejects_depth_beyond_stored_coordinate(self):
+        with self.assertRaisesRegex(ValueError, "below requested"):
+            visualizer._resolve_render_point(
+                point_spec="oldwooddish",
+                random_point=False,
+                x_center=None,
+                y_center=None,
+                random_seed=None,
+                max_log_zoom=160.0,
+            )
+
+    def test_native_reference_tiers_switch_before_deep_bla_can_fail(self):
+        self.assertEqual(visualizer._native_reference_tier_logs(20.0), [12.0])
+        self.assertEqual(
+            visualizer._native_reference_tier_logs(83.0),
+            [12.0, 40.0, 50.0, 60.0, 70.0, 80.0, 83.0],
+        )
+        references = [
+            (12.0, "shallow"),
+            (40.0, "e40"),
+            (50.0, "e50"),
+            (60.0, "e60"),
+        ]
+        self.assertIsNone(visualizer._select_native_reference(references, 11.9))
+        self.assertEqual(visualizer._select_native_reference(references, 20.0), "shallow")
+        self.assertEqual(visualizer._select_native_reference(references, 49.9), "e40")
+        self.assertEqual(visualizer._select_native_reference(references, 59.9), "e50")
+        self.assertEqual(visualizer._select_native_reference(references, 83.0), "e60")
+
+    def test_native_reference_tiers_align_to_atlas_boundaries(self):
+        step = math.log10(2.0)
+        tiers = visualizer._native_reference_tier_logs(83.0, step)
+        expected_first_deep = math.floor(40.0 / step) * step
+        self.assertAlmostEqual(tiers[1], expected_first_deep, places=12)
+        self.assertLessEqual(tiers[1], 40.0)
+        self.assertEqual(tiers[-1], 83.0)
+
+    def test_audio_without_stems_uses_full_mix_for_flow_and_zoom(self):
+        source = np.ones(1000, dtype=np.float32)
+        rms = np.linspace(0.05, 1.0, 100, dtype=np.float32)
+        pitch = np.linspace(0.2, 0.8, 100, dtype=np.float32)
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio_file:
+            audio_path = Path(audio_file.name)
+            with mock.patch.object(visualizer, "_load_audio", return_value=source), \
+                mock.patch.object(visualizer, "_frame_rms", return_value=rms), \
+                mock.patch.object(visualizer, "_frame_pitch", return_value=pitch):
+                features = visualizer.analyse_audio(
+                    audio_path,
+                    sample_rate=100,
+                    fps=10,
+                    separation="none",
+                )
+        np.testing.assert_allclose(features.vocal, features.instrumental)
+        expected_gradient = visualizer._smooth(
+            visualizer._normalise_minmax(rms), 4
+        )
+        np.testing.assert_allclose(features.gradient, expected_gradient)
+        expected_phase = np.cumsum(
+            visualizer.AURORA_FLOW_SPEED
+            * (
+                visualizer.AURORA_MIN_FLOW_FRACTION
+                + (1.0 - visualizer.AURORA_MIN_FLOW_FRACTION)
+                * np.clip(expected_gradient.astype(np.float64), 0.0, 1.0) ** 2.5
+            )
+            / 10.0
+        ).astype(np.float32)
+        np.testing.assert_allclose(features.phase, expected_phase)
+        self.assertGreater(float(np.ptp(features.phase)), 5.0)
+        self.assertGreaterEqual(float(np.min(np.diff(features.phase))), 0.0)
+
+    def test_audio_flow_keeps_moving_through_a_silent_tail(self):
+        source = np.ones(1000, dtype=np.float32)
+        rms = np.concatenate((
+            np.ones(50, dtype=np.float32),
+            np.zeros(50, dtype=np.float32),
+        ))
+        pitch = np.full(100, 0.5, dtype=np.float32)
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio_file:
+            audio_path = Path(audio_file.name)
+            with mock.patch.object(visualizer, "_load_audio", return_value=source), \
+                mock.patch.object(visualizer, "_frame_rms", return_value=rms), \
+                mock.patch.object(visualizer, "_frame_pitch", return_value=pitch):
+                features = visualizer.analyse_audio(
+                    audio_path,
+                    sample_rate=100,
+                    fps=10,
+                    separation="none",
+                )
+        self.assertGreater(float(features.phase[-1] - features.phase[-2]), 0.0)
+        np.testing.assert_allclose(
+            features.phase[-1] - features.phase[-2],
+            visualizer.AURORA_FLOW_SPEED
+            * visualizer.AURORA_MIN_FLOW_FRACTION
+            / 10.0,
+            rtol=0.0,
+            atol=1.0e-5,
+        )
+
+    def test_zoom_plan_reflects_at_ceiling_instead_of_freezing(self):
+        instrumental = np.concatenate((
+            np.ones(100, dtype=np.float32),
+            np.zeros(300, dtype=np.float32),
+        ))
+        zooms = visualizer._zoom_plan(instrumental, "1", "1e12", punch=3.0)
+        self.assertAlmostEqual(float(zooms[-1]), 12.0, places=12)
+        self.assertGreater(float(np.max(zooms)), 11.0)
+        self.assertLess(float(np.min(zooms[95:105])), 12.0)
+        self.assertLess(float(np.min(np.diff(zooms))), 0.0)
+
     def test_deep_local_reference_geometry_supports_odd_tiles(self):
         centres = visualizer._atlas_local_reference_centres(
             125,
@@ -75,6 +278,86 @@ class AnimationTests(unittest.TestCase):
             native_library=library,
         )
         np.testing.assert_allclose(local, single, rtol=0.0, atol=1.0e-3)
+
+    def test_probe_centred_point_reference_preserves_global_pixel_alignment(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_render_points"):
+            raise unittest.SkipTest("native point renderer is unavailable")
+        width = height = 64
+        max_iter = 1800
+        _, global_reference = visualizer._create_native_reference(
+            visualizer.DEFAULT_X_CENTER,
+            visualizer.DEFAULT_Y_CENTER,
+            max_iter,
+            40.0,
+            3,
+            40.0,
+        )
+        cell = (5, 14, 7, 17)
+        probe = (12, 9)
+        geometry = visualizer._atlas_local_reference_cell(
+            width,
+            height,
+            40.0,
+            visualizer.DEFAULT_X_CENTER,
+            visualizer.DEFAULT_Y_CENTER,
+            cell,
+            probe,
+        )
+        _, _, _, _, local_x, local_y, local_log_zoom = geometry
+        _, local_reference = visualizer._create_native_reference(
+            local_x,
+            local_y,
+            max_iter,
+            local_log_zoom,
+            3,
+            local_log_zoom,
+        )
+        try:
+            expected = visualizer.render_fractal(
+                width,
+                height,
+                40.0,
+                visualizer.DEFAULT_X_CENTER,
+                visualizer.DEFAULT_Y_CENTER,
+                max_iter,
+                "native",
+                2,
+                global_reference,
+                3,
+                256,
+                visualizer.NativeRenderOptions(strict=True, strict_cycle=True),
+            )
+            actual = visualizer._render_native_reference_points(
+                render_width=width,
+                render_height=height,
+                log10_zoom=40.0,
+                cell=cell,
+                probe=probe,
+                x_center=visualizer.DEFAULT_X_CENTER,
+                y_center=visualizer.DEFAULT_Y_CENTER,
+                reference_x=local_x,
+                reference_y=local_y,
+                max_iter=max_iter,
+                native_threads=2,
+                native_library=library,
+                native_reference=local_reference,
+                series_order=3,
+                series_block=256,
+                render_options=visualizer.NativeRenderOptions(
+                    strict=True,
+                    strict_cycle=True,
+                ),
+            )
+        finally:
+            library.fractal_destroy_reference(local_reference)
+            library.fractal_destroy_reference(global_reference)
+        np.testing.assert_allclose(
+            actual,
+            expected[cell[2]:cell[3], cell[0]:cell[1]],
+            rtol=0.0,
+            atol=2.0e-3,
+        )
 
     def test_atlas_memory_cache_is_bounded_in_both_directions(self):
         tiles = {level: object() for level in range(7)}
@@ -216,10 +499,77 @@ class AnimationTests(unittest.TestCase):
         self.assertTrue(np.isfinite(recovered).all())
         self.assertGreater(int(np.unique(recovered[2:5, 2:5]).size), 1)
 
+    def test_unresolved_regions_keep_a_real_probe_pixel(self):
+        mask = np.zeros((10, 12), dtype=bool)
+        mask[2:5, 7:10] = True
+        regions = visualizer._unresolved_regions(mask)
+        self.assertEqual(len(regions), 1)
+        x0, x1, y0, y1, count, probe_x, probe_y = regions[0]
+        self.assertEqual(count, 9)
+        self.assertEqual((x0, x1, y0, y1), (6, 11, 1, 6))
+        self.assertTrue(mask[probe_y, probe_x])
+
+    def test_explicit_video_codec_keeps_x264_rate_control(self):
+        codec, preset, rate_control = visualizer._select_video_encoder(
+            "libx264", "ultrafast", 18
+        )
+        self.assertEqual(codec, "libx264")
+        self.assertEqual(preset, "ultrafast")
+        self.assertEqual(rate_control, ["-crf", "18"])
+
+    def test_auto_codec_uses_probed_vaapi_when_available(self):
+        with mock.patch.object(
+            visualizer, "_ffmpeg_encoder_names", return_value={"h264_vaapi"}
+        ), mock.patch.object(
+            visualizer, "_vaapi_encoder_usable", return_value=True
+        ), mock.patch.object(visualizer.Path, "exists", return_value=True):
+            codec, preset, rate_control = visualizer._select_video_encoder(
+                "auto", "ultrafast", 18
+            )
+        self.assertEqual(codec, "h264_vaapi")
+        self.assertEqual(preset, "")
+        self.assertEqual(rate_control, ["-qp", "18"])
+
     def test_crop_factor_is_clamped_to_native_source(self):
         field = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
         view = visualizer._crop_and_resize(field, 32, 32, 2.0, "bilinear")
         self.assertEqual(view.shape, (32, 32))
+        self.assertTrue(np.isfinite(view).all())
+
+    def test_scaled_exponential_radius_preserves_e4000(self):
+        mantissa, exponent = visualizer._scaled_log10_radius(-4000.0)
+        self.assertTrue(np.isfinite(mantissa))
+        self.assertGreaterEqual(mantissa, 0.5)
+        self.assertLess(mantissa, 1.0)
+        self.assertLess(exponent, -12000)
+
+    def test_exponential_field_smoke_is_raw_and_reprojectable(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_render_points"):
+            raise unittest.SkipTest("native point renderer is unavailable")
+        field = visualizer.render_exponential_field(
+            radial_samples=8,
+            angular_samples=16,
+            min_log10_radius=-8.0,
+            max_log10_radius=-6.0,
+            x_center=visualizer.DEFAULT_X_CENTER,
+            y_center=visualizer.DEFAULT_Y_CENTER,
+            max_iter=400,
+            native_threads=2,
+        )
+        self.assertEqual(field.shape, (8, 16))
+        self.assertEqual(field.dtype, np.float32)
+        self.assertTrue(np.isfinite(field).all())
+        view = visualizer.reproject_exponential_field(
+            field,
+            min_log10_radius=-8.0,
+            max_log10_radius=-6.0,
+            log10_zoom=6.5,
+            output_width=12,
+            output_height=10,
+            max_iter=400,
+        )
+        self.assertEqual(view.shape, (10, 12))
         self.assertTrue(np.isfinite(view).all())
 
     def test_envelope_follower_is_bounded_and_release_is_smooth(self):

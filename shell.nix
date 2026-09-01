@@ -18,7 +18,12 @@ pkgs.mkShell {
     pkgs.pkg-config
     pkgs.gmp
     pkgs.mpfr
-  ] ++ pkgs.lib.optional (pkgs ? gh) pkgs.gh;
+  ]
+  ++ pkgs.lib.optional (pkgs ? gh) pkgs.gh
+  ++ pkgs.lib.optionals ((pkgs ? opencl-headers) && (pkgs ? ocl-icd)) [
+    pkgs.opencl-headers
+    pkgs.ocl-icd
+  ];
 
   shellHook = ''
     # This renderer is compiled locally for the current CPU.  Nix normally
@@ -30,6 +35,7 @@ pkgs.mkShell {
     echo "Atlas keyframes are the default; use --keyframe-mode legacy for regression comparisons."
     echo "Use --quality balanced for stable output, --quality extreme for modest supersampling."
     echo "Set OMP_NUM_THREADS and --native-threads to avoid CPU oversubscription."
+    echo "OpenCL is optional; make advertises backend=2 only when a double-capable device is visible."
     echo "Demucs is used automatically when available; --separation spectral enables proxies explicitly."
   '';
 }
