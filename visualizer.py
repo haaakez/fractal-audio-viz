@@ -66,7 +66,16 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
-from deep_zoom_points import DEEP_ZOOM_POINTS, DEEP_ZOOM_POINTS_BY_SLUG, DeepZoomPoint
+from deep_zoom_points import (
+    BURNING_SHIP_POINTS,
+    DEEP_ZOOM_POINTS,
+    FORMULA_POINT_CATALOGUES,
+    FORMULA_POINTS_BY_SLUG,
+    JULIA_POINTS,
+    MULTIBROT3_POINTS,
+    TRICORN_POINTS,
+    DeepZoomPoint,
+)
 from profiles import PROFILE_CHOICES, PROFILE_DEFAULTS, PROFILE_DESCRIPTIONS
 
 
@@ -114,15 +123,15 @@ FORMULA_DESCRIPTIONS = {
     "tricorn": "conjugate z²+c (the Mandelbar)",
     "multibrot3": "cubic z³+c parameter plane",
 }
-# Alternate formulas use the same viewport convention as Mandelbrot but need
-# useful defaults of their own.  The bundled deep catalogue remains
-# Mandelbrot-specific and is deliberately not silently reused for them.
+# Every formula has its own catalogue and default centre.  Julia presets also
+# carry their fixed c value; Mandelbrot's catalogue is the only one screened
+# for the production native e150+ path.
 FORMULA_DEFAULT_CENTERS = {
     "mandelbrot": (DEFAULT_X_CENTER, DEFAULT_Y_CENTER),
-    "julia": ("0.0", "0.0"),
-    "burning-ship": ("-0.5", "-0.5"),
-    "tricorn": ("0.0", "0.0"),
-    "multibrot3": ("0.0", "0.0"),
+    "julia": (JULIA_POINTS[0].x, JULIA_POINTS[0].y),
+    "burning-ship": (BURNING_SHIP_POINTS[0].x, BURNING_SHIP_POINTS[0].y),
+    "tricorn": (TRICORN_POINTS[0].x, TRICORN_POINTS[0].y),
+    "multibrot3": (MULTIBROT3_POINTS[0].x, MULTIBROT3_POINTS[0].y),
 }
 DEFAULT_JULIA_C = ("-0.8", "0.156")
 
@@ -1406,8 +1415,13 @@ def _resolve_render_point(
     y_center: Optional[str],
     random_seed: Optional[int],
     max_log_zoom: float,
+    formula: str = "mandelbrot",
 ) -> tuple[str, str, Optional[DeepZoomPoint]]:
-    """Resolve preset, random, comma-pair, or legacy x/y CLI input."""
+    """Resolve a formula-specific preset, random point, pair, or x/y input."""
+
+    formula = _formula_name(formula)
+    catalogue = FORMULA_POINT_CATALOGUES[formula]
+    points_by_slug = FORMULA_POINTS_BY_SLUG[formula]
 
     if random_point and point_spec is not None:
         raise ValueError("use either --random-point or --point, not both")
@@ -1423,7 +1437,8 @@ def _resolve_render_point(
     spec = "random" if random_point else (point_spec.strip() if point_spec is not None else None)
     if spec is None:
         if x_center is None:
-            return DEFAULT_X_CENTER, DEFAULT_Y_CENTER, None
+            default_x, default_y = FORMULA_DEFAULT_CENTERS[formula]
+            return default_x, default_y, None
         return (
             _validate_center_text(x_center, "real"),
             _validate_center_text(y_center, "imaginary"),
@@ -1431,18 +1446,25 @@ def _resolve_render_point(
         )
 
     if spec.casefold() == "random":
-        candidates = [
-            point
-            for point in DEEP_ZOOM_POINTS
-            if _deep_point_max_log10_zoom(point) + 1.0e-9 >= float(max_log_zoom)
-            and (
-                float(max_log_zoom) < 150.0
-                or point.screened_log10_zoom <= float(max_log_zoom) + 1.0e-9
-            )
-        ]
+        if formula == "mandelbrot":
+            candidates = [
+                point
+                for point in catalogue
+                if _deep_point_max_log10_zoom(point) + 1.0e-9 >= float(max_log_zoom)
+                and (
+                    float(max_log_zoom) < 150.0
+                    or point.screened_log10_zoom <= float(max_log_zoom) + 1.0e-9
+                )
+            ]
+        else:
+            # Alternate formula entries are creative starter views rather
+            # than claims of Mandelbrot's native e150 safety.  Let random
+            # selection choose among that formula's own views; the main
+            # alternate renderer still enforces its e300 exploratory limit.
+            candidates = list(catalogue)
         if not candidates:
             deepest = max(
-                (_deep_point_max_log10_zoom(point) for point in DEEP_ZOOM_POINTS),
+                (_deep_point_max_log10_zoom(point) for point in catalogue),
                 default=0.0,
             )
             raise ValueError(
@@ -1453,10 +1475,10 @@ def _resolve_render_point(
         selected = chooser.choice(candidates)
         return selected.x, selected.y, selected
 
-    preset = DEEP_ZOOM_POINTS_BY_SLUG.get(spec.casefold())
+    preset = points_by_slug.get(spec.casefold())
     if preset is not None:
         supported = _deep_point_max_log10_zoom(preset)
-        if supported + 1.0e-9 < float(max_log_zoom):
+        if formula == "mandelbrot" and supported + 1.0e-9 < float(max_log_zoom):
             raise ValueError(
                 f"point '{preset.slug}' is stored safely through about 10^{supported:.0f}, "
                 f"below requested 10^{float(max_log_zoom):.3f}"
@@ -1471,18 +1493,27 @@ def _resolve_render_point(
             None,
         )
     raise ValueError(
-        f"unknown point '{spec}'; use --list-points, 'random', or REAL,IMAG"
+        f"unknown {formula} point '{spec}'; use --list-points --formula {formula}, "
+        "'random', or REAL,IMAG"
     )
 
 
-def _print_deep_zoom_points() -> None:
-    print(f"Curated deep-zoom points ({len(DEEP_ZOOM_POINTS)}):")
-    for point in DEEP_ZOOM_POINTS:
+def _print_deep_zoom_points(formula: str = "mandelbrot") -> None:
+    formula = _formula_name(formula)
+    points = FORMULA_POINT_CATALOGUES[formula]
+    heading = "Curated deep-zoom points" if formula == "mandelbrot" else "Formula point presets"
+    print(f"{heading} for {formula} ({len(points)}):")
+    for point in points:
         supported = _deep_point_max_log10_zoom(point)
         derived = f", conjugate of {point.conjugate_of}" if point.conjugate_of else ""
+        julia = f", c={','.join(point.julia_c)}" if point.julia_c else ""
+        if formula == "mandelbrot":
+            depth = f"safe to ~1e{supported:.0f}"
+        else:
+            depth = f"recommended through ~1e{point.source_log10_zoom:.1f}"
         print(
-            f"  {point.slug:<27} safe to ~1e{supported:.0f}  "
-            f"{point.name} [{point.source_name}{derived}]"
+            f"  {point.slug:<31} {depth:<28} {point.name}"
+            f" [{point.source_name}{derived}{julia}]"
         )
 
 
@@ -5889,11 +5920,13 @@ def _build_manifest(
 ) -> dict[str, Any]:
     np = _require_numpy()
     point: dict[str, Any] = {
+        "formula": args.formula,
         "x": x_center,
         "y": y_center,
         "catalogue_slug": selected_point.slug if selected_point else None,
         "catalogue_name": selected_point.name if selected_point else None,
         "catalogue_source": selected_point.source_name if selected_point else None,
+        "preset_julia_c": list(selected_point.julia_c) if selected_point and selected_point.julia_c else None,
     }
     try:
         audio_size = args.audio.stat().st_size
@@ -6267,28 +6300,14 @@ def main() -> None:
     if max_log > 9800.0:
         raise SystemExit("max-zoom is beyond the native scaled-exponent range; use a zoom below 1e9800")
     if args.list_points:
-        _print_deep_zoom_points()
+        _print_deep_zoom_points(args.formula)
         return
     if args.formula != "mandelbrot":
-        if args.random_point or (
-            args.point is not None and args.point.strip().casefold() == "random"
-        ):
-            raise SystemExit(
-                "curated/random points are Mandelbrot parameter-plane points; "
-                "use an exact REAL,IMAG pair for an alternate formula"
-            )
-        if args.point is not None and "," not in args.point:
-            raise SystemExit(
-                "catalogue point slugs are Mandelbrot-specific; use --point REAL,IMAG "
-                "with an alternate formula"
-            )
         if max_log > 300.0:
             raise SystemExit(
                 "alternate formulas currently support Python high-precision views up to 1e300; "
                 "the native e150+BLA path is reserved for Mandelbrot"
             )
-        if args.point is None and args.x_center is None and args.y_center is None:
-            args.x_center, args.y_center = FORMULA_DEFAULT_CENTERS[args.formula]
     try:
         args.x_center, args.y_center, selected_point = _resolve_render_point(
             point_spec=args.point,
@@ -6297,9 +6316,20 @@ def main() -> None:
             y_center=args.y_center,
             random_seed=args.random_seed,
             max_log_zoom=max_log,
+            formula=args.formula,
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error
+    if (
+        args.formula == "julia"
+        and selected_point is not None
+        and selected_point.julia_c is not None
+        and args.julia_c == f"{DEFAULT_JULIA_C[0]},{DEFAULT_JULIA_C[1]}"
+    ):
+        # A Julia preset owns both its viewport point and its fixed c.  An
+        # explicitly different --julia-c remains authoritative.
+        args.julia_c = ",".join(selected_point.julia_c)
+        julia_constant = selected_point.julia_c
     if selected_point is not None:
         selection_kind = (
             "Random point"
@@ -6307,9 +6337,13 @@ def main() -> None:
             or (args.point is not None and args.point.casefold() == "random")
             else "Point"
         )
+        depth = (
+            f"catalogue depth ~1e{_deep_point_max_log10_zoom(selected_point):.0f}."
+            if args.formula == "mandelbrot"
+            else f"recommended depth ~1e{selected_point.source_log10_zoom:.1f}."
+        )
         print(
-            f"{selection_kind}: {selected_point.name} ({selected_point.slug}); "
-            f"catalogue depth ~1e{_deep_point_max_log10_zoom(selected_point):.0f}.",
+            f"{selection_kind}: {selected_point.name} ({selected_point.slug}); {depth}",
             flush=True,
         )
     center_error = (
