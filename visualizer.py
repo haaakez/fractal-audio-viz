@@ -45,9 +45,11 @@ import argparse
 import ctypes
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from collections import deque
+import datetime as _datetime
 import hashlib
 import heapq
 import importlib.util
+import json
 import math
 import os
 import queue
@@ -65,6 +67,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from deep_zoom_points import DEEP_ZOOM_POINTS, DEEP_ZOOM_POINTS_BY_SLUG, DeepZoomPoint
+from profiles import PROFILE_CHOICES, PROFILE_DEFAULTS, PROFILE_DESCRIPTIONS
 
 
 # Do this before importing numerical libraries.  It helps BLAS-backed NumPy
@@ -87,8 +90,41 @@ DEFAULT_Y_CENTER = (
 # change when native numerical behaviour changes.  This prevents a new
 # renderer from silently reusing an old, under-resolved .npy keyframe.
 KEYFRAME_CACHE_SCHEMA = "raw-field-series-v10-bla38-tiered"
-AUDIO_CACHE_SCHEMA = "audio-controls-v9-slow-flow-tail"
+AUDIO_CACHE_SCHEMA = "audio-controls-v10-onset-sync"
 ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v10-bla38-aligned-tiered"
+
+FORMULA_CHOICES = (
+    "mandelbrot",
+    "julia",
+    "burning-ship",
+    "tricorn",
+    "multibrot3",
+)
+FORMULA_IDS = {
+    "mandelbrot": 0,
+    "julia": 1,
+    "burning-ship": 2,
+    "tricorn": 3,
+    "multibrot3": 4,
+}
+FORMULA_DESCRIPTIONS = {
+    "mandelbrot": "classic z²+c parameter plane; the e150+ optimized path",
+    "julia": "fixed-c Julia set; use --julia-c to change the constant",
+    "burning-ship": "absolute-value z²+c, with the characteristic ship symmetry",
+    "tricorn": "conjugate z²+c (the Mandelbar)",
+    "multibrot3": "cubic z³+c parameter plane",
+}
+# Alternate formulas use the same viewport convention as Mandelbrot but need
+# useful defaults of their own.  The bundled deep catalogue remains
+# Mandelbrot-specific and is deliberately not silently reused for them.
+FORMULA_DEFAULT_CENTERS = {
+    "mandelbrot": (DEFAULT_X_CENTER, DEFAULT_Y_CENTER),
+    "julia": ("0.0", "0.0"),
+    "burning-ship": ("-0.5", "-0.5"),
+    "tricorn": ("0.0", "0.0"),
+    "multibrot3": ("0.0", "0.0"),
+}
+DEFAULT_JULIA_C = ("-0.8", "0.156")
 
 # A single reference is normally ideal, but at deep zoom a frame-sized tile
 # can contain a narrow boundary that is much farther from that reference than
@@ -462,6 +498,24 @@ def _get_native_library() -> Any:
                     ctypes.POINTER(NativeRenderOptions),
                 ]
                 library.render_mandelbrot_ex.restype = ctypes.c_int
+            if hasattr(library, "render_fractal_ex"):
+                library.render_fractal_ex.argtypes = [
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_char_p,
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.POINTER(NativeRenderOptions),
+                ]
+                library.render_fractal_ex.restype = ctypes.c_int
             if hasattr(library, "fractal_set_stats_enabled"):
                 library.fractal_set_stats_enabled.argtypes = [ctypes.c_int]
                 library.fractal_set_stats_enabled.restype = None
@@ -731,6 +785,9 @@ class AudioFeatures:
     # perfectly usable quiet vocal passage into a grey three-channel palette.
     gradient: Any
     frame_count: int
+    # Normalised onset strength at video-frame timestamps. Optional keeps the
+    # dataclass compatible with small external callers that construct it.
+    onset: Any = None
 
 
 def _require_numpy() -> Any:
@@ -804,6 +861,12 @@ def _atomic_save_features(path: Path, features: AudioFeatures) -> None:
                 phase=np.asarray(features.phase, dtype=np.float32),
                 pitch=np.asarray(features.pitch, dtype=np.float32),
                 gradient=np.asarray(features.gradient, dtype=np.float32),
+                onset=np.asarray(
+                    features.onset
+                    if features.onset is not None
+                    else np.zeros(features.frame_count, dtype=np.float32),
+                    dtype=np.float32,
+                ),
                 frame_count=np.asarray(features.frame_count, dtype=np.int64),
             )
             handle.flush()
@@ -926,6 +989,29 @@ def _frame_pitch(samples: Any, sample_rate: int, fps: int) -> Any:
     log_frequencies[~valid] = median_pitch
     normalized = (log_frequencies - math.log2(fmin)) / (math.log2(fmax) - math.log2(fmin))
     return np.clip(normalized, 0.0, 1.0).astype(np.float32)
+
+
+def _frame_onset(samples: Any, sample_rate: int, fps: int) -> Any:
+    """Return a normalised spectral-onset curve at the analysis hop rate."""
+
+    np = _require_numpy()
+    librosa = _require_librosa()
+    hop = max(1, round(sample_rate / fps))
+    try:
+        strength = librosa.onset.onset_strength(
+            y=samples,
+            sr=sample_rate,
+            hop_length=hop,
+            center=True,
+        )
+    except Exception:
+        # Onset sync is optional. A decoder or older librosa release should
+        # not prevent the ordinary loudness-driven animation from rendering.
+        return np.zeros(1, dtype=np.float32)
+    strength = np.asarray(strength, dtype=np.float32)
+    if strength.size == 0:
+        return np.zeros(1, dtype=np.float32)
+    return _normalise_minmax(strength)
 
 
 def _relative_pitch(values: Any) -> Any:
@@ -1116,6 +1202,7 @@ def analyse_audio(
                 phase = np.asarray(cached["phase"], dtype=np.float32)
                 pitch = np.asarray(cached["pitch"], dtype=np.float32)
                 gradient = np.asarray(cached["gradient"], dtype=np.float32)
+                onset = np.asarray(cached["onset"], dtype=np.float32)
                 frame_count = int(cached["frame_count"])
             if (
                 frame_count > 0
@@ -1124,15 +1211,21 @@ def analyse_audio(
                 and phase.shape == (frame_count,)
                 and pitch.shape == (frame_count,)
                 and gradient.shape == (frame_count,)
+                and onset.shape == (frame_count,)
             ):
                 print(f"Using cached audio controls {cache_path.name}.")
-                return AudioFeatures(vocal, instrumental, phase, pitch, gradient, frame_count)
+                return AudioFeatures(
+                    vocal, instrumental, phase, pitch, gradient, frame_count, onset
+                )
         except (OSError, KeyError, ValueError):
             pass
 
     source = _load_audio(audio_path, sample_rate)
     frame_count = max(1, math.ceil(len(source) * fps / sample_rate))
     full_mix_rms = _resample_features(_frame_rms(source, sample_rate, fps), frame_count, fps, sample_rate)
+    onset = _resample_features(
+        _frame_onset(source, sample_rate, fps), frame_count, fps, sample_rate
+    )
 
     with tempfile.TemporaryDirectory(prefix="fractal-demucs-") as temp:
         stems = None
@@ -1216,7 +1309,7 @@ def analyse_audio(
         + (1.0 - AURORA_MIN_FLOW_FRACTION) * flow_strength
     )
     phase = np.cumsum(phase_rate / max(float(fps), 1.0)).astype(np.float32)
-    features = AudioFeatures(vocal, instrumental, phase, pitch, gradient, frame_count)
+    features = AudioFeatures(vocal, instrumental, phase, pitch, gradient, frame_count, onset)
     if cache_path is not None:
         _atomic_save_features(cache_path, features)
     return features
@@ -1403,6 +1496,39 @@ def _decimal_precision(x_center: str, y_center: str, log10_zoom: float) -> int:
     )
 
 
+def _formula_name(value: str) -> str:
+    """Validate and normalise a formula name used by the render pipeline."""
+
+    name = str(value).strip().casefold()
+    aliases = {
+        "burningship": "burning-ship",
+        "burning_ship": "burning-ship",
+        "mandelbar": "tricorn",
+        "multibrot": "multibrot3",
+        "multibrot-3": "multibrot3",
+    }
+    name = aliases.get(name, name)
+    if name not in FORMULA_CHOICES:
+        raise ValueError(
+            f"unknown formula '{value}'; choose one of: {', '.join(FORMULA_CHOICES)}"
+        )
+    return name
+
+
+def _parse_coordinate_pair(value: str, label: str) -> tuple[str, str]:
+    parts = [part.strip() for part in str(value).split(",")]
+    if len(parts) != 2 or not all(parts):
+        raise ValueError(f"{label} must be REAL,IMAG, for example -0.8,0.156")
+    return (
+        _validate_center_text(parts[0], f"{label} real"),
+        _validate_center_text(parts[1], f"{label} imaginary"),
+    )
+
+
+def _formula_power(formula: str) -> int:
+    return 3 if _formula_name(formula) == "multibrot3" else 2
+
+
 def _zoom_log(value: Any) -> float:
     """Return log10(value) without converting huge decimal zooms to float."""
 
@@ -1438,10 +1564,13 @@ def _reference_orbit(
     y_center: str,
     max_iter: int,
     log10_zoom: float,
+    formula: str = "mandelbrot",
+    julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
 ) -> tuple[Any, Any]:
-    """Return a high-precision reference orbit as two NumPy arrays."""
+    """Return a high-precision reference orbit for an alternate formula."""
 
     np = _require_numpy()
+    formula = _formula_name(formula)
     precision = _decimal_precision(x_center, y_center, log10_zoom)
     real = np.empty(max_iter + 1, dtype=np.float64)
     imag = np.empty(max_iter + 1, dtype=np.float64)
@@ -1452,8 +1581,15 @@ def _reference_orbit(
         with mp.workdps(precision):
             cx = mp.mpf(x_center)
             cy = mp.mpf(y_center)
-            zr = mp.mpf("0")
-            zi = mp.mpf("0")
+            julia_cx = mp.mpf(julia_constant[0])
+            julia_cy = mp.mpf(julia_constant[1])
+            if formula == "julia":
+                zr, zi = cx, cy
+                parameter_real, parameter_imag = julia_cx, julia_cy
+            else:
+                zr = mp.mpf("0")
+                zi = mp.mpf("0")
+                parameter_real, parameter_imag = cx, cy
             float_limit = mp.mpf("1e300")
             for index in range(max_iter + 1):
                 if abs(zr) > float_limit or abs(zi) > float_limit:
@@ -1465,7 +1601,19 @@ def _reference_orbit(
                     break
                 real[index] = float(zr)
                 imag[index] = float(zi)
-                zr, zi = zr * zr - zi * zi + cx, 2 * zr * zi + cy
+                if formula == "burning-ship":
+                    next_real = abs(zr) * abs(zr) - abs(zi) * abs(zi) + parameter_real
+                    next_imag = 2 * abs(zr) * abs(zi) + parameter_imag
+                elif formula == "tricorn":
+                    next_real = zr * zr - zi * zi + parameter_real
+                    next_imag = -2 * zr * zi + parameter_imag
+                elif formula == "multibrot3":
+                    next_real = zr**3 - 3 * zr * zi * zi + parameter_real
+                    next_imag = 3 * zr * zr * zi - zi**3 + parameter_imag
+                else:
+                    next_real = zr * zr - zi * zi + parameter_real
+                    next_imag = 2 * zr * zi + parameter_imag
+                zr, zi = next_real, next_imag
     except ImportError:
         # Decimal is slower but keeps the centre precise without making mpmath
         # a hard dependency for ordinary-depth renders.
@@ -1473,8 +1621,15 @@ def _reference_orbit(
             context.prec = precision
             cx = Decimal(x_center)
             cy = Decimal(y_center)
-            zr = Decimal(0)
-            zi = Decimal(0)
+            julia_cx = Decimal(julia_constant[0])
+            julia_cy = Decimal(julia_constant[1])
+            if formula == "julia":
+                zr, zi = cx, cy
+                parameter_real, parameter_imag = julia_cx, julia_cy
+            else:
+                zr = Decimal(0)
+                zi = Decimal(0)
+                parameter_real, parameter_imag = cx, cy
             decimal_limit = Decimal("1e300")
             for index in range(max_iter + 1):
                 if abs(zr) > decimal_limit or abs(zi) > decimal_limit:
@@ -1483,7 +1638,19 @@ def _reference_orbit(
                     break
                 real[index] = float(zr)
                 imag[index] = float(zi)
-                zr, zi = zr * zr - zi * zi + cx, Decimal(2) * zr * zi + cy
+                if formula == "burning-ship":
+                    next_real = abs(zr) * abs(zr) - abs(zi) * abs(zi) + parameter_real
+                    next_imag = Decimal(2) * abs(zr) * abs(zi) + parameter_imag
+                elif formula == "tricorn":
+                    next_real = zr * zr - zi * zi + parameter_real
+                    next_imag = Decimal(-2) * zr * zi + parameter_imag
+                elif formula == "multibrot3":
+                    next_real = zr**3 - Decimal(3) * zr * zi * zi + parameter_real
+                    next_imag = Decimal(3) * zr * zr * zi - zi**3 + parameter_imag
+                else:
+                    next_real = zr * zr - zi * zi + parameter_real
+                    next_imag = Decimal(2) * zr * zi + parameter_imag
+                zr, zi = next_real, next_imag
 
     return real, imag
 
@@ -1500,10 +1667,19 @@ def _view_offsets(width: int, height: int, log10_zoom: float) -> tuple[Any, Any]
     return np.meshgrid(x, y)
 
 
-def _smooth_escape(iteration: int, magnitude_squared: Any) -> Any:
+def _smooth_escape(iteration: int, magnitude_squared: Any, power: int = 2) -> Any:
     np = _require_numpy()
-    magnitude = np.sqrt(np.maximum(magnitude_squared, 4.0000001))
-    return iteration - np.log(np.log(magnitude)) / math.log(2.0)
+    # Orbit arithmetic can overflow after a pixel has escaped, especially in
+    # the exploratory alternate-formula path. Keep the smooth colour finite
+    # instead of turning an otherwise valid frame into -inf/NaN values.
+    safe_squared = np.nan_to_num(
+        np.asarray(magnitude_squared),
+        nan=np.finfo(np.float64).max,
+        posinf=np.finfo(np.float64).max,
+        neginf=4.0000001,
+    )
+    magnitude = np.sqrt(np.maximum(safe_squared, 4.0000001))
+    return iteration - np.log(np.log(magnitude)) / math.log(float(power))
 
 
 def _render_direct(
@@ -1513,26 +1689,37 @@ def _render_direct(
     x_center: str,
     y_center: str,
     max_iter: int,
+    formula: str = "mandelbrot",
+    julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
 ) -> Any:
-    """Vectorised float64 renderer for the shallow part of the journey."""
+    """Vectorised float64 renderer for shallow Mandelbrot-family views."""
 
     np = _require_numpy()
+    formula = _formula_name(formula)
     x_offset, y_offset = _view_offsets(width, height, log10_zoom)
     # Float conversion is safe here because this path is used before a deep
     # zoom, where the pixel spacing is still much larger than float64 ulps.
     real = (float(x_center) + x_offset).ravel()
     imag = (float(y_center) + y_offset).ravel()
-    z_real = np.zeros_like(real)
-    z_imag = np.zeros_like(imag)
+    if formula == "julia":
+        z_real = real.copy()
+        z_imag = imag.copy()
+        parameter_real = np.full_like(real, float(julia_constant[0]))
+        parameter_imag = np.full_like(imag, float(julia_constant[1]))
+    else:
+        z_real = np.zeros_like(real)
+        z_imag = np.zeros_like(imag)
+        parameter_real = real
+        parameter_imag = imag
     escaped = np.zeros(real.shape, dtype=bool)
     smooth = np.full(real.shape, float(max_iter), dtype=np.float32)
 
-    # Analytic tests remove a large amount of work in the main cardioid and
-    # period-2 bulb, which is especially helpful for high-resolution masters.
-    q = (real - 0.25) ** 2 + imag**2
-    cardioid = q * (q + real - 0.25) <= 0.25 * imag**2
-    bulb = (real + 1.0) ** 2 + imag**2 <= 0.0625
-    escaped[cardioid | bulb] = True
+    # These tests are valid only in the Mandelbrot parameter plane.
+    if formula == "mandelbrot":
+        q = (real - 0.25) ** 2 + imag**2
+        cardioid = q * (q + real - 0.25) <= 0.25 * imag**2
+        bulb = (real + 1.0) ** 2 + imag**2 <= 0.0625
+        escaped[cardioid | bulb] = True
 
     for iteration in range(1, max_iter + 1):
         active_indices = np.flatnonzero(~escaped)
@@ -1540,13 +1727,47 @@ def _render_direct(
             break
         active_real = z_real[active_indices]
         active_imag = z_imag[active_indices]
-        next_real = active_real * active_real - active_imag * active_imag + real[active_indices]
-        next_imag = 2.0 * active_real * active_imag + imag[active_indices]
+        active_parameter_real = parameter_real[active_indices]
+        active_parameter_imag = parameter_imag[active_indices]
+        if formula == "burning-ship":
+            absolute_real = np.abs(active_real)
+            absolute_imag = np.abs(active_imag)
+            next_real = (
+                absolute_real * absolute_real
+                - absolute_imag * absolute_imag
+                + active_parameter_real
+            )
+            next_imag = 2.0 * absolute_real * absolute_imag + active_parameter_imag
+        elif formula == "tricorn":
+            next_real = (
+                active_real * active_real
+                - active_imag * active_imag
+                + active_parameter_real
+            )
+            next_imag = -2.0 * active_real * active_imag + active_parameter_imag
+        elif formula == "multibrot3":
+            next_real = (
+                active_real**3
+                - 3.0 * active_real * active_imag * active_imag
+                + active_parameter_real
+            )
+            next_imag = (
+                3.0 * active_real * active_real * active_imag
+                - active_imag**3
+                + active_parameter_imag
+            )
+        else:
+            next_real = (
+                active_real * active_real
+                - active_imag * active_imag
+                + active_parameter_real
+            )
+            next_imag = 2.0 * active_real * active_imag + active_parameter_imag
         magnitude_squared = next_real * next_real + next_imag * next_imag
-        newly_escaped = magnitude_squared > 4.0
+        newly_escaped = (magnitude_squared > 4.0) | ~np.isfinite(magnitude_squared)
         escaped_indices = active_indices[newly_escaped]
         smooth[escaped_indices] = _smooth_escape(
-            iteration, magnitude_squared[newly_escaped]
+            iteration, magnitude_squared[newly_escaped], _formula_power(formula)
         )
         z_real[active_indices] = next_real
         z_imag[active_indices] = next_imag
@@ -1562,10 +1783,24 @@ def _render_perturbed(
     x_center: str,
     y_center: str,
     max_iter: int,
+    formula: str = "mandelbrot",
+    julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
 ) -> Any:
     """Render using a high-precision centre orbit and pixel perturbations."""
 
     np = _require_numpy()
+    formula = _formula_name(formula)
+    if formula != "mandelbrot":
+        return _render_perturbed_alternate(
+            width,
+            height,
+            log10_zoom,
+            x_center,
+            y_center,
+            max_iter,
+            formula,
+            julia_constant,
+        )
     x_offset, y_offset = _view_offsets(width, height, log10_zoom)
     reference_real, reference_imag = _reference_orbit(
         x_center, y_center, max_iter, log10_zoom
@@ -1607,7 +1842,7 @@ def _render_perturbed(
         next_real = reference_real[iteration + 1] + next_delta_real
         next_imag = reference_imag[iteration + 1] + next_delta_imag
         magnitude_squared = next_real * next_real + next_imag * next_imag
-        newly_escaped = magnitude_squared > 4.0
+        newly_escaped = (magnitude_squared > 4.0) | ~np.isfinite(magnitude_squared)
         escaped_indices = active_indices[newly_escaped]
         smooth[escaped_indices] = _smooth_escape(
             iteration + 1, magnitude_squared[newly_escaped]
@@ -1622,6 +1857,143 @@ def _render_perturbed(
     return smooth.reshape((height, width))
 
 
+def _render_perturbed_alternate(
+    width: int,
+    height: int,
+    log10_zoom: float,
+    x_center: str,
+    y_center: str,
+    max_iter: int,
+    formula: str,
+    julia_constant: tuple[str, str],
+) -> Any:
+    """High-precision-reference perturbation fallback for alternate formulas.
+
+    The validated native BLA hierarchy is specific to the Mandelbrot
+    parameter plane. Alternate formulas still benefit from a high-precision
+    reference orbit here, which makes Julia/Burning Ship/Tricorn views useful
+    well past ordinary float-centre zooms without pretending they use the
+    Mandelbrot BLA proof path.
+    """
+
+    np = _require_numpy()
+    formula = _formula_name(formula)
+    x_offset, y_offset = _view_offsets(width, height, log10_zoom)
+    reference_real, reference_imag = _reference_orbit(
+        x_center,
+        y_center,
+        max_iter,
+        log10_zoom,
+        formula,
+        julia_constant,
+    )
+    offset = x_offset.ravel() + 1j * y_offset.ravel()
+    reference = np.full(reference_real.shape, np.inf + 0j, dtype=np.complex128)
+    finite_reference = np.isfinite(reference_real) & np.isfinite(reference_imag)
+    reference[finite_reference] = (
+        reference_real[finite_reference] + 1j * reference_imag[finite_reference]
+    )
+    delta = offset.copy() if formula == "julia" else np.zeros(width * height, dtype=np.complex128)
+    escaped = np.zeros(width * height, dtype=bool)
+    smooth = np.full(width * height, float(max_iter), dtype=np.float32)
+    power = _formula_power(formula)
+    if formula == "julia":
+        parameter = complex(float(julia_constant[0]), float(julia_constant[1]))
+    else:
+        parameter = complex(float(x_center), float(y_center))
+
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        for iteration in range(max_iter):
+            active_indices = np.flatnonzero(~escaped)
+            if active_indices.size == 0:
+                break
+            ref = reference[iteration]
+            next_ref = reference[iteration + 1]
+            if not np.isfinite(ref) or not np.isfinite(next_ref):
+                smooth[active_indices] = iteration + 1
+                escaped[active_indices] = True
+                break
+            active_delta = delta[active_indices]
+            # The reference orbit is calculated with mpmath, then stored as
+            # float64 for the vector loop.  Add the rounding residual between
+            # the float reference step and the stored high-precision step;
+            # otherwise a common ~1e-16 orbit error hides e150-scale pixel
+            # differences long before the perturbation has a chance to grow.
+            if formula == "julia":
+                reference_step = ref * ref + parameter
+            elif formula == "burning-ship":
+                reference_abs = abs(float(ref.real)) + 1j * abs(float(ref.imag))
+                reference_step = reference_abs * reference_abs + parameter
+            elif formula == "tricorn":
+                reference_step = np.conjugate(ref) * np.conjugate(ref) + parameter
+            else:  # multibrot3
+                reference_step = ref * ref * ref + parameter
+            reference_residual = reference_step - next_ref
+            if formula == "julia":
+                next_delta = (
+                    2.0 * ref * active_delta
+                    + active_delta * active_delta
+                    + reference_residual
+                )
+            elif formula == "tricorn":
+                conjugate_delta = np.conjugate(active_delta)
+                next_delta = (
+                    2.0 * np.conjugate(ref) * conjugate_delta
+                    + conjugate_delta * conjugate_delta
+                    + reference_residual
+                    + offset[active_indices]
+                )
+            elif formula == "burning-ship":
+                reference_abs = abs(float(ref.real)) + 1j * abs(float(ref.imag))
+                sign_real = 1.0 if ref.real >= 0.0 else -1.0
+                sign_imag = 1.0 if ref.imag >= 0.0 else -1.0
+                signed_delta = (
+                    sign_real * active_delta.real
+                    + 1j * sign_imag * active_delta.imag
+                )
+                next_delta = (
+                    2.0 * reference_abs * signed_delta
+                    + signed_delta * signed_delta
+                    + reference_residual
+                    + offset[active_indices]
+                )
+                # The absolute-value map is piecewise analytic. Recompute
+                # pixels crossing an axis exactly for this step instead of
+                # carrying a stale sign into subsequent perturbations.
+                actual = ref + active_delta
+                crossing = (
+                    ((ref.real >= 0.0) & (actual.real < 0.0))
+                    | ((ref.real < 0.0) & (actual.real >= 0.0))
+                    | ((ref.imag >= 0.0) & (actual.imag < 0.0))
+                    | ((ref.imag < 0.0) & (actual.imag >= 0.0))
+                )
+                if np.any(crossing):
+                    absolute_actual = np.abs(actual.real[crossing]) + 1j * np.abs(actual.imag[crossing])
+                    exact_next = absolute_actual * absolute_actual + offset[active_indices][crossing]
+                    next_delta[crossing] = exact_next - next_ref
+            else:  # multibrot3
+                next_delta = (
+                    3.0 * ref * ref * active_delta
+                    + 3.0 * ref * active_delta * active_delta
+                    + active_delta * active_delta * active_delta
+                    + reference_residual
+                    + offset[active_indices]
+                )
+            next_value = next_ref + next_delta
+            magnitude_squared = next_value.real * next_value.real + next_value.imag * next_value.imag
+            newly_escaped = (magnitude_squared > 4.0) | ~np.isfinite(magnitude_squared)
+            escaped_indices = active_indices[newly_escaped]
+            smooth[escaped_indices] = _smooth_escape(
+                iteration + 1,
+                magnitude_squared[newly_escaped],
+                power,
+            )
+            escaped[escaped_indices] = True
+            delta[active_indices] = next_delta
+
+    return smooth.reshape((height, width))
+
+
 def _render_native(
     width: int,
     height: int,
@@ -1631,8 +2003,11 @@ def _render_native(
     max_iter: int,
     native_threads: int,
     render_options: Optional[NativeRenderOptions] = None,
+    formula: str = "mandelbrot",
+    julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
 ) -> Any:
     np = _require_numpy()
+    formula = _formula_name(formula)
     library = _get_native_library()
     if library is None:
         raise RuntimeError("native renderer is unavailable; run `make` inside `nix-shell`")
@@ -1645,8 +2020,26 @@ def _render_native(
     )
     use_perturbation = int(log10_zoom >= 12.0)
     options = render_options or NativeRenderOptions()
+    formula_renderer = getattr(library, "render_fractal_ex", None)
     ex_renderer = getattr(library, "render_mandelbrot_ex", None)
-    if ex_renderer is not None:
+    if formula_renderer is not None:
+        status = formula_renderer(
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            width,
+            height,
+            zoom_text,
+            x_center.encode("ascii"),
+            y_center.encode("ascii"),
+            max_iter,
+            precision_bits,
+            int(log10_zoom >= 12.0),
+            native_threads,
+            FORMULA_IDS[formula],
+            float(julia_constant[0]),
+            float(julia_constant[1]),
+            ctypes.byref(options),
+        )
+    elif ex_renderer is not None and formula == "mandelbrot":
         status = ex_renderer(
             output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             width,
@@ -1660,7 +2053,7 @@ def _render_native(
             native_threads,
             ctypes.byref(options),
         )
-    else:
+    elif formula == "mandelbrot":
         status = library.render_mandelbrot(
             output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             width,
@@ -1672,6 +2065,10 @@ def _render_native(
             precision_bits,
             use_perturbation,
             native_threads,
+        )
+    else:
+        raise RuntimeError(
+            "the native library does not expose render_fractal_ex; rebuild with make"
         )
     if status != 0:
         message = library.fractal_last_error() or b"unknown native renderer error"
@@ -2020,10 +2417,13 @@ def render_fractal(
     series_order: int = 3,
     series_block: int = 256,
     render_options: Optional[NativeRenderOptions] = None,
+    formula: str = "mandelbrot",
+    julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
 ) -> Any:
     """Render with the C-ABI backend, falling back to the Python backend."""
 
     global _native_notice_printed
+    formula = _formula_name(formula)
     if renderer not in {"auto", "native", "python"}:
         raise ValueError(f"unknown renderer: {renderer}")
     if renderer != "python":
@@ -2032,7 +2432,7 @@ def render_fractal(
             # spacing is comfortably above the decimal precision of the
             # selected centre.  Use scaled perturbation for genuinely deep
             # frames, where adding offsets directly would lose detail.
-            if native_reference is not None and log10_zoom >= 12.0:
+            if formula == "mandelbrot" and native_reference is not None and log10_zoom >= 12.0:
                 return _render_native_reference(
                     width,
                     height,
@@ -2043,6 +2443,11 @@ def render_fractal(
                     series_order,
                     series_block,
                     render_options,
+                )
+            if formula != "mandelbrot" and log10_zoom >= 12.0:
+                raise RuntimeError(
+                    f"native e150 acceleration is currently Mandelbrot-only; "
+                    f"{formula} uses the high-precision Python fallback"
                 )
             if log10_zoom >= 12.0 and native_reference is None:
                 raise RuntimeError("deep native rendering needs a prepared reference")
@@ -2055,9 +2460,11 @@ def render_fractal(
                 max_iter,
                 native_threads,
                 render_options,
+                formula,
+                julia_constant,
             )
         except RuntimeError as error:
-            if renderer == "native" or log10_zoom >= 12.0:
+            if renderer == "native" or (log10_zoom >= 12.0 and formula == "mandelbrot"):
                 raise
             if not _native_notice_printed:
                 print(f"Native renderer unavailable ({error}); using shallow Python fallback.")
@@ -2070,8 +2477,14 @@ def render_fractal(
     # float64 centre starts to lose visible detail.  Perturbation keeps the
     # centre separate from the small per-pixel offsets.
     if log10_zoom < 7.0:
-        return _render_direct(width, height, log10_zoom, x_center, y_center, max_iter)
-    return _render_perturbed(width, height, log10_zoom, x_center, y_center, max_iter)
+        return _render_direct(
+            width, height, log10_zoom, x_center, y_center, max_iter,
+            formula, julia_constant,
+        )
+    return _render_perturbed(
+        width, height, log10_zoom, x_center, y_center, max_iter,
+        formula, julia_constant,
+    )
 
 
 def max_iterations(
@@ -2092,6 +2505,8 @@ def _zoom_plan(
     max_zoom: Any,
     punch: float = 3.0,
     quiet_speed: float = -0.04,
+    onset: Any = None,
+    beat_strength: float = 0.0,
 ) -> Any:
     """Make loud instrumental moments punch the logarithmic zoom.
 
@@ -2117,6 +2532,14 @@ def _zoom_plan(
     # logarithmic zoom space, not a zoom position, so it makes quiet passages
     # pull back a little while strong beats still consume most of the travel.
     drive = float(quiet_speed) + (1.0 + punch) * loudness
+    if onset is not None and float(beat_strength) != 0.0:
+        beat_curve = np.asarray(onset, dtype=np.float64)
+        if beat_curve.shape != envelope.shape:
+            raise ValueError("onset and instrumental controls must have the same frame count")
+        beat_curve = np.clip(np.nan_to_num(beat_curve, nan=0.0), 0.0, 1.0)
+        # A slightly sharper response keeps the transient itself visible
+        # without making a sustained chorus drive the camera indefinitely.
+        drive = drive + float(beat_strength) * beat_curve ** 1.35
     cumulative = np.concatenate(([0.0], np.cumsum(drive[:-1])))
     # The last sample has no following frame over which to advance. Normalize
     # by the signed travelled intervals so the final video frame reaches
@@ -3236,6 +3659,8 @@ def _atlas_tile_field(
     allow_recovery: bool = False,
     durable_cache: bool = False,
     cache_evictor: Optional["_CacheEvictor"] = None,
+    formula: str = "mandelbrot",
+    julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
 ) -> Any:
     """Load or render one reusable tile in the fixed zoom atlas."""
 
@@ -3337,6 +3762,8 @@ def _atlas_tile_field(
                 series_order,
                 series_block,
                 NativeRenderOptions(backend=native_backend),
+                formula,
+                julia_constant,
             )
     finally:
         watchdog_stop.set()
@@ -3432,6 +3859,7 @@ def _atlas_colour_frame(
     resample: str,
     palette_name: str,
     pitch: float,
+    palette_file: Optional[Path] = None,
 ) -> Any:
     """Compose a frame from a parent tile and its central child tile.
 
@@ -3447,6 +3875,7 @@ def _atlas_colour_frame(
         and hasattr(native_library, "fractal_atlas_colourise")
         and resample == "bilinear"
         and palette_name == "aurora"
+        and palette_file is None
     ):
         return _atlas_colourise_native(
             parent,
@@ -3486,6 +3915,7 @@ def _atlas_colour_frame(
             native_threads,
             palette_name,
             pitch,
+            palette_file,
         )
     child_fraction = min(float(child_fraction), 1.0)
     if child_fraction >= 0.999999:
@@ -3506,6 +3936,7 @@ def _atlas_colour_frame(
             native_threads,
             palette_name,
             pitch,
+            palette_file,
         )
 
     child_width = max(1, int(round(output_width * child_fraction)))
@@ -3535,6 +3966,7 @@ def _atlas_colour_frame(
             native_threads,
             palette_name,
             pitch,
+            palette_file,
         )
 
     yy, xx = np.ogrid[:child_height, :child_width]
@@ -3568,6 +4000,7 @@ def _atlas_colour_frame(
         native_threads,
         palette_name,
         pitch,
+        palette_file,
     )
 
 
@@ -3603,7 +4036,12 @@ def _render_video_atlas(
     cache_limit_mb: float,
     durable_cache: bool,
     cache_identity: str,
-) -> None:
+    formula: str = "mandelbrot",
+    julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
+    palette_file: Optional[Path] = None,
+    glow: float = 0.0,
+    motion_blur: float = 0.0,
+) -> dict[str, Any]:
     """Render a song through a fixed nested tile atlas.
 
     The old renderer tied source fields to audio-dependent chunk boundaries.
@@ -3693,6 +4131,8 @@ def _render_video_atlas(
             allow_recovery=allow_recovery,
             durable_cache=durable_cache,
             cache_evictor=cache_evictor,
+            formula=formula,
+            julia_constant=julia_constant,
         )
         return field
 
@@ -3768,6 +4208,7 @@ def _render_video_atlas(
     last_backpressure_notice = 0.0
     frame_seconds = 0.0
     encoder_seconds = 0.0
+    previous_rgb = None
     render_started = time.perf_counter()
     active_level = None
     try:
@@ -3876,7 +4317,10 @@ def _render_video_atlas(
                 resample,
                 palette,
                 pitch,
+                palette_file,
             )
+            rgb = _apply_frame_effects(rgb, glow, motion_blur, previous_rgb)
+            previous_rgb = rgb
             enqueue_frame(rgb)
             frame_seconds += time.perf_counter() - frame_started
             if frame_index % max(1, fps * 5) == 0:
@@ -3904,6 +4348,12 @@ def _render_video_atlas(
             f"total {elapsed:.2f}s.",
             flush=True,
         )
+        return {
+            "keyframe_seconds": float(tile_seconds),
+            "frame_seconds": float(frame_seconds),
+            "encoder_seconds": float(encoder_seconds),
+            "total_seconds": float(elapsed),
+        }
     except BrokenPipeError as exc:
         if process is not None:
             process.kill()
@@ -4155,6 +4605,61 @@ def _custom_palette(name: str, size: int = 4096) -> Any:
     return np.asarray(np.rint(output), dtype=np.uint8)
 
 
+def _parse_palette_colour(value: str) -> tuple[int, int, int]:
+    text = value.strip()
+    if text.startswith("#"):
+        text = text[1:]
+    if len(text) == 3 and all(character in "0123456789abcdefABCDEF" for character in text):
+        text = "".join(character * 2 for character in text)
+    if len(text) == 6 and all(character in "0123456789abcdefABCDEF" for character in text):
+        return tuple(int(text[index:index + 2], 16) for index in (0, 2, 4))
+    components = [component for component in text.replace(",", " ").split() if component]
+    if len(components) != 3:
+        raise ValueError(f"invalid palette colour '{value}'")
+    channels = tuple(int(component) for component in components)
+    if not all(0 <= channel <= 255 for channel in channels):
+        raise ValueError(f"palette RGB values must be between 0 and 255: '{value}'")
+    return channels  # type: ignore[return-value]
+
+
+@lru_cache(maxsize=16)
+def _palette_file_palette(path_text: str, mtime_ns: int, size: int = 4096) -> Any:
+    """Load ``#rrggbb`` or ``r g b`` stops and interpolate them once."""
+
+    np = _require_numpy()
+    path = Path(path_text)
+    stops = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#") and len(line) not in {4, 7}:
+            continue
+        if not line.startswith("#"):
+            line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        stops.append(_parse_palette_colour(line))
+    if len(stops) < 2:
+        raise ValueError(f"palette file needs at least two colour stops: {path}")
+    anchors = np.linspace(0.0, 1.0, len(stops), dtype=np.float32)
+    positions = np.linspace(0.0, 1.0, size, dtype=np.float32)
+    output = np.empty((size, 3), dtype=np.float32)
+    for channel in range(3):
+        output[:, channel] = np.interp(
+            positions,
+            anchors,
+            [stop[channel] for stop in stops],
+        )
+    return np.asarray(np.rint(output), dtype=np.uint8)
+
+
+def _palette_from_file(path: Path, size: int = 4096) -> Any:
+    path = Path(path).expanduser().resolve()
+    stat = path.stat()
+    return _palette_file_palette(str(path), int(stat.st_mtime_ns), int(size))
+
+
 def _colourise_custom(
     field: Any,
     max_iter: int,
@@ -4163,9 +4668,14 @@ def _colourise_custom(
     instrumental: float,
     palette_name: str,
     pitch: float = 0.5,
+    palette_file: Optional[Path] = None,
 ) -> Any:
     np = _require_numpy()
-    palette = _custom_palette(palette_name)
+    palette = (
+        _palette_from_file(palette_file)
+        if palette_file is not None
+        else _custom_palette(palette_name)
+    )
     inside = field >= max_iter - 0.5
     position = np.asarray(field, dtype=np.float32) / max(float(max_iter), 1.0)
     position = np.mod(position + phase * 0.006 + vocal * 0.08 + float(pitch) * 0.12, 1.0)
@@ -4407,6 +4917,8 @@ def _keyframe_field(
     render_options: Optional[NativeRenderOptions] = None,
     durable_cache: bool = False,
     cache_evictor: Optional[_CacheEvictor] = None,
+    formula: str = "mandelbrot",
+    julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
 ) -> Any:
     """Load or render one absolute-zoom field, with an atomic cache."""
 
@@ -4452,6 +4964,8 @@ def _keyframe_field(
         series_order,
         series_block,
         render_options,
+        formula,
+        julia_constant,
     )
     if cache_path is not None:
         _atomic_save_field(cache_path, field, durable=durable_cache)
@@ -4482,9 +4996,21 @@ def _colourise_view(
     native_threads: int,
     palette_name: str,
     pitch: float,
+    palette_file: Optional[Path] = None,
 ) -> Any:
     """Colour an already-resampled scalar iteration field."""
 
+    if palette_file is not None:
+        return _colourise_custom(
+            view,
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            palette_name,
+            pitch,
+            palette_file,
+        )
     if native_library is not None and palette_name == "aurora":
         return _colourise_native(
             view,
@@ -4515,8 +5041,14 @@ def _colour_frame(
     resample: str,
     palette_name: str,
     pitch: float = 0.5,
+    palette_file: Optional[Path] = None,
 ) -> Any:
-    if native_library is not None and resample == "bilinear" and palette_name == "aurora":
+    if (
+        palette_file is None
+        and native_library is not None
+        and resample == "bilinear"
+        and palette_name == "aurora"
+    ):
         return _crop_and_colourise_native(
             field,
             output_width,
@@ -4541,7 +5073,47 @@ def _colour_frame(
         native_threads,
         palette_name,
         pitch,
+        palette_file,
     )
+
+
+def _apply_frame_effects(
+    rgb: Any,
+    glow: float = 0.0,
+    motion_blur: float = 0.0,
+    previous: Any = None,
+) -> Any:
+    """Apply optional compositor effects after the scalar field is coloured."""
+
+    np = _require_numpy()
+    output = np.asarray(rgb, dtype=np.uint8)
+    if glow > 0.0:
+        try:
+            from PIL import Image, ImageFilter
+
+            height, width = output.shape[:2]
+            small_size = (max(1, width // 8), max(1, height // 8))
+            bloom = Image.fromarray(output, mode="RGB").resize(
+                small_size, Image.Resampling.BILINEAR
+            ).filter(ImageFilter.GaussianBlur(radius=2.0))
+            bloom = bloom.resize((width, height), Image.Resampling.BILINEAR)
+            bloom_array = np.asarray(bloom, dtype=np.float32)
+            output = np.clip(
+                output.astype(np.float32) + bloom_array * (0.65 * float(glow)),
+                0.0,
+                255.0,
+            ).astype(np.uint8)
+        except ImportError as exc:  # pragma: no cover - dependency error
+            raise RuntimeError("Pillow is required for --glow") from exc
+    if previous is not None and motion_blur > 0.0:
+        output = np.asarray(
+            np.rint(
+                output.astype(np.float32) * (1.0 - float(motion_blur))
+                + np.asarray(previous, dtype=np.float32) * float(motion_blur)
+            ),
+            dtype=np.uint8,
+        )
+    return np.ascontiguousarray(output, dtype=np.uint8)
 
 
 def render_video(
@@ -4576,8 +5148,14 @@ def render_video(
     keyframe_mode: str = "atlas",
     durable_cache: bool = False,
     native_backend: str = "auto",
-) -> None:
+    formula: str = "mandelbrot",
+    julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
+    palette_file: Optional[Path] = None,
+    glow: float = 0.0,
+    motion_blur: float = 0.0,
+) -> dict[str, Any]:
     np = _require_numpy()
+    formula = _formula_name(formula)
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required to encode the video, but it was not found on PATH")
     selected_codec, selected_preset, rate_control = _select_video_encoder(
@@ -4602,6 +5180,22 @@ def render_video(
             video_preset,
             crf,
         )
+
+    if formula != "mandelbrot" and native_backend == "auto":
+        native_backend = "scalar"
+    if formula != "mandelbrot" and native_backend in {"avx2", "opencl"}:
+        raise RuntimeError(
+            f"--native-backend {native_backend} is only available for Mandelbrot; "
+            "use --native-backend scalar for alternate formulas"
+        )
+    if palette_file is not None:
+        palette_file = Path(palette_file)
+        if not palette_file.is_file():
+            raise RuntimeError(f"palette file not found: {palette_file}")
+    if not math.isfinite(float(glow)) or not 0.0 <= float(glow) <= 1.0:
+        raise ValueError("glow must be between 0 and 1")
+    if not math.isfinite(float(motion_blur)) or not 0.0 <= float(motion_blur) < 1.0:
+        raise ValueError("motion-blur must be between 0 (off) and 1")
 
     if keyframe_mode not in {"atlas", "legacy"}:
         raise ValueError(f"unknown keyframe mode: {keyframe_mode}")
@@ -4716,7 +5310,20 @@ def render_video(
                 raise RuntimeError(
                     "--native-backend opencl currently supports only direct zooms below 1e6"
                 )
-        if native_library is not None and float(np.max(zooms)) >= 12.0:
+        if formula != "mandelbrot" and max_log_zoom >= 12.0:
+            # The native reference/BLA context is mathematically specific to
+            # z²+c in the Mandelbrot parameter plane. Alternate formulas use
+            # the high-precision Python perturbation fallback instead.
+            if renderer == "native":
+                raise RuntimeError(
+                    f"--renderer native does not support e150 {formula} yet; "
+                    "use --renderer auto or python"
+                )
+            active_renderer = "python"
+            native_library = None
+            native_references.clear()
+            native_backend_id = 0
+        if formula == "mandelbrot" and native_library is not None and float(np.max(zooms)) >= 12.0:
             reference_iter = max(
                 max_iterations(
                     float(np.max(zooms)),
@@ -4861,6 +5468,10 @@ def render_video(
                 native_library = None
 
     cache_identity = _field_renderer_cache_identity(active_renderer)
+    cache_identity = (
+        f"{cache_identity}-formula-{formula}"
+        + (f"-julia-{julia_constant[0]}-{julia_constant[1]}" if formula == "julia" else "")
+    )
     print(
         f"Keyframe source: {render_width}x{render_height} ({quality}); "
         f"planned keyframes: "
@@ -4874,8 +5485,9 @@ def render_video(
     )
 
     if keyframe_mode == "atlas":
+        atlas_result = None
         try:
-            _render_video_atlas(
+            atlas_result = _render_video_atlas(
                 command=command,
                 temporary_output=temporary_output,
                 output_path=output_path,
@@ -4905,7 +5517,12 @@ def render_video(
                 cache_dir=cache_dir,
                 cache_limit_mb=cache_limit_mb,
                 durable_cache=durable_cache,
-                cache_identity=_field_renderer_cache_identity(active_renderer),
+                cache_identity=cache_identity,
+                formula=formula,
+                julia_constant=julia_constant,
+                palette_file=palette_file,
+                glow=glow,
+                motion_blur=motion_blur,
             )
         finally:
             if native_library is not None:
@@ -4916,13 +5533,23 @@ def render_video(
                     temporary_output.unlink()
                 except OSError:
                     pass
-        return
+        return {
+            **(atlas_result or {}),
+            "codec": selected_codec,
+            "preset": selected_preset,
+            "renderer": active_renderer,
+            "formula": formula,
+            "source_width": render_width,
+            "source_height": render_height,
+            "frames": total_frames,
+        }
 
     process = None
     render_started = time.perf_counter()
     keyframe_seconds = 0.0
     frame_seconds = 0.0
     cache_evictor = _CacheEvictor(cache_dir, cache_limit_mb)
+    previous_rgb = None
 
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE)
@@ -4970,6 +5597,8 @@ def render_video(
                     render_options=native_render_options,
                     durable_cache=durable_cache,
                     cache_evictor=cache_evictor,
+                    formula=formula,
+                    julia_constant=julia_constant,
                 )
                 field_source_zoom = chunk_log_zoom
                 field_max_zoom = chunk_max_zoom
@@ -5025,6 +5654,8 @@ def render_video(
                         render_options=native_render_options,
                         durable_cache=durable_cache,
                         cache_evictor=cache_evictor,
+                        formula=formula,
+                        julia_constant=julia_constant,
                     )
                     _prune_cache(cache_dir, cache_limit_mb, cache_evictor)
                 else:
@@ -5054,6 +5685,7 @@ def render_video(
                     resample,
                     palette,
                     pitch,
+                    palette_file,
                 )
                 if next_field is not None and next_log_zoom is not None and next_iter is not None:
                     progress = (frame_index - chunk_start) / max(
@@ -5085,6 +5717,7 @@ def render_video(
                             resample,
                             palette,
                             pitch,
+                            palette_file,
                         )
                         rgb = np.asarray(
                             np.rint(
@@ -5093,6 +5726,8 @@ def render_video(
                             ),
                             dtype=np.uint8,
                         )
+                rgb = _apply_frame_effects(rgb, glow, motion_blur, previous_rgb)
+                previous_rgb = rgb
                 assert process.stdin is not None
                 # NumPy exposes a contiguous buffer here; writing it directly
                 # avoids allocating one 0.75 MB bytes object per 500x500 frame.
@@ -5129,6 +5764,12 @@ def render_video(
             f"{frame_seconds:.2f}s, total {elapsed:.2f}s.",
             flush=True,
         )
+        result = {
+            "keyframe_seconds": float(keyframe_seconds),
+            "frame_seconds": float(frame_seconds),
+            "encoder_seconds": 0.0,
+            "total_seconds": float(elapsed),
+        }
     except BrokenPipeError as exc:
         assert process is not None
         process.kill()
@@ -5149,12 +5790,163 @@ def render_video(
                 temporary_output.unlink()
             except OSError:
                 pass
+    return {
+        **result,
+        "codec": selected_codec,
+        "preset": selected_preset,
+        "renderer": active_renderer,
+        "formula": formula,
+        "source_width": render_width,
+        "source_height": render_height,
+        "frames": total_frames,
+    }
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _print_profiles() -> None:
+    print("Built-in profiles:")
+    for name in PROFILE_CHOICES:
+        print(f"  {name:<12} {PROFILE_DESCRIPTIONS[name]}")
+
+
+def _print_formulas() -> None:
+    print("Supported formulas:")
+    for name in FORMULA_CHOICES:
+        print(f"  {name:<14} {FORMULA_DESCRIPTIONS[name]}")
+
+
+def _manifest_path(
+    output_path: Path,
+    requested: Optional[Path],
+    disabled: bool,
+) -> Optional[Path]:
+    if disabled:
+        return None
+    if requested is not None:
+        return requested
+    return output_path.with_suffix(".json")
+
+
+def _git_revision() -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    revision = result.stdout.strip()
+    return revision or None
+
+
+def _json_safe_arguments(args: argparse.Namespace) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for key, value in vars(args).items():
+        output[key] = str(value) if isinstance(value, Path) else value
+    return output
+
+
+def _write_manifest(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write a human-readable sidecar without partial JSON."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def _build_manifest(
+    args: argparse.Namespace,
+    x_center: str,
+    y_center: str,
+    selected_point: Optional[DeepZoomPoint],
+    max_log_zoom: float,
+    features: AudioFeatures,
+    zooms: Any,
+) -> dict[str, Any]:
+    np = _require_numpy()
+    point: dict[str, Any] = {
+        "x": x_center,
+        "y": y_center,
+        "catalogue_slug": selected_point.slug if selected_point else None,
+        "catalogue_name": selected_point.name if selected_point else None,
+        "catalogue_source": selected_point.source_name if selected_point else None,
+    }
+    try:
+        audio_size = args.audio.stat().st_size
+    except OSError:
+        audio_size = None
+    return {
+        "schema": "fractal-audio-viz.render-manifest.v1",
+        "status": "running",
+        "started_at": _datetime.datetime.now(_datetime.timezone.utc).isoformat(),
+        "command": list(sys.argv),
+        "git_revision": _git_revision(),
+        "profile": args.profile,
+        "formula": args.formula,
+        "julia_c": args.julia_c,
+        "audio": {"path": str(args.audio), "bytes": audio_size},
+        "output": str(args.output),
+        "point": point,
+        "zoom": {
+            "base": str(args.base_zoom),
+            "max": str(args.max_zoom),
+            "max_log10": float(max_log_zoom),
+            "planned_min_log10": float(np.min(zooms)),
+            "planned_max_log10": float(np.max(zooms)),
+        },
+        "frames": {
+            "count": int(features.frame_count),
+            "fps": int(args.fps),
+            "duration_seconds": float(features.frame_count / max(args.fps, 1)),
+        },
+        "audio_controls": {
+            "separation": args.separation,
+            "beat_strength": float(args.beat_strength),
+            "onset_sync": bool(args.beat_strength != 0.0),
+        },
+        "settings": _json_safe_arguments(args),
+    }
+
+
+def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("audio", nargs="?", default=DEFAULT_AUDIO, type=Path)
     parser.add_argument("--output", type=Path, default=Path(DEFAULT_OUTPUT))
+    parser.add_argument(
+        "--profile",
+        choices=PROFILE_CHOICES,
+        default=None,
+        help="start from a named preset; explicit options still override it",
+    )
+    parser.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="list built-in profiles and exit",
+    )
     parser.add_argument("--width", type=int, default=1920, help="output width in pixels")
     parser.add_argument("--height", type=int, default=1080, help="output height in pixels")
     parser.add_argument("--fps", type=int, default=30, help="output frames per second")
@@ -5226,6 +6018,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="list the curated deep-zoom catalogue and exit",
     )
     parser.add_argument(
+        "--list-formulas",
+        action="store_true",
+        help="list Mandelbrot-family formulas and exit",
+    )
+    parser.add_argument(
+        "--formula",
+        choices=FORMULA_CHOICES,
+        default="mandelbrot",
+        help="fractal family; alternate formulas use the direct/high-precision Python path",
+    )
+    parser.add_argument(
+        "--julia-c",
+        default=f"{DEFAULT_JULIA_C[0]},{DEFAULT_JULIA_C[1]}",
+        help="Julia constant as REAL,IMAG when --formula julia is selected",
+    )
+    parser.add_argument(
         "--x-center",
         default=None,
         help="exact custom real coordinate; requires --y-center",
@@ -5281,6 +6089,12 @@ def build_parser() -> argparse.ArgumentParser:
             "quiet-time logarithmic zoom velocity; the slightly negative default "
             "lets the camera pull back between loud punches"
         ),
+    )
+    parser.add_argument(
+        "--beat-strength",
+        type=float,
+        default=0.0,
+        help="additional onset/beat contribution to zoom speed; 0 keeps loudness-only motion",
     )
     parser.add_argument(
         "--attack",
@@ -5363,6 +6177,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="colour palette; aurora uses the fused native colour path",
     )
     parser.add_argument(
+        "--palette-file",
+        type=Path,
+        default=None,
+        help="optional text file of colour stops (#rrggbb or r g b), interpolated per frame",
+    )
+    parser.add_argument(
+        "--glow",
+        type=float,
+        default=0.0,
+        help="subtle low-resolution bloom amount after colourisation (0-1)",
+    )
+    parser.add_argument(
+        "--motion-blur",
+        type=float,
+        default=0.0,
+        help="blend each frame with the previous frame (0-<1; adds compositor work)",
+    )
+    parser.add_argument(
         "--encoder-threads",
         type=int,
         default=0,
@@ -5386,15 +6218,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="fsync each cache tile before replacement; slower but safer after power loss",
     )
     parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="JSON render manifest path; defaults to OUTPUT with a .json suffix",
+    )
+    parser.add_argument(
+        "--no-manifest",
+        action="store_true",
+        help="disable the automatic JSON sidecar manifest",
+    )
+    parser.add_argument(
         "--estimate",
         action="store_true",
         help="analyse audio and print keyframe workload without rendering",
     )
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument("--profile", choices=PROFILE_CHOICES, default=None)
+    probe_argv = sys.argv[1:] if argv is None else argv
+    selected = probe.parse_known_args(probe_argv)[0].profile
+    if selected is not None:
+        parser.set_defaults(**PROFILE_DEFAULTS[selected])
     return parser
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    args = build_parser(sys.argv[1:]).parse_args()
+    if args.list_profiles:
+        _print_profiles()
+        return
+    if args.list_formulas:
+        _print_formulas()
+        return
+    try:
+        args.formula = _formula_name(args.formula)
+        julia_constant = _parse_coordinate_pair(args.julia_c, "--julia-c")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if args.width <= 0 or args.height <= 0 or args.fps <= 0:
         raise SystemExit("width, height, and fps must be positive")
     try:
@@ -5409,6 +6269,26 @@ def main() -> None:
     if args.list_points:
         _print_deep_zoom_points()
         return
+    if args.formula != "mandelbrot":
+        if args.random_point or (
+            args.point is not None and args.point.strip().casefold() == "random"
+        ):
+            raise SystemExit(
+                "curated/random points are Mandelbrot parameter-plane points; "
+                "use an exact REAL,IMAG pair for an alternate formula"
+            )
+        if args.point is not None and "," not in args.point:
+            raise SystemExit(
+                "catalogue point slugs are Mandelbrot-specific; use --point REAL,IMAG "
+                "with an alternate formula"
+            )
+        if max_log > 300.0:
+            raise SystemExit(
+                "alternate formulas currently support Python high-precision views up to 1e300; "
+                "the native e150+BLA path is reserved for Mandelbrot"
+            )
+        if args.point is None and args.x_center is None and args.y_center is None:
+            args.x_center, args.y_center = FORMULA_DEFAULT_CENTERS[args.formula]
     try:
         args.x_center, args.y_center, selected_point = _resolve_render_point(
             point_spec=args.point,
@@ -5432,7 +6312,11 @@ def main() -> None:
             f"catalogue depth ~1e{_deep_point_max_log10_zoom(selected_point):.0f}.",
             flush=True,
         )
-    center_error = _center_precision_error(args.x_center, args.y_center, max_log)
+    center_error = (
+        _center_precision_error(args.x_center, args.y_center, max_log)
+        if args.formula == "mandelbrot"
+        else None
+    )
     if center_error is not None:
         if not args.allow_underspecified_center:
             raise SystemExit(center_error)
@@ -5443,9 +6327,12 @@ def main() -> None:
         ("keyframe-factor", args.keyframe_factor),
         ("zoom-punch", args.zoom_punch),
         ("zoom-speed", args.zoom_speed),
+        ("beat-strength", args.beat_strength),
         ("attack", args.attack),
         ("release", args.release),
         ("cache-limit-mb", args.cache_limit_mb),
+        ("glow", args.glow),
+        ("motion-blur", args.motion_blur),
     )
     for option_name, option_value in finite_options:
         if not math.isfinite(option_value):
@@ -5460,6 +6347,8 @@ def main() -> None:
         raise SystemExit("iteration-cap must be greater than iteration-base")
     if args.zoom_punch < 0:
         raise SystemExit("zoom-punch cannot be negative")
+    if args.beat_strength < 0:
+        raise SystemExit("beat-strength cannot be negative")
     if args.attack < 0 or args.release < 0:
         raise SystemExit("attack and release cannot be negative")
     if not 1 <= args.series_order <= 32:
@@ -5478,6 +6367,8 @@ def main() -> None:
         raise SystemExit("cache-limit-mb cannot be negative")
     if args.sample_rate <= 0:
         raise SystemExit("sample-rate must be positive")
+    if args.palette_file is not None and not args.palette_file.is_file():
+        raise SystemExit(f"palette file not found: {args.palette_file}")
     if not args.audio.exists():
         raise SystemExit(f"Audio file not found: {args.audio}")
 
@@ -5498,6 +6389,8 @@ def main() -> None:
         args.max_zoom,
         args.zoom_punch,
         args.zoom_speed,
+        features.onset,
+        args.beat_strength,
     )
     print(
         f"{features.frame_count} frames ({features.frame_count / args.fps:.1f}s) -> "
@@ -5531,39 +6424,73 @@ def main() -> None:
             f"{args.video_preset} encoder, {args.quality} quality."
         )
         return
-    render_video(
-        args.audio,
-        args.output,
-        features,
-        args.width,
-        args.height,
-        args.fps,
-        args.render_scale,
-        args.fractal_scale,
-        args.keyframe_factor,
+    manifest_path = _manifest_path(args.output, args.manifest, args.no_manifest)
+    manifest = _build_manifest(
+        args,
         args.x_center,
         args.y_center,
+        selected_point,
+        max_log,
+        features,
         zooms,
-        args.iteration_base,
-        args.iterations_per_decade,
-        args.iteration_cap,
-        args.renderer,
-        args.native_threads,
-        args.series_order,
-        args.series_block,
-        args.video_preset,
-        args.resample,
-        args.encoder_threads,
-        args.cache_dir,
-        args.quality,
-        args.palette,
-        args.cache_limit_mb,
-        args.codec,
-        args.crf,
-        args.keyframe_mode,
-        args.durable_cache,
-        args.native_backend,
     )
+    if manifest_path is not None:
+        _write_manifest(manifest_path, manifest)
+    try:
+        render_result = render_video(
+            args.audio,
+            args.output,
+            features,
+            args.width,
+            args.height,
+            args.fps,
+            args.render_scale,
+            args.fractal_scale,
+            args.keyframe_factor,
+            args.x_center,
+            args.y_center,
+            zooms,
+            args.iteration_base,
+            args.iterations_per_decade,
+            args.iteration_cap,
+            args.renderer,
+            args.native_threads,
+            args.series_order,
+            args.series_block,
+            args.video_preset,
+            args.resample,
+            args.encoder_threads,
+            args.cache_dir,
+            args.quality,
+            args.palette,
+            args.cache_limit_mb,
+            args.codec,
+            args.crf,
+            args.keyframe_mode,
+            args.durable_cache,
+            args.native_backend,
+            args.formula,
+            julia_constant,
+            args.palette_file,
+            args.glow,
+            args.motion_blur,
+        )
+    except Exception as error:
+        if manifest_path is not None:
+            manifest.update({
+                "status": "failed",
+                "finished_at": _datetime.datetime.now(_datetime.timezone.utc).isoformat(),
+                "error": str(error),
+            })
+            _write_manifest(manifest_path, manifest)
+        raise
+    if manifest_path is not None:
+        manifest.update({
+            "status": "complete",
+            "finished_at": _datetime.datetime.now(_datetime.timezone.utc).isoformat(),
+            "timing": render_result or {},
+        })
+        _write_manifest(manifest_path, manifest)
     print(f"Done -> {args.output}")
 
 

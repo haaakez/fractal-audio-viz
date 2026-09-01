@@ -10,6 +10,14 @@ extern "C" {
 #define FRACTAL_ABI_VERSION 10
 #define FRACTAL_RENDER_OPTIONS_VERSION 1
 
+/* Formula ids used by render_fractal_ex.  The original Mandelbrot entry
+ * points remain available for ABI compatibility. */
+#define FRACTAL_FORMULA_MANDELBROT 0
+#define FRACTAL_FORMULA_JULIA 1
+#define FRACTAL_FORMULA_BURNING_SHIP 2
+#define FRACTAL_FORMULA_TRICORN 3
+#define FRACTAL_FORMULA_MULTIBROT3 4
+
 /*
  * Per-call controls for the native renderer.  Callers should initialize this
  * with fractal_render_options_default() and keep struct_size/version intact.
@@ -103,6 +111,26 @@ int render_mandelbrot_ex(
     int precision_bits,
     int use_perturbation,
     int threads,
+    const FractalRenderOptions *options
+);
+
+/* Direct renderer for the Mandelbrot family.  Alternate formulas are
+ * intentionally direct/shallow for now; the validated MPFR+BLA deep path
+ * remains attached to the Mandelbrot parameter plane. */
+int render_fractal_ex(
+    float *output,
+    int width,
+    int height,
+    const char *zoom_text,
+    const char *x_center,
+    const char *y_center,
+    int max_iter,
+    int precision_bits,
+    int use_perturbation,
+    int threads,
+    int formula,
+    double julia_real,
+    double julia_imag,
     const FractalRenderOptions *options
 );
 

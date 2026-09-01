@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fractal-audio-viz"
+version = "0.2.0"
+description = "Audio-reactive Mandelbrot-family deep-zoom renderer"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "librosa>=0.10",
+  "Pillow>=10.0",
+  "mpmath>=1.3",
+]
+
+[project.optional-dependencies]
+demucs = ["demucs>=4.0"]
+
+[project.scripts]
+fractal-viz = "visualizer:main"
+fractal-viz-gui = "gui:main"
+fractal-viz-preview = "make_preview:main"
+fractal-viz-points = "point_sheet:main"
+
+[tool.setuptools]
+py-modules = ["visualizer", "profiles", "deep_zoom_points", "gui", "make_preview", "point_sheet"]

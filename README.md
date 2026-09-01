@@ -1,8 +1,11 @@
-# Mandelbrot music visualizer
+# Fractal Audio Viz
 
-This is a command-line renderer for audio-reactive Mandelbrot zooms. It reads
-one audio file, turns the audio into animation controls, renders a sequence of
-deep-zoom source images, and sends the final RGB frames to FFmpeg.
+Fractal Audio Viz renders audio-reactive zooms through the Mandelbrot family:
+Mandelbrot, Julia, Burning Ship, Tricorn, and Multibrot³. It reads one local
+song, turns the audio into animation controls, renders reusable scalar
+keyframes, and sends the final RGB frames to FFmpeg. The Mandelbrot path is
+the production path for e150+ deep zooms; the other formulas are first-class
+shallow and exploratory high-precision modes.
 
 ## How it works
 
@@ -13,7 +16,8 @@ The render is split into five stages.
    pitch tracking controls the colour movement. With `--separation auto`, the
    program tries Demucs first; if no usable vocal/instrumental split is
    available, the whole song drives both controls. `--separation spectral`
-   enables frequency-band proxies instead.
+   enables frequency-band proxies instead. An onset-strength curve is also
+   cached; enable its contribution with `--beat-strength`.
 
 2. **Zoom planning.** The camera moves in logarithmic zoom space from
    `--base-zoom` to `--max-zoom`. Instrumental energy changes the speed. The
@@ -26,18 +30,20 @@ The render is split into five stages.
    calculation is not repeated for every video frame. The older full-field
    chunk renderer remains available as `--keyframe-mode legacy`.
 
-4. **Mandelbrot rendering.** Shallow views use the direct native renderer. At
-   deep zooms, the C++ backend builds a high-precision MPFR reference orbit and
-   renders pixel offsets with perturbation arithmetic. Scaled mantissa/exponent
-   values preserve tiny offsets at e150 and beyond. BLA maps, an adaptive
-   image-wide series, OpenMP, and depth-specific reference tiers reduce the
-   per-pixel cost. Large difficult tiles can be split around local secondary
-   references rather than making the whole tile fall back to a slow path.
+4. **Fractal rendering.** Shallow formula views use the direct native renderer.
+   At Mandelbrot e150+ depths, the C++ backend builds a high-precision MPFR
+   reference orbit and renders pixel offsets with perturbation arithmetic.
+   Scaled mantissa/exponent values preserve tiny offsets, while BLA maps, an
+   adaptive image-wide series, OpenMP, and depth-specific reference tiers
+   reduce the per-pixel cost. Julia, Burning Ship, Tricorn, and Multibrot³ use
+   formula-aware direct iteration and a high-precision Python perturbation
+   fallback for exploratory deep views.
 
 5. **Colour and encoding.** Keyframes store scalar iteration data. The native
-   colour path or Pillow turns that data into RGB after cropping, and FFmpeg
-   writes the video with the original audio. `--codec auto` probes available
-   hardware encoders and falls back to `libx264`.
+   colour path or Pillow turns that data into RGB after cropping. Built-in or
+   user-supplied palettes, optional glow, and motion blur are applied at this
+   stage, and FFmpeg writes the video with the original audio. `--codec auto`
+   probes available hardware encoders and falls back to `libx264`.
 
 The output dimensions are controlled by `--width` and `--height`. The fractal
 source can be smaller or larger than the output: `--render-scale` multiplies
@@ -52,6 +58,10 @@ source fields and still produces a 4K video.
 | `visualizer.py` | Audio analysis, zoom planning, keyframes, colour, and FFmpeg. |
 | `renderer.cpp` / `renderer.h` | Native C ABI, MPFR deep rendering, BLA, OpenMP, and colour paths. |
 | `deep_zoom_points.py` | Source-attributed deep-zoom catalogue and exact decimal centres. |
+| `profiles.py` | Shared render presets used by the CLI and GUI. |
+| `gui.py` | Optional Tkinter launcher; the CLI remains the reproducible interface. |
+| `make_preview.py` | Converts the newest 4K/e150 render to a GIF or short MP4. |
+| `point_sheet.py` | Creates a labelled catalogue contact sheet. |
 | `benchmark.py` | Field, compositor, and atlas benchmarks without audio or video encoding. |
 | `tests/` | Python and native correctness tests. |
 | `shell.nix` / `Makefile` | Reproducible dependencies and the native build. |
@@ -59,8 +69,10 @@ source fields and still produces a 4K video.
 ## Installation and build
 
 The supplied Nix shell provides Python, NumPy, librosa, Pillow, mpmath,
-FFmpeg, GCC, GMP, and MPFR. OpenCL support is enabled when the host has the
-headers and ICD available.
+FFmpeg, GCC, GMP, MPFR, and Tk. OpenCL support is enabled when the host has
+the headers and ICD available. A regular Python environment can use
+`pip install -r requirements.txt`, followed by `make` if GMP/MPFR and a C++
+compiler are installed.
 
 ```sh
 nix-shell
@@ -70,7 +82,9 @@ make test
 
 `make` creates `mandelbrot.so`. GMP and MPFR are required for native deep
 zooms. The Python renderer is useful for shallow previews and tests, but it is
-not a replacement for the native e150+ path.
+not a replacement for the native Mandelbrot e150+ path. On Linux, Tkinter may
+need to be installed separately by the distribution; Windows Python normally
+ships it.
 
 ## Running a render
 
@@ -93,6 +107,15 @@ python3 visualizer.py "Music/Live set.flac" \
 The program creates the output directory when needed. Use `python3
 visualizer.py --help` for the parser’s built-in summary.
 
+For a quick desktop launcher:
+
+```sh
+python3 gui.py
+```
+
+The GUI only starts the same CLI in a child process, so it stays responsive
+and every render can still be copied from the log and reproduced in a shell.
+
 ## Constructing a command
 
 Start with this shape:
@@ -105,25 +128,39 @@ Then choose the parts that matter for the render:
 
 1. Set the input song and output file.
 2. Set `--width`, `--height`, and `--fps`.
-3. Choose a centre with `--point`, `--random-point`, or `--x-center` plus
+3. Choose a formula with `--formula`; for Julia, set its constant with
+   `--julia-c`.
+4. Choose a centre with `--point`, `--random-point`, or `--x-center` plus
    `--y-center`.
-4. Set `--max-zoom` and, for a deep custom point, provide enough decimal
+5. Set `--max-zoom` and, for a deep custom point, provide enough decimal
    digits in both coordinates.
-5. Choose a quality/speed trade-off with `--quality`, `--fractal-scale`, and
+6. Choose a quality/speed trade-off with `--quality`, `--fractal-scale`, and
    `--keyframe-factor`.
-6. Add `--cache-dir` if the render may be resumed or repeated.
+7. Add `--cache-dir` if the render may be resumed or repeated.
+
+Profiles are shortcuts for a coherent set of these values. Explicit options
+override the profile, so this is a convenient starting point:
+
+```sh
+python3 visualizer.py music/track.mp3 --profile 4k-e150 \
+  --point random --random-seed 42 --output renders/track.mp4
+```
+
+Inspect the available presets with `python3 visualizer.py --list-profiles`.
 
 ### Common examples
 
-A normal 1080p render using a named e150-capable point:
+A normal Full HD render using a named e150-capable point:
 
 ```sh
 python3 visualizer.py music/track.mp3 \
-  --output renders/track.mp4 \
-  --width 1920 --height 1080 --fps 30 \
+  --profile fullhd \
   --point oldwooddish --max-zoom 1e150 \
+  --output renders/track.mp4 \
   --cache-dir cache/track
 ```
+
+`--profile 1080p` remains available as an alias for `--profile fullhd`.
 
 A reproducible random point:
 
@@ -181,6 +218,32 @@ Use either `--point` or the `--x-center`/`--y-center` pair, not both. The
 `--point=...` and `--x-center=...` forms are convenient when a negative value
 would otherwise be mistaken for another command-line option.
 
+### Formula examples
+
+The default is Mandelbrot. The native direct renderer also handles the
+alternate formulas below; their coordinates describe the visible viewport.
+
+```sh
+# Julia set for c = -0.8 + 0.156i, centred on the Julia plane
+python3 visualizer.py music/track.mp3 --formula julia --julia-c=-0.8,0.156 \
+  --max-zoom 1e8 --output renders/julia.mp4
+
+# Burning Ship, with onset-driven punches and a custom palette
+python3 visualizer.py music/track.mp3 --formula burning-ship \
+  --max-zoom 1e8 --beat-strength 1.0 \
+  --palette-file examples/palette-neon.txt --output renders/ship.mp4
+
+# The remaining built-ins are tricorn (Mandelbar) and multibrot3.
+python3 visualizer.py music/track.mp3 --formula tricorn --max-zoom 1e7
+python3 visualizer.py music/track.mp3 --formula multibrot3 --max-zoom 1e7
+```
+
+Use `python3 visualizer.py --list-formulas` for the complete list. The
+validated MPFR/BLA e150+ accelerator is currently specific to the Mandelbrot
+parameter plane. Alternate formulas remain useful for ordinary renders and
+Python exploratory zooms up to about e300; they are not silently routed through
+an incompatible Mandelbrot reference.
+
 ### 4K/e150 speed profile
 
 This profile writes 4K output while keeping the fractal source at 2K. It is a
@@ -189,17 +252,19 @@ CPU; actual time depends on the song, selected point, and encoder.
 
 ```sh
 python3 visualizer.py music/track.mp3 \
+  --profile 4k-e150 \
   --output renders/track-4k-e150.mp4 \
-  --width 3840 --height 2160 --fps 30 \
   --point random --random-seed 42 --max-zoom 1e150 \
-  --quality balanced --fractal-scale 0.5 \
-  --keyframe-factor 4 --codec auto \
+  --codec auto \
   --cache-dir cache/track-4k-e150
 ```
 
 For a native-density master, use `--fractal-scale 1 --keyframe-factor 2`.
-That produces about 499 source levels at e150 and is substantially slower.
-The speed profile uses about 251 levels and 1920×1080 source fields.
+That produces about 500 source levels at e150 and is substantially slower.
+The speed profile uses about 168 levels and 1920×1080 source fields. If the
+ten-minute ceiling matters more than the smoothest outer crop, add
+`--keyframe-factor 16`; use `--keyframe-factor 4` when source detail matters
+more than render time.
 
 Use `--estimate` to analyse the song and print the planned source resolution
 and keyframe count without rendering video:
@@ -209,6 +274,29 @@ python3 visualizer.py music/track.mp3 \
   --width 3840 --height 2160 --quality balanced \
   --fractal-scale 0.5 --keyframe-factor 4 \
   --max-zoom 1e150 --estimate
+```
+
+### Previews and point browsing
+
+After a render, the small helper chooses the newest filename containing
+`4k`/`e150` and creates a looping GIF:
+
+```sh
+python3 make_preview.py
+```
+
+Choose a source or make a short MP4 explicitly:
+
+```sh
+python3 make_preview.py renders/track-4k-e150.mp4 \
+  --format mp4 --duration 12 --width 1280 \
+  --output renders/track-preview.mp4
+```
+
+To browse the curated deep points visually:
+
+```sh
+python3 point_sheet.py --output renders/deep-zoom-points.png
 ```
 
 ## `visualizer.py` argument reference
@@ -221,6 +309,8 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | --- | --- |
 | `audio` (`song.mp3`) | Positional input audio file. This is how you choose a custom song. |
 | `--output PATH` (`fractal_viz.mp4`) | Output video path. |
+| `--profile NAME` | Start from `preview`, `fullhd` (`1080p` alias), `4k-e150`, `master-e150`, or `beat`; later options override it. |
+| `--list-profiles` | Print the built-in profiles and exit. |
 | `--width N` (`1920`) | Output width in pixels. |
 | `--height N` (`1080`) | Output height in pixels. |
 | `--fps N` (`30`) | Output frame rate and audio-analysis frame rate. |
@@ -235,6 +325,9 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--random-point` | Select a safe catalogue point at random. Equivalent to `--point random`. |
 | `--random-seed N` | Seed random point selection so the same command chooses the same entry. Without it, system randomness is used. |
 | `--list-points` | Print every catalogue slug and its stored safe depth, then exit. An audio file is not needed. |
+| `--list-formulas` | Print the supported Mandelbrot-family formulas and exit. |
+| `--formula NAME` (`mandelbrot`) | Select `mandelbrot`, `julia`, `burning-ship`, `tricorn`, or `multibrot3`. |
+| `--julia-c REAL,IMAG` (`-0.8,0.156`) | Fixed Julia constant used when `--formula julia` is selected. |
 | `--x-center VALUE` | Exact real coordinate. Must be paired with `--y-center`. |
 | `--y-center VALUE` | Exact imaginary coordinate. Must be paired with `--x-center`. |
 | `--base-zoom VALUE` (`1.0`) | Starting zoom. Decimal notation such as `1e0` is accepted. |
@@ -249,6 +342,7 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--zoom-speed N` (`-0.04`) | Quiet-time velocity in log-zoom space. `0` removes the default quiet pullback; more-negative values pull back farther between events. |
 | `--attack SECONDS` (`0.025`) | Attack time for the audio envelope. Smaller values react faster. |
 | `--release SECONDS` (`0.12`) | Release time for the audio envelope. Larger values smooth the response. |
+| `--beat-strength N` (`0`) | Add normalised spectral-onset strength to zoom speed. `0` preserves the original loudness-only motion; `1`–`1.5` is a noticeable setting. |
 
 ### Quality and fractal rendering
 
@@ -277,6 +371,9 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--crf N` (`18`) | Quality value from `0` to `51`. It is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
 | `--resample MODE` (`bilinear`) | Crop filter: `bilinear` is faster; `lanczos` gives a smoother, slower resize. |
 | `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, or `mono`. `aurora` uses the fused native colour path. |
+| `--palette-file PATH` | Read at least two `#rrggbb` or `r g b` stops from a text file and interpolate them. This selects the Python colour path. |
+| `--glow N` (`0`) | Add a low-resolution bloom pass after colourisation, from `0` to `1`. It is off by default for the 10-minute target. |
+| `--motion-blur N` (`0`) | Blend the current frame with the previous one, from `0` to below `1`. It is off by default. |
 | `--encoder-threads N` (`0`) | FFmpeg encoder thread hint. `0` lets FFmpeg choose; a smaller value leaves more CPU for fractal rendering. Hardware encoders may ignore or reinterpret it. |
 
 ### Caching and inspection
@@ -286,6 +383,8 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--cache-dir PATH` | Store reusable scalar keyframes and audio-analysis data in this directory. Reusing the same settings and centre allows later runs to resume completed keyframes. |
 | `--cache-limit-mb N` (`0`) | Maximum cache size in megabytes. `0` means unlimited. Eviction is incremental. |
 | `--durable-cache` | Flush each cache tile before replacing its temporary file. Safer after power loss, but slower. |
+| `--manifest PATH` | Write the render settings, selected point, formula, command, Git revision, timing, and status to JSON. Without this option the sidecar uses the output filename with a `.json` suffix. |
+| `--no-manifest` | Disable the automatic JSON sidecar. |
 | `--estimate` | Analyse the song and print source resolution/keyframe count without rendering the video. |
 
 ## Caching and reruns
@@ -298,6 +397,27 @@ interrupted tile does not replace a completed tile.
 The final video is assembled from the beginning on every run. This is required
 for a valid compressed stream, even when most keyframes and the audio analysis
 are already cached.
+
+Every normal render also writes a JSON manifest beside the output. It records
+the command, Git revision, audio path, formula, Julia constant, resolved point,
+zoom plan, settings, timings, and whether the render completed. Use
+`--no-manifest` when a sidecar is not wanted.
+
+## GUI and project tools
+
+Tkinter is the lightest reasonable cross-platform GUI choice here: it ships
+with standard Windows Python installations and is available as a small system
+package on Linux. The GUI is intentionally a launcher rather than a second
+renderer, which keeps the command line reproducible:
+
+```sh
+python3 gui.py
+```
+
+The repository also includes `examples/make_test_tone.py` for a dependency-free
+audio smoke test, `point_sheet.py` for catalogue previews, and
+`make_preview.py` for GIF/MP4 exports. Generated audio, videos, GIFs, caches,
+and native build products are ignored by Git.
 
 ## Benchmarking
 
@@ -334,6 +454,8 @@ Benchmark arguments:
 | `--reference-zoom-log` | Reference/BLA setup depth. It must be at least the rendered depth. |
 | `--iterations` (`20000`) | Iteration budget for the field. |
 | `--x-center`, `--y-center` | Decimal benchmark centre; defaults to the bundled centre. |
+| `--formula` (`mandelbrot`) | Formula to benchmark: `mandelbrot`, `julia`, `burning-ship`, `tricorn`, or `multibrot3`. |
+| `--julia-c` (`-0.8,0.156`) | Fixed Julia constant when benchmarking the Julia formula. |
 | `--renderer` (`auto`) | `auto`, `native`, or `python`. |
 | `--backend` (`auto`) | `auto`, `scalar`, `avx2`, or `opencl`. OpenCL is shallow only. |
 | `--threads` (`0`) | Native OpenMP worker count. |
@@ -367,6 +489,10 @@ For further native details, see the public declarations in
 [`renderer.h`](renderer.h) and the source-attributed catalogue in
 [`deep_zoom_points.py`](deep_zoom_points.py).
 
+## License
+
+This project is released under the [MIT License](LICENSE).
+
 ## Troubleshooting
 
 - **Audio file not found:** pass the path as the first argument, for example
@@ -380,3 +506,10 @@ For further native details, see the public declarations in
   Demucs and keep `--separation auto`/`demucs`.
 - **Hardware encoder error:** leave `--codec auto` enabled so the complete
   hardware path is probed and `libx264` is selected when necessary.
+- **Alternate formula is slow at extreme depth:** this is expected. The
+  Mandelbrot e150+ path uses the validated native BLA implementation; Julia,
+  Burning Ship, Tricorn, and Multibrot³ currently use direct native iteration
+  for shallow views and a correctness-oriented Python perturbation fallback
+  for exploratory deep views.
+- **GUI will not start on Linux:** install the distribution's Tk package (for
+  example `python3-tk` on Debian/Ubuntu) or enter the supplied `nix-shell`.

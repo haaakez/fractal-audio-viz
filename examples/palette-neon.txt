@@ -1,0 +1,7 @@
+# One RGB stop per line. Hex and space-separated RGB are both accepted.
+# The renderer interpolates between stops and reuses the palette cache.
+#12002b
+#8a00b8
+#00dcff
+#dcff28
+#ffffff

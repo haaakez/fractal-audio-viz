@@ -6,6 +6,8 @@ __pycache__/
 *.wav
 *.mp4
 *.mkv
+*.webm
+*.gif
 # Render caches and generated keyframes
 keyframes*/
 .cache/

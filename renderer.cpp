@@ -66,6 +66,70 @@ constexpr int MAX_SAFE_DEEP_LINEAR_BLA_LENGTH = 1024;
 constexpr long double ESCAPE_RADIUS_SQUARED = 4.0L;
 constexpr long double LOG_TWO = 0.693147180559945309417232121458176568L;
 
+bool valid_formula(int formula) noexcept {
+    return formula >= FRACTAL_FORMULA_MANDELBROT
+        && formula <= FRACTAL_FORMULA_MULTIBROT3;
+}
+
+int formula_power(int formula) noexcept {
+    return formula == FRACTAL_FORMULA_MULTIBROT3 ? 3 : 2;
+}
+
+void iterate_direct_formula(
+    int formula,
+    double zr,
+    double zi,
+    double parameter_real,
+    double parameter_imag,
+    double& next_real,
+    double& next_imag
+) noexcept {
+    if (formula == FRACTAL_FORMULA_BURNING_SHIP) {
+        const double absolute_real = std::abs(zr);
+        const double absolute_imag = std::abs(zi);
+        // Keep the piecewise alternate maps reproducible with the NumPy
+        // fallback.  A fused multiply-add changes a late orbit by a few ulps
+        // and can move a boundary pixel to the other side of escape.
+        const volatile double real_square = absolute_real * absolute_real;
+        const volatile double imag_square = absolute_imag * absolute_imag;
+        const volatile double cross = 2.0 * absolute_real * absolute_imag;
+        const volatile double real_difference = real_square - imag_square;
+        const volatile double imaginary_product = cross + parameter_imag;
+        next_real = real_difference + parameter_real;
+        next_imag = imaginary_product;
+    } else if (formula == FRACTAL_FORMULA_TRICORN) {
+        const volatile double real_square = zr * zr;
+        const volatile double imag_square = zi * zi;
+        const volatile double cross = -2.0 * zr * zi;
+        const volatile double real_difference = real_square - imag_square;
+        const volatile double imaginary_product = cross + parameter_imag;
+        next_real = real_difference + parameter_real;
+        next_imag = imaginary_product;
+    } else if (formula == FRACTAL_FORMULA_MULTIBROT3) {
+        const volatile double real_square = zr * zr;
+        const volatile double imag_square = zi * zi;
+        const volatile double real_cube = real_square * zr;
+        const volatile double imag_cube = imag_square * zi;
+        const volatile double mixed_real = 3.0 * zr * imag_square;
+        const volatile double mixed_imag = 3.0 * real_square * zi;
+        const volatile double real_difference = real_cube - mixed_real;
+        const volatile double imaginary_difference = mixed_imag - imag_cube;
+        next_real = real_difference + parameter_real;
+        next_imag = imaginary_difference + parameter_imag;
+    } else if (formula == FRACTAL_FORMULA_JULIA) {
+        const volatile double real_square = zr * zr;
+        const volatile double imag_square = zi * zi;
+        const volatile double cross = 2.0 * zr * zi;
+        const volatile double real_difference = real_square - imag_square;
+        const volatile double imaginary_product = cross + parameter_imag;
+        next_real = real_difference + parameter_real;
+        next_imag = imaginary_product;
+    } else {
+        next_real = zr * zr - zi * zi + parameter_real;
+        next_imag = 2.0 * zr * zi + parameter_imag;
+    }
+}
+
 #ifdef FRACTAL_HAVE_OPENCL
 
 // The OpenCL path is deliberately limited to the direct, shallow renderer.
@@ -1522,7 +1586,10 @@ void render_direct(
     long double y_center,
     int max_iter,
     int threads,
-    int backend = 0
+    int backend = 0,
+    int formula = FRACTAL_FORMULA_MANDELBROT,
+    double julia_real = 0.0,
+    double julia_imag = 0.0
 ) {
     // This path is deliberately ordinary double precision.  The Python
     // layer routes only shallow views here; using long double for every
@@ -1550,7 +1617,8 @@ void render_direct(
         y_coordinates[static_cast<size_t>(py)] = center_imag + y_offset;
     }
 #if defined(__AVX2__)
-    if (backend == 1 && avx2_runtime_available()) {
+    if (formula == FRACTAL_FORMULA_MANDELBROT
+        && backend == 1 && avx2_runtime_available()) {
         render_direct_avx2(
             output,
             width,
@@ -1562,6 +1630,9 @@ void render_direct(
         return;
     }
     if (backend == 1) {
+        if (formula != FRACTAL_FORMULA_MANDELBROT) {
+            throw std::runtime_error("AVX2 alternate-formula rendering is not implemented");
+        }
         throw std::runtime_error("AVX2 backend requested but the CPU does not support AVX2");
     }
 #else
@@ -1570,7 +1641,7 @@ void render_direct(
     }
 #endif
 #ifdef FRACTAL_HAVE_OPENCL
-    if (backend == 2) {
+    if (backend == 2 && formula == FRACTAL_FORMULA_MANDELBROT) {
         render_direct_opencl(
             output,
             width,
@@ -1583,6 +1654,9 @@ void render_direct(
     }
 #else
     if (backend == 2) {
+        if (formula != FRACTAL_FORMULA_MANDELBROT) {
+            throw std::runtime_error("OpenCL alternate-formula rendering is not implemented");
+        }
         throw std::runtime_error("OpenCL backend is not available in this build");
     }
 #endif
@@ -1601,28 +1675,42 @@ void render_direct(
         const double cy = y_coordinates[static_cast<size_t>(py)];
         for (int px = 0; px < width; ++px) {
             const double cx = x_coordinates[static_cast<size_t>(px)];
-            const double q = (cx - 0.25) * (cx - 0.25) + cy * cy;
-            const bool in_cardioid = q * (q + cx - 0.25) <= 0.25 * cy * cy;
-            const bool in_bulb = (cx + 1.0) * (cx + 1.0) + cy * cy <= 0.0625;
             const int index = py * width + px;
-            if (in_cardioid || in_bulb) {
-                output[index] = static_cast<float>(max_iter);
-                continue;
+            if (formula == FRACTAL_FORMULA_MANDELBROT) {
+                const double q = (cx - 0.25) * (cx - 0.25) + cy * cy;
+                const bool in_cardioid = q * (q + cx - 0.25) <= 0.25 * cy * cy;
+                const bool in_bulb = (cx + 1.0) * (cx + 1.0) + cy * cy <= 0.0625;
+                if (in_cardioid || in_bulb) {
+                    output[index] = static_cast<float>(max_iter);
+                    continue;
+                }
             }
 
-            double zr = 0.0;
-            double zi = 0.0;
+            double zr = formula == FRACTAL_FORMULA_JULIA ? cx : 0.0;
+            double zi = formula == FRACTAL_FORMULA_JULIA ? cy : 0.0;
+            const double parameter_real = formula == FRACTAL_FORMULA_JULIA
+                ? julia_real : cx;
+            const double parameter_imag = formula == FRACTAL_FORMULA_JULIA
+                ? julia_imag : cy;
             int iteration = 0;
             for (; iteration < max_iter; ++iteration) {
-                const double next_real = zr * zr - zi * zi + cx;
-                const double next_imag = 2.0 * zr * zi + cy;
+                double next_real = 0.0;
+                double next_imag = 0.0;
+                iterate_direct_formula(
+                    formula, zr, zi, parameter_real, parameter_imag,
+                    next_real, next_imag);
                 zr = next_real;
                 zi = next_imag;
                 const double magnitude_squared = zr * zr + zi * zi;
-                if (magnitude_squared > ESCAPE_RADIUS_SQUARED) {
-                    const double magnitude = std::sqrt(std::max(magnitude_squared, 4.0000001));
+                if (magnitude_squared > ESCAPE_RADIUS_SQUARED
+                    || !std::isfinite(magnitude_squared)) {
+                    const double safe_squared = std::isfinite(magnitude_squared)
+                        ? std::max(magnitude_squared, 4.0000001)
+                        : std::numeric_limits<double>::max();
+                    const double magnitude = std::sqrt(safe_squared);
                     output[index] = static_cast<float>(static_cast<double>(iteration + 1)
-                        - std::log(std::log(magnitude)) / static_cast<double>(LOG_TWO));
+                        - std::log(std::log(magnitude))
+                            / std::log(static_cast<double>(formula_power(formula))));
                     break;
                 }
             }
@@ -3942,11 +4030,10 @@ int render_mandelbrot_reference(
         nullptr);
 }
 
-// Versioned one-shot entry point.  This is primarily used for shallow
-// previews, where creating a reusable reference would cost more than the
-// direct orbit.  It also gives the backend selector the same explicit options
-// structure as the deep renderer.
-int render_mandelbrot_ex(
+// Versioned one-shot entry point for all supported formulas. Alternate
+// formulas use the direct scalar path; the reusable MPFR/BLA reference
+// machinery remains deliberately specific to the Mandelbrot parameter plane.
+int render_fractal_ex(
     float* output,
     int width,
     int height,
@@ -3957,28 +4044,50 @@ int render_mandelbrot_ex(
     int precision_bits,
     int use_perturbation,
     int threads,
+    int formula,
+    double julia_real,
+    double julia_imag,
     const FractalRenderOptions* supplied_options
 ) {
     try {
         if (!output || !zoom_text || !x_center || !y_center
-            || width <= 0 || height <= 0 || max_iter <= 0) {
-            throw std::runtime_error("invalid native render dimensions or argument");
+            || width <= 0 || height <= 0 || max_iter <= 0
+            || !valid_formula(formula)
+            || !std::isfinite(julia_real) || !std::isfinite(julia_imag)) {
+            throw std::runtime_error("invalid native render dimensions, formula, or argument");
         }
         const FractalRenderOptions options = checked_render_options(supplied_options);
         if (options.backend != 0 && options.backend != 1 && options.backend != 2) {
             throw std::runtime_error("unknown native render backend");
         }
+        if (formula != FRACTAL_FORMULA_MANDELBROT && use_perturbation) {
+            throw std::runtime_error(
+                "native deep perturbation is currently Mandelbrot-only; "
+                "alternate formulas use the Python high-precision fallback");
+        }
         if (!use_perturbation) {
             const long double zoom = parse_zoom(zoom_text);
-            render_direct(output, width, height, zoom, std::strtold(x_center, nullptr),
-                          std::strtold(y_center, nullptr), max_iter, threads, options.backend);
+            render_direct(
+                output,
+                width,
+                height,
+                zoom,
+                std::strtold(x_center, nullptr),
+                std::strtold(y_center, nullptr),
+                max_iter,
+                threads,
+                options.backend,
+                formula,
+                julia_real,
+                julia_imag);
         } else {
             if (options.backend == 2) {
                 throw std::runtime_error(
                     "OpenCL backend is only valid for direct one-shot renders");
             }
             std::unique_ptr<ReferenceContext> context(static_cast<ReferenceContext*>(
-                fractal_create_reference(x_center, y_center, zoom_text, max_iter, precision_bits, 8)));
+                fractal_create_reference(
+                    x_center, y_center, zoom_text, max_iter, precision_bits, 8)));
             if (!context) throw std::runtime_error(last_error);
             const int status = fractal_render_mandelbrot_reference_ex(
                 output,
@@ -3998,6 +4107,38 @@ int render_mandelbrot_ex(
         set_error(error.what());
         return 1;
     }
+}
+
+// Versioned Mandelbrot compatibility entry point.  New callers should use
+// render_fractal_ex when they need an alternate formula.
+int render_mandelbrot_ex(
+    float* output,
+    int width,
+    int height,
+    const char* zoom_text,
+    const char* x_center,
+    const char* y_center,
+    int max_iter,
+    int precision_bits,
+    int use_perturbation,
+    int threads,
+    const FractalRenderOptions* supplied_options
+) {
+    return render_fractal_ex(
+        output,
+        width,
+        height,
+        zoom_text,
+        x_center,
+        y_center,
+        max_iter,
+        precision_bits,
+        use_perturbation,
+        threads,
+        FRACTAL_FORMULA_MANDELBROT,
+        0.0,
+        0.0,
+        supplied_options);
 }
 
 // Compatibility entry point for shallow one-off renders and old callers.

@@ -18,7 +18,7 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
 
     if args.renderer == "python" and log_zoom >= 300.0:
         raise SystemExit("the Python renderer cannot sweep zooms beyond 1e300")
-    if args.renderer != "python" and log_zoom >= 12.0:
+    if args.formula == "mandelbrot" and args.renderer != "python" and log_zoom >= 12.0:
         native_library = visualizer._get_native_library()
         if native_library is None:
             raise SystemExit("the native renderer is unavailable; run make first")
@@ -47,7 +47,7 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
     reference_seconds = 0.0
     reference_stats = None
     stats_supported = False
-    if native_library is not None and log_zoom >= 12.0:
+    if args.formula == "mandelbrot" and native_library is not None and log_zoom >= 12.0:
         reference_iter = visualizer.max_iterations(
             log_zoom,
             args.iteration_base,
@@ -90,7 +90,7 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
             )
             started = time.perf_counter()
             glitch_diagnostics = {} if args.local_references else None
-            if args.local_references:
+            if args.local_references and args.formula == "mandelbrot":
                 field = visualizer._atlas_local_reference_field(
                     render_width=args.width,
                     render_height=args.height,
@@ -123,6 +123,8 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
                     args.series_order,
                     args.series_block,
                     render_options,
+                    args.formula,
+                    args.julia_constant,
                 )
             elapsed = time.perf_counter() - started
             record = {
@@ -159,6 +161,8 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
         "height": args.height,
         "max_zoom": args.zoom,
         "max_zoom_log10": log_zoom,
+        "formula": args.formula,
+        "julia_c": args.julia_c,
         "local_references": bool(args.local_references),
         "keyframe_factor": args.keyframe_factor,
         "levels": len(records),
@@ -252,8 +256,19 @@ def main() -> None:
         help="reference precision zoom for a field probe; defaults to the rendered zoom",
     )
     parser.add_argument("--iterations", type=int, default=20000)
-    parser.add_argument("--x-center", default=visualizer.DEFAULT_X_CENTER)
-    parser.add_argument("--y-center", default=visualizer.DEFAULT_Y_CENTER)
+    parser.add_argument("--x-center", default=None)
+    parser.add_argument("--y-center", default=None)
+    parser.add_argument(
+        "--formula",
+        choices=visualizer.FORMULA_CHOICES,
+        default="mandelbrot",
+        help="formula to benchmark; alternate formulas use direct iteration",
+    )
+    parser.add_argument(
+        "--julia-c",
+        default=f"{visualizer.DEFAULT_JULIA_C[0]},{visualizer.DEFAULT_JULIA_C[1]}",
+        help="Julia constant as REAL,IMAG",
+    )
     parser.add_argument("--renderer", choices=("auto", "native", "python"), default="auto")
     parser.add_argument(
         "--backend",
@@ -299,6 +314,19 @@ def main() -> None:
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    try:
+        julia_constant = visualizer._parse_coordinate_pair(args.julia_c, "--julia-c")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    args.julia_constant = julia_constant
+    if args.x_center is None and args.y_center is None:
+        args.x_center, args.y_center = visualizer.FORMULA_DEFAULT_CENTERS[args.formula]
+    elif (args.x_center is None) != (args.y_center is None):
+        raise SystemExit("--x-center and --y-center must be supplied together")
+    if args.formula != "mandelbrot" and args.zoom_log is not None and args.zoom_log >= 12.0:
+        if args.renderer == "native":
+            raise SystemExit("alternate formulas are not available through the native deep benchmark")
+        args.renderer = "python"
     if min(args.width, args.height, args.iterations, args.repeat) <= 0:
         raise SystemExit("width, height, iterations, and repeat must be positive")
     if args.threads < 0:
@@ -394,7 +422,7 @@ def main() -> None:
     reference_log_zoom = None
     reference_stats = None
     stats_supported = False
-    if args.renderer != "python" and log_zoom >= 12.0:
+    if args.formula == "mandelbrot" and args.renderer != "python" and log_zoom >= 12.0:
         reference_started = time.perf_counter()
         reference_log_zoom = (
             args.reference_zoom_log
@@ -435,6 +463,8 @@ def main() -> None:
         if args.renderer != "python"
         else 0
     )
+    if args.formula != "mandelbrot" and args.backend == "auto":
+        native_backend = 0
     render_options = visualizer.NativeRenderOptions(
         backend=native_backend,
         series_min_terms=32 if args.disable_series else 8,
@@ -447,7 +477,7 @@ def main() -> None:
         for _ in range(args.repeat):
             started = time.perf_counter()
             glitch_diagnostics = {} if args.local_references else None
-            if args.local_references:
+            if args.local_references and args.formula == "mandelbrot":
                 field = visualizer._atlas_local_reference_field(
                     render_width=args.width,
                     render_height=args.height,
@@ -480,6 +510,8 @@ def main() -> None:
                     args.series_order,
                     args.series_block,
                     render_options,
+                    args.formula,
+                    julia_constant,
                 )
             elapsed = time.perf_counter() - started
             timings.append(elapsed)
@@ -494,6 +526,8 @@ def main() -> None:
             "iterations": args.iterations,
             "x_center": args.x_center,
             "y_center": args.y_center,
+            "formula": args.formula,
+            "julia_c": args.julia_c,
             "repeat": args.repeat,
             "reference_seconds": reference_seconds,
             "reference_zoom_log10": reference_log_zoom,

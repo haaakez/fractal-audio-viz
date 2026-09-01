@@ -24,7 +24,7 @@ else
   OPENCL_LIBS :=
 endif
 
-.PHONY: all test benchmark clean
+.PHONY: all test benchmark gui preview clean
 
 all: mandelbrot.so
 
@@ -36,6 +36,12 @@ test: mandelbrot.so
 
 benchmark: mandelbrot.so
 	python3 benchmark.py --renderer native --zoom 1e100 --width 256 --height 256
+
+gui:
+	python3 gui.py
+
+preview:
+	python3 make_preview.py
 
 clean:
 	rm -f mandelbrot.so

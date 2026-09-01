@@ -11,6 +11,7 @@ except ImportError as error:  # pragma: no cover - environment dependent
     raise unittest.SkipTest(f"NumPy is unavailable: {error}") from error
 
 import visualizer
+from profiles import PROFILE_DEFAULTS
 
 
 class AnimationTests(unittest.TestCase):
@@ -214,6 +215,74 @@ class AnimationTests(unittest.TestCase):
         self.assertGreater(float(np.max(zooms)), 11.0)
         self.assertLess(float(np.min(zooms[95:105])), 12.0)
         self.assertLess(float(np.min(np.diff(zooms))), 0.0)
+
+    def test_onset_strength_can_add_transient_zoom_energy(self):
+        instrumental = np.zeros(8, dtype=np.float32)
+        onset = np.zeros(8, dtype=np.float32)
+        onset[3] = 1.0
+        loudness_only = visualizer._zoom_plan(
+            instrumental, "1", "1e8", punch=0.0, quiet_speed=0.0
+        )
+        onset_sync = visualizer._zoom_plan(
+            instrumental, "1", "1e8", punch=0.0, quiet_speed=0.0,
+            onset=onset, beat_strength=2.0,
+        )
+        self.assertAlmostEqual(float(loudness_only[-1]), 8.0, places=12)
+        self.assertAlmostEqual(float(onset_sync[-1]), 8.0, places=12)
+        self.assertFalse(np.array_equal(loudness_only, onset_sync))
+
+    def test_formula_defaults_and_profile_defaults_are_available(self):
+        self.assertEqual(visualizer._formula_name("burningship"), "burning-ship")
+        self.assertEqual(visualizer._parse_coordinate_pair("-0.8,0.156", "julia"), ("-0.8", "0.156"))
+        self.assertEqual(PROFILE_DEFAULTS["fullhd"], PROFILE_DEFAULTS["1080p"])
+        self.assertEqual(PROFILE_DEFAULTS["fullhd"]["width"], 1920)
+        self.assertEqual(PROFILE_DEFAULTS["fullhd"]["height"], 1080)
+        self.assertEqual(PROFILE_DEFAULTS["4k-e150"]["width"], 3840)
+        self.assertGreater(PROFILE_DEFAULTS["4k-e150"]["max_zoom"].count("e"), 0)
+
+    def test_palette_file_and_frame_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            palette_path = Path(directory) / "palette.txt"
+            palette_path.write_text("#000000\n#ffffff\n", encoding="utf-8")
+            palette = visualizer._palette_from_file(palette_path, 8)
+            self.assertEqual(tuple(palette[0]), (0, 0, 0))
+            self.assertEqual(tuple(palette[-1]), (255, 255, 255))
+            field = np.linspace(0.0, 10.0, 64).reshape(8, 8).astype(np.float32)
+            rgb = visualizer._colourise_custom(
+                field, 10, 0.0, 0.5, 0.5, "aurora", palette_file=palette_path
+            )
+            self.assertEqual(rgb.shape, (8, 8, 3))
+            effected = visualizer._apply_frame_effects(
+                rgb, glow=0.2, motion_blur=0.5, previous=np.zeros_like(rgb)
+            )
+            self.assertEqual(effected.dtype, np.uint8)
+            self.assertTrue(np.isfinite(effected).all())
+
+    def test_native_formula_modes_produce_fields(self):
+        if visualizer._get_native_library() is None:
+            raise unittest.SkipTest("native renderer is unavailable")
+        for formula in ("julia", "burning-ship", "tricorn", "multibrot3"):
+            field = visualizer.render_fractal(
+                40,
+                30,
+                0.0,
+                *visualizer.FORMULA_DEFAULT_CENTERS[formula],
+                128,
+                "native",
+                2,
+                formula=formula,
+            )
+            self.assertEqual(field.shape, (30, 40))
+            self.assertTrue(np.isfinite(field).all())
+            expected = visualizer._render_direct(
+                40,
+                30,
+                0.0,
+                *visualizer.FORMULA_DEFAULT_CENTERS[formula],
+                128,
+                formula,
+            )
+            np.testing.assert_allclose(field, expected, rtol=0.0, atol=1.0e-4)
 
     def test_deep_local_reference_geometry_supports_odd_tiles(self):
         centres = visualizer._atlas_local_reference_centres(
