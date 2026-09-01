@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover - depends on the Python distribution
     tk = None  # type: ignore[assignment]
     filedialog = messagebox = ttk = None  # type: ignore[assignment]
 
-from deep_zoom_points import DEEP_ZOOM_POINTS
+from deep_zoom_points import FORMULA_POINT_CATALOGUES, FORMULA_POINTS_BY_SLUG
 from profiles import PROFILE_CHOICES, PROFILE_DEFAULTS
 
 
@@ -42,61 +42,147 @@ class RenderApp:
         self.profile = tk.StringVar(value="preview")
         self.formula = tk.StringVar(value="mandelbrot")
         self.point = tk.StringVar(value="")
+        self.random_point = tk.BooleanVar(value=False)
+        self.random_seed = tk.StringVar(value="")
         self.julia_c = tk.StringVar(value="-0.8,0.156")
+        self.x_center = tk.StringVar(value="")
+        self.y_center = tk.StringVar(value="")
+        self.base_zoom = tk.StringVar(value="1.0")
         self.max_zoom = tk.StringVar(value="1e24")
         self.width = tk.StringVar(value="960")
         self.height = tk.StringVar(value="540")
         self.fps = tk.StringVar(value="24")
+        self.sample_rate = tk.StringVar(value="44100")
+        self.separation = tk.StringVar(value="auto")
+        self.render_scale = tk.StringVar(value="1.0")
+        self.fractal_scale = tk.StringVar(value="0.5")
+        self.quality = tk.StringVar(value="draft")
+        self.keyframe_factor = tk.StringVar(value="4.0")
+        self.keyframe_mode = tk.StringVar(value="atlas")
+        self.allow_underspecified_center = tk.BooleanVar(value=False)
+        self.iteration_base = tk.StringVar(value="384")
+        self.iterations_per_decade = tk.StringVar(value="500")
+        self.iteration_cap = tk.StringVar(value="100000")
+        self.zoom_punch = tk.StringVar(value="3.0")
+        self.zoom_speed = tk.StringVar(value="-0.04")
+        self.attack = tk.StringVar(value="0.025")
+        self.release = tk.StringVar(value="0.12")
+        self.series_order = tk.StringVar(value="3")
+        self.series_block = tk.StringVar(value="256")
+        self.renderer = tk.StringVar(value="auto")
+        self.native_threads = tk.StringVar(value="0")
+        self.native_backend = tk.StringVar(value="auto")
+        self.video_preset = tk.StringVar(value="ultrafast")
+        self.codec = tk.StringVar(value="auto")
+        self.crf = tk.StringVar(value="18")
+        self.resample = tk.StringVar(value="bilinear")
+        self.encoder_threads = tk.StringVar(value="0")
         self.cache = tk.StringVar(value=str(ROOT / "cache"))
+        self.cache_limit_mb = tk.StringVar(value="0")
+        self.durable_cache = tk.BooleanVar(value=False)
+        self.manifest = tk.StringVar(value="")
+        self.no_manifest = tk.BooleanVar(value=False)
         self.palette = tk.StringVar(value="aurora")
         self.palette_file = tk.StringVar(value="")
-        self.beat_strength = tk.StringVar(value="0")
-        self.glow = tk.StringVar(value="0")
-        self.motion_blur = tk.StringVar(value="0")
+        self.beat_strength = tk.DoubleVar(value=0.0)
+        self.glow = tk.DoubleVar(value=0.0)
+        self.motion_blur = tk.DoubleVar(value=0.0)
+        self.beat_strength_value = tk.StringVar(value="0.00")
+        self.glow_value = tk.StringVar(value="0.00")
+        self.motion_blur_value = tk.StringVar(value="0.00")
 
         self._build_widgets()
         self.profile.trace_add("write", self._profile_changed)
+        self.formula.trace_add("write", self._formula_changed)
+        self._profile_changed()
+        self._formula_changed()
         self.root.after(100, self._drain_output)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
     def _build_widgets(self) -> None:
-        root_frame = ttk.Frame(self.root, padding=12)
-        root_frame.pack(fill="both", expand=True)
-        root_frame.columnconfigure(1, weight=1)
+        self.root.minsize(780, 640)
+        shell = ttk.Frame(self.root)
+        shell.pack(fill="both", expand=True)
+        shell.rowconfigure(0, weight=1)
+        shell.columnconfigure(0, weight=1)
 
+        canvas = tk.Canvas(shell, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        root_frame = ttk.Frame(canvas, padding=12)
+        root_frame.columnconfigure(0, weight=1)
+        window_id = canvas.create_window((0, 0), window=root_frame, anchor="nw")
+
+        def update_scroll_region(_event: object = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def resize_content(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=max(event.width, root_frame.winfo_reqwidth()))
+
+        root_frame.bind("<Configure>", update_scroll_region)
+        canvas.bind("<Configure>", resize_content)
+
+        def scroll(event: tk.Event) -> None:
+            if getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(1, "units")
+            else:
+                canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        canvas.bind_all("<MouseWheel>", scroll)
+        canvas.bind_all("<Button-4>", scroll)
+        canvas.bind_all("<Button-5>", scroll)
+
+        render_frame = ttk.LabelFrame(root_frame, text="Render")
+        render_frame.grid(row=0, column=0, sticky="ew")
+        render_frame.columnconfigure(1, weight=1)
         row = 0
-        row = self._path_row(root_frame, row, "Audio", self.audio, [
+        row = self._path_row(render_frame, row, "Audio", self.audio, [
             ("Audio files", "*.mp3 *.wav *.flac *.ogg"),
             ("All files", "*"),
         ])
-        row = self._path_row(root_frame, row, "Output", self.output, [
+        row = self._path_row(render_frame, row, "Output", self.output, [
             ("MP4", "*.mp4"),
             ("All files", "*"),
         ], save=True)
+        row = self._combo_row(render_frame, row, "Profile", self.profile, PROFILE_CHOICES)
+        row = self._combo_row(
+            render_frame,
+            row,
+            "Formula",
+            self.formula,
+            tuple(FORMULA_POINT_CATALOGUES),
+        )
 
-        ttk.Label(root_frame, text="Profile").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Combobox(
-            root_frame, textvariable=self.profile, values=PROFILE_CHOICES, state="readonly"
-        ).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Label(render_frame, text="Point").grid(row=row, column=0, sticky="w", pady=4)
+        point_frame = ttk.Frame(render_frame)
+        point_frame.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
+        point_frame.columnconfigure(0, weight=1)
+        self.point_combo = ttk.Combobox(
+            point_frame,
+            textvariable=self.point,
+            values=("", "random"),
+        )
+        self.point_combo.grid(row=0, column=0, sticky="ew")
+        self.point_combo.bind("<<ComboboxSelected>>", self._point_changed)
+        ttk.Checkbutton(
+            point_frame,
+            text="Random catalogue point",
+            variable=self.random_point,
+        ).grid(row=0, column=1, padx=(8, 0))
         row += 1
+        row = self._entry_row(render_frame, row, "Julia c", self.julia_c, "REAL,IMAG")
+        row = self._entry_row(render_frame, row, "Max zoom", self.max_zoom, "for example 1e150")
 
-        ttk.Label(root_frame, text="Formula").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Combobox(
-            root_frame,
-            textvariable=self.formula,
-            values=("mandelbrot", "julia", "burning-ship", "tricorn", "multibrot3"),
-            state="readonly",
-        ).grid(row=row, column=1, sticky="ew", pady=4)
-        row += 1
-        row = self._entry_row(root_frame, row, "Point", self.point, "slug, random, or REAL,IMAG")
-        row = self._entry_row(root_frame, row, "Julia c", self.julia_c, "used by the Julia formula")
-        row = self._entry_row(root_frame, row, "Max zoom", self.max_zoom, "for example 1e150")
-
-        dimensions = ttk.Frame(root_frame)
-        dimensions.grid(row=row, column=1, sticky="ew", pady=4)
+        dimensions = ttk.Frame(render_frame)
+        dimensions.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
         for index in range(6):
             dimensions.columnconfigure(index, weight=1 if index in {1, 3, 5} else 0)
-        ttk.Label(root_frame, text="Video").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Label(render_frame, text="Video").grid(row=row, column=0, sticky="w", pady=4)
         for index, (label, variable) in enumerate(
             (("W", self.width), ("H", self.height), ("FPS", self.fps))
         ):
@@ -105,39 +191,198 @@ class RenderApp:
                 row=0, column=index * 2 + 1, sticky="ew", padx=(0, 12)
             )
         row += 1
-        row = self._path_row(
-            root_frame,
+        row = self._combo_row(
+            render_frame,
             row,
-            "Cache",
-            self.cache,
-            [("Directories", "*")],
-            directory=True,
+            "Palette",
+            self.palette,
+            ("aurora", "fire", "ocean", "neon", "sunset", "mono"),
         )
-        row = self._entry_row(root_frame, row, "Palette", self.palette, "aurora, fire, ocean, neon...")
         row = self._path_row(
-            root_frame,
+            render_frame,
             row,
             "Palette file",
             self.palette_file,
             [("Palette text", "*.txt"), ("All files", "*")],
         )
-        row = self._entry_row(root_frame, row, "Beat strength", self.beat_strength, "0 disables onset sync")
-        row = self._entry_row(root_frame, row, "Glow", self.glow, "0 to 1")
-        row = self._entry_row(root_frame, row, "Motion blur", self.motion_blur, "0 to <1")
+
+        effects = ttk.LabelFrame(root_frame, text="Audio and effects")
+        effects.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        effects.columnconfigure(1, weight=1)
+        row = 0
+        row = self._slider_row(
+            effects, row, "Beat strength", self.beat_strength, self.beat_strength_value,
+            3.0, "onset contribution; 0 disables it",
+        )
+        row = self._slider_row(
+            effects, row, "Glow", self.glow, self.glow_value,
+            1.0, "bloom amount; adds compositor work",
+        )
+        self._slider_row(
+            effects, row, "Motion blur", self.motion_blur, self.motion_blur_value,
+            0.99, "blend with the previous frame",
+        )
+
+        technical = ttk.LabelFrame(root_frame, text="Technical options")
+        technical.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        technical.columnconfigure(1, weight=1)
+        row = 0
+        row = self._technical_row(technical, row, "Sample rate", self.sample_rate, "Hz")
+        row = self._technical_row(
+            technical, row, "Separation", self.separation, "audio stem strategy",
+            ("auto", "demucs", "spectral", "none"),
+        )
+        row = self._technical_row(technical, row, "Render scale", self.render_scale, "keyframe resolution multiplier")
+        row = self._technical_row(technical, row, "Fractal scale", self.fractal_scale, "minimum source resolution multiplier")
+        row = self._technical_row(
+            technical, row, "Quality", self.quality, "draft / balanced / quality / extreme",
+            ("draft", "balanced", "quality", "extreme"),
+        )
+        row = self._technical_row(technical, row, "Keyframe factor", self.keyframe_factor, "maximum zoom jump between keyframes")
+        row = self._technical_row(
+            technical, row, "Keyframe mode", self.keyframe_mode, "atlas reuses nested tiles",
+            ("atlas", "legacy"),
+        )
+        row = self._technical_row(technical, row, "Random seed", self.random_seed, "reproducible catalogue selection")
+        row = self._technical_row(technical, row, "X centre", self.x_center, "paired with Y centre; conflicts with Point")
+        row = self._technical_row(technical, row, "Y centre", self.y_center, "paired with X centre; conflicts with Point")
+        row = self._technical_row(technical, row, "Base zoom", self.base_zoom, "starting zoom")
+        row = self._check_row(
+            technical, row, "Allow underspecified centre", self.allow_underspecified_center,
+            "exploratory deep render only",
+        )
+        row = self._technical_row(technical, row, "Iteration base", self.iteration_base, "minimum shallow iteration budget")
+        row = self._technical_row(technical, row, "Iterations / decade", self.iterations_per_decade, "added per decimal zoom")
+        row = self._technical_row(technical, row, "Iteration cap", self.iteration_cap, "maximum iteration budget")
+        row = self._technical_row(technical, row, "Zoom punch", self.zoom_punch, "loudness contrast")
+        row = self._technical_row(technical, row, "Zoom speed", self.zoom_speed, "quiet-time log zoom velocity")
+        row = self._technical_row(technical, row, "Attack", self.attack, "audio envelope seconds")
+        row = self._technical_row(technical, row, "Release", self.release, "audio envelope seconds")
+        row = self._technical_row(technical, row, "Series order", self.series_order, "native BLA polynomial degree")
+        row = self._technical_row(technical, row, "Series block", self.series_block, "native BLA block length")
+        row = self._technical_row(
+            technical, row, "Renderer", self.renderer, "auto / native / python",
+            ("auto", "native", "python"),
+        )
+        row = self._technical_row(technical, row, "Native threads", self.native_threads, "0 uses the runtime default")
+        row = self._technical_row(
+            technical, row, "Native backend", self.native_backend, "hardware field backend",
+            ("auto", "scalar", "avx2", "opencl"),
+        )
+        row = self._technical_row(
+            technical, row, "Video preset", self.video_preset, "FFmpeg speed / size trade-off",
+            ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"),
+        )
+        row = self._technical_row(technical, row, "Codec", self.codec, "FFmpeg encoder name or auto")
+        row = self._technical_row(technical, row, "CRF", self.crf, "encoder quality, 0 to 51")
+        row = self._technical_row(
+            technical, row, "Resample", self.resample, "crop filter",
+            ("bilinear", "lanczos"),
+        )
+        row = self._technical_row(technical, row, "Encoder threads", self.encoder_threads, "0 lets FFmpeg choose")
+        row = self._technical_row(technical, row, "Cache limit MB", self.cache_limit_mb, "0 means unlimited")
+        row = self._check_row(
+            technical, row, "Durable cache", self.durable_cache,
+            "fsync each tile; safer but slower",
+        )
+        row = self._path_row(
+            technical, row, "Manifest", self.manifest,
+            [("JSON", "*.json"), ("All files", "*")], save=True,
+        )
+        self._check_row(
+            technical, row, "Disable manifest", self.no_manifest,
+            "do not write the automatic JSON sidecar",
+        )
 
         buttons = ttk.Frame(root_frame)
-        buttons.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 6))
+        buttons.grid(row=3, column=0, sticky="ew", pady=(10, 6))
         self.start_button = ttk.Button(buttons, text="Render", command=self._start)
         self.start_button.pack(side="left")
         self.estimate_button = ttk.Button(buttons, text="Estimate", command=self._estimate)
         self.estimate_button.pack(side="left", padx=6)
         self.stop_button = ttk.Button(buttons, text="Stop", command=self._stop, state="disabled")
         self.stop_button.pack(side="left")
-        row += 1
 
-        self.log = tk.Text(root_frame, height=16, wrap="word", state="disabled", background="#101218", foreground="#e8eaf0")
-        self.log.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
-        root_frame.rowconfigure(row, weight=1)
+        ttk.Label(root_frame, text="Renderer output").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        self.log = tk.Text(
+            root_frame,
+            height=16,
+            wrap="word",
+            state="disabled",
+            background="#101218",
+            foreground="#e8eaf0",
+        )
+        self.log.grid(row=5, column=0, sticky="nsew", pady=(4, 0))
+
+    def _combo_row(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        variable: tk.StringVar,
+        values: tuple[str, ...],
+    ) -> int:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Combobox(
+            parent, textvariable=variable, values=values, state="readonly"
+        ).grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
+        return row + 1
+
+    def _slider_row(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        variable: tk.DoubleVar,
+        display: tk.StringVar,
+        maximum: float,
+        hint: str,
+    ) -> int:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=5)
+        ttk.Scale(
+            parent,
+            from_=0.0,
+            to=maximum,
+            variable=variable,
+            command=lambda value: display.set(f"{float(value):.2f}"),
+        ).grid(row=row, column=1, sticky="ew", padx=(4, 8), pady=5)
+        ttk.Label(parent, textvariable=display, width=6, anchor="e").grid(
+            row=row, column=2, sticky="e", padx=(0, 8), pady=5
+        )
+        ttk.Label(parent, text=hint).grid(row=row, column=3, sticky="w", padx=(0, 8), pady=5)
+        return row + 1
+
+    def _technical_row(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        variable: tk.StringVar,
+        hint: str,
+        values: tuple[str, ...] | None = None,
+    ) -> int:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=3)
+        if values is None:
+            widget: tk.Widget = ttk.Entry(parent, textvariable=variable)
+        else:
+            widget = ttk.Combobox(parent, textvariable=variable, values=values, state="readonly")
+        widget.grid(row=row, column=1, sticky="ew", padx=4, pady=3)
+        ttk.Label(parent, text=hint).grid(row=row, column=2, sticky="w", padx=(8, 8), pady=3)
+        return row + 1
+
+    def _check_row(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        variable: tk.BooleanVar,
+        hint: str,
+    ) -> int:
+        ttk.Checkbutton(parent, text=label, variable=variable).grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=8, pady=3
+        )
+        ttk.Label(parent, text=hint).grid(row=row, column=2, sticky="w", padx=(8, 8), pady=3)
+        return row + 1
 
     def _entry_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, hint: str) -> int:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
@@ -171,6 +416,27 @@ class RenderApp:
         ttk.Button(parent, text="Browse", command=browse).grid(row=row, column=2, padx=(6, 0), pady=4)
         return row + 1
 
+    def _formula_changed(self, *_: object) -> None:
+        formula = self.formula.get()
+        points = FORMULA_POINT_CATALOGUES.get(formula, ())
+        values = ("", "random", *(point.slug for point in points))
+        self.point_combo.configure(values=values)
+
+        current = self.point.get().strip()
+        known_values = {value.casefold() for value in values if value}
+        if current and "," not in current and current.casefold() not in known_values:
+            # A slug belongs to one formula.  Exact coordinate pairs remain
+            # editable when the user changes formula.
+            self.point.set("")
+        self._point_changed()
+
+    def _point_changed(self, *_: object) -> None:
+        preset = FORMULA_POINTS_BY_SLUG.get(self.formula.get(), {}).get(
+            self.point.get().strip().casefold()
+        )
+        if preset is not None and preset.julia_c is not None:
+            self.julia_c.set(",".join(preset.julia_c))
+
     def _profile_changed(self, *_: object) -> None:
         values = PROFILE_DEFAULTS.get(self.profile.get(), {})
         for key, variable in (
@@ -178,27 +444,82 @@ class RenderApp:
             ("height", self.height),
             ("fps", self.fps),
             ("max_zoom", self.max_zoom),
-            ("beat_strength", self.beat_strength),
+            ("separation", self.separation),
+            ("fractal_scale", self.fractal_scale),
+            ("quality", self.quality),
+            ("keyframe_factor", self.keyframe_factor),
+            ("video_preset", self.video_preset),
         ):
             if key in values:
                 variable.set(str(values[key]))
+        self.beat_strength.set(float(values.get("beat_strength", 0.0)))
+        self.beat_strength_value.set(f"{self.beat_strength.get():.2f}")
+        self.glow_value.set(f"{self.glow.get():.2f}")
+        self.motion_blur_value.set(f"{self.motion_blur.get():.2f}")
 
     def _command(self, estimate: bool = False) -> list[str]:
         command = [sys.executable, "-u", str(VISUALIZER), self.audio.get()]
         command.extend(["--output", self.output.get(), "--profile", self.profile.get()])
+        formula = self.formula.get()
         command.extend([
-            "--formula", self.formula.get(),
-            "--julia-c", self.julia_c.get(),
+            "--formula", formula,
             "--max-zoom", self.max_zoom.get(),
             "--width", self.width.get(), "--height", self.height.get(), "--fps", self.fps.get(),
+            "--sample-rate", self.sample_rate.get(),
+            "--separation", self.separation.get(),
+            "--render-scale", self.render_scale.get(),
+            "--fractal-scale", self.fractal_scale.get(),
+            "--quality", self.quality.get(),
+            "--keyframe-factor", self.keyframe_factor.get(),
+            "--keyframe-mode", self.keyframe_mode.get(),
+            "--base-zoom", self.base_zoom.get(),
+            "--iteration-base", self.iteration_base.get(),
+            "--iterations-per-decade", self.iterations_per_decade.get(),
+            "--iteration-cap", self.iteration_cap.get(),
+            "--zoom-punch", self.zoom_punch.get(),
+            "--zoom-speed", self.zoom_speed.get(),
             "--palette", self.palette.get(),
-            "--beat-strength", self.beat_strength.get(),
-            "--glow", self.glow.get(), "--motion-blur", self.motion_blur.get(),
+            "--beat-strength", str(self.beat_strength.get()),
+            "--attack", self.attack.get(),
+            "--release", self.release.get(),
+            "--series-order", self.series_order.get(),
+            "--series-block", self.series_block.get(),
+            "--renderer", self.renderer.get(),
+            "--native-threads", self.native_threads.get(),
+            "--native-backend", self.native_backend.get(),
+            "--video-preset", self.video_preset.get(),
+            "--codec", self.codec.get(),
+            "--crf", self.crf.get(),
+            "--resample", self.resample.get(),
+            "--glow", str(self.glow.get()), "--motion-blur", str(self.motion_blur.get()),
+            "--encoder-threads", self.encoder_threads.get(),
+            "--cache-limit-mb", self.cache_limit_mb.get(),
         ])
-        if self.point.get().strip():
-            command.extend(["--point", self.point.get().strip()])
+        if formula == "julia":
+            # A value such as -0.8,0.156 is interpreted as an option by
+            # argparse when it is passed as a separate argv item.
+            command.append("--julia-c=" + self.julia_c.get().strip())
+        if self.random_point.get():
+            command.append("--random-point")
+        elif self.point.get().strip():
+            # The same applies to negative custom Mandelbrot coordinates.
+            command.append("--point=" + self.point.get().strip())
+        if self.random_seed.get().strip():
+            command.extend(["--random-seed", self.random_seed.get().strip()])
+        if self.x_center.get().strip():
+            command.append("--x-center=" + self.x_center.get().strip())
+        if self.y_center.get().strip():
+            command.append("--y-center=" + self.y_center.get().strip())
+        if self.allow_underspecified_center.get():
+            command.append("--allow-underspecified-center")
         if self.cache.get().strip():
             command.extend(["--cache-dir", self.cache.get().strip()])
+        if self.durable_cache.get():
+            command.append("--durable-cache")
+        if self.manifest.get().strip():
+            command.extend(["--manifest", self.manifest.get().strip()])
+        if self.no_manifest.get():
+            command.append("--no-manifest")
         if self.palette_file.get().strip():
             command.extend(["--palette-file", self.palette_file.get().strip()])
         if estimate:
