@@ -57,7 +57,7 @@ source fields and still produces a 4K video.
 | --- | --- |
 | `visualizer.py` | Audio analysis, zoom planning, keyframes, colour, and FFmpeg. |
 | `renderer.cpp` / `renderer.h` | Native C ABI, MPFR deep rendering, BLA, OpenMP, and colour paths. |
-| `deep_zoom_points.py` | Source-attributed deep-zoom catalogue and exact decimal centres. |
+| `deep_zoom_points.py` | Formula-specific point catalogues and exact decimal centres. |
 | `profiles.py` | Shared render presets used by the CLI and GUI. |
 | `gui.py` | Optional Tkinter launcher; the CLI remains the reproducible interface. |
 | `make_preview.py` | Converts the newest 4K/e150 render to a GIF or short MP4. |
@@ -115,6 +115,10 @@ python3 gui.py
 
 The GUI only starts the same CLI in a child process, so it stays responsive
 and every render can still be copied from the log and reproduced in a shell.
+Profiles, formulas, palettes, catalogue points, and the audio/effects values
+are available at the top; scroll down for the complete technical options,
+including precision, iteration, native backend, encoder, cache, and manifest
+settings.
 
 ## Constructing a command
 
@@ -178,20 +182,27 @@ python3 visualizer.py music/track.mp3 \
   --random-point --random-seed 42 --max-zoom 1e150
 ```
 
-List the catalogue before choosing:
+List the points for the formula you want to render:
 
 ```sh
 python3 visualizer.py --list-points
+python3 visualizer.py --list-points --formula burning-ship
+python3 visualizer.py --list-points --formula julia
 ```
 
-The catalogue is built from named KFR files in the [MDZ
-gallery](https://mathr.co.uk/mdz/gallery/) and deep test views in
-[FractalShark](https://github.com/mattsaccount364/FractalShark). It currently
-contains 24 entries, including labelled exact conjugate mirrors. Random
-selection only uses entries whose stored coordinates and renderer screening
-cover the requested `--max-zoom`.
+Each formula has its own point list. Mandelbrot contains 24 entries from named
+KFR files in the [MDZ gallery](https://mathr.co.uk/mdz/gallery/) and deep test
+views in [FractalShark](https://github.com/mattsaccount364/FractalShark),
+including labelled conjugate mirrors. Burning Ship, Tricorn, and Multibrot³
+use their own parameter-plane locations. Julia presets also include their
+fixed `c` value, so choosing `julia-douady-rabbit`, for example, changes both
+the preset and the Julia constant. `random` and `--random-point` select from
+the catalogue for the currently selected formula. Only Mandelbrot entries are
+screened for the production native e150+ path; alternate entries are
+exploratory recommendations.
 
-To use your own centre, pass a comma-separated pair to `--point`:
+To use your own centre, pass a comma-separated pair to `--point`. This works
+for every formula and replaces that formula's preset:
 
 ```sh
 python3 visualizer.py music/track.mp3 \
@@ -199,11 +210,13 @@ python3 visualizer.py music/track.mp3 \
   --max-zoom 1e12 --allow-underspecified-center
 ```
 
-For a deep render, replace that short pair with the full decimal export from
-your zoom tool. The production guard requires at least
+For a deep Mandelbrot render, replace that short pair with the full decimal
+export from your zoom tool. The production guard requires at least
 `ceil(log10(max-zoom)) + 16` fractional decimal places in both coordinates.
 This prevents a short decimal from silently producing a different deep
-target. `--allow-underspecified-center` is for exploratory renders only.
+target. `--allow-underspecified-center` is for exploratory Mandelbrot renders
+only. Alternate formulas accept their own presets or exact pairs and remain
+limited to the exploratory Python path at extreme depth.
 
 The two-coordinate form is also available for scripts and Kalles exports:
 
@@ -321,8 +334,8 @@ Unless noted otherwise, the values in parentheses are the defaults.
 
 | Argument | Description |
 | --- | --- |
-| `--point VALUE` | Select a catalogue slug, `random`, or an exact `REAL,IMAG` decimal pair. With no point option, the bundled centre is used. |
-| `--random-point` | Select a safe catalogue point at random. Equivalent to `--point random`. |
+| `--point VALUE` | Select a slug from the catalogue for the chosen formula, `random`, or an exact `REAL,IMAG` decimal pair. With no point option, that formula's default centre is used. |
+| `--random-point` | Select a point at random from the chosen formula's catalogue. Equivalent to `--point random`. |
 | `--random-seed N` | Seed random point selection so the same command chooses the same entry. Without it, system randomness is used. |
 | `--list-points` | Print every catalogue slug and its stored safe depth, then exit. An audio file is not needed. |
 | `--list-formulas` | Print the supported Mandelbrot-family formulas and exit. |
@@ -331,7 +344,7 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--x-center VALUE` | Exact real coordinate. Must be paired with `--y-center`. |
 | `--y-center VALUE` | Exact imaginary coordinate. Must be paired with `--x-center`. |
 | `--base-zoom VALUE` (`1.0`) | Starting zoom. Decimal notation such as `1e0` is accepted. |
-| `--max-zoom VALUE` (`1e32`) | Final zoom. Native scaled arithmetic accepts values below about `1e9800`, but the centre must have enough digits and each catalogue point has its own safe limit. |
+| `--max-zoom VALUE` (`1e32`) | Final zoom. Native scaled arithmetic accepts values below about `1e9800`; Mandelbrot catalogue points have individual safety limits, while alternate formula presets are exploratory. |
 | `--allow-underspecified-center` | Bypass the decimal-place guard for an exploratory render. It can follow a different deep path from the intended target. |
 
 ### Audio response
