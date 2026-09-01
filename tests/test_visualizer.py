@@ -11,6 +11,7 @@ except ImportError as error:  # pragma: no cover - environment dependent
     raise unittest.SkipTest(f"NumPy is unavailable: {error}") from error
 
 import visualizer
+from deep_zoom_points import FORMULA_POINT_CATALOGUES
 from profiles import PROFILE_DEFAULTS
 
 
@@ -84,6 +85,53 @@ class AnimationTests(unittest.TestCase):
         self.assertIsNotNone(first[2])
         self.assertLessEqual(first[2].screened_log10_zoom, 150.0)
         self.assertIsNone(visualizer._center_precision_error(first[0], first[1], 150.0))
+
+    def test_formula_catalogues_are_individual(self):
+        all_slugs = []
+        for formula, points in FORMULA_POINT_CATALOGUES.items():
+            self.assertGreater(len(points), 0)
+            self.assertTrue(all(point.formula == formula for point in points))
+            all_slugs.extend(point.slug for point in points)
+        self.assertEqual(len(all_slugs), len(set(all_slugs)))
+        self.assertNotIn(
+            "oldwooddish",
+            {point.slug for point in FORMULA_POINT_CATALOGUES["burning-ship"]},
+        )
+
+    def test_formula_point_resolution_uses_the_selected_catalogue(self):
+        burning_ship = visualizer._resolve_render_point(
+            point_spec="burning-ship-mast",
+            random_point=False,
+            x_center=None,
+            y_center=None,
+            random_seed=None,
+            max_log_zoom=50.0,
+            formula="burning-ship",
+        )
+        self.assertEqual(burning_ship[2].formula, "burning-ship")
+        self.assertEqual(burning_ship[0], "-1.77375")
+
+        julia = visualizer._resolve_render_point(
+            point_spec="julia-douady-rabbit",
+            random_point=False,
+            x_center=None,
+            y_center=None,
+            random_seed=None,
+            max_log_zoom=1.0,
+            formula="julia",
+        )
+        self.assertEqual(julia[2].julia_c, ("-0.123", "0.745"))
+
+        with self.assertRaisesRegex(ValueError, "unknown burning-ship point"):
+            visualizer._resolve_render_point(
+                point_spec="oldwooddish",
+                random_point=False,
+                x_center=None,
+                y_center=None,
+                random_seed=None,
+                max_log_zoom=1.0,
+                formula="burning-ship",
+            )
 
     def test_point_accepts_exact_custom_pair_and_rejects_conflicts(self):
         x, y, preset = visualizer._resolve_render_point(
