@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import math
+import os
 from pathlib import Path
 
 import visualizer
@@ -35,8 +37,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.zoom_log < 0.0 or args.width < 16 or args.height < 16 or args.columns < 1:
-        raise SystemExit("zoom-log must be non-negative; dimensions and columns must be positive")
+    if (
+        not math.isfinite(args.zoom_log)
+        or args.zoom_log < 0.0
+        or args.zoom_log > visualizer.MAX_LOG10_ZOOM
+        or args.width < 16
+        or args.height < 16
+        or args.columns < 1
+        or args.threads < 0
+    ):
+        raise SystemExit(
+            "zoom-log must be finite and non-negative; dimensions, columns, and threads "
+            "must be positive/non-negative"
+        )
+    try:
+        args.threads = visualizer._validate_thread_count(args.threads, "threads")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if args.formula != "mandelbrot" and args.zoom_log > 300.0:
+        raise SystemExit("alternate formula point sheets support zooms only through 1e300")
     try:
         from PIL import Image, ImageDraw
     except ImportError as exc:  # pragma: no cover - dependency error
@@ -45,6 +64,24 @@ def main() -> None:
     points = visualizer.FORMULA_POINT_CATALOGUES[args.formula]
     label_height = 30
     rows = (len(points) + args.columns - 1) // args.columns
+    output_path = args.output.expanduser()
+    try:
+        visualizer._reject_final_symlink(output_path, "output")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    output_path = visualizer._absolute_path(output_path)
+    if output_path.exists() and output_path.is_dir():
+        raise SystemExit(f"output path is a directory: {output_path}")
+    if output_path.parent.exists() and not output_path.parent.is_dir():
+        raise SystemExit(f"output parent is not a directory: {output_path.parent}")
+    try:
+        visualizer._validate_dimensions(
+            args.columns * args.width,
+            rows * (args.height + label_height),
+            "point sheet",
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     sheet = Image.new(
         "RGB",
         (args.columns * args.width, rows * (args.height + label_height)),
@@ -99,9 +136,18 @@ def main() -> None:
         draw.rectangle((x, y + args.height, x + args.width, y + args.height + label_height), fill=(12, 12, 18))
         draw.text((x + 5, y + args.height + 7), point.slug, fill=(235, 235, 245))
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    sheet.save(args.output)
-    print(f"Point sheet ready: {args.output}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_output = visualizer._reserved_temporary_sibling(output_path, "writing")
+    try:
+        sheet.save(temporary_output)
+        os.replace(temporary_output, output_path)
+    finally:
+        if temporary_output.exists():
+            try:
+                temporary_output.unlink()
+            except OSError:
+                pass
+    print(f"Point sheet ready: {output_path}")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,9 @@ responsive and the CLI remains the source of truth for reproducible renders.
 from __future__ import annotations
 
 import queue
+import os
+import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -27,6 +30,27 @@ from profiles import PROFILE_CHOICES, PROFILE_DEFAULTS
 
 ROOT = Path(__file__).resolve().parent
 VISUALIZER = ROOT / "visualizer.py"
+OUTPUT_QUEUE_LIMIT = 2048
+MAX_LOG_LINES = 20_000
+MAX_LOG_LINE_CHARS = 16_384
+
+
+def _read_bounded_line(stream: object, limit: int) -> str | None:
+    """Read renderer output without buffering an unterminated line forever."""
+
+    readline = getattr(stream, "readline")
+    chunk = readline(limit + 1)
+    if not chunk:
+        return None
+    truncated = len(chunk) > limit
+    if truncated and not chunk.endswith("\n"):
+        while True:
+            remainder = readline(limit + 1)
+            if not remainder or remainder.endswith("\n"):
+                break
+    if truncated:
+        chunk = chunk[:limit] + "… [line truncated]\n"
+    return str(chunk)
 
 
 class RenderApp:
@@ -35,7 +59,7 @@ class RenderApp:
         self.root.title("Fractal Audio Viz")
         self.root.minsize(720, 560)
         self.process: subprocess.Popen[str] | None = None
-        self.output_queue: queue.Queue[str] = queue.Queue()
+        self.output_queue: queue.Queue[str] = queue.Queue(maxsize=OUTPUT_QUEUE_LIMIT)
 
         self.audio = tk.StringVar(value=str(ROOT / "song.mp3"))
         self.output = tk.StringVar(value=str(ROOT / "fractal_viz.mp4"))
@@ -459,10 +483,21 @@ class RenderApp:
         self.motion_blur_value.set(f"{self.motion_blur.get():.2f}")
 
     def _command(self, estimate: bool = False) -> list[str]:
-        command = [sys.executable, "-u", str(VISUALIZER), self.audio.get()]
-        command.extend(["--output", self.output.get(), "--profile", self.profile.get()])
-        formula = self.formula.get()
         point_spec = self.point.get().strip()
+        has_point = self.random_point.get() or bool(point_spec)
+        has_x = bool(self.x_center.get().strip())
+        has_y = bool(self.y_center.get().strip())
+        if has_point and (has_x or has_y):
+            raise ValueError("Point/random point cannot be combined with X/Y centre")
+        if has_x != has_y:
+            raise ValueError("X and Y centre must be supplied together")
+        audio_path = Path(self.audio.get()).expanduser().resolve()
+        # Preserve the final component so the CLI can reject an output
+        # symlink safely instead of resolving it into the target file.
+        output_path = Path(self.output.get()).expanduser().absolute()
+        command = [sys.executable, "-u", str(VISUALIZER), str(audio_path)]
+        command.extend(["--output", str(output_path), "--profile", self.profile.get()])
+        formula = self.formula.get()
         julia_preset = FORMULA_POINTS_BY_SLUG.get(formula, {}).get(point_spec.casefold())
         command.extend([
             "--formula", formula,
@@ -525,70 +560,159 @@ class RenderApp:
         if self.allow_underspecified_center.get():
             command.append("--allow-underspecified-center")
         if self.cache.get().strip():
-            command.extend(["--cache-dir", self.cache.get().strip()])
+            command.extend([
+                "--cache-dir",
+                str(Path(self.cache.get().strip()).expanduser().resolve()),
+            ])
         if self.durable_cache.get():
             command.append("--durable-cache")
         if self.manifest.get().strip():
-            command.extend(["--manifest", self.manifest.get().strip()])
+            command.extend([
+                "--manifest",
+                str(Path(self.manifest.get().strip()).expanduser().absolute()),
+            ])
         if self.no_manifest.get():
             command.append("--no-manifest")
         if self.palette_file.get().strip():
-            command.extend(["--palette-file", self.palette_file.get().strip()])
+            command.extend([
+                "--palette-file",
+                str(Path(self.palette_file.get().strip()).expanduser().resolve()),
+            ])
         if estimate:
             command.append("--estimate")
         return command
 
+    @staticmethod
+    def _process_options() -> dict[str, object]:
+        if os.name == "nt":
+            return {
+                "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            }
+        return {"start_new_session": True}
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen[str]) -> None:
+        """Terminate the renderer and its FFmpeg descendants as one unit."""
+
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
+            try:
+                process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
+            except (OSError, ValueError):
+                try:
+                    process.terminate()
+                except OSError:
+                    return
+        else:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                try:
+                    process.terminate()
+                except OSError:
+                    return
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                try:
+                    process.kill()
+                except OSError:
+                    return
+            else:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    try:
+                        process.kill()
+                    except OSError:
+                        return
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                return
+
     def _start(self) -> None:
         if self.process is not None:
             return
-        if not Path(self.audio.get()).expanduser().is_file():
+        if not Path(self.audio.get()).expanduser().resolve().is_file():
             messagebox.showerror("Audio file", "Choose an existing audio file first.")
             return
         try:
+            command = self._command()
             self.process = subprocess.Popen(
-                self._command(),
+                command,
                 cwd=ROOT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                **self._process_options(),
             )
-        except OSError as error:
+        except (OSError, ValueError) as error:
             messagebox.showerror("Could not start renderer", str(error))
             return
         self._set_running(True)
-        self._append("Command: " + " ".join(self._command()) + "\n")
+        self._append("Command: " + shlex.join(command) + "\n")
         threading.Thread(target=self._read_process, daemon=True).start()
 
     def _estimate(self) -> None:
         if self.process is not None:
             return
-        if not Path(self.audio.get()).expanduser().is_file():
+        if not Path(self.audio.get()).expanduser().resolve().is_file():
             messagebox.showerror("Audio file", "Choose an existing audio file first.")
             return
         try:
+            command = self._command(estimate=True)
             self.process = subprocess.Popen(
-                self._command(estimate=True),
+                command,
                 cwd=ROOT,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                **self._process_options(),
             )
-        except OSError as error:
+        except (OSError, ValueError) as error:
             messagebox.showerror("Could not start renderer", str(error))
             return
         self._set_running(True)
-        self._append("Estimate command: " + " ".join(self._command(True)) + "\n")
+        self._append("Estimate command: " + shlex.join(command) + "\n")
         threading.Thread(target=self._read_process, daemon=True).start()
 
     def _read_process(self) -> None:
-        assert self.process is not None and self.process.stdout is not None
-        for line in self.process.stdout:
-            self.output_queue.put(line)
-        code = self.process.wait()
-        self.output_queue.put(f"\nProcess exited with status {code}.\n")
-        self.output_queue.put("__FRACTAL_PROCESS_DONE__")
+        process = self.process
+        assert process is not None and process.stdout is not None
+        while True:
+            line = _read_bounded_line(process.stdout, MAX_LOG_LINE_CHARS)
+            if line is None:
+                break
+            self._queue_output(line)
+        code = process.wait()
+        self._queue_output(f"\nProcess exited with status {code}.\n")
+        self._queue_output("__FRACTAL_PROCESS_DONE__")
+
+    def _queue_output(self, text: str) -> None:
+        """Keep a stalled GUI from retaining unbounded renderer output."""
+
+        if len(text) > MAX_LOG_LINE_CHARS:
+            text = text[:MAX_LOG_LINE_CHARS] + "… [line truncated]\n"
+        try:
+            self.output_queue.put_nowait(text)
+            return
+        except queue.Full:
+            pass
+        # Dropping the oldest log line is preferable to blocking the reader:
+        # a blocked GUI pipe can also stall FFmpeg and make Stop ineffective.
+        try:
+            self.output_queue.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            self.output_queue.put_nowait(text)
+        except queue.Full:
+            pass
 
     def _drain_output(self) -> None:
         try:
@@ -606,6 +730,10 @@ class RenderApp:
     def _append(self, text: str) -> None:
         self.log.configure(state="normal")
         self.log.insert("end", text)
+        line_number = int(self.log.index("end-1c").split(".", 1)[0])
+        if line_number > MAX_LOG_LINES:
+            first_kept_line = line_number - MAX_LOG_LINES + 1
+            self.log.delete("1.0", f"{first_kept_line}.0")
         self.log.see("end")
         self.log.configure(state="disabled")
 
@@ -617,14 +745,14 @@ class RenderApp:
 
     def _stop(self) -> None:
         if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
+            self._terminate_process(self.process)
             self._append("Stopping renderer...\n")
 
     def _close(self) -> None:
         if self.process is not None and self.process.poll() is None:
             if not messagebox.askyesno("Stop render?", "A render is still running. Stop it and close?"):
                 return
-            self.process.terminate()
+            self._terminate_process(self.process)
         self.root.destroy()
 
 

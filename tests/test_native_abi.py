@@ -87,6 +87,12 @@ class NativeRendererTests(unittest.TestCase):
             library.fractal_clone_reference.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             library.fractal_clone_reference.restype = ctypes.c_void_p
         library.fractal_destroy_reference.argtypes = [ctypes.c_void_p]
+        library.fractal_get_reference_stats.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_int,
+        ]
+        library.fractal_get_reference_stats.restype = ctypes.c_int
         library.fractal_colourise.argtypes = [
             ctypes.POINTER(ctypes.c_float),
             ctypes.POINTER(ctypes.c_uint8),
@@ -192,6 +198,22 @@ class NativeRendererTests(unittest.TestCase):
 
     def test_abi_version(self):
         self.assertEqual(self.library.fractal_abi_version(), 10)
+
+    def test_invalid_reference_handles_are_rejected_without_dereferencing(self):
+        invalid = ctypes.c_void_p(1)
+        if hasattr(self.library, "fractal_clone_reference"):
+            clone = self.library.fractal_clone_reference(invalid, b"1e12")
+            self.assertFalse(clone)
+            self.assertIn(b"invalid", self.library.fractal_last_error().lower())
+        values = (ctypes.c_uint64 * 5)()
+        self.assertEqual(
+            self.library.fractal_get_reference_stats(invalid, values, 5),
+            -1,
+        )
+        self.assertIn(b"invalid", self.library.fractal_last_error().lower())
+        # Destroying a stale/foreign handle is a safe no-op with a diagnostic.
+        self.library.fractal_destroy_reference(invalid)
+        self.assertIn(b"invalid", self.library.fractal_last_error().lower())
 
     def test_cloned_radius_tier_matches_independent_reference(self):
         if not hasattr(self.library, "fractal_create_reference_reusable"):

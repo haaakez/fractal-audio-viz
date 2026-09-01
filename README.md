@@ -400,6 +400,47 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--no-manifest` | Disable the automatic JSON sidecar. |
 | `--estimate` | Analyse the song and print source resolution/keyframe count without rendering the video. |
 
+### Safety and resource limits
+
+Public entry points validate dimensions before allocating fields (at most
+100,000,000 pixels), decoded audio (at most 120,000,000 float32 samples),
+video frames (at most 10,000,000), frame rate (1–1,000), sample rate
+(1–768,000 Hz), and iteration budgets (1–10,000,000). Zoom exponents are
+bounded to `10^-300` through `10^9800` for the native scaled path; the Python
+fallback remains limited to approximately `10^300`. Coordinate text is capped
+at 50,000 characters and each cache entry is bounded before NumPy opens it.
+
+Rendered videos, previews, manifests, and cache fields are written beside
+their final targets and replaced atomically, so an interrupted operation does
+not publish a partial result. Cache loading disables pickle and rejects
+malformed, non-finite, oversized, or zip-bomb-like entries. FFmpeg and the
+optional Demucs process drain only a bounded diagnostic tail and are started in
+a private process group so cancellation also reaches their descendants.
+
+When `--codec auto` is used, the advertised hardware encoders are filtered by
+a short real encode probe. NVENC uses `-cq`, QSV uses `-global_quality`, VAAPI
+uses `format=nv12,hwupload` with `-qp`, and VideoToolbox uses its mapped
+`-q:v` scale. If the selected hardware path is unavailable or fails its
+probe, the deterministic `libx264` software path is selected.
+
+### Reproducibility and fallback matrix
+
+For reproducible output, keep the same Git revision, Python/native dependency
+versions, command-line arguments, audio bytes, and exact centre coordinates.
+The cache namespace includes the active field-renderer implementation, but
+encoded bytes can still differ across FFmpeg builds, hardware encoders, CPU
+instruction sets, and parallel floating-point runtimes. Compare decoded
+frames or scalar fields when checking numerical output across machines.
+
+| Requested path | Actual path | Boundary |
+| --- | --- | --- |
+| `--renderer python` | Python direct/perturbed renderer | All formulas; exploratory fallback supports up to approximately `10^300`. |
+| `--renderer auto` + shallow zoom | Native direct CPU renderer when available; Python fallback otherwise | All formulas; OpenCL is used only when explicitly selected. |
+| `--renderer auto` + deep Mandelbrot | Native MPFR reference + scaled perturbation/BLA | Production path from approximately `10^12` through the validated catalogue depth. |
+| `--renderer auto` + deep alternate formula | Python high-precision perturbation fallback | Julia, Burning Ship, Tricorn, and Multibrot³ remain exploratory at deep zoom. |
+| `--native-backend opencl` | Native OpenCL direct renderer | Mandelbrot-only shallow views; unavailable or deep paths fail clearly rather than silently changing numerical mode. |
+| `--codec auto` | First passing hardware probe, otherwise `libx264` | The selected encoder is recorded in the manifest; hardware output is not byte-for-byte portable. |
+
 ## Caching and reruns
 
 Keyframe cache entries include the centre, absolute zoom, dimensions, iteration

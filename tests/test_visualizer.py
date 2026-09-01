@@ -1,6 +1,8 @@
 import unittest
 import tempfile
 import math
+import os
+import struct
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -305,6 +307,103 @@ class AnimationTests(unittest.TestCase):
             )
             self.assertEqual(effected.dtype, np.uint8)
             self.assertTrue(np.isfinite(effected).all())
+
+    def test_public_limits_reject_aliases_and_unbounded_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "song.wav"
+            audio.write_bytes(b"audio")
+            output = root / "render.mp4"
+            manifest = root / "render.json"
+            valid = visualizer._validate_render_paths(audio, output, manifest)
+            self.assertEqual(valid[0], audio.resolve())
+            with self.assertRaisesRegex(ValueError, "input audio"):
+                visualizer._validate_render_paths(audio, audio)
+            with self.assertRaisesRegex(ValueError, "input audio"):
+                visualizer._validate_render_paths(audio, output, audio)
+
+            hardlink = root / "audio-alias.bin"
+            os.link(audio, hardlink)
+            with self.assertRaisesRegex(ValueError, "input audio"):
+                visualizer._validate_render_paths(audio, hardlink)
+
+            protected = root / "protected.bin"
+            protected.write_bytes(b"must survive")
+            output_link = root / "render-link.mp4"
+            try:
+                output_link.symlink_to(protected)
+            except (OSError, NotImplementedError):
+                pass
+            else:
+                with self.assertRaisesRegex(ValueError, "symbolic link"):
+                    visualizer._validate_render_paths(audio, output_link)
+                self.assertEqual(protected.read_bytes(), b"must survive")
+
+            with self.assertRaises(ValueError):
+                visualizer._validate_dimensions(10_000, 10_001, "test")
+            with self.assertRaises(ValueError):
+                visualizer._validate_log10_zoom(float("inf"))
+            with self.assertRaises(ValueError):
+                visualizer.NativeRenderOptions(series_min_terms=0)
+            with self.assertRaises(ValueError):
+                visualizer.NativeRenderOptions(strict=2)
+
+            sibling = visualizer._temporary_sibling(output, "rendering")
+            self.assertEqual(sibling.parent, output.parent)
+            self.assertFalse(sibling.exists())
+
+    def test_colourisers_sanitize_extreme_and_nonfinite_fields(self):
+        field = np.asarray(
+            [[0.0, np.finfo(np.float32).max, np.inf, -np.inf, np.nan]],
+            dtype=np.float32,
+        )
+        aurora = visualizer._colourise(field, 100, 0.0, 0.5, 0.5)
+        custom = visualizer._colourise_custom(
+            field, 100, 0.0, 0.5, 0.5, "fire"
+        )
+        self.assertEqual(aurora.shape, (1, 5, 3))
+        self.assertEqual(custom.shape, (1, 5, 3))
+        self.assertEqual(aurora.dtype, np.uint8)
+        self.assertEqual(custom.dtype, np.uint8)
+        np.testing.assert_array_equal(aurora[0, 2:], 0)
+        np.testing.assert_array_equal(custom[0, 2:], 0)
+
+    def test_cache_safety_rejects_malformed_archives(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            malformed = root / "broken.npz"
+            malformed.write_bytes(b"not a zip archive")
+            self.assertFalse(visualizer._cache_file_is_safe(malformed))
+            unknown = root / "unknown.cache"
+            unknown.write_bytes(b"not a NumPy cache")
+            self.assertFalse(visualizer._cache_file_is_safe(unknown))
+            valid = root / "valid.npz"
+            np.savez(valid, field=np.zeros((2, 2), dtype=np.float32))
+            self.assertTrue(visualizer._cache_file_is_safe(valid))
+            empty = root / "empty.npz"
+            np.savez(empty)
+            self.assertFalse(visualizer._cache_file_is_safe(empty))
+
+            deceptive = root / "deceptive.npy"
+            header = (
+                "{'descr': '<f4', 'fortran_order': False, "
+                "'shape': (100000000000,), }"
+            ).encode("ascii")
+            header += b" " * ((64 - (10 + len(header) + 1) % 64) % 64) + b"\n"
+            deceptive.write_bytes(
+                b"\x93NUMPY\x01\x00"
+                + struct.pack("<H", len(header))
+                + header
+            )
+            self.assertFalse(visualizer._cache_file_is_safe(deceptive))
+
+            symlink = root / "cache-link.npy"
+            try:
+                symlink.symlink_to(valid)
+            except (OSError, NotImplementedError):
+                pass
+            else:
+                self.assertFalse(visualizer._cache_file_is_safe(symlink))
 
     def test_native_formula_modes_produce_fields(self):
         if visualizer._get_native_library() is None:

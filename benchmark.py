@@ -18,6 +18,10 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
 
     if args.renderer == "python" and log_zoom >= 300.0:
         raise SystemExit("the Python renderer cannot sweep zooms beyond 1e300")
+    if log_zoom > visualizer.MAX_LOG10_ZOOM:
+        raise SystemExit(
+            f"zoom exceeds the supported 10^{visualizer.MAX_LOG10_ZOOM:.0f} range"
+        )
     if args.formula == "mandelbrot" and args.renderer != "python" and log_zoom >= 12.0:
         native_library = visualizer._get_native_library()
         if native_library is None:
@@ -232,7 +236,6 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
 
 
 def main() -> None:
-    np = visualizer._require_numpy()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--height", type=int, default=256)
@@ -314,6 +317,9 @@ def main() -> None:
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    # Parse help and syntax without importing the optional numerical stack;
+    # this keeps ``benchmark.py --help`` useful in a minimal installation.
+    np = visualizer._require_numpy()
     try:
         julia_constant = visualizer._parse_coordinate_pair(args.julia_c, "--julia-c")
     except ValueError as error:
@@ -323,31 +329,71 @@ def main() -> None:
         args.x_center, args.y_center = visualizer.FORMULA_DEFAULT_CENTERS[args.formula]
     elif (args.x_center is None) != (args.y_center is None):
         raise SystemExit("--x-center and --y-center must be supplied together")
-    if args.formula != "mandelbrot" and args.zoom_log is not None and args.zoom_log >= 12.0:
-        if args.renderer == "native":
-            raise SystemExit("alternate formulas are not available through the native deep benchmark")
-        args.renderer = "python"
-    if min(args.width, args.height, args.iterations, args.repeat) <= 0:
-        raise SystemExit("width, height, iterations, and repeat must be positive")
-    if args.threads < 0:
-        raise SystemExit("threads cannot be negative")
+    try:
+        args.x_center = visualizer._validate_center_text(args.x_center, "real")
+        args.y_center = visualizer._validate_center_text(args.y_center, "imaginary")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    try:
+        args.width, args.height = visualizer._validate_dimensions(
+            args.width, args.height, "benchmark"
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    try:
+        args.iterations = visualizer._validate_iteration_count(args.iterations, "iterations")
+        args.threads = visualizer._validate_thread_count(args.threads, "threads")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if args.repeat <= 0 or args.repeat > 1000:
+        raise SystemExit("repeat must be between 1 and 1000")
     if not 2 <= args.series_block <= 4096:
         raise SystemExit("series-block must be between 2 and 4096")
-    if not args.keyframe_factor > 1.0:
+    if not np.isfinite(args.keyframe_factor) or not args.keyframe_factor > 1.0:
         raise SystemExit("keyframe-factor must be greater than 1")
-    if min(args.iteration_base, args.iterations_per_decade, args.iteration_cap) <= 0:
-        raise SystemExit("iteration settings must be positive")
+    try:
+        args.iteration_base = visualizer._validate_iteration_count(
+            args.iteration_base, "iteration-base"
+        )
+        args.iteration_cap = visualizer._validate_iteration_count(
+            args.iteration_cap, "iteration-cap"
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if not 0 <= args.iterations_per_decade <= visualizer.MAX_ITERATION_BUDGET:
+        raise SystemExit(
+            f"iterations-per-decade must be between 0 and {visualizer.MAX_ITERATION_BUDGET:,}"
+        )
     if args.iteration_cap < args.iteration_base:
         raise SystemExit("iteration-cap must be at least iteration-base")
 
     if args.zoom_log is not None:
-        if not np.isfinite(args.zoom_log) or args.zoom_log < 0.0:
-            raise SystemExit("zoom-log must be a finite non-negative number")
+        if (
+            not np.isfinite(args.zoom_log)
+            or args.zoom_log < 0.0
+            or args.zoom_log > visualizer.MAX_LOG10_ZOOM
+        ):
+            raise SystemExit("zoom-log must be finite, non-negative, and within the supported range")
         log_zoom = float(args.zoom_log)
     else:
-        log_zoom = visualizer._zoom_log(args.zoom)
+        try:
+            log_zoom = visualizer._zoom_log(args.zoom)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+    if args.formula != "mandelbrot" and log_zoom > 300.0:
+        raise SystemExit("alternate formulas support benchmark zooms only through 1e300")
+    if args.formula != "mandelbrot" and log_zoom >= 12.0:
+        if args.renderer == "native":
+            raise SystemExit("alternate formulas are not available through the native deep benchmark")
+        args.renderer = "python"
+    if args.formula != "mandelbrot" and args.backend in {"avx2", "opencl"}:
+        raise SystemExit("alternate formulas require --backend scalar or auto")
     if args.reference_zoom_log is not None:
-        if not np.isfinite(args.reference_zoom_log) or args.reference_zoom_log < log_zoom:
+        if (
+            not np.isfinite(args.reference_zoom_log)
+            or args.reference_zoom_log < log_zoom
+            or args.reference_zoom_log > visualizer.MAX_LOG10_ZOOM
+        ):
             raise SystemExit("reference-zoom-log must be finite and at least zoom-log")
     if args.stage == "atlas":
         _atlas_sweep(args, np, log_zoom)
@@ -386,7 +432,6 @@ def main() -> None:
             0.5,
             args.threads,
         )
-        library.fractal_atlas_colourise(*call_args)
         timings = []
         for _ in range(args.repeat):
             started = time.perf_counter()

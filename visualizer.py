@@ -42,6 +42,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import ast
 import ctypes
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from collections import deque
@@ -52,14 +53,21 @@ import importlib.util
 import json
 import math
 import os
+import operator
 import queue
 import random
 import shutil
+import signal
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
+import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from functools import lru_cache
@@ -151,6 +159,39 @@ ATLAS_LOCAL_REFERENCE_FINAL_BUDGET_MS = 750
 ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS = 30_000
 ATLAS_PROGRESS_INTERVAL_SECONDS = 20.0
 ENCODER_BACKPRESSURE_NOTICE_SECONDS = 10.0
+MIN_LOG10_ZOOM = -300.0
+MAX_LOG10_ZOOM = 9800.0
+# A render can multiply the output dimensions by both --render-scale and a
+# quality preset. Keep the public boundary finite so a typo cannot allocate a
+# multi-gigabyte field before FFmpeg has even started.
+MAX_RENDER_PIXELS = 100_000_000
+MAX_AUDIO_FRAMES = 10_000_000
+# Keep decoded audio bounded as well as video frames. A high requested sample
+# rate can otherwise turn an otherwise valid multi-minute track into a
+# multi-gigabyte float32 allocation before frame-count validation runs.
+MAX_AUDIO_SAMPLES = 120_000_000
+MAX_ITERATION_BUDGET = 10_000_000
+MAX_KEYFRAME_LEVELS = 100_000
+MAX_THREAD_COUNT = 4096
+MAX_FPS = 1000
+MAX_SAMPLE_RATE = 768_000
+MAX_COORDINATE_TEXT_LENGTH = 50_000
+MAX_NATIVE_PRECISION_BITS = 131_072
+MAX_PALETTE_FILE_BYTES = 4 * 1024 * 1024
+MAX_PALETTE_STOPS = 4096
+MAX_CACHE_FILE_BYTES = 512 * 1024 * 1024
+MAX_CACHE_ARCHIVE_MEMBERS = 16
+MAX_CACHE_ARCHIVE_COMMENT_BYTES = 65_535
+MAX_CACHE_HEADER_BYTES = 64 * 1024
+MAX_CACHE_ARRAY_ELEMENTS = MAX_RENDER_PIXELS
+DEMUCS_TIMEOUT_SECONDS = 30.0 * 60.0
+MAX_DEMUCS_DISCOVERY_ENTRIES = 10_000
+MAX_CACHE_SCAN_ENTRIES = 100_000
+MAX_DIAGNOSTIC_LINE_CHARS = 16_384
+FFMPEG_ENCODER_QUERY_TIMEOUT_SECONDS = 5.0
+MAX_FFMPEG_ENCODER_QUERY_BYTES = 1 * 1024 * 1024
+FFMPEG_FINALIZE_TIMEOUT_SECONDS = 30.0 * 60.0
+FFMPEG_STDIN_STALL_TIMEOUT_SECONDS = 5.0 * 60.0
 
 # These are the original visualizer's liquid-gradient constants.  Keep the
 # numerical field independent from them: the atlas stores raw iteration data,
@@ -176,6 +217,7 @@ CENTER_PRECISION_GUARD_DIGITS = 16
 _native_library: Any = None
 _native_checked = False
 _native_notice_printed = False
+_native_library_lock = threading.Lock()
 
 NATIVE_STATS_FIELDS = (
     "pixels",
@@ -242,19 +284,59 @@ class NativeRenderOptions(ctypes.Structure):
         backend: int = 0,
     ) -> None:
         super().__init__()
+        integer_values = {
+            "time budget": time_budget_ms,
+            "series minimum": series_min_terms,
+            "series maximum": series_max_terms,
+            "maximum BLA length": max_bla_length,
+            "maximum linear BLA length": max_linear_bla_length,
+            "backend": backend,
+        }
+        checked_values: dict[str, int] = {}
+        for label, value in integer_values.items():
+            try:
+                checked_values[label] = int(operator.index(value))
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{label} must be an integer") from error
+        if checked_values["time budget"] < 0:
+            raise ValueError("time budget cannot be negative")
+        if not 1 <= checked_values["series minimum"] <= 32:
+            raise ValueError("series minimum must be between 1 and 32")
+        if not 1 <= checked_values["series maximum"] <= 32:
+            raise ValueError("series maximum must be between 1 and 32")
+        if checked_values["series minimum"] > checked_values["series maximum"]:
+            raise ValueError("series minimum cannot exceed series maximum")
+        if not 1 <= checked_values["maximum BLA length"] <= 4096:
+            raise ValueError("maximum BLA length must be between 1 and 4096")
+        if not 1 <= checked_values["maximum linear BLA length"] <= 4096:
+            raise ValueError("maximum linear BLA length must be between 1 and 4096")
+        if checked_values["backend"] not in {0, 1, 2}:
+            raise ValueError("backend must be scalar (0), avx2 (1), or opencl (2)")
+        if checked_values["time budget"] > 2_147_483_647:
+            raise ValueError("time budget is too large for the native ABI")
+
+        def binary_flag(value: Any, label: str) -> int:
+            try:
+                result = int(operator.index(value))
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{label} must be 0 or 1") from error
+            if result not in {0, 1}:
+                raise ValueError(f"{label} must be 0 or 1")
+            return result
+
         self.struct_size = ctypes.sizeof(self)
         self.version = 1
-        self.strict = int(strict)
-        self.allow_recovery = int(allow_recovery)
-        self.time_budget_ms = int(time_budget_ms)
-        self.disable_bla = int(disable_bla)
-        self.disable_cycle = int(disable_cycle)
-        self.strict_cycle = int(strict_cycle)
-        self.series_min_terms = int(series_min_terms)
-        self.series_max_terms = int(series_max_terms)
-        self.max_bla_length = int(max_bla_length)
-        self.max_linear_bla_length = int(max_linear_bla_length)
-        self.backend = int(backend)
+        self.strict = binary_flag(strict, "strict")
+        self.allow_recovery = binary_flag(allow_recovery, "allow recovery")
+        self.time_budget_ms = checked_values["time budget"]
+        self.disable_bla = binary_flag(disable_bla, "disable BLA")
+        self.disable_cycle = binary_flag(disable_cycle, "disable cycle detection")
+        self.strict_cycle = binary_flag(strict_cycle, "strict cycle detection")
+        self.series_min_terms = checked_values["series minimum"]
+        self.series_max_terms = checked_values["series maximum"]
+        self.max_bla_length = checked_values["maximum BLA length"]
+        self.max_linear_bla_length = checked_values["maximum linear BLA length"]
+        self.backend = checked_values["backend"]
 
 
 NATIVE_BACKEND_NAMES = {
@@ -293,9 +375,16 @@ def _native_backend_id(name: str, library: Any) -> int:
 def _field_renderer_cache_identity(renderer: str) -> str:
     """Return a content-based cache namespace for the active field renderer."""
 
+    def file_digest(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()[:16]
+
     if renderer == "python":
         try:
-            return "python-" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+            return "python-" + file_digest(Path(__file__))
         except OSError:
             return "python-unknown"
 
@@ -306,9 +395,9 @@ def _field_renderer_cache_identity(renderer: str) -> str:
     ]
     for candidate in candidates:
         try:
-            if candidate.exists():
-                return "native-" + hashlib.sha256(candidate.read_bytes()).hexdigest()[:16]
-        except OSError:
+            if candidate.is_file():
+                return "native-" + file_digest(candidate)
+        except (OSError, ValueError):
             continue
     return "native-unavailable"
 
@@ -319,82 +408,66 @@ def _get_native_library() -> Any:
     global _native_checked, _native_library
     if _native_checked:
         return _native_library
-    _native_checked = True
+    with _native_library_lock:
+        # A render can be started from more than one Python worker. Do not let
+        # one worker observe the in-progress probe as a permanent "no native
+        # library" result.
+        if _native_checked:
+            return _native_library
 
-    configured = os.environ.get("MANDELBROT_LIBRARY")
-    candidates = [
-        Path(configured) if configured else Path(__file__).with_name("mandelbrot.so"),
-        Path(__file__).with_name("libmandelbrot.so"),
-    ]
-    for candidate in candidates:
-        if not candidate.exists():
-            continue
+        configured = os.environ.get("MANDELBROT_LIBRARY")
+        default_library = Path(__file__).with_name("mandelbrot.so")
         try:
-            library = ctypes.CDLL(str(candidate))
-            if not hasattr(library, "fractal_abi_version"):
-                continue
-            library.fractal_abi_version.restype = ctypes.c_int
-            if library.fractal_abi_version() != 10:
-                continue
-            if hasattr(library, "fractal_backend_capabilities"):
-                library.fractal_backend_capabilities.restype = ctypes.c_int
-            library.fractal_last_error.restype = ctypes.c_char_p
-            library.fractal_colourise.argtypes = [
-                ctypes.POINTER(ctypes.c_float),
-                ctypes.POINTER(ctypes.c_uint8),
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_double,
-                ctypes.c_double,
-                ctypes.c_double,
-                ctypes.c_double,
-                ctypes.c_int,
-            ]
-            library.fractal_colourise.restype = ctypes.c_int
-            if hasattr(library, "fractal_crop_field"):
-                library.fractal_crop_field.argtypes = [
+            configured_library = Path(configured) if configured else default_library
+        except (TypeError, ValueError):
+            configured_library = default_library
+        candidates = [configured_library, Path(__file__).with_name("libmandelbrot.so")]
+        for candidate in candidates:
+            try:
+                if not candidate.is_file():
+                    continue
+                library = ctypes.CDLL(str(candidate))
+                if not hasattr(library, "fractal_abi_version"):
+                    continue
+                library.fractal_abi_version.restype = ctypes.c_int
+                if library.fractal_abi_version() != 10:
+                    continue
+                if hasattr(library, "fractal_backend_capabilities"):
+                    library.fractal_backend_capabilities.restype = ctypes.c_int
+                library.fractal_last_error.restype = ctypes.c_char_p
+                library.fractal_colourise.argtypes = [
                     ctypes.POINTER(ctypes.c_float),
+                    ctypes.POINTER(ctypes.c_uint8),
                     ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.POINTER(ctypes.c_float),
                     ctypes.c_int,
                     ctypes.c_int,
                     ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_double,
                     ctypes.c_int,
                 ]
-                library.fractal_crop_field.restype = ctypes.c_int
-            library.fractal_crop_colourise.argtypes = [
-                ctypes.POINTER(ctypes.c_float),
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.POINTER(ctypes.c_uint8),
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_double,
-                ctypes.c_int,
-                ctypes.c_double,
-                ctypes.c_double,
-                ctypes.c_double,
-                ctypes.c_double,
-                ctypes.c_int,
-            ]
-            library.fractal_crop_colourise.restype = ctypes.c_int
-            if hasattr(library, "fractal_atlas_colourise"):
-                library.fractal_atlas_colourise.argtypes = [
+                library.fractal_colourise.restype = ctypes.c_int
+                if hasattr(library, "fractal_crop_field"):
+                    library.fractal_crop_field.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_crop_field.restype = ctypes.c_int
+                library.fractal_crop_colourise.argtypes = [
                     ctypes.POINTER(ctypes.c_float),
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.POINTER(ctypes.c_float),
-                    ctypes.c_int,
                     ctypes.c_int,
                     ctypes.c_int,
                     ctypes.POINTER(ctypes.c_uint8),
                     ctypes.c_int,
                     ctypes.c_int,
                     ctypes.c_double,
-                    ctypes.c_double,
                     ctypes.c_int,
                     ctypes.c_double,
                     ctypes.c_double,
@@ -402,18 +475,31 @@ def _get_native_library() -> Any:
                     ctypes.c_double,
                     ctypes.c_int,
                 ]
-                library.fractal_atlas_colourise.restype = ctypes.c_int
-            library.fractal_create_reference.argtypes = [
-                ctypes.c_char_p,
-                ctypes.c_char_p,
-                ctypes.c_char_p,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-            ]
-            library.fractal_create_reference.restype = ctypes.c_void_p
-            if hasattr(library, "fractal_create_reference_reusable"):
-                library.fractal_create_reference_reusable.argtypes = [
+                library.fractal_crop_colourise.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_colourise"):
+                    library.fractal_atlas_colourise.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_colourise.restype = ctypes.c_int
+                library.fractal_create_reference.argtypes = [
                     ctypes.c_char_p,
                     ctypes.c_char_p,
                     ctypes.c_char_p,
@@ -421,36 +507,33 @@ def _get_native_library() -> Any:
                     ctypes.c_int,
                     ctypes.c_int,
                 ]
-                library.fractal_create_reference_reusable.restype = ctypes.c_void_p
-            if hasattr(library, "fractal_clone_reference"):
-                library.fractal_clone_reference.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.c_char_p,
-                ]
-                library.fractal_clone_reference.restype = ctypes.c_void_p
-            library.fractal_destroy_reference.argtypes = [ctypes.c_void_p]
-            library.fractal_destroy_reference.restype = None
-            if hasattr(library, "fractal_get_reference_stats"):
-                library.fractal_get_reference_stats.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.POINTER(ctypes.c_uint64),
-                    ctypes.c_int,
-                ]
-                library.fractal_get_reference_stats.restype = ctypes.c_int
-            library.render_mandelbrot_reference.argtypes = [
-                ctypes.POINTER(ctypes.c_float),
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_void_p,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-            ]
-            library.render_mandelbrot_reference.restype = ctypes.c_int
-            if hasattr(library, "fractal_render_mandelbrot_reference_ex"):
-                library.fractal_render_mandelbrot_reference_ex.argtypes = [
+                library.fractal_create_reference.restype = ctypes.c_void_p
+                if hasattr(library, "fractal_create_reference_reusable"):
+                    library.fractal_create_reference_reusable.argtypes = [
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_create_reference_reusable.restype = ctypes.c_void_p
+                if hasattr(library, "fractal_clone_reference"):
+                    library.fractal_clone_reference.argtypes = [
+                        ctypes.c_void_p,
+                        ctypes.c_char_p,
+                    ]
+                    library.fractal_clone_reference.restype = ctypes.c_void_p
+                library.fractal_destroy_reference.argtypes = [ctypes.c_void_p]
+                library.fractal_destroy_reference.restype = None
+                if hasattr(library, "fractal_get_reference_stats"):
+                    library.fractal_get_reference_stats.argtypes = [
+                        ctypes.c_void_p,
+                        ctypes.POINTER(ctypes.c_uint64),
+                        ctypes.c_int,
+                    ]
+                    library.fractal_get_reference_stats.restype = ctypes.c_int
+                library.render_mandelbrot_reference.argtypes = [
                     ctypes.POINTER(ctypes.c_float),
                     ctypes.c_int,
                     ctypes.c_int,
@@ -460,55 +543,39 @@ def _get_native_library() -> Any:
                     ctypes.c_int,
                     ctypes.c_int,
                     ctypes.c_int,
-                    ctypes.POINTER(NativeRenderOptions),
                 ]
-                library.fractal_render_mandelbrot_reference_ex.restype = ctypes.c_int
-            if hasattr(library, "fractal_render_points"):
-                library.fractal_render_points.argtypes = [
-                    ctypes.POINTER(ctypes.c_float),
-                    ctypes.c_int,
-                    ctypes.c_char_p,
-                    ctypes.POINTER(ctypes.c_double),
-                    ctypes.POINTER(ctypes.c_double),
-                    ctypes.POINTER(ctypes.c_int32),
-                    ctypes.c_void_p,
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.POINTER(NativeRenderOptions),
-                ]
-                library.fractal_render_points.restype = ctypes.c_int
-            library.render_mandelbrot.argtypes = [
-                ctypes.POINTER(ctypes.c_float),
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_char_p,
-                ctypes.c_char_p,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-            ]
-            library.render_mandelbrot.restype = ctypes.c_int
-            if hasattr(library, "render_mandelbrot_ex"):
-                library.render_mandelbrot_ex.argtypes = [
-                    ctypes.POINTER(ctypes.c_float),
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.c_char_p,
-                    ctypes.c_char_p,
-                    ctypes.c_char_p,
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.POINTER(NativeRenderOptions),
-                ]
-                library.render_mandelbrot_ex.restype = ctypes.c_int
-            if hasattr(library, "render_fractal_ex"):
-                library.render_fractal_ex.argtypes = [
+                library.render_mandelbrot_reference.restype = ctypes.c_int
+                if hasattr(library, "fractal_render_mandelbrot_reference_ex"):
+                    library.fractal_render_mandelbrot_reference_ex.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_char_p,
+                        ctypes.c_void_p,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(NativeRenderOptions),
+                    ]
+                    library.fractal_render_mandelbrot_reference_ex.restype = ctypes.c_int
+                if hasattr(library, "fractal_render_points"):
+                    library.fractal_render_points.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_char_p,
+                        ctypes.POINTER(ctypes.c_double),
+                        ctypes.POINTER(ctypes.c_double),
+                        ctypes.POINTER(ctypes.c_int32),
+                        ctypes.c_void_p,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(NativeRenderOptions),
+                    ]
+                    library.fractal_render_points.restype = ctypes.c_int
+                library.render_mandelbrot.argtypes = [
                     ctypes.POINTER(ctypes.c_float),
                     ctypes.c_int,
                     ctypes.c_int,
@@ -519,34 +586,66 @@ def _get_native_library() -> Any:
                     ctypes.c_int,
                     ctypes.c_int,
                     ctypes.c_int,
-                    ctypes.c_int,
-                    ctypes.c_double,
-                    ctypes.c_double,
-                    ctypes.POINTER(NativeRenderOptions),
                 ]
-                library.render_fractal_ex.restype = ctypes.c_int
-            if hasattr(library, "fractal_set_stats_enabled"):
-                library.fractal_set_stats_enabled.argtypes = [ctypes.c_int]
-                library.fractal_set_stats_enabled.restype = None
-            if hasattr(library, "fractal_get_last_stats"):
-                library.fractal_get_last_stats.argtypes = [
-                    ctypes.POINTER(ctypes.c_uint64),
-                    ctypes.c_int,
-                ]
-                library.fractal_get_last_stats.restype = ctypes.c_int
-            if hasattr(library, "fractal_get_last_stats_ex"):
-                library.fractal_get_last_stats_ex.argtypes = [
-                    ctypes.POINTER(ctypes.c_uint64),
-                    ctypes.c_int,
-                ]
-                library.fractal_get_last_stats_ex.restype = ctypes.c_int
-            _native_library = library
-            return library
-        except OSError:
-            # Missing MPFR/OpenMP runtime libraries should not prevent the
-            # Python implementation from running.
-            continue
-    return None
+                library.render_mandelbrot.restype = ctypes.c_int
+                if hasattr(library, "render_mandelbrot_ex"):
+                    library.render_mandelbrot_ex.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(NativeRenderOptions),
+                    ]
+                    library.render_mandelbrot_ex.restype = ctypes.c_int
+                if hasattr(library, "render_fractal_ex"):
+                    library.render_fractal_ex.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(NativeRenderOptions),
+                    ]
+                    library.render_fractal_ex.restype = ctypes.c_int
+                if hasattr(library, "fractal_set_stats_enabled"):
+                    library.fractal_set_stats_enabled.argtypes = [ctypes.c_int]
+                    library.fractal_set_stats_enabled.restype = None
+                if hasattr(library, "fractal_get_last_stats"):
+                    library.fractal_get_last_stats.argtypes = [
+                        ctypes.POINTER(ctypes.c_uint64),
+                        ctypes.c_int,
+                    ]
+                    library.fractal_get_last_stats.restype = ctypes.c_int
+                if hasattr(library, "fractal_get_last_stats_ex"):
+                    library.fractal_get_last_stats_ex.argtypes = [
+                        ctypes.POINTER(ctypes.c_uint64),
+                        ctypes.c_int,
+                    ]
+                    library.fractal_get_last_stats_ex.restype = ctypes.c_int
+                _native_library = library
+                _native_checked = True
+                return library
+            except (OSError, AttributeError, TypeError, ValueError):
+                # Missing runtimes, malformed symbols, and incompatible shared
+                # libraries should not prevent a later candidate or the Python
+                # implementation from running.
+                continue
+        _native_checked = True
+        return None
 
 
 def _native_set_stats_enabled(library: Any, enabled: bool) -> bool:
@@ -652,13 +751,27 @@ def render_exponential_field(
     """
 
     np = _require_numpy()
+    radial_samples = _index_value(radial_samples, "radial sample count")
+    angular_samples = _index_value(angular_samples, "angular sample count")
+    max_iter = _validate_iteration_count(max_iter)
+    series_order = _index_value(series_order, "series order")
+    series_block = _index_value(series_block, "series block")
+    native_threads = _validate_thread_count(native_threads, "native thread count")
+    if radial_samples <= 1 or angular_samples <= 3:
+        raise ValueError("exponential-map sampling grid is too small")
+    if radial_samples * angular_samples > MAX_RENDER_PIXELS:
+        raise ValueError("exponential-map sampling grid is too large")
+    if not 1 <= series_order <= 32 or not 2 <= series_block <= 4096:
+        raise ValueError("series order/block are outside the supported range")
+    min_log10_radius = _validate_log10_zoom(min_log10_radius, "minimum exp-map radius")
+    max_log10_radius = _validate_log10_zoom(max_log10_radius, "maximum exp-map radius")
+    if max_log10_radius <= min_log10_radius:
+        raise ValueError("exponential-map radius range must be increasing")
+    x_center = _validate_center_text(x_center, "real")
+    y_center = _validate_center_text(y_center, "imaginary")
     library = _get_native_library()
     if library is None or not hasattr(library, "fractal_render_points"):
         raise RuntimeError("native point renderer is unavailable; run `make`")
-    if radial_samples <= 1 or angular_samples <= 3:
-        raise ValueError("exponential-map sampling grid is too small")
-    if max_log10_radius <= min_log10_radius:
-        raise ValueError("exponential-map radius range must be increasing")
     if native_reference is None:
         # The reference viewport radius is 2.8 / zoom.  Choose it from the
         # largest radius in the map so every point stays inside the BLA/series
@@ -734,6 +847,13 @@ def reproject_exponential_field(
     source = np.asarray(field, dtype=np.float32)
     if source.ndim != 2 or source.shape[0] < 2 or source.shape[1] < 4:
         raise ValueError("invalid exponential-map field")
+    if not np.isfinite(source).all():
+        raise ValueError("exponential-map field contains non-finite samples")
+    output_width, output_height = _validate_dimensions(output_width, output_height, "exp-map output")
+    max_iter = _validate_iteration_count(max_iter)
+    min_log10_radius = _validate_log10_zoom(min_log10_radius, "minimum exp-map radius")
+    max_log10_radius = _validate_log10_zoom(max_log10_radius, "maximum exp-map radius")
+    log10_zoom = _validate_log10_zoom(log10_zoom)
     if max_log10_radius <= min_log10_radius:
         raise ValueError("exponential-map radius range must be increasing")
     y_fraction = (
@@ -817,16 +937,1036 @@ def _require_librosa() -> Any:
     return librosa
 
 
+def _subprocess_group_options() -> dict[str, Any]:
+    """Start optional tools in a private process group for reliable cleanup."""
+
+    if os.name == "nt":
+        return {
+            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        }
+    return {"start_new_session": True}
+
+
+def _terminate_subprocess(process: Any, timeout: float = 2.0) -> None:
+    """Stop a child and any descendants without allowing cleanup to hang."""
+
+    try:
+        if process.poll() is not None:
+            return
+    except (AttributeError, OSError):
+        return
+    if os.name == "nt":
+        try:
+            process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
+        except (AttributeError, OSError, ValueError):
+            try:
+                process.terminate()
+            except (AttributeError, OSError):
+                return
+    else:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except (AttributeError, OSError, ProcessLookupError):
+            try:
+                process.terminate()
+            except (AttributeError, OSError):
+                return
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            try:
+                process.kill()
+            except (AttributeError, OSError):
+                return
+        else:
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (AttributeError, OSError, ProcessLookupError):
+                try:
+                    process.kill()
+                except (AttributeError, OSError):
+                    return
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # The OS owns the final cleanup now. Do not make the caller wait
+            # forever for a broken child that ignored both signals.
+            return
+
+
+def _read_bounded_line(stream: Any, limit: int) -> Optional[str]:
+    """Read one subprocess line without buffering an unterminated flood."""
+
+    chunk = stream.readline(limit + 1)
+    if not chunk:
+        return None
+    is_bytes = isinstance(chunk, bytes)
+    newline = b"\n" if is_bytes else "\n"
+    truncated = len(chunk) > limit
+    if truncated and not chunk.endswith(newline):
+        # ``readline(size)`` stops at the size limit. Drain the remainder of
+        # this logical line in equally bounded pieces so a child that never
+        # emits a newline cannot grow the reader's temporary allocation.
+        while True:
+            remainder = stream.readline(limit + 1)
+            if not remainder or remainder.endswith(newline):
+                break
+    if truncated:
+        chunk = chunk[:limit]
+        chunk += (
+            b"... [line truncated]\n"
+            if is_bytes
+            else "… [line truncated]\n"
+        )
+    if is_bytes:
+        return chunk.decode("utf-8", errors="replace")
+    return str(chunk)
+
+
+def _start_process_with_diagnostics(
+    command: list[str],
+    *,
+    stdin: Any = None,
+    stdout: Any = None,
+) -> tuple[Any, deque[str], threading.Thread]:
+    """Start a child and continuously drain a bounded diagnostic buffer."""
+
+    diagnostics: deque[str] = deque(maxlen=80)
+    process = subprocess.Popen(
+        command,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=subprocess.PIPE,
+        **_subprocess_group_options(),
+    )
+    stream = process.stderr
+
+    def drain_stderr() -> None:
+        if stream is None:
+            return
+        try:
+            while True:
+                line = _read_bounded_line(stream, MAX_DIAGNOSTIC_LINE_CHARS)
+                if line is None:
+                    break
+                diagnostics.append(line)
+        except (OSError, ValueError):
+            # Process teardown can close the descriptor while the reader is
+            # between lines. The exit status remains the authoritative result.
+            return
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    reader = threading.Thread(
+        target=drain_stderr,
+        name="fractal-ffmpeg-diagnostics",
+        daemon=True,
+    )
+    try:
+        reader.start()
+    except BaseException:
+        _terminate_subprocess(process)
+        raise
+    return process, diagnostics, reader
+
+
+def _start_ffmpeg_process(
+    command: list[str],
+) -> tuple[Any, deque[str], threading.Thread]:
+    """Start FFmpeg and continuously drain a bounded diagnostic buffer."""
+
+    return _start_process_with_diagnostics(command, stdin=subprocess.PIPE)
+
+
+def _diagnostic_snapshot(diagnostics: Optional[deque[str]]) -> tuple[str, ...]:
+    """Take a race-tolerant snapshot of a background stderr ring buffer."""
+
+    if diagnostics is None:
+        return ()
+    try:
+        return tuple(diagnostics.copy())
+    except (AttributeError, RuntimeError):
+        # The normal object is a deque, whose copy operation is safe while the
+        # reader thread appends.  A defensive fallback keeps error reporting
+        # from masking the original process failure for test doubles or an
+        # unusual deque implementation.
+        return ()
+
+
+def _ffmpeg_error_message(
+    prefix: str,
+    diagnostics: Optional[deque[str]] = None,
+    return_code: Optional[int] = None,
+    reader: Optional[threading.Thread] = None,
+) -> str:
+    """Format a compact FFmpeg failure without allowing stderr to grow output."""
+
+    if reader is not None:
+        reader.join(timeout=2.0)
+    status = "" if return_code is None else f" (status {return_code})"
+    details = "".join(_diagnostic_snapshot(diagnostics)).strip()
+    if len(details) > 4000:
+        details = details[-4000:]
+        details = "[diagnostics truncated]\n" + details
+    return f"{prefix}{status}" + (f":\n{details}" if details else "")
+
+
+def _wait_for_ffmpeg(
+    process: Any,
+    diagnostics: Optional[deque[str]],
+    reader: Optional[threading.Thread],
+) -> int:
+    """Wait for FFmpeg to finalize without allowing a broken child to hang."""
+
+    try:
+        return int(process.wait(timeout=FFMPEG_FINALIZE_TIMEOUT_SECONDS))
+    except subprocess.TimeoutExpired as error:
+        _terminate_subprocess(process)
+        raise RuntimeError(
+            _ffmpeg_error_message(
+                f"ffmpeg exceeded the {FFMPEG_FINALIZE_TIMEOUT_SECONDS / 60.0:.0f}-minute "
+                "finalization timeout",
+                diagnostics,
+                process.returncode,
+                reader,
+            )
+        ) from error
+
+
+class _FFmpegFrameWriter:
+    """Write video frames through a bounded queue with stall detection."""
+
+    def __init__(
+        self,
+        process: Any,
+        diagnostics: Optional[deque[str]],
+        reader: Optional[threading.Thread],
+    ) -> None:
+        if process.stdin is None:
+            raise RuntimeError("FFmpeg did not provide a video input pipe")
+        self.process = process
+        self.diagnostics = diagnostics
+        self.reader = reader
+        self.stream = process.stdin
+        self.queue: queue.Queue[Any] = queue.Queue(maxsize=3)
+        self.errors: list[BaseException] = []
+        self.finished = threading.Event()
+        self.progress = time.monotonic()
+        self.last_backpressure_notice = 0.0
+        self.thread = threading.Thread(
+            target=self._worker,
+            name="fractal-encoder-writer",
+            daemon=True,
+        )
+        try:
+            self.thread.start()
+        except BaseException:
+            _terminate_subprocess(process)
+            raise
+
+    def _drain_pending(self) -> None:
+        # Items still queued have no worker left to acknowledge them after a
+        # write failure. Mark them done so shutdown cannot deadlock in a join.
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                return
+            else:
+                self.queue.task_done()
+
+    def _worker(self) -> None:
+        try:
+            while True:
+                frame = self.queue.get()
+                try:
+                    if frame is None:
+                        self.finished.set()
+                        return
+                    self.stream.write(frame)
+                    self.progress = time.monotonic()
+                finally:
+                    self.queue.task_done()
+        except BaseException as error:  # surfaced by the producer thread
+            self.errors.append(error)
+            self._drain_pending()
+
+    def _failure(self, prefix: str) -> RuntimeError:
+        return RuntimeError(
+            _ffmpeg_error_message(
+                prefix,
+                self.diagnostics,
+                self.process.poll(),
+                self.reader,
+            )
+        )
+
+    def check_health(self) -> None:
+        if self.errors:
+            raise self._failure("FFmpeg writer failed") from self.errors[0]
+        return_code = self.process.poll()
+        if return_code is not None:
+            raise self._failure("ffmpeg exited before the frame queue drained")
+        if time.monotonic() - self.progress > FFMPEG_STDIN_STALL_TIMEOUT_SECONDS:
+            _terminate_subprocess(self.process)
+            raise self._failure("FFmpeg stopped draining video input for too long")
+
+    def write(self, frame: Any) -> None:
+        np = _require_numpy()
+        contiguous = np.ascontiguousarray(frame, dtype=np.uint8)
+        while True:
+            self.check_health()
+            try:
+                self.queue.put(memoryview(contiguous), timeout=0.5)
+                return
+            except queue.Full:
+                now = time.monotonic()
+                if now - self.last_backpressure_notice >= ENCODER_BACKPRESSURE_NOTICE_SECONDS:
+                    print(
+                        "  Encoder backpressure: native/compositor is "
+                        "waiting for FFmpeg to drain the frame queue.",
+                        flush=True,
+                    )
+                    self.last_backpressure_notice = now
+
+    def _put_sentinel(self) -> None:
+        while True:
+            self.check_health()
+            try:
+                self.queue.put(None, timeout=0.5)
+                return
+            except queue.Full:
+                continue
+
+    def finish(self) -> int:
+        self._put_sentinel()
+        while not self.finished.wait(timeout=0.5):
+            self.check_health()
+        self.thread.join(timeout=2.0)
+        if self.thread.is_alive():
+            raise RuntimeError("FFmpeg writer thread did not shut down")
+        if self.errors:
+            raise self._failure("FFmpeg writer failed") from self.errors[0]
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+            self.process.stdin = None
+        return _wait_for_ffmpeg(self.process, self.diagnostics, self.reader)
+
+    def abort(self) -> None:
+        """Best-effort queue shutdown for an outer render failure."""
+
+        if not self.thread.is_alive():
+            return
+        try:
+            self.queue.put(None, timeout=0.5)
+        except queue.Full:
+            pass
+        self.thread.join(timeout=2.0)
+
+
+def _normalise_path(path: Path) -> Path:
+    """Return a stable absolute path without requiring the target to exist."""
+
+    candidate = Path(path).expanduser()
+    try:
+        return candidate.resolve(strict=False)
+    except (OSError, RuntimeError):
+        # A broken symlink loop or an unusual network filesystem should not
+        # make validation itself fail. ``absolute`` still gives us a useful
+        # collision check for ordinary paths.
+        return Path(os.path.abspath(str(candidate)))
+
+
+def _absolute_path(path: Path) -> Path:
+    """Return an absolute lexical path without following its final symlink."""
+
+    candidate = Path(path).expanduser()
+    try:
+        return Path(os.path.abspath(str(candidate)))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return candidate.absolute()
+
+
+def _reject_final_symlink(path: Path, label: str) -> None:
+    """Reject a final symlink before an atomic writer chooses its target."""
+
+    candidate = Path(path).expanduser()
+    try:
+        if candidate.is_symlink():
+            raise ValueError(f"{label} path must not be a symbolic link: {candidate}")
+    except OSError as error:
+        raise ValueError(f"could not inspect {label} path {candidate}: {error}") from error
+
+
+def _paths_refer_to_same_target(first: Path, second: Path) -> bool:
+    """Detect lexical, symlink, and hard-link aliases for two path targets."""
+
+    first = _normalise_path(first)
+    second = _normalise_path(second)
+    if first == second:
+        return True
+    try:
+        return first.exists() and second.exists() and first.samefile(second)
+    except OSError:
+        return False
+
+
+def _path_is_within_directory(path: Path, directory: Path) -> bool:
+    """Return whether a path is inside a directory, including the directory."""
+
+    try:
+        _normalise_path(path).relative_to(_normalise_path(directory))
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _read_cache_bytes(stream: Any, size: int) -> Optional[bytes]:
+    """Read a small cache header completely without trusting one short read."""
+
+    if size < 0 or size > MAX_CACHE_HEADER_BYTES:
+        return None
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        block = stream.read(remaining)
+        if not block or len(block) > remaining:
+            return None
+        chunks.append(bytes(block))
+        remaining -= len(block)
+    return b"".join(chunks)
+
+
+def _cache_npy_payload_is_safe(stream: Any, member_size: int) -> bool:
+    """Validate a NumPy header before a claimed shape can trigger allocation."""
+
+    # The header is parsed with literal_eval, never executed. The subsequent
+    # dtype check deliberately accepts only plain numeric arrays: cache files
+    # have no legitimate object, structured, or subarray payloads.
+    magic = _read_cache_bytes(stream, 6)
+    version = _read_cache_bytes(stream, 2)
+    if magic != b"\x93NUMPY" or version is None or len(version) != 2:
+        return False
+    major, minor = version
+    if minor != 0 or major not in {1, 2, 3}:
+        return False
+    if major == 1:
+        raw_length = _read_cache_bytes(stream, 2)
+        if raw_length is None or len(raw_length) != 2:
+            return False
+        header_length = struct.unpack("<H", raw_length)[0]
+        preamble_size = 10
+    else:
+        raw_length = _read_cache_bytes(stream, 4)
+        if raw_length is None or len(raw_length) != 4:
+            return False
+        header_length = struct.unpack("<I", raw_length)[0]
+        preamble_size = 12
+    if header_length > MAX_CACHE_HEADER_BYTES:
+        return False
+    header = _read_cache_bytes(stream, header_length)
+    if header is None:
+        return False
+    try:
+        metadata = ast.literal_eval(header.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(metadata, dict) or set(metadata) != {
+        "descr", "fortran_order", "shape",
+    }:
+        return False
+    if not isinstance(metadata["descr"], str) or not isinstance(
+        metadata["fortran_order"], bool
+    ):
+        return False
+    shape = metadata["shape"]
+    if not isinstance(shape, tuple) or len(shape) > 2:
+        return False
+    element_count = 1
+    for dimension in shape:
+        if type(dimension) is not int or dimension < 0:
+            return False
+        if dimension > MAX_CACHE_ARRAY_ELEMENTS:
+            return False
+        if dimension and element_count > MAX_CACHE_ARRAY_ELEMENTS // dimension:
+            return False
+        element_count *= dimension
+    try:
+        np = _require_numpy()
+        dtype = np.dtype(metadata["descr"])
+    except (ImportError, TypeError, ValueError):
+        return False
+    if (
+        dtype.hasobject
+        or dtype.fields is not None
+        or dtype.subdtype is not None
+        or dtype.kind not in {"f", "i", "u"}
+        or dtype.itemsize <= 0
+        or dtype.itemsize > 8
+    ):
+        return False
+    payload_size = element_count * int(dtype.itemsize)
+    data_offset = preamble_size + header_length
+    return data_offset <= member_size and payload_size <= member_size - data_offset
+
+
+def _open_cache_stream(path: Path) -> tuple[Any, int]:
+    """Open a cache entry safely and return its stream plus stable file size."""
+
+    candidate = Path(path)
+    if candidate.is_symlink():
+        raise OSError("cache entry is a symbolic link")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    # Linux/Unix can make the final-component check atomic with the open. The
+    # explicit is_symlink check above remains the fallback on platforms that
+    # do not expose O_NOFOLLOW.
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(candidate, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("cache entry is not a regular file")
+        file_size = int(metadata.st_size)
+        if file_size < 0 or file_size > MAX_CACHE_FILE_BYTES:
+            raise ValueError("cache entry exceeds the size limit")
+        stream = os.fdopen(descriptor, "rb")
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    return stream, file_size
+
+
+def _cache_archive_directory_is_bounded(stream: Any, file_size: int) -> bool:
+    """Reject an oversized ZIP central directory before ``ZipFile`` parses it."""
+
+    # ``ZipFile`` builds one ZipInfo object per central-directory entry during
+    # construction. Inspect the fixed-size end record first so a hostile NPZ
+    # with millions of tiny members cannot force that allocation before our
+    # member-count check runs. ZIP64 archives necessarily report 0xffff here;
+    # under the 512 MiB cache-file limit such an entry count is not legitimate
+    # for our 16-member cache format, so reject it conservatively.
+    end_record_size = 22
+    if file_size < end_record_size:
+        return False
+    tail_size = min(
+        int(file_size),
+        end_record_size + MAX_CACHE_ARCHIVE_COMMENT_BYTES,
+    )
+    stream.seek(file_size - tail_size)
+    tail = stream.read(tail_size)
+    if not isinstance(tail, bytes) or len(tail) != tail_size:
+        return False
+    signature = b"PK\x05\x06"
+    for offset in range(len(tail) - end_record_size, -1, -1):
+        if tail[offset : offset + 4] != signature:
+            continue
+        comment_length = struct.unpack_from("<H", tail, offset + 20)[0]
+        if offset + end_record_size + comment_length != len(tail):
+            continue
+        member_count = struct.unpack_from("<H", tail, offset + 10)[0]
+        return member_count <= MAX_CACHE_ARCHIVE_MEMBERS
+    return False
+
+
+def _cache_stream_is_safe(path: Path, stream: Any, file_size: int) -> bool:
+    """Validate one already-open cache stream before deserialization."""
+
+    suffix = path.suffix.casefold()
+    if suffix == ".npy":
+        return _cache_npy_payload_is_safe(stream, file_size)
+    if suffix != ".npz":
+        return False
+    if not _cache_archive_directory_is_bounded(stream, file_size):
+        return False
+    with zipfile.ZipFile(stream) as archive:
+        members = archive.infolist()
+        if not members or len(members) > MAX_CACHE_ARCHIVE_MEMBERS:
+            return False
+        expanded_size = 0
+        for member in members:
+            if (
+                member.is_dir()
+                or not member.filename.casefold().endswith(".npy")
+                or member.file_size < 0
+                or member.file_size > MAX_CACHE_FILE_BYTES
+            ):
+                return False
+            expanded_size += int(member.file_size)
+            if expanded_size > MAX_CACHE_FILE_BYTES:
+                return False
+            with archive.open(member, "r") as member_stream:
+                if not _cache_npy_payload_is_safe(member_stream, int(member.file_size)):
+                    return False
+        return True
+
+
+def _cache_file_is_safe(path: Path) -> bool:
+    """Reject oversized, deceptive, or zip-bomb-like cache entries."""
+
+    try:
+        stream, file_size = _open_cache_stream(path)
+        try:
+            return _cache_stream_is_safe(Path(path), stream, file_size)
+        finally:
+            stream.close()
+    except (
+        EOFError,
+        KeyError,
+        MemoryError,
+        OSError,
+        OverflowError,
+        RuntimeError,
+        ValueError,
+        zipfile.BadZipFile,
+    ):
+        return False
+
+
+@contextmanager
+def _safe_cache_load(path: Path):
+    """Validate and deserialize a cache entry through the same open handle."""
+
+    stream, file_size = _open_cache_stream(path)
+    cached = None
+    try:
+        try:
+            safe = _cache_stream_is_safe(Path(path), stream, file_size)
+        except (
+            EOFError,
+            KeyError,
+            MemoryError,
+            OSError,
+            OverflowError,
+            RuntimeError,
+            ValueError,
+            zipfile.BadZipFile,
+        ):
+            safe = False
+        if not safe:
+            yield None
+            return
+        stream.seek(0)
+        np = _require_numpy()
+        cached = np.load(stream, allow_pickle=False)
+        yield cached
+    finally:
+        if cached is not None and hasattr(cached, "close"):
+            try:
+                cached.close()
+            except (OSError, ValueError):
+                pass
+        stream.close()
+
+
+def _temporary_sibling(path: Path, label: str) -> Path:
+    """Return a unique same-directory temporary path for atomic output.
+
+    The path is deliberately not created here. Callers can perform additional
+    setup (native reference construction, cache creation, and encoder probing)
+    after choosing it; avoiding a placeholder file means an exception during
+    that setup cannot leave an orphaned output beside the user's target.
+    """
+
+    path = _absolute_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    safe_label = "".join(
+        character if character.isalnum() or character in "-_" else "-"
+        for character in str(label)
+    ) or "temporary"
+    return path.with_name(
+        f".{path.name}.{safe_label}-{uuid.uuid4().hex}{path.suffix}"
+    )
+
+
+def _reserved_temporary_sibling(path: Path, label: str) -> Path:
+    """Reserve a same-directory temporary file with exclusive creation."""
+
+    for _ in range(3):
+        candidate = _temporary_sibling(path, label)
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        try:
+            os.close(descriptor)
+        except OSError:
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
+            raise
+        return candidate
+    raise OSError("could not reserve a unique temporary output path")
+
+
+def _validate_render_paths(
+    audio_path: Path,
+    output_path: Path,
+    manifest_path: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
+) -> tuple[Path, Path, Optional[Path], Optional[Path]]:
+    """Validate all paths before analysis/encoding can mutate anything."""
+
+    _reject_final_symlink(output_path, "output")
+    if manifest_path is not None:
+        _reject_final_symlink(manifest_path, "manifest")
+    audio = _normalise_path(audio_path)
+    output = _absolute_path(output_path)
+    manifest = _absolute_path(manifest_path) if manifest_path is not None else None
+    cache = _normalise_path(cache_dir) if cache_dir is not None else None
+
+    if not audio.is_file():
+        raise ValueError(f"audio file not found: {audio}")
+    if output.exists() and output.is_dir():
+        raise ValueError(f"output path is a directory: {output}")
+    if output.parent.exists() and not output.parent.is_dir():
+        raise ValueError(f"output parent is not a directory: {output.parent}")
+    if _paths_refer_to_same_target(audio, output):
+        raise ValueError("output path must be different from the input audio file")
+
+    if manifest is not None:
+        if manifest.exists() and manifest.is_dir():
+            raise ValueError(f"manifest path is a directory: {manifest}")
+        if manifest.parent.exists() and not manifest.parent.is_dir():
+            raise ValueError(f"manifest parent is not a directory: {manifest.parent}")
+        if _paths_refer_to_same_target(manifest, audio):
+            raise ValueError("manifest path must be different from the input audio file")
+        if _paths_refer_to_same_target(manifest, output):
+            raise ValueError("manifest path must be different from the output video")
+
+    if cache is not None:
+        if cache.exists() and not cache.is_dir():
+            raise ValueError(f"cache path is not a directory: {cache}")
+        if cache.parent.exists() and not cache.parent.is_dir():
+            raise ValueError(f"cache parent is not a directory: {cache.parent}")
+        for label, candidate in (
+            ("input audio", audio),
+            ("output", output),
+            ("manifest", manifest),
+        ):
+            if candidate is not None and _path_is_within_directory(candidate, cache):
+                raise ValueError(
+                    f"cache directory must not contain the {label} path"
+                )
+        if _paths_refer_to_same_target(cache, output):
+            raise ValueError("cache directory must be different from the output video")
+        if manifest is not None and _paths_refer_to_same_target(cache, manifest):
+            raise ValueError("cache directory must be different from the manifest file")
+
+    return audio, output, manifest, cache
+
+
+def _index_value(value: Any, label: str) -> int:
+    try:
+        return int(operator.index(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be an integer") from exc
+
+
+def _validate_iteration_count(value: Any, label: str = "iteration count") -> int:
+    result = _index_value(value, label)
+    if result <= 0 or result > MAX_ITERATION_BUDGET:
+        raise ValueError(
+            f"{label} must be between 1 and {MAX_ITERATION_BUDGET:,}"
+        )
+    return result
+
+
+def _validate_thread_count(value: Any, label: str = "thread count") -> int:
+    result = _index_value(value, label)
+    if result < 0 or result > MAX_THREAD_COUNT:
+        raise ValueError(f"{label} must be between 0 and {MAX_THREAD_COUNT:,}")
+    return result
+
+
+def _validate_fps(value: Any, label: str = "fps") -> int:
+    result = _index_value(value, label)
+    if result <= 0 or result > MAX_FPS:
+        raise ValueError(f"{label} must be between 1 and {MAX_FPS:,}")
+    return result
+
+
+def _validate_log10_zoom(value: Any, label: str = "zoom exponent") -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{label} must be numeric") from error
+    if not math.isfinite(result) or not MIN_LOG10_ZOOM <= result <= MAX_LOG10_ZOOM:
+        raise ValueError(
+            f"{label} must be between {MIN_LOG10_ZOOM:.0f} and "
+            f"{MAX_LOG10_ZOOM:.0f}"
+        )
+    return result
+
+
+def _validate_keyframe_factor(value: Any) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("keyframe factor must be numeric") from error
+    if not math.isfinite(result) or result <= 1.0:
+        raise ValueError("keyframe factor must be finite and greater than 1")
+    return result
+
+
+def _validate_ffmpeg_token(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    token = value.strip()
+    if (
+        not token
+        or token.startswith("-")
+        or any(character.isspace() for character in token)
+        or len(token) > 128
+    ):
+        raise ValueError(f"{label} must be one non-empty FFmpeg token")
+    return token
+
+
+def _validate_dimensions(width: Any, height: Any, label: str = "render") -> tuple[int, int]:
+    width_value = _index_value(width, f"{label} width")
+    height_value = _index_value(height, f"{label} height")
+    if width_value <= 0 or height_value <= 0:
+        raise ValueError(f"{label} width and height must be positive")
+    if width_value * height_value > MAX_RENDER_PIXELS:
+        raise ValueError(
+            f"{label} dimensions contain too many pixels; maximum is {MAX_RENDER_PIXELS:,}"
+        )
+    return width_value, height_value
+
+
+def _scaled_dimensions(
+    width: Any,
+    height: Any,
+    scale: Any,
+    label: str = "fractal source",
+) -> tuple[int, int]:
+    """Scale a frame size without allowing float/int overflow to escape."""
+
+    width_value, height_value = _validate_dimensions(width, height, label)
+    try:
+        scale_value = float(scale)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{label} scale must be numeric") from error
+    if not math.isfinite(scale_value) or scale_value <= 0.0:
+        raise ValueError(f"{label} scale must be finite and positive")
+    scaled_width = float(width_value) * scale_value
+    scaled_height = float(height_value) * scale_value
+    if not math.isfinite(scaled_width) or not math.isfinite(scaled_height):
+        raise ValueError(f"{label} dimensions are too large")
+    try:
+        result_width = max(16, int(round(scaled_width)))
+        result_height = max(16, int(round(scaled_height)))
+    except (OverflowError, ValueError) as error:
+        raise ValueError(f"{label} dimensions are too large") from error
+    return _validate_dimensions(result_width, result_height, label)
+
+
+def _validate_numeric_series(
+    values: Any,
+    frame_count: int,
+    name: str,
+    *,
+    bounded: bool = False,
+) -> Any:
+    np = _require_numpy()
+    try:
+        array = np.asarray(values)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} must contain real numeric samples") from error
+    if array.ndim != 1 or array.size != frame_count:
+        raise ValueError(f"{name} must contain exactly {frame_count} one-dimensional samples")
+    if not np.issubdtype(array.dtype, np.number) or np.issubdtype(
+        array.dtype, np.complexfloating
+    ):
+        raise ValueError(f"{name} must contain real numeric samples")
+    try:
+        array = np.asarray(array, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} must contain real numeric samples") from error
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} contains non-finite samples")
+    if bounded and (float(np.min(array)) < -1.0e-6 or float(np.max(array)) > 1.0 + 1.0e-6):
+        raise ValueError(f"{name} samples must be between 0 and 1")
+    return array.astype(np.float32, copy=False)
+
+
+def _validate_audio_features(features: AudioFeatures) -> int:
+    """Validate externally supplied controls before they reach the encoder."""
+
+    try:
+        frame_count = _index_value(features.frame_count, "audio frame count")
+    except AttributeError as exc:
+        raise ValueError("features must be an AudioFeatures-like object") from exc
+    if frame_count <= 0 or frame_count > MAX_AUDIO_FRAMES:
+        raise ValueError(
+            f"audio frame count must be between 1 and {MAX_AUDIO_FRAMES:,}"
+        )
+    for name in ("vocal", "instrumental", "pitch", "gradient"):
+        try:
+            values = getattr(features, name)
+        except AttributeError as exc:
+            raise ValueError(f"features is missing the {name} control") from exc
+        _validate_numeric_series(values, frame_count, name, bounded=True)
+    try:
+        phase = features.phase
+    except AttributeError as exc:
+        raise ValueError("features is missing the phase control") from exc
+    _validate_numeric_series(phase, frame_count, "phase")
+    onset = getattr(features, "onset", None)
+    if onset is not None:
+        _validate_numeric_series(onset, frame_count, "onset", bounded=True)
+    return frame_count
+
+
+def _normalise_audio_features(features: AudioFeatures) -> AudioFeatures:
+    """Copy validated controls so rendering cannot mutate its caller's data."""
+
+    np = _require_numpy()
+    frame_count = _validate_audio_features(features)
+    controls = {
+        name: np.array(getattr(features, name), dtype=np.float32, copy=True)
+        for name in ("vocal", "instrumental", "phase", "pitch", "gradient")
+    }
+    onset_value = getattr(features, "onset", None)
+    onset = (
+        None
+        if onset_value is None
+        else np.array(onset_value, dtype=np.float32, copy=True)
+    )
+    return AudioFeatures(
+        controls["vocal"],
+        controls["instrumental"],
+        controls["phase"],
+        controls["pitch"],
+        controls["gradient"],
+        frame_count,
+        onset,
+    )
+
+
+def _validate_zoom_series(zooms: Any, frame_count: int) -> Any:
+    np = _require_numpy()
+    try:
+        array = np.asarray(zooms)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("zoom path must contain real numeric samples") from error
+    if array.ndim != 1 or array.size != frame_count or array.size == 0:
+        raise ValueError(f"zoom path must contain exactly {frame_count} one-dimensional samples")
+    if not np.issubdtype(array.dtype, np.number) or np.issubdtype(
+        array.dtype, np.complexfloating
+    ):
+        raise ValueError("zoom path must contain real numeric samples")
+    try:
+        array = np.asarray(array, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("zoom path must contain real numeric samples") from error
+    if not np.isfinite(array).all():
+        raise ValueError("zoom path contains non-finite samples")
+    minimum = float(np.min(array))
+    maximum = float(np.max(array))
+    if minimum < MIN_LOG10_ZOOM or maximum > MAX_LOG10_ZOOM:
+        raise ValueError(
+            f"zoom path must stay between 10^{MIN_LOG10_ZOOM:.0f} and "
+            f"10^{MAX_LOG10_ZOOM:.0f}"
+        )
+    return array
+
+
+def _cached_audio_features(cached: Any) -> Optional[AudioFeatures]:
+    """Read a cache entry only after validating every stored control array."""
+
+    np = _require_numpy()
+    frame_value = np.asarray(cached["frame_count"])
+    if frame_value.size != 1:
+        raise ValueError("cached audio frame count is not scalar")
+    if not np.issubdtype(frame_value.dtype, np.integer):
+        raise ValueError("cached audio frame count is not an integer")
+    frame_count = int(frame_value.reshape(-1)[0])
+    if frame_count <= 0 or frame_count > MAX_AUDIO_FRAMES:
+        raise ValueError("cached audio frame count is out of range")
+    vocal = _validate_numeric_series(cached["vocal"], frame_count, "cached vocal", bounded=True)
+    instrumental = _validate_numeric_series(
+        cached["instrumental"], frame_count, "cached instrumental", bounded=True
+    )
+    phase = _validate_numeric_series(cached["phase"], frame_count, "cached phase")
+    pitch = _validate_numeric_series(cached["pitch"], frame_count, "cached pitch", bounded=True)
+    gradient = _validate_numeric_series(
+        cached["gradient"], frame_count, "cached gradient", bounded=True
+    )
+    onset = _validate_numeric_series(cached["onset"], frame_count, "cached onset", bounded=True)
+    return AudioFeatures(vocal, instrumental, phase, pitch, gradient, frame_count, onset)
+
+
 def _load_audio(path: Path, sample_rate: int) -> Any:
     np = _require_numpy()
     librosa = _require_librosa()
+    sample_rate = _index_value(sample_rate, "sample rate")
+    if sample_rate <= 0 or sample_rate > MAX_SAMPLE_RATE:
+        raise ValueError(f"sample rate must be between 1 and {MAX_SAMPLE_RATE:,}")
     try:
-        samples, _ = librosa.load(str(path), sr=sample_rate, mono=True)
+        duration = float(librosa.get_duration(path=str(path)))
+    except Exception:
+        # Some codecs do not expose duration metadata. The decoded-size check
+        # below remains authoritative for those files.
+        duration = None
+    if duration is not None:
+        if not math.isfinite(duration) or duration < 0.0:
+            raise RuntimeError(f"audio decoder returned an invalid duration: {path}")
+        if duration * sample_rate > MAX_AUDIO_SAMPLES:
+            raise RuntimeError(
+                f"audio is too long at {sample_rate:,} Hz; decoded samples may not exceed "
+                f"{MAX_AUDIO_SAMPLES:,}"
+            )
+    try:
+        # Ask the decoder for one sentinel sample beyond the accepted budget.
+        # This bounds backends that honour the duration argument while still
+        # letting us reject a file whose true decoded length exceeds the limit
+        # when metadata was unavailable or inaccurate.
+        decode_duration = (MAX_AUDIO_SAMPLES + 1) / float(sample_rate)
+        samples, _ = librosa.load(
+            str(path),
+            sr=sample_rate,
+            mono=True,
+            duration=decode_duration,
+        )
     except Exception as exc:
         raise RuntimeError(f"Could not decode audio file {path}: {exc}") from exc
     if samples.size == 0:
         raise RuntimeError(f"Audio file is empty: {path}")
-    return np.asarray(samples, dtype=np.float32)
+    if samples.size > MAX_AUDIO_SAMPLES:
+        raise RuntimeError(
+            f"audio contains too many decoded samples; maximum is {MAX_AUDIO_SAMPLES:,}"
+        )
+    samples = np.asarray(samples, dtype=np.float32)
+    if not np.isfinite(samples).all():
+        # A damaged decoder window should not poison every downstream
+        # percentile and phase calculation. Treat non-finite samples as
+        # silence while retaining the rest of the track.
+        samples = np.nan_to_num(samples, nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.isfinite(samples).all():
+        raise RuntimeError(f"Audio decoder returned non-finite samples: {path}")
+    return samples
+
+
+def _demucs_is_available() -> bool:
+    """Probe the optional separator without letting a broken install abort auto mode."""
+
+    try:
+        return importlib.util.find_spec("demucs") is not None
+    except (ImportError, ModuleNotFoundError, ValueError, AttributeError):
+        return False
 
 
 def _audio_cache_path(
@@ -847,7 +1987,7 @@ def _audio_cache_path(
     digest.update(f"{float(attack):.9g},{float(release):.9g}".encode("ascii"))
     separation_signature = separation
     if separation == "auto":
-        separation_signature += "-demucs" if importlib.util.find_spec("demucs") else "-fullmix"
+        separation_signature += "-demucs" if _demucs_is_available() else "-fullmix"
     digest.update(separation_signature.encode("ascii"))
     with audio_path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
@@ -857,6 +1997,9 @@ def _audio_cache_path(
 
 def _atomic_save_features(path: Path, features: AudioFeatures) -> None:
     np = _require_numpy()
+    path = _absolute_path(path)
+    _reject_final_symlink(path, "cache entry")
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -890,12 +2033,43 @@ def _atomic_save_features(path: Path, features: AudioFeatures) -> None:
 
 
 def _find_demucs_stems(root: Path) -> Optional[tuple[Path, Path]]:
-    vocals = sorted(root.rglob("vocals.wav"))
-    no_vocals = sorted(root.rglob("no_vocals.wav"))
+    """Return regular stem files that remain inside Demucs' private directory."""
+
+    try:
+        root = root.resolve(strict=True)
+    except OSError:
+        return None
+
+    def safe_candidates(name: str) -> list[Path]:
+        try:
+            candidates = []
+            for index, candidate in enumerate(root.rglob(name)):
+                if index >= MAX_DEMUCS_DISCOVERY_ENTRIES:
+                    return []
+                candidates.append(candidate)
+        except (OSError, RuntimeError):
+            return []
+        safe: list[Path] = []
+        for candidate in candidates:
+            try:
+                # A separator is an optional third-party process. Do not let a
+                # compromised/broken install make the parent decode an
+                # arbitrary symlink target outside its private temp tree.
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            safe.append(resolved)
+        return sorted(safe)
+
+    vocals = safe_candidates("vocals.wav")
+    no_vocals = safe_candidates("no_vocals.wav")
     if vocals and no_vocals:
         return vocals[0], no_vocals[0]
     # Some Demucs versions use ``instrumental.wav`` for the second stem.
-    instruments = sorted(root.rglob("instrumental.wav"))
+    instruments = safe_candidates("instrumental.wav")
     if vocals and instruments:
         return vocals[0], instruments[0]
     return None
@@ -904,7 +2078,7 @@ def _find_demucs_stems(root: Path) -> Optional[tuple[Path, Path]]:
 def _demucs_stems(audio_path: Path, output_dir: Path, mode: str) -> Optional[tuple[Path, Path]]:
     """Run Demucs if requested/available and return its two stem paths."""
 
-    available = importlib.util.find_spec("demucs") is not None
+    available = _demucs_is_available()
     if not available:
         if mode == "demucs":
             raise RuntimeError(
@@ -912,6 +2086,26 @@ def _demucs_stems(audio_path: Path, output_dir: Path, mode: str) -> Optional[tup
                 "Install it with: pip install demucs"
             )
         print("Demucs is not installed; using full-song control.")
+        return None
+
+    # Demucs receives the original path rather than the bounded NumPy
+    # samples. If a decoder cannot report duration, running it would let an
+    # otherwise bounded render hand an unbounded source to a third-party
+    # process. Auto mode can safely fall back; explicit mode gets an actionable
+    # error instead.
+    try:
+        duration = float(_require_librosa().get_duration(path=str(audio_path)))
+    except Exception as error:
+        message = "could not determine audio duration safely for Demucs"
+        if mode == "demucs":
+            raise RuntimeError(message) from error
+        print(f"{message}; using full-song control.")
+        return None
+    if not math.isfinite(duration) or duration < 0.0:
+        message = "audio duration metadata is invalid for Demucs"
+        if mode == "demucs":
+            raise RuntimeError(message)
+        print(f"{message}; using full-song control.")
         return None
 
     command = [
@@ -926,14 +2120,47 @@ def _demucs_stems(audio_path: Path, output_dir: Path, mode: str) -> Optional[tup
         str(audio_path),
     ]
     print("Separating vocals and instruments with Demucs...")
-    result = subprocess.run(command, text=True, capture_output=True)
-    if result.returncode != 0:
+    process = None
+    diagnostics: Optional[deque[str]] = None
+    diagnostic_reader: Optional[threading.Thread] = None
+    try:
+        process, diagnostics, diagnostic_reader = _start_process_with_diagnostics(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+        )
+        try:
+            process.wait(timeout=DEMUCS_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            _terminate_subprocess(process)
+            message = (
+                f"Demucs exceeded the {DEMUCS_TIMEOUT_SECONDS / 60.0:.0f}-minute timeout"
+            )
+            if mode == "demucs":
+                raise RuntimeError(message) from exc
+            print(f"{message}; using full-song control.")
+            return None
+    except OSError as exc:
+        message = f"could not start Demucs: {exc}"
         if mode == "demucs":
-            details = (result.stderr or result.stdout).strip()
+            raise RuntimeError(message) from exc
+        print(f"Demucs {message}; using full-song control.")
+        return None
+    finally:
+        if diagnostic_reader is not None:
+            diagnostic_reader.join(timeout=2.0)
+    if process is None:
+        raise RuntimeError("Demucs process was not started")
+    if process.returncode != 0:
+        if mode == "demucs":
+            details = "".join(_diagnostic_snapshot(diagnostics)).strip()
+            if len(details) > 4000:
+                details = "[diagnostics truncated]\n" + details[-4000:]
             raise RuntimeError(f"Demucs failed:\n{details}")
         print("Demucs failed; using full-song control.")
-        if result.stderr:
-            print(result.stderr.strip())
+        details = "".join(_diagnostic_snapshot(diagnostics)).strip()
+        if details:
+            print(details)
         return None
 
     stems = _find_demucs_stems(output_dir)
@@ -1199,38 +2426,54 @@ def analyse_audio(
     """Load one song and produce frame-aligned vocal/instrument controls."""
 
     np = _require_numpy()
+    audio_path = _normalise_path(audio_path)
+    if not audio_path.is_file():
+        raise ValueError(f"audio file not found: {audio_path}")
+    sample_rate = _index_value(sample_rate, "sample rate")
+    fps = _validate_fps(fps)
+    if sample_rate <= 0 or sample_rate > MAX_SAMPLE_RATE:
+        raise ValueError(f"sample rate must be between 1 and {MAX_SAMPLE_RATE:,}")
+    if separation not in {"auto", "demucs", "spectral", "none"}:
+        raise ValueError(f"unknown audio separation mode: {separation}")
+    if not math.isfinite(float(attack)) or not math.isfinite(float(release)):
+        raise ValueError("audio attack and release must be finite")
+    if float(attack) < 0.0 or float(release) < 0.0:
+        raise ValueError("audio attack and release cannot be negative")
+    if cache_dir is not None:
+        cache_dir = _normalise_path(cache_dir)
+        if cache_dir.exists() and not cache_dir.is_dir():
+            raise ValueError(f"cache path is not a directory: {cache_dir}")
     cache_path = _audio_cache_path(
         audio_path, sample_rate, fps, separation, attack, release, cache_dir
     )
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with np.load(cache_path, allow_pickle=False) as cached:
-                vocal = np.asarray(cached["vocal"], dtype=np.float32)
-                instrumental = np.asarray(cached["instrumental"], dtype=np.float32)
-                phase = np.asarray(cached["phase"], dtype=np.float32)
-                pitch = np.asarray(cached["pitch"], dtype=np.float32)
-                gradient = np.asarray(cached["gradient"], dtype=np.float32)
-                onset = np.asarray(cached["onset"], dtype=np.float32)
-                frame_count = int(cached["frame_count"])
-            if (
-                frame_count > 0
-                and vocal.shape == (frame_count,)
-                and instrumental.shape == (frame_count,)
-                and phase.shape == (frame_count,)
-                and pitch.shape == (frame_count,)
-                and gradient.shape == (frame_count,)
-                and onset.shape == (frame_count,)
-            ):
-                print(f"Using cached audio controls {cache_path.name}.")
-                return AudioFeatures(
-                    vocal, instrumental, phase, pitch, gradient, frame_count, onset
-                )
-        except (OSError, KeyError, ValueError):
+            with _safe_cache_load(cache_path) as cached:
+                if cached is None:
+                    raise ValueError("unsafe cached audio controls")
+                cached_features = _cached_audio_features(cached)
+                if cached_features is not None:
+                    print(f"Using cached audio controls {cache_path.name}.")
+                    return cached_features
+        except (
+            EOFError,
+            KeyError,
+            MemoryError,
+            OSError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            zipfile.BadZipFile,
+        ):
             pass
 
     source = _load_audio(audio_path, sample_rate)
     frame_count = max(1, math.ceil(len(source) * fps / sample_rate))
+    if frame_count > MAX_AUDIO_FRAMES:
+        raise ValueError(
+            f"audio produces too many video frames; maximum is {MAX_AUDIO_FRAMES:,}"
+        )
     full_mix_rms = _resample_features(_frame_rms(source, sample_rate, fps), frame_count, fps, sample_rate)
     onset = _resample_features(
         _frame_onset(source, sample_rate, fps), frame_count, fps, sample_rate
@@ -1319,6 +2562,7 @@ def analyse_audio(
     )
     phase = np.cumsum(phase_rate / max(float(fps), 1.0)).astype(np.float32)
     features = AudioFeatures(vocal, instrumental, phase, pitch, gradient, frame_count, onset)
+    _validate_audio_features(features)
     if cache_path is not None:
         _atomic_save_features(cache_path, features)
     return features
@@ -1398,6 +2642,11 @@ def _deep_point_max_log10_zoom(point: DeepZoomPoint) -> float:
 
 def _validate_center_text(value: str, label: str) -> str:
     text = str(value).strip()
+    if not text or len(text) > MAX_COORDINATE_TEXT_LENGTH:
+        raise ValueError(
+            f"{label} coordinate must contain between 1 and "
+            f"{MAX_COORDINATE_TEXT_LENGTH:,} characters"
+        )
     try:
         parsed = Decimal(text)
     except Exception as error:
@@ -1405,6 +2654,18 @@ def _validate_center_text(value: str, label: str) -> str:
     if not parsed.is_finite():
         raise ValueError(f"{label} coordinate must be finite")
     return text
+
+
+def _finite_float_coordinate(value: str, label: str) -> float:
+    """Convert a coordinate for a binary renderer without allowing infinity."""
+
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{label} coordinate is outside the binary renderer range") from error
+    if not math.isfinite(converted):
+        raise ValueError(f"{label} coordinate is outside the binary renderer range")
+    return converted
 
 
 def _resolve_render_point(
@@ -1485,11 +2746,19 @@ def _resolve_render_point(
             )
         return preset.x, preset.y, preset
 
-    parts = [part.strip() for part in spec.split(",")]
-    if len(parts) == 2 and all(parts):
+    if len(spec) <= 2 * MAX_COORDINATE_TEXT_LENGTH + 1:
+        real_text, separator, imaginary_text = spec.partition(",")
+    else:
+        real_text, separator, imaginary_text = "", "", ""
+    if (
+        separator
+        and "," not in imaginary_text
+        and real_text.strip()
+        and imaginary_text.strip()
+    ):
         return (
-            _validate_center_text(parts[0], "real"),
-            _validate_center_text(parts[1], "imaginary"),
+            _validate_center_text(real_text, "real"),
+            _validate_center_text(imaginary_text, "imaginary"),
             None,
         )
     raise ValueError(
@@ -1518,13 +2787,31 @@ def _print_deep_zoom_points(formula: str = "mandelbrot") -> None:
 
 
 def _decimal_precision(x_center: str, y_center: str, log10_zoom: float) -> int:
-
-    return max(
+    precision = max(
         50,
         32 + int(math.ceil(max(0.0, log10_zoom))),
         _fractional_decimal_places(x_center),
         _fractional_decimal_places(y_center),
     )
+    if precision > MAX_COORDINATE_TEXT_LENGTH:
+        raise ValueError(
+            f"coordinate precision exceeds the {MAX_COORDINATE_TEXT_LENGTH:,}-digit limit"
+        )
+    return precision
+
+
+def _native_precision_bits(x_center: str, y_center: str, log10_zoom: float) -> int:
+    """Return a precision accepted by the native MPFR ABI."""
+
+    precision_bits = max(
+        256,
+        int(_decimal_precision(x_center, y_center, log10_zoom) * math.log2(10.0)) + 32,
+    )
+    if precision_bits > MAX_NATIVE_PRECISION_BITS:
+        raise ValueError(
+            f"native coordinate precision exceeds the {MAX_NATIVE_PRECISION_BITS:,}-bit limit"
+        )
+    return precision_bits
 
 
 def _formula_name(value: str) -> str:
@@ -1547,12 +2834,23 @@ def _formula_name(value: str) -> str:
 
 
 def _parse_coordinate_pair(value: str, label: str) -> tuple[str, str]:
-    parts = [part.strip() for part in str(value).split(",")]
-    if len(parts) != 2 or not all(parts):
+    text = str(value).strip()
+    if len(text) > 2 * MAX_COORDINATE_TEXT_LENGTH + 1:
+        raise ValueError(
+            f"{label} must contain no more than "
+            f"{2 * MAX_COORDINATE_TEXT_LENGTH + 1:,} characters"
+        )
+    real_text, separator, imaginary_text = text.partition(",")
+    if (
+        not separator
+        or "," in imaginary_text
+        or not real_text.strip()
+        or not imaginary_text.strip()
+    ):
         raise ValueError(f"{label} must be REAL,IMAG, for example -0.8,0.156")
     return (
-        _validate_center_text(parts[0], f"{label} real"),
-        _validate_center_text(parts[1], f"{label} imaginary"),
+        _validate_center_text(real_text, f"{label} real"),
+        _validate_center_text(imaginary_text, f"{label} imaginary"),
     )
 
 
@@ -1564,21 +2862,42 @@ def _zoom_log(value: Any) -> float:
     """Return log10(value) without converting huge decimal zooms to float."""
 
     try:
-        decimal_value = Decimal(str(value))
+        text = str(value).strip()
     except Exception as exc:
-        raise ValueError(f"invalid zoom value: {value}") from exc
+        raise ValueError("invalid zoom value") from exc
+    if not text or len(text) > MAX_COORDINATE_TEXT_LENGTH:
+        raise ValueError(
+            f"zoom value must contain between 1 and {MAX_COORDINATE_TEXT_LENGTH:,} characters"
+        )
+    try:
+        decimal_value = Decimal(text)
+    except Exception as exc:
+        raise ValueError("invalid zoom value") from exc
     if not decimal_value.is_finite() or decimal_value <= 0:
-        raise ValueError(f"zoom must be a finite positive decimal: {value}")
+        raise ValueError("zoom must be a finite positive decimal")
     exponent = decimal_value.adjusted()
+    if exponent < math.floor(MIN_LOG10_ZOOM) - 1 or exponent > math.ceil(MAX_LOG10_ZOOM) + 1:
+        raise ValueError(
+            f"zoom exponent must be between {MIN_LOG10_ZOOM:.0f} and "
+            f"{MAX_LOG10_ZOOM:.0f}"
+        )
     mantissa = decimal_value.scaleb(-exponent)
-    return float(exponent) + math.log10(float(mantissa))
+    try:
+        result = float(exponent) + math.log10(float(mantissa))
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("invalid zoom value") from exc
+    if result < MIN_LOG10_ZOOM or result > MAX_LOG10_ZOOM:
+        raise ValueError(
+            f"zoom exponent must be between {MIN_LOG10_ZOOM:.0f} and "
+            f"{MAX_LOG10_ZOOM:.0f}"
+        )
+    return result
 
 
 def _zoom_text(log10_zoom: float) -> bytes:
     """Encode 10**log10_zoom without overflowing Python's binary float."""
 
-    if not math.isfinite(log10_zoom):
-        raise ValueError("zoom exponent must be finite")
+    log10_zoom = _validate_log10_zoom(log10_zoom)
     exponent = math.floor(log10_zoom)
     mantissa = 10.0 ** (log10_zoom - exponent)
     return f"{mantissa:.17g}e{exponent:+d}".encode("ascii")
@@ -1688,11 +3007,15 @@ def _reference_orbit(
 
 def _view_offsets(width: int, height: int, log10_zoom: float) -> tuple[Any, Any]:
     np = _require_numpy()
+    width, height = _validate_dimensions(width, height, "fractal")
+    log10_zoom = _validate_log10_zoom(log10_zoom)
     if log10_zoom > 300.0:
         raise RuntimeError("Python rendering cannot represent zooms beyond 10^300; use the native renderer")
     zoom = 10.0 ** log10_zoom
     view_height = 2.8 / zoom
     view_width = view_height * width / height
+    if not math.isfinite(view_height) or not math.isfinite(view_width):
+        raise ValueError("zoom and frame dimensions produce an unrepresentable viewport")
     x = (np.arange(width, dtype=np.float64) - (width - 1) / 2.0) * view_width / width
     y = ((height - 1) / 2.0 - np.arange(height, dtype=np.float64)) * view_height / height
     return np.meshgrid(x, y)
@@ -1726,17 +3049,31 @@ def _render_direct(
     """Vectorised float64 renderer for shallow Mandelbrot-family views."""
 
     np = _require_numpy()
+    width, height = _validate_dimensions(width, height, "fractal")
+    max_iter = _validate_iteration_count(max_iter)
+    x_center = _validate_center_text(x_center, "real")
+    y_center = _validate_center_text(y_center, "imaginary")
+    if len(julia_constant) != 2:
+        raise ValueError("Julia constant must contain real and imaginary coordinates")
+    julia_constant = (
+        _validate_center_text(julia_constant[0], "Julia real"),
+        _validate_center_text(julia_constant[1], "Julia imaginary"),
+    )
     formula = _formula_name(formula)
     x_offset, y_offset = _view_offsets(width, height, log10_zoom)
     # Float conversion is safe here because this path is used before a deep
     # zoom, where the pixel spacing is still much larger than float64 ulps.
-    real = (float(x_center) + x_offset).ravel()
-    imag = (float(y_center) + y_offset).ravel()
+    real = (_finite_float_coordinate(x_center, "real") + x_offset).ravel()
+    imag = (_finite_float_coordinate(y_center, "imaginary") + y_offset).ravel()
     if formula == "julia":
         z_real = real.copy()
         z_imag = imag.copy()
-        parameter_real = np.full_like(real, float(julia_constant[0]))
-        parameter_imag = np.full_like(imag, float(julia_constant[1]))
+        parameter_real = np.full_like(
+            real, _finite_float_coordinate(julia_constant[0], "Julia real")
+        )
+        parameter_imag = np.full_like(
+            imag, _finite_float_coordinate(julia_constant[1], "Julia imaginary")
+        )
     else:
         z_real = np.zeros_like(real)
         z_imag = np.zeros_like(imag)
@@ -1909,6 +3246,17 @@ def _render_perturbed_alternate(
 
     np = _require_numpy()
     formula = _formula_name(formula)
+    width, height = _validate_dimensions(width, height, "fractal")
+    max_iter = _validate_iteration_count(max_iter)
+    log10_zoom = _validate_log10_zoom(log10_zoom)
+    x_center = _validate_center_text(x_center, "real")
+    y_center = _validate_center_text(y_center, "imaginary")
+    if len(julia_constant) != 2:
+        raise ValueError("Julia constant must contain real and imaginary coordinates")
+    julia_constant = (
+        _validate_center_text(julia_constant[0], "Julia real"),
+        _validate_center_text(julia_constant[1], "Julia imaginary"),
+    )
     x_offset, y_offset = _view_offsets(width, height, log10_zoom)
     reference_real, reference_imag = _reference_orbit(
         x_center,
@@ -1929,9 +3277,15 @@ def _render_perturbed_alternate(
     smooth = np.full(width * height, float(max_iter), dtype=np.float32)
     power = _formula_power(formula)
     if formula == "julia":
-        parameter = complex(float(julia_constant[0]), float(julia_constant[1]))
+        parameter = complex(
+            _finite_float_coordinate(julia_constant[0], "Julia real"),
+            _finite_float_coordinate(julia_constant[1], "Julia imaginary"),
+        )
     else:
-        parameter = complex(float(x_center), float(y_center))
+        parameter = complex(
+            _finite_float_coordinate(x_center, "real"),
+            _finite_float_coordinate(y_center, "imaginary"),
+        )
 
     with np.errstate(over="ignore", invalid="ignore", under="ignore"):
         for iteration in range(max_iter):
@@ -2045,10 +3399,7 @@ def _render_native(
 
     output = np.empty((height, width), dtype=np.float32)
     zoom_text = _zoom_text(log10_zoom)
-    precision_bits = max(
-        256,
-        int(_decimal_precision(x_center, y_center, log10_zoom) * math.log2(10.0)) + 32,
-    )
+    precision_bits = _native_precision_bits(x_center, y_center, log10_zoom)
     use_perturbation = int(log10_zoom >= 12.0)
     options = render_options or NativeRenderOptions()
     formula_renderer = getattr(library, "render_fractal_ex", None)
@@ -2066,8 +3417,8 @@ def _render_native(
             int(log10_zoom >= 12.0),
             native_threads,
             FORMULA_IDS[formula],
-            float(julia_constant[0]),
-            float(julia_constant[1]),
+            _finite_float_coordinate(julia_constant[0], "Julia real"),
+            _finite_float_coordinate(julia_constant[1], "Julia imaginary"),
             ctypes.byref(options),
         )
     elif ex_renderer is not None and formula == "mandelbrot":
@@ -2125,13 +3476,22 @@ def _create_native_reference(
     image-series terms without changing the BLA degree selected by callers.
     """
 
+    x_center = _validate_center_text(x_center, "real")
+    y_center = _validate_center_text(y_center, "imaginary")
+    max_iter = _validate_iteration_count(max_iter)
+    log10_zoom = _validate_log10_zoom(log10_zoom)
+    if bla_log10_zoom is not None:
+        bla_log10_zoom = _validate_log10_zoom(bla_log10_zoom, "BLA zoom exponent")
+    series_order = _index_value(series_order, "series order")
+    image_series_order = _index_value(image_series_order, "image series order")
+    if not 1 <= series_order <= 32:
+        raise ValueError("series order must be between 1 and 32")
+    if not 8 <= image_series_order <= 32:
+        raise ValueError("image series order must be between 8 and 32")
     library = _get_native_library()
     if library is None:
         raise RuntimeError("native renderer is unavailable; run `make` inside `nix-shell`")
-    precision_bits = max(
-        256,
-        int(_decimal_precision(x_center, y_center, log10_zoom) * math.log2(10.0)) + 32,
-    )
+    precision_bits = _native_precision_bits(x_center, y_center, log10_zoom)
     creator = (
         getattr(library, "fractal_create_reference_reusable", None)
         if reusable
@@ -2143,7 +3503,7 @@ def _create_native_reference(
         _zoom_text(log10_zoom if bla_log10_zoom is None else bla_log10_zoom),
         max_iter,
         precision_bits,
-        max(8, min(32, int(image_series_order))),
+        image_series_order,
     )
     if not handle:
         message = library.fractal_last_error() or b"unknown native reference error"
@@ -2166,6 +3526,25 @@ def _clone_native_reference(
         message = library.fractal_last_error() or b"unknown native reference clone error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
     return handle
+
+
+def _destroy_native_references(
+    library: Any,
+    references: list[tuple[float, Any]],
+) -> None:
+    """Release every native tier even when setup or rendering raises."""
+
+    if library is None:
+        references.clear()
+        return
+    for _, reference in references:
+        try:
+            library.fractal_destroy_reference(reference)
+        except Exception:
+            # Cleanup must not mask the original render/setup failure. The
+            # native destroy entry point is itself idempotent for stale handles.
+            pass
+    references.clear()
 
 
 def _native_reference_tier_logs(
@@ -2205,11 +3584,15 @@ def _native_reference_tier_logs(
         if not math.isfinite(step) or step <= 0.0:
             raise ValueError("atlas_step must be a finite positive value")
         # Atlas origins are integer multiples of the step, so a zero-origin
-        # floor gives the same boundaries for every render path.
+        # floor gives the same boundaries for every render path.  Never move
+        # a tier below e12: the native deep path has no validated BLA contract
+        # for a broad shallow-radius map, and an extreme keyframe factor can
+        # otherwise quantise every decade boundary to e0.
         decade_starts = [
-            math.floor(value / step) * step for value in decade_starts
+            max(12.0, math.floor(value / step) * step) for value in decade_starts
         ]
     starts.extend(decade_starts)
+    starts = sorted(set(starts))
     # Give the final atlas level a radius-specific tier. It is cheap compared
     # with the movie and avoids making the last, deepest tile use a needlessly
     # conservative e.g. e80 table when the target is e100.
@@ -2454,6 +3837,24 @@ def render_fractal(
     """Render with the C-ABI backend, falling back to the Python backend."""
 
     global _native_notice_printed
+    width, height = _validate_dimensions(width, height, "fractal")
+    max_iter = _validate_iteration_count(max_iter)
+    log10_zoom = _validate_log10_zoom(log10_zoom)
+    x_center = _validate_center_text(x_center, "real")
+    y_center = _validate_center_text(y_center, "imaginary")
+    if len(julia_constant) != 2:
+        raise ValueError("Julia constant must contain real and imaginary coordinates")
+    julia_constant = (
+        _validate_center_text(julia_constant[0], "Julia real"),
+        _validate_center_text(julia_constant[1], "Julia imaginary"),
+    )
+    native_threads = _validate_thread_count(native_threads, "native thread count")
+    series_order = _index_value(series_order, "series order")
+    series_block = _index_value(series_block, "series block")
+    if not 1 <= series_order <= 32:
+        raise ValueError("series order must be between 1 and 32")
+    if not 2 <= series_block <= 4096:
+        raise ValueError("series block must be between 2 and 4096")
     formula = _formula_name(formula)
     if renderer not in {"auto", "native", "python"}:
         raise ValueError(f"unknown renderer: {renderer}")
@@ -2524,6 +3925,18 @@ def max_iterations(
     iterations_per_decade: int,
     iteration_cap: int,
 ) -> int:
+    log10_zoom = _validate_log10_zoom(log10_zoom)
+    iteration_base = _validate_iteration_count(iteration_base, "iteration base")
+    iterations_per_decade = _index_value(iterations_per_decade, "iterations per decade")
+    if iterations_per_decade > MAX_ITERATION_BUDGET:
+        raise ValueError(
+            f"iterations per decade must be at most {MAX_ITERATION_BUDGET:,}"
+        )
+    iteration_cap = _validate_iteration_count(iteration_cap, "iteration cap")
+    if iterations_per_decade < 0:
+        raise ValueError("iterations per decade cannot be negative")
+    if iteration_cap < iteration_base:
+        raise ValueError("iteration cap must be greater than or equal to iteration base")
     return min(
         iteration_cap,
         max(64, int(iteration_base + iterations_per_decade * max(0.0, log10_zoom))),
@@ -2552,37 +3965,74 @@ def _zoom_plan(
     np = _require_numpy()
     start_log = _zoom_log(start_zoom)
     max_log = _zoom_log(max_zoom)
+    envelope = np.asarray(instrumental)
+    if envelope.ndim != 1 or envelope.size == 0:
+        raise ValueError("instrumental controls must be a non-empty one-dimensional series")
+    if not np.issubdtype(envelope.dtype, np.number) or np.issubdtype(
+        envelope.dtype, np.complexfloating
+    ):
+        raise ValueError("instrumental controls must be real numeric samples")
+    envelope = np.asarray(envelope, dtype=np.float64)
+    if not np.isfinite(envelope).all():
+        raise ValueError("instrumental controls contain non-finite samples")
+    try:
+        punch_value = float(punch)
+        quiet_speed_value = float(quiet_speed)
+        beat_strength_value = float(beat_strength)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("zoom controls must be numeric") from error
+    if not math.isfinite(punch_value) or punch_value < 0.0:
+        raise ValueError("zoom punch must be finite and non-negative")
+    if not math.isfinite(quiet_speed_value):
+        raise ValueError("quiet zoom speed must be finite")
+    if not math.isfinite(beat_strength_value) or beat_strength_value < 0.0:
+        raise ValueError("beat strength must be finite and non-negative")
     if max_log <= start_log:
-        return np.full(instrumental.shape, start_log, dtype=np.float64)
+        return np.full(envelope.shape, start_log, dtype=np.float64)
     span = max_log - start_log
-    envelope = np.clip(np.asarray(instrumental, dtype=np.float64), 0.0, 1.0)
+    envelope = np.clip(envelope, 0.0, 1.0)
     if envelope.size == 1:
         return np.asarray([max_log], dtype=np.float64)
     loudness = envelope ** 2.2
     # The default is intentionally slightly negative.  This is a velocity in
     # logarithmic zoom space, not a zoom position, so it makes quiet passages
     # pull back a little while strong beats still consume most of the travel.
-    drive = float(quiet_speed) + (1.0 + punch) * loudness
-    if onset is not None and float(beat_strength) != 0.0:
-        beat_curve = np.asarray(onset, dtype=np.float64)
+    drive = quiet_speed_value + (1.0 + punch_value) * loudness
+    if onset is not None and beat_strength_value != 0.0:
+        try:
+            beat_curve = np.asarray(onset, dtype=np.float64)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("onset controls must be real numeric samples") from error
         if beat_curve.shape != envelope.shape:
             raise ValueError("onset and instrumental controls must have the same frame count")
+        if not np.isfinite(beat_curve).all():
+            raise ValueError("onset controls contain non-finite samples")
         beat_curve = np.clip(np.nan_to_num(beat_curve, nan=0.0), 0.0, 1.0)
         # A slightly sharper response keeps the transient itself visible
         # without making a sustained chorus drive the camera indefinitely.
-        drive = drive + float(beat_strength) * beat_curve ** 1.35
+        drive = drive + beat_strength_value * beat_curve ** 1.35
+    if not np.isfinite(drive).all():
+        raise ValueError("zoom controls produce a non-finite camera velocity")
     cumulative = np.concatenate(([0.0], np.cumsum(drive[:-1])))
+    if not np.isfinite(cumulative).all():
+        raise ValueError("zoom controls produce an unrepresentable camera path")
     # The last sample has no following frame over which to advance. Normalize
     # by the signed travelled intervals so the final video frame reaches
     # max_zoom even when the path briefly moves backwards.  A completely
     # silent track has no positive punches; make that degenerate case crawl
     # forward rather than reversing the entire movie.
     total = float(np.sum(drive[:-1])) if drive.size > 1 else 1.0
+    if not math.isfinite(total):
+        raise ValueError("zoom controls produce an unrepresentable camera path")
     if total <= 1.0e-6:
         drive = drive - float(np.min(drive)) + 1.0e-3
         cumulative = np.concatenate(([0.0], np.cumsum(drive[:-1])))
         total = max(float(np.sum(drive[:-1])), 1.0e-6) if drive.size > 1 else 1.0
+        if not np.isfinite(cumulative).all() or not math.isfinite(total):
+            raise ValueError("zoom controls produce an unrepresentable camera path")
     planned = start_log + span * cumulative / total
+    if not np.isfinite(planned).all():
+        raise ValueError("zoom controls produce an unrepresentable camera path")
     # Clipping creates a real still frame whenever a loud passage reaches the
     # ceiling before the final sample.  Fold the signed path at both bounds
     # instead, matching the old live renderer's direction reversal while
@@ -2607,6 +4057,23 @@ def _crop_and_resize(
     except ImportError as exc:  # pragma: no cover - depends on environment
         raise RuntimeError("Pillow is required for high-resolution crop animation: pip install Pillow") from exc
 
+    field = np.asarray(field)
+    if field.ndim != 2 or field.shape[0] <= 0 or field.shape[1] <= 0:
+        raise ValueError("crop source must be a non-empty two-dimensional field")
+    if np.issubdtype(field.dtype, np.complexfloating):
+        raise ValueError("crop source must contain real numeric samples")
+    _validate_dimensions(field.shape[1], field.shape[0], "crop source")
+    try:
+        if not np.isfinite(field).all():
+            raise ValueError("crop source contains non-finite samples")
+    except TypeError as error:
+        raise ValueError("crop source must contain numeric samples") from error
+    field = np.asarray(field, dtype=np.float32)
+    output_width, output_height = _validate_dimensions(output_width, output_height, "crop")
+    if not math.isfinite(float(zoom_factor)) or float(zoom_factor) <= 0.0:
+        raise ValueError("crop zoom factor must be a finite positive value")
+    if resample not in {"lanczos", "bilinear"}:
+        raise ValueError(f"unknown crop resample mode: {resample}")
     source_height, source_width = field.shape
     # Map output pixel centres continuously into the source image. Integer
     # crop widths/origins cause visible half-pixel jumps at small resolutions,
@@ -2647,9 +4114,11 @@ def _zoom_chunks(zooms: Any, keyframe_factor: float) -> Any:
     request a crop factor below one in that case.
     """
 
+    keyframe_factor = _validate_keyframe_factor(keyframe_factor)
     limit = math.log10(max(1.05, keyframe_factor))
     start = 0
     total = len(zooms)
+    chunk_count = 0
     while start < total:
         low = high = float(zooms[start])
         end = start + 1
@@ -2662,6 +4131,12 @@ def _zoom_chunks(zooms: Any, keyframe_factor: float) -> Any:
             low = candidate_low
             high = candidate_high
             end += 1
+        chunk_count += 1
+        if chunk_count > MAX_KEYFRAME_LEVELS:
+            raise ValueError(
+                f"zoom path would require more than {MAX_KEYFRAME_LEVELS:,} keyframes; "
+                "increase keyframe factor or shorten the render"
+            )
         yield start, end, low, high
         start = end
 
@@ -2685,11 +4160,19 @@ def _atlas_geometry(
 
     if len(zooms) == 0:
         raise ValueError("cannot build an atlas for an empty zoom path")
-    step = math.log10(max(1.05, float(keyframe_factor)))
+    keyframe_factor = _validate_keyframe_factor(keyframe_factor)
+    step = math.log10(max(1.05, keyframe_factor))
     minimum = float(min(float(value) for value in zooms))
     maximum = float(max(float(value) for value in zooms))
+    minimum = _validate_log10_zoom(minimum, "minimum zoom path value")
+    maximum = _validate_log10_zoom(maximum, "maximum zoom path value")
     origin = math.floor(minimum / step) * step
     level_count = max(0, int(math.ceil((maximum - origin) / step - 1.0e-12)))
+    if level_count > MAX_KEYFRAME_LEVELS:
+        raise ValueError(
+            f"zoom path would require more than {MAX_KEYFRAME_LEVELS:,} atlas levels; "
+            "increase keyframe factor or shorten the render"
+        )
     return origin, step, level_count
 
 
@@ -3711,13 +5194,27 @@ def _atlas_tile_field(
     )
     if cache_path is not None:
         try:
-            cached = np.load(cache_path, mmap_mode="r", allow_pickle=False)
-            if cached.shape == (render_height, render_width):
-                if cache_evictor is not None:
-                    cache_evictor.touch(cache_path)
-                print(f"Using cached atlas tile {level} ({cache_path.name}).", flush=True)
-                return cached
-        except (OSError, ValueError):
+            with _safe_cache_load(cache_path) as cached:
+                if cached is None:
+                    raise ValueError("unsafe cached atlas tile")
+                if _valid_field_array(cached, (render_height, render_width)):
+                    if cache_evictor is not None:
+                        cache_evictor.touch(cache_path)
+                    print(f"Using cached atlas tile {level} ({cache_path.name}).", flush=True)
+                    # Do not retain an mmap while the LRU evictor is allowed
+                    # to remove neighbouring entries. A private copy keeps
+                    # cache hits portable on Windows, where deleting an open
+                    # mapping fails and can otherwise make pruning nondeterministic.
+                    return np.array(cached, dtype=np.float32, copy=True)
+        except (
+            EOFError,
+            KeyError,
+            MemoryError,
+            OSError,
+            TypeError,
+            ValueError,
+            zipfile.BadZipFile,
+        ):
             pass
 
     print(
@@ -3804,15 +5301,20 @@ def _atlas_tile_field(
         f"{time.monotonic() - tile_started:.2f}s.",
         flush=True,
     )
+    field = _validated_field(field, (render_height, render_width), "atlas tile")
     if cache_path is not None:
         _atomic_save_field(cache_path, field, durable=durable_cache)
         if cache_evictor is not None:
             cache_evictor.observe(cache_path)
         try:
-            return np.load(cache_path, mmap_mode="r", allow_pickle=False)
-        except (OSError, ValueError):
+            with _safe_cache_load(cache_path) as cached:
+                if cached is None:
+                    raise ValueError("unsafe cached atlas tile")
+                if _valid_field_array(cached, (render_height, render_width)):
+                    return np.array(cached, dtype=np.float32, copy=True)
+        except (OSError, EOFError, ValueError, TypeError):
             pass
-    return np.asarray(field, dtype=np.float32)
+    return field
 
 
 def _atlas_colourise_native(
@@ -4035,6 +5537,32 @@ def _atlas_colour_frame(
     )
 
 
+def _valid_field_array(field: Any, shape: tuple[int, int]) -> bool:
+    """Return whether a cached/rendered scalar field is safe to consume."""
+
+    np = _require_numpy()
+    try:
+        array = np.asarray(field)
+    except (TypeError, ValueError):
+        return False
+    if array.shape != shape or array.ndim != 2:
+        return False
+    if not np.issubdtype(array.dtype, np.floating):
+        return False
+    return bool(np.isfinite(array).all())
+
+
+def _validated_field(field: Any, shape: tuple[int, int], label: str) -> Any:
+    np = _require_numpy()
+    raw = np.asarray(field)
+    if np.issubdtype(raw.dtype, np.complexfloating):
+        raise RuntimeError(f"{label} must contain real numeric samples")
+    converted = np.asarray(raw, dtype=np.float32)
+    if not _valid_field_array(converted, shape):
+        raise RuntimeError(f"{label} is not a finite {shape[1]}x{shape[0]} scalar field")
+    return np.ascontiguousarray(converted, dtype=np.float32)
+
+
 def _render_video_atlas(
     *,
     command: list[str],
@@ -4233,72 +5761,26 @@ def _render_video_atlas(
         )
 
     process = None
-    encoder_queue: Optional[queue.Queue[Any]] = None
-    encoder_thread: Optional[threading.Thread] = None
-    encoder_errors: list[BaseException] = []
-    last_backpressure_notice = 0.0
+    ffmpeg_diagnostics: Optional[deque[str]] = None
+    ffmpeg_reader: Optional[threading.Thread] = None
+    frame_writer: Optional[_FFmpegFrameWriter] = None
     frame_seconds = 0.0
     encoder_seconds = 0.0
     previous_rgb = None
     render_started = time.perf_counter()
     active_level = None
+    render_succeeded = False
     try:
-        process = subprocess.Popen(command, stdin=subprocess.PIPE)
-        assert process.stdin is not None
-        encoder_queue = queue.Queue(maxsize=3)
-        encoder_stream = process.stdin
-
-        def encoder_worker() -> None:
-            try:
-                while True:
-                    frame = encoder_queue.get()
-                    try:
-                        if frame is None:
-                            return
-                        encoder_stream.write(frame)
-                    finally:
-                        encoder_queue.task_done()
-            except BaseException as error:  # surfaced by the producer thread
-                encoder_errors.append(error)
-
-        encoder_thread = threading.Thread(
-            target=encoder_worker,
-            name="fractal-encoder-writer",
-            daemon=True,
+        process, ffmpeg_diagnostics, ffmpeg_reader = _start_ffmpeg_process(command)
+        frame_writer = _FFmpegFrameWriter(
+            process,
+            ffmpeg_diagnostics,
+            ffmpeg_reader,
         )
-        encoder_thread.start()
 
         def enqueue_frame(frame: Any) -> None:
-            nonlocal last_backpressure_notice
-            assert encoder_queue is not None
-            contiguous = np.ascontiguousarray(frame, dtype=np.uint8)
-            while True:
-                if encoder_errors:
-                    raise RuntimeError("FFmpeg writer failed") from encoder_errors[0]
-                if process is not None:
-                    return_code = process.poll()
-                    if return_code is not None:
-                        raise RuntimeError(
-                            f"ffmpeg exited with status {return_code} while "
-                            "the render queue was still receiving frames"
-                        )
-                try:
-                    # A bounded queue prevents a fast compositor from
-                    # retaining an entire 4K movie in RAM while still
-                    # allowing the encoder and native field producer to run
-                    # concurrently.
-                    encoder_queue.put(memoryview(contiguous), timeout=0.5)
-                    return
-                except queue.Full:
-                    now = time.monotonic()
-                    if now - last_backpressure_notice >= ENCODER_BACKPRESSURE_NOTICE_SECONDS:
-                        print(
-                            "  Encoder backpressure: native/compositor is "
-                            "waiting for FFmpeg to drain the frame queue.",
-                            flush=True,
-                        )
-                        last_backpressure_notice = now
-                    continue
+            assert frame_writer is not None
+            frame_writer.write(frame)
 
         for frame_index in range(total_frames):
             frame_started = time.perf_counter()
@@ -4358,20 +5840,18 @@ def _render_video_atlas(
                 print(f"  encoded {100.0 * frame_index / total_frames:5.1f}%")
 
         encoder_started = time.perf_counter()
-        assert encoder_queue is not None
-        encoder_queue.put(None)
-        encoder_queue.join()
-        if encoder_thread is not None:
-            encoder_thread.join()
+        assert frame_writer is not None
+        return_code = frame_writer.finish()
         encoder_seconds += time.perf_counter() - encoder_started
-        if encoder_errors:
-            raise RuntimeError("FFmpeg writer failed") from encoder_errors[0]
-        process.stdin.close()
-        process.stdin = None
-        return_code = process.wait()
         if return_code != 0:
-            raise RuntimeError(f"ffmpeg exited with status {return_code}")
+            raise RuntimeError(_ffmpeg_error_message(
+                "ffmpeg exited with an error",
+                ffmpeg_diagnostics,
+                return_code,
+                ffmpeg_reader,
+            ))
         os.replace(temporary_output, output_path)
+        render_succeeded = True
         elapsed = time.perf_counter() - render_started
         print(
             f"Atlas timing: tiles {tile_seconds:.2f}s, frame/reproject/queue "
@@ -4387,24 +5867,32 @@ def _render_video_atlas(
         }
     except BrokenPipeError as exc:
         if process is not None:
-            process.kill()
-            process.wait()
-        raise RuntimeError("ffmpeg stopped while receiving video frames") from exc
+            _terminate_subprocess(process)
+        raise RuntimeError(
+            _ffmpeg_error_message(
+                "ffmpeg stopped while receiving video frames",
+                ffmpeg_diagnostics,
+                reader=ffmpeg_reader,
+            )
+        ) from exc
     except BaseException:
-        if process is not None and process.poll() is None:
-            process.kill()
         if process is not None:
-            process.wait()
+            _terminate_subprocess(process)
         raise
     finally:
-        if encoder_queue is not None and encoder_thread is not None and encoder_thread.is_alive():
-            try:
-                encoder_queue.put(None, timeout=0.5)
-            except queue.Full:
-                pass
-            encoder_thread.join(timeout=2.0)
+        if frame_writer is not None:
+            frame_writer.abort()
         if prefetch_executor is not None:
-            prefetch_executor.shutdown(wait=True, cancel_futures=True)
+            # A failed render must not wait forever for a speculative field
+            # task that is stuck inside a slow decoder/native call. Successful
+            # renders still join the worker so no background task survives a
+            # completed render and its reference handles can be released.
+            prefetch_executor.shutdown(
+                wait=render_succeeded,
+                cancel_futures=True,
+            )
+        if ffmpeg_reader is not None:
+            ffmpeg_reader.join(timeout=2.0)
         if temporary_output.exists():
             try:
                 temporary_output.unlink()
@@ -4418,20 +5906,79 @@ def _ffmpeg_encoder_names() -> set[str]:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         return set()
+    known_encoders = {
+        "h264_nvenc",
+        "h264_qsv",
+        "h264_vaapi",
+        "h264_videotoolbox",
+        "libx264",
+    }
+    process = None
+    reader: Optional[threading.Thread] = None
+    captured = bytearray()
     try:
-        result = subprocess.run(
-            [ffmpeg, "-hide_banner", "-encoders"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5.0,
+        process = subprocess.Popen(
+            [ffmpeg, "-nostdin", "-hide_banner", "-encoders"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            **_subprocess_group_options(),
         )
+        stream = process.stdout
+
+        def drain_stdout() -> None:
+            if stream is None:
+                return
+            try:
+                while True:
+                    block = stream.read(64 * 1024)
+                    if not block:
+                        break
+                    remaining = MAX_FFMPEG_ENCODER_QUERY_BYTES - len(captured)
+                    if remaining > 0:
+                        captured.extend(block[:remaining])
+            except (OSError, ValueError):
+                return
+            finally:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+        reader = threading.Thread(
+            target=drain_stdout,
+            name="fractal-ffmpeg-encoder-query",
+            daemon=True,
+        )
+        try:
+            reader.start()
+        except BaseException:
+            _terminate_subprocess(process)
+            return set()
+        try:
+            process.wait(timeout=FFMPEG_ENCODER_QUERY_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            _terminate_subprocess(process)
+            return set()
     except (OSError, subprocess.SubprocessError):
         return set()
+    finally:
+        if reader is not None:
+            reader.join(timeout=2.0)
+        if process is not None and process.poll() is None:
+            _terminate_subprocess(process)
+    if process is None or process.returncode != 0:
+        return set()
+
     names: set[str] = set()
-    for line in result.stdout.splitlines():
+    for line in bytes(captured).decode("utf-8", errors="replace").splitlines():
         parts = line.split()
-        if len(parts) >= 2 and parts[0] and not parts[0].startswith("#"):
+        if (
+            len(parts) >= 2
+            and parts[0]
+            and not parts[0].startswith("#")
+            and parts[1] in known_encoders
+        ):
             names.add(parts[1])
     return names
 
@@ -4447,6 +5994,7 @@ def _vaapi_encoder_usable(device: str = "/dev/dri/renderD128") -> bool:
         result = subprocess.run(
             [
                 ffmpeg,
+                "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -4467,13 +6015,91 @@ def _vaapi_encoder_usable(device: str = "/dev/dri/renderD128") -> bool:
                 "-",
             ],
             check=False,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=5.0,
+            **_subprocess_group_options(),
         )
     except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode == 0
+
+
+@lru_cache(maxsize=8)
+def _hardware_encoder_usable(encoder: str) -> bool:
+    """Run a tiny encode so ``auto`` never selects a merely advertised codec."""
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return False
+    command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=black:s=128x128:d=0.05",
+        "-frames:v",
+        "1",
+    ]
+    try:
+        _, rate_control, _ = _video_encoder_settings(encoder, "ultrafast", 24)
+    except ValueError:
+        return False
+    command.extend(["-c:v", encoder, *rate_control, "-f", "null", "-"])
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+            **_subprocess_group_options(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _video_encoder_settings(
+    encoder: str,
+    video_preset: str,
+    crf: int,
+) -> tuple[str, list[str], bool]:
+    """Return ``(preset, rate-control, needs-vaapi-upload)`` for one codec."""
+
+    if encoder == "h264_nvenc":
+        nvenc_presets = {
+            "ultrafast": "p1",
+            "superfast": "p2",
+            "veryfast": "p3",
+            "faster": "p4",
+            "fast": "p5",
+            "medium": "p6",
+            "slow": "p7",
+        }
+        return nvenc_presets.get(video_preset, "p3"), [
+            "-cq", str(crf), "-rc", "vbr",
+        ], False
+    if encoder == "h264_vaapi":
+        return "", ["-qp", str(crf)], True
+    if encoder == "h264_qsv":
+        # QSV accepts system-memory input and performs its own upload.  Using
+        # global_quality keeps the probe and the real rawvideo command on the
+        # same path; a bare hwupload filter would require a device context
+        # whose name differs across Linux driver stacks.
+        return "", ["-global_quality", str(crf)], False
+    if encoder == "h264_videotoolbox":
+        # VideoToolbox uses a quality scale rather than CRF.  Map the CLI's
+        # 0..51 quality range onto its documented 1..63 range.
+        quality = max(1, min(63, int(round(float(crf) * 63.0 / 51.0))))
+        return "", ["-q:v", str(quality)], False
+    return video_preset, ["-crf", str(crf)], False
 
 
 def _select_video_encoder(
@@ -4483,46 +6109,69 @@ def _select_video_encoder(
 ) -> tuple[str, str, list[str]]:
     """Resolve ``auto`` without making a render depend on unavailable hardware."""
 
-    if requested == "h264_vaapi":
-        if not _vaapi_encoder_usable():
+    requested = _validate_ffmpeg_token(requested, "video codec")
+    video_preset = _validate_ffmpeg_token(video_preset, "video preset")
+    crf = _index_value(crf, "crf")
+    if not 0 <= crf <= 51:
+        raise ValueError("crf must be between 0 and 51")
+    hardware = {"h264_nvenc", "h264_qsv", "h264_vaapi", "h264_videotoolbox"}
+    if requested in hardware:
+        usable = (
+            _vaapi_encoder_usable()
+            if requested == "h264_vaapi"
+            else _hardware_encoder_usable(requested)
+        )
+        if not usable:
             raise RuntimeError(
-                "h264_vaapi was requested, but /dev/dri/renderD128 failed its encode probe"
+                f"{requested} was requested, but its complete FFmpeg encode path "
+                "failed the hardware probe"
             )
-        return requested, "", ["-qp", str(crf)]
+        preset, rate_control, _ = _video_encoder_settings(
+            requested, video_preset, crf
+        )
+        return requested, preset, rate_control
     if requested != "auto":
-        return requested, video_preset, ["-crf", str(crf)]
+        preset, rate_control, _ = _video_encoder_settings(
+            requested, video_preset, crf
+        )
+        return requested, preset, rate_control
     available = _ffmpeg_encoder_names()
-    candidates: list[tuple[str, bool]] = []
+    candidates: list[str] = []
     if shutil.which("nvidia-smi") is not None:
-        candidates.append(("h264_nvenc", True))
+        candidates.append("h264_nvenc")
     if Path("/dev/dri/renderD128").exists():
-        candidates.extend([
-            ("h264_qsv", True),
-            ("h264_vaapi", True),
-        ])
+        candidates.extend(["h264_qsv", "h264_vaapi"])
     if sys.platform == "darwin":
-        candidates.append(("h264_videotoolbox", True))
-    for encoder, compatible_rate_control in candidates:
-        if encoder not in available or not compatible_rate_control:
+        candidates.append("h264_videotoolbox")
+    for encoder in candidates:
+        if encoder not in available:
             continue
         if encoder == "h264_nvenc":
-            nvenc_presets = {
-                "ultrafast": "p1",
-                "superfast": "p2",
-                "veryfast": "p3",
-                "faster": "p4",
-                "fast": "p5",
-                "medium": "p6",
-                "slow": "p7",
-            }
-            return encoder, nvenc_presets.get(video_preset, "p3"), [
-                "-cq", str(crf), "-rc", "vbr",
-            ]
+            if not _hardware_encoder_usable(encoder):
+                continue
+            preset, rate_control, _ = _video_encoder_settings(
+                encoder, video_preset, crf
+            )
+            return encoder, preset, rate_control
         if encoder == "h264_vaapi":
             if not _vaapi_encoder_usable():
                 continue
-            return encoder, "", ["-qp", str(crf)]
-        return encoder, video_preset, ["-crf", str(crf)]
+            preset, rate_control, _ = _video_encoder_settings(
+                encoder, video_preset, crf
+            )
+            return encoder, preset, rate_control
+        if encoder in {"h264_qsv", "h264_videotoolbox"}:
+            if not _hardware_encoder_usable(encoder):
+                continue
+        preset, rate_control, _ = _video_encoder_settings(
+            encoder, video_preset, crf
+        )
+        return encoder, preset, rate_control
+    if available and "libx264" not in available:
+        raise RuntimeError(
+            "no usable hardware encoder was found and this FFmpeg build does not "
+            "provide libx264"
+        )
     return "libx264", video_preset, ["-crf", str(crf)]
 
 
@@ -4580,7 +6229,8 @@ def _colourise(
     pitch: float = 0.5,
 ) -> Any:
     np = _require_numpy()
-    inside = field >= max_iter - 0.5
+    field = np.asarray(field, dtype=np.float32)
+    inside = ~np.isfinite(field) | (field >= max_iter - 0.5)
     # This is the original three-wave liquid gradient.  The field is a smooth
     # iteration count, so each channel is exactly
     #   0.5 - 0.5*cos(band_thickness*field - phase_channel).
@@ -4604,7 +6254,20 @@ def _colourise(
         (0.5 - 0.5 * blue_wave) * 140.0, 0.0, 255.0
     )
     palette = np.clip(_rotate_hue_rgb(palette, pitch), 0.0, 255.0).astype(np.uint8)
-    palette_indices = np.clip(field * scale, 0, palette.shape[0] - 1).astype(np.intp)
+    # Do the arithmetic in float64 and sanitize before converting to an
+    # integer index. A finite float32 field can still overflow during the
+    # multiplication, and NumPy's float-to-int overflow result is platform
+    # dependent (and can become a negative palette index).
+    scaled = np.asarray(field, dtype=np.float64) * float(scale)
+    scaled = np.nan_to_num(
+        scaled,
+        nan=0.0,
+        posinf=float(palette.shape[0] - 1),
+        neginf=0.0,
+    )
+    palette_indices = np.clip(
+        scaled, 0.0, float(palette.shape[0] - 1)
+    ).astype(np.intp)
     rgb = palette[palette_indices]
     rgb[inside] = 0
     return rgb
@@ -4644,7 +6307,7 @@ def _parse_palette_colour(value: str) -> tuple[int, int, int]:
         text = "".join(character * 2 for character in text)
     if len(text) == 6 and all(character in "0123456789abcdefABCDEF" for character in text):
         return tuple(int(text[index:index + 2], 16) for index in (0, 2, 4))
-    components = [component for component in text.replace(",", " ").split() if component]
+    components = text.replace(",", " ").split(None, 3)
     if len(components) != 3:
         raise ValueError(f"invalid palette colour '{value}'")
     channels = tuple(int(component) for component in components)
@@ -4659,8 +6322,29 @@ def _palette_file_palette(path_text: str, mtime_ns: int, size: int = 4096) -> An
 
     np = _require_numpy()
     path = Path(path_text)
+    try:
+        file_size = path.stat().st_size
+    except OSError as error:
+        raise ValueError(f"cannot read palette file: {path}") from error
+    if file_size > MAX_PALETTE_FILE_BYTES:
+        raise ValueError(
+            f"palette file exceeds the {MAX_PALETTE_FILE_BYTES:,}-byte limit: {path}"
+        )
+    try:
+        with path.open("rb") as handle:
+            raw_text = handle.read(MAX_PALETTE_FILE_BYTES + 1)
+    except OSError as error:
+        raise ValueError(f"cannot read palette file: {path}") from error
+    if len(raw_text) > MAX_PALETTE_FILE_BYTES:
+        raise ValueError(
+            f"palette file exceeds the {MAX_PALETTE_FILE_BYTES:,}-byte limit: {path}"
+        )
+    try:
+        palette_text = raw_text.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"palette file is not valid UTF-8: {path}") from error
     stops = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in palette_text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -4671,6 +6355,10 @@ def _palette_file_palette(path_text: str, mtime_ns: int, size: int = 4096) -> An
         if not line:
             continue
         stops.append(_parse_palette_colour(line))
+        if len(stops) > MAX_PALETTE_STOPS:
+            raise ValueError(
+                f"palette file exceeds the {MAX_PALETTE_STOPS:,}-stop limit: {path}"
+            )
     if len(stops) < 2:
         raise ValueError(f"palette file needs at least two colour stops: {path}")
     anchors = np.linspace(0.0, 1.0, len(stops), dtype=np.float32)
@@ -4707,9 +6395,17 @@ def _colourise_custom(
         if palette_file is not None
         else _custom_palette(palette_name)
     )
-    inside = field >= max_iter - 0.5
-    position = np.asarray(field, dtype=np.float32) / max(float(max_iter), 1.0)
+    field = np.asarray(field, dtype=np.float32)
+    inside = ~np.isfinite(field) | (field >= max_iter - 0.5)
+    safe_field = np.nan_to_num(
+        np.asarray(field, dtype=np.float64),
+        nan=0.0,
+        posinf=float(max_iter),
+        neginf=0.0,
+    )
+    position = safe_field / max(float(max_iter), 1.0)
     position = np.mod(position + phase * 0.006 + vocal * 0.08 + float(pitch) * 0.12, 1.0)
+    position = np.nan_to_num(position, nan=0.0, posinf=1.0, neginf=0.0)
     indices = np.clip(
         position * (palette.shape[0] - 1), 0, palette.shape[0] - 1
     ).astype(np.intp)
@@ -4811,6 +6507,9 @@ def _atomic_save_field(path: Path, field: Any, *, durable: bool = False) -> None
     """
 
     np = _require_numpy()
+    path = _absolute_path(path)
+    _reject_final_symlink(path, "cache entry")
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -4822,6 +6521,12 @@ def _atomic_save_field(path: Path, field: Any, *, durable: bool = False) -> None
             if durable:
                 os.fsync(handle.fileno())
         os.replace(temporary, path)
+        if durable and hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if temporary is not None and temporary.exists():
             try:
@@ -4853,6 +6558,7 @@ class _CacheEvictor:
         self._total_bytes = 0
         self._sequence = 0
         self._scanned = False
+        self._lock = threading.RLock()
 
     @property
     def enabled(self) -> bool:
@@ -4867,32 +6573,47 @@ class _CacheEvictor:
             return
         self._scanned = True
         assert self.cache_dir is not None
+        scanned = 0
         for pattern in self._PATTERNS:
-            for path in self.cache_dir.glob(pattern):
-                try:
-                    size = path.stat().st_size
-                except OSError:
-                    continue
-                sequence = self._next_sequence()
-                self._entries[path] = (size, sequence)
-                self._total_bytes += size
-                heapq.heappush(self._heap, (sequence, path))
+            try:
+                for path in self.cache_dir.glob(pattern):
+                    if scanned >= MAX_CACHE_SCAN_ENTRIES:
+                        return
+                    scanned += 1
+                    try:
+                        if path.is_symlink() or not path.is_file():
+                            continue
+                        size = path.stat().st_size
+                    except OSError:
+                        continue
+                    sequence = self._next_sequence()
+                    self._entries[path] = (size, sequence)
+                    self._total_bytes += size
+                    heapq.heappush(self._heap, (sequence, path))
+            except (OSError, RuntimeError):
+                # Cache entries are advisory. A directory can be modified or
+                # become inaccessible while it is being indexed; the render
+                # should continue with the entries it could inspect.
+                continue
 
     def observe(self, path: Path) -> None:
         if not self.enabled:
             return
-        self._scan_once()
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return
-        previous = self._entries.get(path)
-        if previous is not None:
-            self._total_bytes -= previous[0]
-        sequence = self._next_sequence()
-        self._entries[path] = (size, sequence)
-        self._total_bytes += size
-        heapq.heappush(self._heap, (sequence, path))
+        with self._lock:
+            self._scan_once()
+            try:
+                if path.is_symlink() or not path.is_file():
+                    return
+                size = path.stat().st_size
+            except OSError:
+                return
+            previous = self._entries.get(path)
+            if previous is not None:
+                self._total_bytes -= previous[0]
+            sequence = self._next_sequence()
+            self._entries[path] = (size, sequence)
+            self._total_bytes += size
+            heapq.heappush(self._heap, (sequence, path))
 
     def touch(self, path: Path) -> None:
         """Mark a valid cache hit as recently used without rewriting it."""
@@ -4902,32 +6623,33 @@ class _CacheEvictor:
     def prune(self, protected: Optional[set[Path]] = None) -> None:
         if not self.enabled:
             return
-        self._scan_once()
-        if self._total_bytes <= self.limit_bytes:
-            return
-        protected = protected or set()
+        with self._lock:
+            self._scan_once()
+            if self._total_bytes <= self.limit_bytes:
+                return
+            protected = protected or set()
 
-        deferred: list[tuple[int, Path]] = []
-        while self._total_bytes > self.limit_bytes and self._heap:
-            sequence, path = heapq.heappop(self._heap)
-            current = self._entries.get(path)
-            if current is None or current[1] != sequence:
-                continue
-            if path in protected:
-                deferred.append((sequence, path))
-                continue
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                # Do not spin on an undeletable entry during this render.
-                deferred.append((sequence, path))
-                break
-            self._total_bytes -= current[0]
-            self._entries.pop(path, None)
-        for item in deferred:
-            heapq.heappush(self._heap, item)
+            deferred: list[tuple[int, Path]] = []
+            while self._total_bytes > self.limit_bytes and self._heap:
+                sequence, path = heapq.heappop(self._heap)
+                current = self._entries.get(path)
+                if current is None or current[1] != sequence:
+                    continue
+                if path in protected:
+                    deferred.append((sequence, path))
+                    continue
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    # Do not spin on an undeletable entry during this render.
+                    deferred.append((sequence, path))
+                    break
+                self._total_bytes -= current[0]
+                self._entries.pop(path, None)
+            for item in deferred:
+                heapq.heappush(self._heap, item)
 
 
 def _keyframe_field(
@@ -4973,13 +6695,17 @@ def _keyframe_field(
         ).hexdigest()[:20]
         cache_path = cache_dir / f"keyframe-{cache_key}.npy"
         try:
-            cached = np.load(cache_path, allow_pickle=False)
-            if cached.shape == (render_height, render_width):
-                if cache_evictor is not None:
-                    cache_evictor.touch(cache_path)
-                print(f"Using cached keyframe {cache_path.name}.", flush=True)
-                return np.asarray(cached, dtype=np.float32)
-        except (OSError, ValueError):
+            with _safe_cache_load(cache_path) as cached:
+                if cached is None:
+                    raise ValueError("unsafe cached keyframe")
+                if _valid_field_array(cached, (render_height, render_width)):
+                    if cache_evictor is not None:
+                        cache_evictor.touch(cache_path)
+                    print(f"Using cached keyframe {cache_path.name}.", flush=True)
+                    # Keep the returned field independent of a memory map that
+                    # cache eviction may unlink while the render is running.
+                    return np.array(cached, dtype=np.float32, copy=True)
+        except (OSError, EOFError, ValueError, TypeError):
             pass
 
     field = render_fractal(
@@ -4998,11 +6724,12 @@ def _keyframe_field(
         formula,
         julia_constant,
     )
+    field = _validated_field(field, (render_height, render_width), "keyframe")
     if cache_path is not None:
         _atomic_save_field(cache_path, field, durable=durable_cache)
         if cache_evictor is not None:
             cache_evictor.observe(cache_path)
-    return np.asarray(field, dtype=np.float32)
+    return field
 
 
 def _prune_cache(
@@ -5186,8 +6913,71 @@ def render_video(
     motion_blur: float = 0.0,
 ) -> dict[str, Any]:
     np = _require_numpy()
+    audio_path, output_path, _, cache_dir = _validate_render_paths(
+        audio_path,
+        output_path,
+        cache_dir=cache_dir,
+    )
+    width, height = _validate_dimensions(width, height, "video")
+    fps = _validate_fps(fps)
+    features = _normalise_audio_features(features)
+    frame_count = features.frame_count
+    zooms = _validate_zoom_series(zooms, frame_count)
+    render_scale = float(render_scale)
+    fractal_scale = float(fractal_scale)
+    keyframe_factor = _validate_keyframe_factor(keyframe_factor)
+    if not math.isfinite(render_scale) or render_scale < 1.0:
+        raise ValueError("render scale must be finite and at least 1")
+    if not math.isfinite(fractal_scale) or fractal_scale <= 0.0:
+        raise ValueError("fractal scale must be finite and positive")
+    iteration_base = _validate_iteration_count(iteration_base, "iteration base")
+    iterations_per_decade = _index_value(iterations_per_decade, "iterations per decade")
+    if iterations_per_decade > MAX_ITERATION_BUDGET:
+        raise ValueError(
+            f"iterations per decade must be at most {MAX_ITERATION_BUDGET:,}"
+        )
+    iteration_cap = _validate_iteration_count(iteration_cap, "iteration cap")
+    if iterations_per_decade < 0:
+        raise ValueError("iterations per decade cannot be negative")
+    if iteration_cap < iteration_base:
+        raise ValueError("iteration cap must be greater than or equal to iteration base")
+    native_threads = _validate_thread_count(native_threads, "native thread count")
+    encoder_threads = _validate_thread_count(encoder_threads, "encoder thread count")
+    series_order = _index_value(series_order, "series order")
+    series_block = _index_value(series_block, "series block")
+    if not 1 <= series_order <= 32 or not 2 <= series_block <= 4096:
+        raise ValueError("series order/block are outside the supported range")
+    if renderer not in {"auto", "native", "python"}:
+        raise ValueError(f"unknown renderer: {renderer}")
+    if native_backend not in NATIVE_BACKEND_NAMES and native_backend != "auto":
+        raise ValueError(f"unknown native backend: {native_backend}")
+    x_center = _validate_center_text(x_center, "real")
+    y_center = _validate_center_text(y_center, "imaginary")
+    if len(julia_constant) != 2:
+        raise ValueError("Julia constant must contain real and imaginary coordinates")
+    julia_constant = (
+        _validate_center_text(julia_constant[0], "Julia real"),
+        _validate_center_text(julia_constant[1], "Julia imaginary"),
+    )
+    cache_limit_mb = float(cache_limit_mb)
+    if not math.isfinite(cache_limit_mb) or cache_limit_mb < 0.0:
+        raise ValueError("cache limit must be finite and non-negative")
+    if cache_limit_mb > 1_000_000.0:
+        raise ValueError("cache limit is too large")
+    glow = float(glow)
+    motion_blur = float(motion_blur)
+    if not math.isfinite(glow) or not 0.0 <= glow <= 1.0:
+        raise ValueError("glow must be between 0 and 1")
+    if not math.isfinite(motion_blur) or not 0.0 <= motion_blur < 1.0:
+        raise ValueError("motion blur must be between 0 (off) and 1")
+    video_codec = _validate_ffmpeg_token(video_codec, "video codec")
+    video_preset = _validate_ffmpeg_token(video_preset, "video preset")
+    crf = _index_value(crf, "crf")
+    if not 0 <= crf <= 51:
+        raise ValueError("crf must be between 0 and 51")
     formula = _formula_name(formula)
-    if shutil.which("ffmpeg") is None:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
         raise RuntimeError("ffmpeg is required to encode the video, but it was not found on PATH")
     selected_codec, selected_preset, rate_control = _select_video_encoder(
         video_codec,
@@ -5220,9 +7010,13 @@ def render_video(
             "use --native-backend scalar for alternate formulas"
         )
     if palette_file is not None:
-        palette_file = Path(palette_file)
+        palette_file = _normalise_path(palette_file)
         if not palette_file.is_file():
             raise RuntimeError(f"palette file not found: {palette_file}")
+        if _paths_refer_to_same_target(palette_file, audio_path):
+            raise ValueError("palette file must be different from the input audio file")
+        if _paths_refer_to_same_target(palette_file, output_path):
+            raise ValueError("palette file must be different from the output video")
     if not math.isfinite(float(glow)) or not 0.0 <= float(glow) <= 1.0:
         raise ValueError("glow must be between 0 and 1")
     if not math.isfinite(float(motion_blur)) or not 0.0 <= float(motion_blur) < 1.0:
@@ -5258,61 +7052,18 @@ def render_video(
     allow_recovery = quality == "draft"
     cpu_count = max(2, os.cpu_count() or 2)
     if native_threads == 0:
-        native_threads = max(1, (cpu_count * 2) // 3)
+        native_threads = min(MAX_THREAD_COUNT, max(1, (cpu_count * 2) // 3))
     if encoder_threads == 0:
-        encoder_threads = max(1, cpu_count // 3)
-    render_width = max(16, int(round(width * render_scale * source_scale)))
-    render_height = max(16, int(round(height * render_scale * source_scale)))
-    temporary_output = output_path.with_name(
-        f".{output_path.stem}.rendering-{os.getpid()}{output_path.suffix}"
+        encoder_threads = min(MAX_THREAD_COUNT, max(1, cpu_count // 3))
+    render_width, render_height = _scaled_dimensions(
+        width,
+        height,
+        render_scale * float(source_scale),
+        "fractal source",
     )
-    using_vaapi = selected_codec == "h264_vaapi"
-    command = [
-        "ffmpeg",
-        "-y",
-        "-nostdin",
-        "-loglevel",
-        "error",
-        *(["-vaapi_device", "/dev/dri/renderD128"] if using_vaapi else []),
-        "-f",
-        "rawvideo",
-        "-vcodec",
-        "rawvideo",
-        "-s",
-        f"{width}x{height}",
-        "-pix_fmt",
-        "rgb24",
-        "-r",
-        str(fps),
-        "-i",
-        "-",
-        "-i",
-        str(audio_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        *(["-vf", "format=nv12,hwupload"] if using_vaapi else []),
-        "-c:v",
-        selected_codec,
-        *([] if using_vaapi else ["-preset", selected_preset]),
-        *([] if using_vaapi else ["-threads", str(encoder_threads)]),
-        *rate_control,
-        *([] if using_vaapi else ["-pix_fmt", "yuv420p"]),
-        "-c:a",
-        "aac",
-        # The decoded sample count is rounded up to a video frame.  Padding
-        # the audio covers that sub-frame amount, while the explicit output
-        # duration below prevents AAC padding from creating a frozen tail.
-        "-af",
-        "apad",
-        "-t",
-        f"{features.frame_count / max(float(fps), 1.0):.9f}",
-        "-movflags",
-        "+faststart",
-        str(temporary_output),
-    ]
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # The encoder destination is reserved only after validation and native
+    # setup below have succeeded. This avoids orphaning a placeholder when a
+    # hardware probe or deep-reference build fails before encoding starts.
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
     total_frames = features.frame_count
@@ -5489,19 +7240,21 @@ def render_video(
                     flush=True,
                 )
             except RuntimeError as error:
-                for _, reference in native_references:
-                    native_library.fractal_destroy_reference(reference)
-                native_references.clear()
+                _destroy_native_references(native_library, native_references)
                 if renderer == "native" or float(np.max(zooms)) > 300.0:
                     raise
                 print(f"Native deep reference unavailable ({error}); using Python fallback.")
                 active_renderer = "python"
                 native_library = None
+            except BaseException:
+                _destroy_native_references(native_library, native_references)
+                raise
 
     cache_identity = _field_renderer_cache_identity(active_renderer)
     cache_identity = (
         f"{cache_identity}-formula-{formula}"
         + (f"-julia-{julia_constant[0]}-{julia_constant[1]}" if formula == "julia" else "")
+        + f"-backend-{native_backend_id}"
     )
     print(
         f"Keyframe source: {render_width}x{render_height} ({quality}); "
@@ -5514,6 +7267,66 @@ def render_video(
         f"encoder threads: {encoder_threads}",
         flush=True,
     )
+
+    temporary_output: Optional[Path] = None
+    try:
+        temporary_output = _reserved_temporary_sibling(output_path, "rendering")
+        using_vaapi = selected_codec == "h264_vaapi"
+        preset_arguments = ["-preset", selected_preset] if selected_preset else []
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            *(["-vaapi_device", "/dev/dri/renderD128"] if using_vaapi else []),
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-s",
+            f"{width}x{height}",
+            "-pix_fmt",
+            "rgb24",
+            "-r",
+            str(fps),
+            "-i",
+            "-",
+            "-i",
+            str(audio_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            *(["-vf", "format=nv12,hwupload"] if using_vaapi else []),
+            "-c:v",
+            selected_codec,
+            *preset_arguments,
+            *([] if using_vaapi else ["-threads", str(encoder_threads)]),
+            *rate_control,
+            *([] if using_vaapi else ["-pix_fmt", "yuv420p"]),
+            "-c:a",
+            "aac",
+            # The decoded sample count is rounded up to a video frame.  Padding
+            # the audio covers that sub-frame amount, while the explicit output
+            # duration below prevents AAC padding from creating a frozen tail.
+            "-af",
+            "apad",
+            "-t",
+            f"{features.frame_count / max(float(fps), 1.0):.9f}",
+            "-movflags",
+            "+faststart",
+            str(temporary_output),
+        ]
+    except BaseException:
+        _destroy_native_references(native_library, native_references)
+        if temporary_output is not None and temporary_output.exists():
+            try:
+                temporary_output.unlink()
+            except OSError:
+                pass
+        raise
+    assert temporary_output is not None
 
     if keyframe_mode == "atlas":
         atlas_result = None
@@ -5556,9 +7369,7 @@ def render_video(
                 motion_blur=motion_blur,
             )
         finally:
-            if native_library is not None:
-                for _, reference in native_references:
-                    native_library.fractal_destroy_reference(reference)
+            _destroy_native_references(native_library, native_references)
             if temporary_output.exists():
                 try:
                     temporary_output.unlink()
@@ -5576,6 +7387,9 @@ def render_video(
         }
 
     process = None
+    ffmpeg_diagnostics: Optional[deque[str]] = None
+    ffmpeg_reader: Optional[threading.Thread] = None
+    frame_writer: Optional[_FFmpegFrameWriter] = None
     render_started = time.perf_counter()
     keyframe_seconds = 0.0
     frame_seconds = 0.0
@@ -5583,7 +7397,12 @@ def render_video(
     previous_rgb = None
 
     try:
-        process = subprocess.Popen(command, stdin=subprocess.PIPE)
+        process, ffmpeg_diagnostics, ffmpeg_reader = _start_ffmpeg_process(command)
+        frame_writer = _FFmpegFrameWriter(
+            process,
+            ffmpeg_diagnostics,
+            ffmpeg_reader,
+        )
         chunk_index = 0
         field = None
         field_source_zoom = None
@@ -5759,10 +7578,10 @@ def render_video(
                         )
                 rgb = _apply_frame_effects(rgb, glow, motion_blur, previous_rgb)
                 previous_rgb = rgb
-                assert process.stdin is not None
-                # NumPy exposes a contiguous buffer here; writing it directly
-                # avoids allocating one 0.75 MB bytes object per 500x500 frame.
-                process.stdin.write(rgb)
+                assert frame_writer is not None
+                # A bounded writer keeps the compatibility path responsive if
+                # FFmpeg stops consuming input while its process remains alive.
+                frame_writer.write(rgb)
                 frame_seconds += time.perf_counter() - frame_started
                 if frame_index % max(1, fps * 5) == 0:
                     print(f"  encoded {100.0 * frame_index / total_frames:5.1f}%")
@@ -5782,12 +7601,15 @@ def render_video(
                 field_iter = next_iter
             chunk_index += 1
 
-        assert process.stdin is not None
-        process.stdin.close()
-        process.stdin = None
-        return_code = process.wait()
+        assert frame_writer is not None
+        return_code = frame_writer.finish()
         if return_code != 0:
-            raise RuntimeError(f"ffmpeg exited with status {return_code}")
+            raise RuntimeError(_ffmpeg_error_message(
+                "ffmpeg exited with an error",
+                ffmpeg_diagnostics,
+                return_code,
+                ffmpeg_reader,
+            ))
         os.replace(temporary_output, output_path)
         elapsed = time.perf_counter() - render_started
         print(
@@ -5803,24 +7625,29 @@ def render_video(
         }
     except BrokenPipeError as exc:
         assert process is not None
-        process.kill()
-        process.wait()
-        raise RuntimeError("ffmpeg stopped while receiving video frames") from exc
+        _terminate_subprocess(process)
+        raise RuntimeError(
+            _ffmpeg_error_message(
+                "ffmpeg stopped while receiving video frames",
+                ffmpeg_diagnostics,
+                reader=ffmpeg_reader,
+            )
+        ) from exc
     except BaseException:
-        if process is not None and process.poll() is None:
-            process.kill()
         if process is not None:
-            process.wait()
+            _terminate_subprocess(process)
         raise
     finally:
-        if native_library is not None:
-            for _, reference in native_references:
-                native_library.fractal_destroy_reference(reference)
+        if frame_writer is not None:
+            frame_writer.abort()
+        _destroy_native_references(native_library, native_references)
         if temporary_output.exists():
             try:
                 temporary_output.unlink()
             except OSError:
                 pass
+        if ffmpeg_reader is not None:
+            ffmpeg_reader.join(timeout=2.0)
     return {
         **result,
         "codec": selected_codec,
@@ -5853,8 +7680,10 @@ def _manifest_path(
     if disabled:
         return None
     if requested is not None:
-        return requested
-    return output_path.with_suffix(".json")
+        _reject_final_symlink(requested, "manifest")
+        return _absolute_path(requested)
+    _reject_final_symlink(output_path, "output")
+    return _absolute_path(output_path).with_suffix(".json")
 
 
 def _git_revision() -> Optional[str]:
@@ -5883,7 +7712,8 @@ def _json_safe_arguments(args: argparse.Namespace) -> dict[str, Any]:
 def _write_manifest(path: Path, data: dict[str, Any]) -> None:
     """Atomically write a human-readable sidecar without partial JSON."""
 
-    path = Path(path)
+    path = _absolute_path(Path(path))
+    _reject_final_symlink(path, "manifest")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Optional[Path] = None
     try:
@@ -6275,7 +8105,7 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def _main_impl() -> None:
     args = build_parser(sys.argv[1:]).parse_args()
     if args.list_profiles:
         _print_profiles()
@@ -6288,8 +8118,14 @@ def main() -> None:
         julia_constant = _parse_coordinate_pair(args.julia_c, "--julia-c")
     except ValueError as error:
         raise SystemExit(str(error)) from error
-    if args.width <= 0 or args.height <= 0 or args.fps <= 0:
-        raise SystemExit("width, height, and fps must be positive")
+    try:
+        args.width, args.height = _validate_dimensions(args.width, args.height, "video")
+        args.fps = _validate_fps(args.fps)
+        args.sample_rate = _index_value(args.sample_rate, "sample rate")
+        if args.sample_rate <= 0 or args.sample_rate > MAX_SAMPLE_RATE:
+            raise ValueError(f"sample rate must be between 1 and {MAX_SAMPLE_RATE:,}")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     try:
         base_log = _zoom_log(args.base_zoom)
         max_log = _zoom_log(args.max_zoom)
@@ -6297,7 +8133,7 @@ def main() -> None:
         raise SystemExit(str(error)) from error
     if max_log < base_log:
         raise SystemExit("max-zoom must be greater than or equal to base-zoom")
-    if max_log > 9800.0:
+    if max_log > MAX_LOG10_ZOOM:
         raise SystemExit("max-zoom is beyond the native scaled-exponent range; use a zoom below 1e9800")
     if args.list_points:
         _print_deep_zoom_points(args.formula)
@@ -6377,6 +8213,15 @@ def main() -> None:
         raise SystemExit("fractal-scale must be positive")
     if args.keyframe_factor <= 1.0:
         raise SystemExit("keyframe-factor must be greater than 1")
+    try:
+        args.iteration_base = _validate_iteration_count(args.iteration_base, "iteration-base")
+        args.iteration_cap = _validate_iteration_count(args.iteration_cap, "iteration-cap")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if not 0 <= args.iterations_per_decade <= MAX_ITERATION_BUDGET:
+        raise SystemExit(
+            f"iterations-per-decade must be between 0 and {MAX_ITERATION_BUDGET:,}"
+        )
     if args.iteration_cap < args.iteration_base:
         raise SystemExit("iteration-cap must be greater than iteration-base")
     if args.zoom_punch < 0:
@@ -6385,26 +8230,66 @@ def main() -> None:
         raise SystemExit("beat-strength cannot be negative")
     if args.attack < 0 or args.release < 0:
         raise SystemExit("attack and release cannot be negative")
+    if not 0.0 <= args.glow <= 1.0:
+        raise SystemExit("glow must be between 0 and 1")
+    if not 0.0 <= args.motion_blur < 1.0:
+        raise SystemExit("motion-blur must be between 0 (off) and 1")
     if not 1 <= args.series_order <= 32:
         raise SystemExit("series-order must be between 1 and 32")
     if not 2 <= args.series_block <= 4096:
         raise SystemExit("series-block must be between 2 and 4096")
-    if args.native_threads < 0:
-        raise SystemExit("native-threads cannot be negative")
-    if args.encoder_threads < 0:
-        raise SystemExit("encoder-threads cannot be negative")
-    if not args.codec or args.codec.startswith("-"):
-        raise SystemExit("codec must be a non-empty FFmpeg encoder name")
+    try:
+        args.native_threads = _validate_thread_count(args.native_threads, "native-threads")
+        args.encoder_threads = _validate_thread_count(args.encoder_threads, "encoder-threads")
+        _validate_ffmpeg_token(args.codec, "codec")
+        _validate_ffmpeg_token(args.video_preset, "video-preset")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if not 0 <= args.crf <= 51:
         raise SystemExit("crf must be between 0 and 51")
     if args.cache_limit_mb < 0:
         raise SystemExit("cache-limit-mb cannot be negative")
-    if args.sample_rate <= 0:
-        raise SystemExit("sample-rate must be positive")
-    if args.palette_file is not None and not args.palette_file.is_file():
-        raise SystemExit(f"palette file not found: {args.palette_file}")
-    if not args.audio.exists():
-        raise SystemExit(f"Audio file not found: {args.audio}")
+    if args.sample_rate <= 0 or args.sample_rate > MAX_SAMPLE_RATE:
+        raise SystemExit(f"sample-rate must be between 1 and {MAX_SAMPLE_RATE:,}")
+    try:
+        # Keep the final destination lexical. Resolving an output symlink here
+        # would make os.replace overwrite the symlink's target instead of
+        # replacing the link itself, which is an unsafe and surprising write.
+        _reject_final_symlink(args.output, "output")
+        if args.manifest is not None:
+            _reject_final_symlink(args.manifest, "manifest")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    args.audio = _normalise_path(args.audio)
+    args.output = _absolute_path(args.output)
+    if args.cache_dir is not None:
+        args.cache_dir = _normalise_path(args.cache_dir)
+    if args.palette_file is not None:
+        args.palette_file = _normalise_path(args.palette_file)
+        if not args.palette_file.is_file():
+            raise SystemExit(f"palette file not found: {args.palette_file}")
+    manifest_path = _manifest_path(args.output, args.manifest, args.no_manifest)
+    try:
+        args.audio, args.output, manifest_path, args.cache_dir = _validate_render_paths(
+            args.audio,
+            args.output,
+            manifest_path,
+            args.cache_dir,
+        )
+        if args.palette_file is not None and _paths_refer_to_same_target(
+            args.palette_file, args.output
+        ):
+            raise ValueError("palette file must be different from the output video")
+        if args.palette_file is not None and _paths_refer_to_same_target(
+            args.palette_file, args.audio
+        ):
+            raise ValueError("palette file must be different from the input audio file")
+        if args.palette_file is not None and manifest_path is not None and _paths_refer_to_same_target(
+            args.palette_file, manifest_path
+        ):
+            raise ValueError("palette file must be different from the manifest file")
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
 
     audio_started = time.perf_counter()
     features = analyse_audio(
@@ -6445,8 +8330,15 @@ def main() -> None:
                 "quality": max(args.fractal_scale, args.keyframe_factor),
                 "extreme": max(args.fractal_scale, args.keyframe_factor * 2.0),
             }[args.quality]
-        render_width = max(16, int(round(args.width * args.render_scale * estimate_scale)))
-        render_height = max(16, int(round(args.height * args.render_scale * estimate_scale)))
+        try:
+            render_width, render_height = _scaled_dimensions(
+                args.width,
+                args.height,
+                args.render_scale * estimate_scale,
+                "fractal source",
+            )
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
         planned_units = (
             _atlas_geometry(zooms, args.keyframe_factor)[2] + 1
             if args.keyframe_mode == "atlas"
@@ -6458,7 +8350,6 @@ def main() -> None:
             f"{args.video_preset} encoder, {args.quality} quality."
         )
         return
-    manifest_path = _manifest_path(args.output, args.manifest, args.no_manifest)
     manifest = _build_manifest(
         args,
         args.x_center,
@@ -6526,6 +8417,17 @@ def main() -> None:
         })
         _write_manifest(manifest_path, manifest)
     print(f"Done -> {args.output}")
+
+
+def main() -> None:
+    """Run the CLI with concise errors instead of implementation tracebacks."""
+
+    try:
+        _main_impl()
+    except SystemExit:
+        raise
+    except (OSError, RuntimeError, ValueError, OverflowError) as error:
+        raise SystemExit(f"Error: {error}") from error
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "renderer.h"
@@ -65,10 +66,79 @@ constexpr int MAX_SAFE_LINEAR_BLA_LENGTH = 4096;
 constexpr int MAX_SAFE_DEEP_LINEAR_BLA_LENGTH = 1024;
 constexpr long double ESCAPE_RADIUS_SQUARED = 4.0L;
 constexpr long double LOG_TWO = 0.693147180559945309417232121458176568L;
+constexpr long double LOG_TEN = 2.302585092994045684017991454684364208L;
+constexpr int MAX_NATIVE_ITERATIONS = 10'000'000;
+constexpr int MAX_NATIVE_THREADS = 4096;
+constexpr int MAX_NATIVE_PRECISION_BITS = 131'072;
+constexpr int MAX_NATIVE_PIXELS = 100'000'000;
+constexpr int MAX_NATIVE_POINTS = 100'000'000;
+constexpr std::size_t MAX_NATIVE_TEXT_LENGTH = 50'000;
+constexpr long double MIN_NATIVE_LOG10_ZOOM = -300.0L;
+constexpr long double MAX_NATIVE_LOG10_ZOOM = 9800.0L;
 
 bool valid_formula(int formula) noexcept {
     return formula >= FRACTAL_FORMULA_MANDELBROT
         && formula <= FRACTAL_FORMULA_MULTIBROT3;
+}
+
+bool valid_pixel_dimensions(int width, int height) noexcept {
+    if (width <= 0 || height <= 0) return false;
+    const auto maximum = static_cast<std::uint64_t>(MAX_NATIVE_PIXELS);
+    return static_cast<std::uint64_t>(width)
+        <= maximum / static_cast<std::uint64_t>(height);
+}
+
+bool valid_colour_controls(
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch
+) noexcept {
+    return std::isfinite(phase)
+        && std::isfinite(vocal)
+        && std::isfinite(instrumental)
+        && std::isfinite(pitch);
+}
+
+bool valid_iteration_count(int value) noexcept {
+    return value > 0 && value <= MAX_NATIVE_ITERATIONS;
+}
+
+bool valid_thread_count(int value) noexcept {
+    return value >= 0 && value <= MAX_NATIVE_THREADS;
+}
+
+bool valid_precision_bits(int value) noexcept {
+    return value >= 128 && value <= MAX_NATIVE_PRECISION_BITS;
+}
+
+bool valid_series_parameters(int series_order, int series_block) noexcept {
+    return series_order >= 1 && series_order <= 32
+        && series_block >= 2 && series_block <= 4096;
+}
+
+bool valid_c_string(const char* text) noexcept {
+    if (!text) return false;
+    for (std::size_t length = 0; length <= MAX_NATIVE_TEXT_LENGTH; ++length) {
+        if (text[length] == '\0') return true;
+    }
+    return false;
+}
+
+long double parse_coordinate(const char* text, const char* label) {
+    if (!valid_c_string(text) || !label) {
+        throw std::runtime_error("native coordinate text is too long or null");
+    }
+    errno = 0;
+    char* end = nullptr;
+    const long double value = std::strtold(text, &end);
+    if (end == text || *end != '\0' || !std::isfinite(value)) {
+        throw std::runtime_error(std::string("invalid ") + label + " coordinate");
+    }
+    // Underflow to zero is harmless for the direct fallback and the original
+    // text is still passed to MPFR for deep references. Overflow, handled by
+    // the non-finite check above, cannot be represented by any native path.
+    return value;
 }
 
 int formula_power(int formula) noexcept {
@@ -131,6 +201,13 @@ void iterate_direct_formula(
 }
 
 #ifdef FRACTAL_HAVE_OPENCL
+
+// OpenCL reports collection sizes through the driver. Treat those values as
+// untrusted metadata: a broken ICD must not turn capability probing into an
+// arbitrarily large host allocation or diagnostic string.
+constexpr cl_uint MAX_OPENCL_PLATFORMS = 256;
+constexpr cl_uint MAX_OPENCL_DEVICES = 256;
+constexpr size_t MAX_OPENCL_INFO_BYTES = 1U << 20;
 
 // The OpenCL path is deliberately limited to the direct, shallow renderer.
 // Deep MPFR reference construction and perturbation/BLA remain on the CPU
@@ -224,6 +301,11 @@ void initialise_opencl() {
             opencl_runtime = std::move(runtime);
             return;
         }
+        if (platform_count > MAX_OPENCL_PLATFORMS) {
+            runtime->error = "OpenCL reported too many platforms";
+            opencl_runtime = std::move(runtime);
+            return;
+        }
         std::vector<cl_platform_id> platforms(platform_count);
         status = clGetPlatformIDs(platform_count, platforms.data(), nullptr);
         if (status != CL_SUCCESS) {
@@ -238,6 +320,7 @@ void initialise_opencl() {
             cl_uint device_count = 0;
             if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &device_count)
                     == CL_SUCCESS && device_count > 0) {
+                if (device_count > MAX_OPENCL_DEVICES) continue;
                 std::vector<cl_device_id> devices(device_count);
                 if (clGetDeviceIDs(
                         platform, CL_DEVICE_TYPE_GPU, device_count,
@@ -253,6 +336,7 @@ void initialise_opencl() {
                 cl_uint device_count = 0;
                 if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 0, nullptr, &device_count)
                         == CL_SUCCESS && device_count > 0) {
+                    if (device_count > MAX_OPENCL_DEVICES) continue;
                     std::vector<cl_device_id> devices(device_count);
                     if (clGetDeviceIDs(
                             platform, CL_DEVICE_TYPE_CPU, device_count,
@@ -273,9 +357,16 @@ void initialise_opencl() {
         size_t extension_size = 0;
         status = clGetDeviceInfo(
             selected, CL_DEVICE_EXTENSIONS, 0, nullptr, &extension_size);
-        std::string extensions(extension_size, '\0');
         if (status != CL_SUCCESS || extension_size == 0
-            || clGetDeviceInfo(
+            || extension_size > MAX_OPENCL_INFO_BYTES) {
+            runtime->error = status != CL_SUCCESS
+                ? opencl_error_text(status)
+                : "selected OpenCL device reported invalid extension metadata";
+            opencl_runtime = std::move(runtime);
+            return;
+        }
+        std::string extensions(extension_size, '\0');
+        if (clGetDeviceInfo(
                 selected, CL_DEVICE_EXTENSIONS, extension_size,
                 extensions.data(), nullptr) != CL_SUCCESS
             || (extensions.find("cl_khr_fp64") == std::string::npos
@@ -318,6 +409,12 @@ void initialise_opencl() {
             clGetProgramBuildInfo(
                 runtime->program, selected, CL_PROGRAM_BUILD_LOG,
                 0, nullptr, &log_size);
+            if (log_size > MAX_OPENCL_INFO_BYTES) {
+                runtime->error = opencl_error_text(status)
+                    + ": OpenCL build log exceeded the safety limit";
+                opencl_runtime = std::move(runtime);
+                return;
+            }
             std::string build_log(log_size, '\0');
             if (log_size > 0) {
                 clGetProgramBuildInfo(
@@ -401,8 +498,10 @@ void render_direct_opencl(
 
 #endif
 
-std::mutex error_mutex;
-std::string last_error;
+// Each C-ABI caller gets its own diagnostic buffer. Native reference tiers
+// are prepared concurrently, so a process-wide error string would otherwise
+// let one failed worker overwrite another worker's useful message.
+thread_local std::string last_error;
 
 struct PaletteBasis {
     int max_iter = -1;
@@ -452,7 +551,7 @@ std::atomic<bool> render_stats_enabled{false};
 std::mutex stats_mutex;
 RenderStats last_render_stats;
 
-void publish_render_stats(const RenderStats& stats) {
+[[maybe_unused]] void publish_render_stats(const RenderStats& stats) {
     std::lock_guard<std::mutex> lock(stats_mutex);
     last_render_stats = stats;
 }
@@ -537,6 +636,16 @@ FractalRenderOptions checked_render_options(const FractalRenderOptions* supplied
         throw std::runtime_error("unsupported FractalRenderOptions version or size");
     }
     options = *supplied;
+    const auto validate_flag = [](std::int32_t value, const char* label) {
+        if (value != 0 && value != 1) {
+            throw std::runtime_error(std::string(label) + " must be 0 or 1");
+        }
+    };
+    validate_flag(options.strict, "strict render flag");
+    validate_flag(options.allow_recovery, "recovery flag");
+    validate_flag(options.disable_bla, "disable-BLA flag");
+    validate_flag(options.disable_cycle, "disable-cycle flag");
+    validate_flag(options.strict_cycle, "strict-cycle flag");
     options.series_min_terms = std::clamp(options.series_min_terms, 1, 32);
     options.series_max_terms = std::clamp(options.series_max_terms, options.series_min_terms, 32);
     options.max_bla_length = std::clamp(options.max_bla_length, 1, MAX_SAFE_BLA_LENGTH);
@@ -566,7 +675,6 @@ thread_local PaletteBasis palette_basis;
 thread_local AuroraPalette aurora_palette;
 
 void set_error(const std::string& message) {
-    std::lock_guard<std::mutex> lock(error_mutex);
     last_error = message;
 }
 
@@ -768,10 +876,13 @@ inline void write_colour_pixel(
         return;
     }
     const int palette_size = static_cast<int>(palette.rgb.size());
-    const int palette_index = std::clamp(
-        static_cast<int>(smooth * palette_index_scale),
-        0,
-        palette_size - 1);
+    const double scaled_index = static_cast<double>(smooth)
+        * static_cast<double>(palette_index_scale);
+    const int palette_index = scaled_index >= static_cast<double>(palette_size - 1)
+        ? palette_size - 1
+        : !std::isfinite(scaled_index) || scaled_index <= 0.0
+            ? 0
+            : static_cast<int>(scaled_index);
     const auto& colour = palette.rgb[static_cast<size_t>(palette_index)];
     destination[0] = colour[0];
     destination[1] = colour[1];
@@ -779,7 +890,7 @@ inline void write_colour_pixel(
 }
 
 long double parse_zoom(const char* text) {
-    if (!text) throw std::runtime_error("null Mandelbrot zoom");
+    if (!valid_c_string(text)) throw std::runtime_error("native zoom text is too long or null");
     errno = 0;
     char* end = nullptr;
     const long double zoom = std::strtold(text, &end);
@@ -787,7 +898,23 @@ long double parse_zoom(const char* text) {
         || !std::isfinite(zoom) || zoom <= 0.0L) {
         throw std::runtime_error("invalid Mandelbrot zoom");
     }
+    const long double log10_zoom = std::log10(zoom);
+    if (!std::isfinite(log10_zoom)
+        || log10_zoom < MIN_NATIVE_LOG10_ZOOM
+        || log10_zoom > MAX_NATIVE_LOG10_ZOOM) {
+        throw std::runtime_error("Mandelbrot zoom is outside the supported range");
+    }
     return zoom;
+}
+
+inline int saturating_exponent(long long value) noexcept {
+    if (value > static_cast<long long>(std::numeric_limits<int>::max())) {
+        return std::numeric_limits<int>::max();
+    }
+    if (value < static_cast<long long>(std::numeric_limits<int>::min())) {
+        return std::numeric_limits<int>::min();
+    }
+    return static_cast<int>(value);
 }
 
 // A normalized mantissa/exponent number.  The mantissa keeps ordinary CPU
@@ -803,7 +930,11 @@ struct FloatExp {
         if (value == 0.0 || std::isnan(value)) return {value, 0};
         int shift = 0;
         const double normalized = std::frexp(value, &shift);
-        return {normalized, exponent + shift};
+        return {
+            normalized,
+            saturating_exponent(
+                static_cast<long long>(exponent) + static_cast<long long>(shift)),
+        };
     }
 
     static FloatExp from_long_double(long double value) {
@@ -838,16 +969,6 @@ struct FloatExp {
     bool zero() const { return mantissa == 0.0; }
 };
 
-inline int saturating_exponent(long long value) noexcept {
-    if (value > static_cast<long long>(std::numeric_limits<int>::max())) {
-        return std::numeric_limits<int>::max();
-    }
-    if (value < static_cast<long long>(std::numeric_limits<int>::min())) {
-        return std::numeric_limits<int>::min();
-    }
-    return static_cast<int>(value);
-}
-
 // A complex value represented with one shared binary exponent.  The two
 // components of a perturbation normally have comparable magnitudes, so a
 // shared exponent avoids normalizing real and imaginary parts separately in
@@ -873,14 +994,14 @@ struct ScaledComplex {
         if (magnitude >= 1.0) {
             real *= 0.5;
             imag *= 0.5;
-            ++exponent;
+            exponent = saturating_exponent(static_cast<long long>(exponent) + 1);
             return;
         }
         if (magnitude >= 0.5) return;
         if (magnitude >= 0.25) {
             real *= 2.0;
             imag *= 2.0;
-            --exponent;
+            exponent = saturating_exponent(static_cast<long long>(exponent) - 1);
             return;
         }
         int shift = 0;
@@ -894,11 +1015,15 @@ struct ScaledComplex {
     static ScaledComplex from_float_exp(const FloatExp& real_part, const FloatExp& imag_part) {
         if (real_part.zero() && imag_part.zero()) return {};
         const int common_exponent = std::max(real_part.exponent, imag_part.exponent);
+        const long long real_difference = static_cast<long long>(real_part.exponent)
+            - static_cast<long long>(common_exponent);
+        const long long imag_difference = static_cast<long long>(imag_part.exponent)
+            - static_cast<long long>(common_exponent);
         ScaledComplex result{
-            real_part.exponent - common_exponent < -1074
-                ? 0.0 : std::ldexp(real_part.mantissa, real_part.exponent - common_exponent),
-            imag_part.exponent - common_exponent < -1074
-                ? 0.0 : std::ldexp(imag_part.mantissa, imag_part.exponent - common_exponent),
+            real_difference < -1074
+                ? 0.0 : std::ldexp(real_part.mantissa, static_cast<int>(real_difference)),
+            imag_difference < -1074
+                ? 0.0 : std::ldexp(imag_part.mantissa, static_cast<int>(imag_difference)),
             common_exponent,
         };
         result.normalize();
@@ -1050,8 +1175,10 @@ inline FloatExp fe_add(const FloatExp& a, const FloatExp& b) {
         larger = &b;
         smaller = &a;
     }
-    const int difference = larger->exponent - smaller->exponent;
-    if (difference > 60) return *larger;
+    const long long exponent_difference = static_cast<long long>(larger->exponent)
+        - static_cast<long long>(smaller->exponent);
+    if (exponent_difference > 60) return *larger;
+    const int difference = static_cast<int>(exponent_difference);
     const double mantissa = larger->mantissa
         + std::ldexp(smaller->mantissa, -difference);
     if (mantissa == 0.0 || !std::isfinite(mantissa)) {
@@ -1064,13 +1191,20 @@ inline FloatExp fe_add(const FloatExp& a, const FloatExp& b) {
     // than the old unconditional normalization in the inner pixel loop.
     const double magnitude = std::abs(mantissa);
     if (magnitude >= 1.0) {
-        return {mantissa * 0.5, larger->exponent + 1};
+        return {
+            mantissa * 0.5,
+            saturating_exponent(static_cast<long long>(larger->exponent) + 1),
+        };
     }
     if (magnitude >= 0.5) {
         return {mantissa, larger->exponent};
     }
     int shift = 0;
-    return {std::frexp(mantissa, &shift), larger->exponent + shift};
+    return {
+        std::frexp(mantissa, &shift),
+        saturating_exponent(
+            static_cast<long long>(larger->exponent) + static_cast<long long>(shift)),
+    };
 }
 
 inline FloatExp fe_sub(const FloatExp& a, const FloatExp& b) {
@@ -1085,13 +1219,21 @@ inline FloatExp fe_mul(const FloatExp& a, const FloatExp& b) {
     // The product of two normalized mantissas lies in [0.25, 1), apart from
     // a possible rounding hit at 1.  Normalize it without calling frexp.
     const double magnitude = std::abs(mantissa);
+    const long long exponent_sum = static_cast<long long>(a.exponent)
+        + static_cast<long long>(b.exponent);
     if (magnitude >= 1.0) {
-        return {mantissa * 0.5, a.exponent + b.exponent + 1};
+        return {
+            mantissa * 0.5,
+            saturating_exponent(exponent_sum + 1),
+        };
     }
     if (magnitude < 0.5) {
-        return {mantissa * 2.0, a.exponent + b.exponent - 1};
+        return {
+            mantissa * 2.0,
+            saturating_exponent(exponent_sum - 1),
+        };
     }
-    return {mantissa, a.exponent + b.exponent};
+    return {mantissa, saturating_exponent(exponent_sum)};
 }
 
 inline FloatExp fe_mul(const FloatExp& a, double b) {
@@ -1103,13 +1245,21 @@ inline FloatExp fe_div(const FloatExp& a, const FloatExp& b) {
     const double mantissa = a.mantissa / b.mantissa;
     if (!std::isfinite(mantissa)) return FloatExp::from_parts(mantissa, 0);
     const double magnitude = std::abs(mantissa);
+    const long long exponent_difference = static_cast<long long>(a.exponent)
+        - static_cast<long long>(b.exponent);
     if (magnitude >= 1.0) {
-        return {mantissa * 0.5, a.exponent - b.exponent + 1};
+        return {
+            mantissa * 0.5,
+            saturating_exponent(exponent_difference + 1),
+        };
     }
     if (magnitude < 0.5) {
-        return {mantissa * 2.0, a.exponent - b.exponent - 1};
+        return {
+            mantissa * 2.0,
+            saturating_exponent(exponent_difference - 1),
+        };
     }
-    return {mantissa, a.exponent - b.exponent};
+    return {mantissa, saturating_exponent(exponent_difference)};
 }
 
 inline FloatExp fe_sqr(const FloatExp& value) {
@@ -1118,19 +1268,22 @@ inline FloatExp fe_sqr(const FloatExp& value) {
 
 inline FloatExp fe_sqrt(const FloatExp& value) {
     if (value.zero()) return value;
-    int exponent = value.exponent;
+    long long exponent = value.exponent;
     double mantissa = value.mantissa;
     if (mantissa < 0.0 || !std::isfinite(mantissa)) {
         return FloatExp::from_parts(std::sqrt(mantissa), 0);
     }
-    if (exponent & 1) {
+    if (exponent % 2 != 0) {
         mantissa *= 2.0;
         --exponent;
         // sqrt(2 * normalized_mantissa) is in [1, sqrt(2)); normalize the
         // result directly rather than sending it through frexp.
-        return {std::sqrt(mantissa) * 0.5, exponent / 2 + 1};
+        return {
+            std::sqrt(mantissa) * 0.5,
+            saturating_exponent(exponent / 2 + 1),
+        };
     }
-    return {std::sqrt(mantissa), exponent / 2};
+    return {std::sqrt(mantissa), saturating_exponent(exponent / 2)};
 }
 
 inline int fe_compare(const FloatExp& a, const FloatExp& b) {
@@ -1462,6 +1615,52 @@ struct ReferenceContext {
 #endif
 };
 
+// Opaque C-ABI handles must not be blindly cast and dereferenced.  In
+// addition to turning accidental double-destroys into a safe diagnostic, the
+// registry gives render/clone calls a shared ownership hold while a concurrent
+// destroy removes the public handle. The map owns every context returned to
+// an external caller; callers never own a raw C++ allocation directly.
+//
+// Handles are monotonically increasing opaque tokens rather than the address
+// of the context. Reusing a freed context address could otherwise make a
+// stale handle accidentally refer to a later render's context (an ABA bug).
+std::mutex reference_registry_mutex;
+std::unordered_map<std::uintptr_t, std::shared_ptr<ReferenceContext>> reference_registry;
+std::uintptr_t next_reference_handle = 0x1000U;
+
+void* register_reference(std::unique_ptr<ReferenceContext> context) {
+    if (!context) throw std::runtime_error("cannot register an empty reference");
+    auto shared = std::shared_ptr<ReferenceContext>(std::move(context));
+    std::lock_guard<std::mutex> lock(reference_registry_mutex);
+    for (;;) {
+        const std::uintptr_t token = next_reference_handle++;
+        if (token == 0 || reference_registry.find(token) != reference_registry.end()) {
+            continue;
+        }
+        reference_registry.emplace(token, std::move(shared));
+        return reinterpret_cast<void*>(token);
+    }
+}
+
+std::shared_ptr<ReferenceContext> acquire_reference(void* handle) {
+    if (!handle) return {};
+    const auto key = reinterpret_cast<std::uintptr_t>(handle);
+    std::lock_guard<std::mutex> lock(reference_registry_mutex);
+    const auto found = reference_registry.find(key);
+    return found == reference_registry.end() ? nullptr : found->second;
+}
+
+std::shared_ptr<ReferenceContext> remove_reference(void* handle) {
+    if (!handle) return {};
+    const auto key = reinterpret_cast<std::uintptr_t>(handle);
+    std::lock_guard<std::mutex> lock(reference_registry_mutex);
+    const auto found = reference_registry.find(key);
+    if (found == reference_registry.end()) return {};
+    auto context = std::move(found->second);
+    reference_registry.erase(found);
+    return context;
+}
+
 #if defined(__AVX2__)
 void render_direct_avx2(
     float* output,
@@ -1595,10 +1794,18 @@ void render_direct(
     // layer routes only shallow views here; using long double for every
     // pixel made the inexpensive part of a zoom sequence disproportionately
     // slow on low-power CPUs.
-    const double height_span = 2.8 / static_cast<double>(zoom);
-    const double width_span = height_span * static_cast<double>(width) / static_cast<double>(height);
+    const double zoom_value = static_cast<double>(zoom);
     const double center_real = static_cast<double>(x_center);
     const double center_imag = static_cast<double>(y_center);
+    if (!std::isfinite(zoom_value) || zoom_value <= 0.0
+        || !std::isfinite(center_real) || !std::isfinite(center_imag)) {
+        throw std::runtime_error("direct native coordinates or zoom exceed double range");
+    }
+    const double height_span = 2.8 / zoom_value;
+    const double width_span = height_span * static_cast<double>(width) / static_cast<double>(height);
+    if (!std::isfinite(height_span) || !std::isfinite(width_span)) {
+        throw std::runtime_error("direct native viewport is outside double range");
+    }
     // Pixel coordinates are shared by every row/column. Keeping the final c
     // coordinates out of the inner orbit loop removes one multiply and one
     // add per pixel from every shallow atlas tile.
@@ -1721,6 +1928,32 @@ void render_direct(
 
 #ifdef FRACTAL_HAVE_MPFR
 
+struct MpfrWorkspace {
+    mpfr_t cx, cy, viewport_zoom, viewport_radius;
+    mpfr_t zr, zi, next_real, next_imag, temporary;
+
+    explicit MpfrWorkspace(mpfr_prec_t precision_bits) {
+        mpfr_init2(cx, precision_bits);
+        mpfr_init2(cy, precision_bits);
+        mpfr_init2(viewport_zoom, precision_bits);
+        mpfr_init2(viewport_radius, precision_bits);
+        mpfr_init2(zr, precision_bits);
+        mpfr_init2(zi, precision_bits);
+        mpfr_init2(next_real, precision_bits);
+        mpfr_init2(next_imag, precision_bits);
+        mpfr_init2(temporary, precision_bits);
+    }
+
+    ~MpfrWorkspace() {
+        mpfr_clears(
+            cx, cy, viewport_zoom, viewport_radius, zr, zi,
+            next_real, next_imag, temporary, nullptr);
+    }
+
+    MpfrWorkspace(const MpfrWorkspace&) = delete;
+    MpfrWorkspace& operator=(const MpfrWorkspace&) = delete;
+};
+
 void make_reference_orbit(
     ReferenceContext& context,
     const char* x_text,
@@ -1729,16 +1962,23 @@ void make_reference_orbit(
     int max_iter,
     int precision_bits
 ) {
+    if (!valid_c_string(x_text) || !valid_c_string(y_text)
+        || (viewport_zoom_text && !valid_c_string(viewport_zoom_text))) {
+        throw std::runtime_error("native reference text is too long or null");
+    }
     context.requested_max_iter = max_iter;
     precision_bits = std::max(128, precision_bits);
-    mpfr_t cx, cy, viewport_zoom, viewport_radius, zr, zi, next_real, next_imag, temporary;
-    mpfr_init2(cx, precision_bits); mpfr_init2(cy, precision_bits);
-    mpfr_init2(viewport_zoom, precision_bits); mpfr_init2(viewport_radius, precision_bits);
-    mpfr_init2(zr, precision_bits); mpfr_init2(zi, precision_bits);
-    mpfr_init2(next_real, precision_bits); mpfr_init2(next_imag, precision_bits);
-    mpfr_init2(temporary, precision_bits);
+    MpfrWorkspace workspace(static_cast<mpfr_prec_t>(precision_bits));
+    mpfr_ptr cx = workspace.cx;
+    mpfr_ptr cy = workspace.cy;
+    mpfr_ptr viewport_zoom = workspace.viewport_zoom;
+    mpfr_ptr viewport_radius = workspace.viewport_radius;
+    mpfr_ptr zr = workspace.zr;
+    mpfr_ptr zi = workspace.zi;
+    mpfr_ptr next_real = workspace.next_real;
+    mpfr_ptr next_imag = workspace.next_imag;
+    mpfr_ptr temporary = workspace.temporary;
     if (mpfr_set_str(cx, x_text, 10, MPFR_RNDN) != 0 || mpfr_set_str(cy, y_text, 10, MPFR_RNDN) != 0) {
-        mpfr_clears(cx, cy, viewport_zoom, viewport_radius, zr, zi, next_real, next_imag, temporary, nullptr);
         throw std::runtime_error("invalid MPFR Mandelbrot centre");
     }
     if (viewport_zoom_text && mpfr_set_str(viewport_zoom, viewport_zoom_text, 10, MPFR_RNDN) == 0
@@ -1782,7 +2022,6 @@ void make_reference_orbit(
     // render loop still retains every finite entry before the cutoff, which is
     // enough to detect the reference (and nearby) escape without a NaN map.
     if (finite_orbit_size == 0) {
-        mpfr_clears(cx, cy, viewport_zoom, viewport_radius, zr, zi, next_real, next_imag, temporary, nullptr);
         throw std::runtime_error("reference orbit lost finite state at iteration zero");
     }
     context.bla.map_end = static_cast<int>(finite_orbit_size) - 1;
@@ -1810,7 +2049,6 @@ void make_reference_orbit(
         render_orbit->imag_double[index] = std::ldexp(value.imag, value.exponent);
     }
     context.orbit = std::move(render_orbit);
-    mpfr_clears(cx, cy, viewport_zoom, viewport_radius, zr, zi, next_real, next_imag, temporary, nullptr);
 }
 
 #else
@@ -2293,7 +2531,7 @@ void retarget_linear_levels(
     }
 }
 
-void build_retargeted_bla(
+[[maybe_unused]] void build_retargeted_bla(
     ReferenceContext& context,
     const ReferenceContext& source
 ) {
@@ -2339,6 +2577,9 @@ inline bool render_time_budget_expired(
 }
 
 FloatExp parse_zoom_float_exp(const char* text, mpfr_prec_t precision_bits) {
+    if (!valid_c_string(text)) {
+        throw std::runtime_error("native zoom text is too long or null");
+    }
     mpfr_t value;
     mpfr_init2(value, precision_bits);
     const int status = mpfr_set_str(value, text, 10, MPFR_RNDN);
@@ -2348,6 +2589,15 @@ FloatExp parse_zoom_float_exp(const char* text, mpfr_prec_t precision_bits) {
     }
     const FloatExp result = FloatExp::from_mpfr(value);
     mpfr_clear(value);
+    if (!result.finite() || result.zero()) {
+        throw std::runtime_error("deep Mandelbrot zoom is outside the native exponent range");
+    }
+    const long double log10_zoom = fe_log(result) / LOG_TEN;
+    if (!std::isfinite(log10_zoom)
+        || log10_zoom < MIN_NATIVE_LOG10_ZOOM
+        || log10_zoom > MAX_NATIVE_LOG10_ZOOM) {
+        throw std::runtime_error("deep Mandelbrot zoom is outside the supported range");
+    }
     return result;
 }
 
@@ -2648,7 +2898,15 @@ void render_bla_impl(
     if constexpr (CollectStats) {
         int worker_count = 1;
 #ifdef _OPENMP
-        worker_count = std::max(1, omp_get_max_threads());
+        // A direct C caller can leave the OpenMP default under control of the
+        // environment.  Bound it before allocating per-worker diagnostics;
+        // otherwise OMP_NUM_THREADS could turn --stats into an allocation DoS.
+        omp_set_dynamic(0);
+        worker_count = std::clamp(
+            std::max(1, omp_get_max_threads()),
+            1,
+            MAX_NATIVE_THREADS);
+        omp_set_num_threads(worker_count);
 #endif
         thread_stats.resize(static_cast<size_t>(worker_count));
     }
@@ -2665,7 +2923,14 @@ void render_bla_impl(
         RenderStats* stats = nullptr;
         if constexpr (CollectStats) {
 #ifdef _OPENMP
-            stats = &thread_stats[static_cast<size_t>(omp_get_thread_num())];
+            // The explicit team-size bound above should make this a no-op in
+            // normal operation; keep the index defensive for unusual OpenMP
+            // runtimes that report a larger team than requested.
+            const int worker_index = std::clamp(
+                omp_get_thread_num(),
+                0,
+                static_cast<int>(thread_stats.size()) - 1);
+            stats = &thread_stats[static_cast<size_t>(worker_index)];
 #else
             stats = &thread_stats[0];
 #endif
@@ -3185,9 +3450,23 @@ std::unique_ptr<ReferenceContext> create_reference_context(
     int series_order,
     bool retain_builder_orbit
 ) {
+    if (!valid_c_string(x_center) || !valid_c_string(y_center)
+        || !valid_c_string(viewport_zoom)) {
+        throw std::runtime_error("native reference text is too long or null");
+    }
+    // Validate the decimal zoom before MPFR builds the orbit. Without this
+    // early range check, an ABI caller could supply an enormous exponent and
+    // make the reference setup spend time on a value the scaled renderer
+    // cannot represent anyway.
+#ifdef FRACTAL_HAVE_MPFR
+    (void)parse_zoom_float_exp(
+        viewport_zoom, static_cast<mpfr_prec_t>(precision_bits));
+#else
+    (void)parse_zoom(viewport_zoom);
+#endif
     auto context = std::make_unique<ReferenceContext>();
-    context->x_center = std::strtold(x_center, nullptr);
-    context->y_center = std::strtold(y_center, nullptr);
+    context->x_center = parse_coordinate(x_center, "real");
+    context->y_center = parse_coordinate(y_center, "imaginary");
     context->requested_series_order = std::clamp(series_order, 8, 32);
     const auto reference_started = std::chrono::steady_clock::now();
     make_reference_orbit(
@@ -3263,18 +3542,26 @@ void fractal_render_options_default(FractalRenderOptions* options) {
 }
 
 int fractal_backend_capabilities() {
-    int capabilities = 1; // scalar CPU is always available.
+    try {
+        int capabilities = 1; // scalar CPU is always available.
 #if defined(__AVX2__)
-    if (avx2_runtime_available()) capabilities |= 2;
+        if (avx2_runtime_available()) capabilities |= 2;
 #endif
 #ifdef FRACTAL_HAVE_OPENCL
-    if (opencl_available()) capabilities |= 4;
+        if (opencl_available()) capabilities |= 4;
 #endif
-    return capabilities;
+        set_error("");
+        return capabilities;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native backend capability query failed with an unknown exception");
+        return 1;
+    }
 }
 
 const char* fractal_last_error() {
-    std::lock_guard<std::mutex> lock(error_mutex);
     return last_error.c_str();
 }
 
@@ -3291,7 +3578,9 @@ int fractal_colourise(
     int threads
 ) {
     try {
-        if (!field || !output || width <= 0 || height <= 0 || max_iter <= 0) {
+        if (!field || !output || !valid_pixel_dimensions(width, height)
+            || !valid_iteration_count(max_iter) || !valid_thread_count(threads)
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)) {
             throw std::runtime_error("invalid native colour dimensions or palette");
         }
         const AuroraPalette& palette = aurora_palette_for(
@@ -3317,10 +3606,13 @@ int fractal_colourise(
                 rgb[2] = 0;
                 continue;
             }
-            const int palette_index = std::clamp(
-                static_cast<int>(smooth * index_scale),
-                0,
-                palette_size - 1);
+            const double scaled_index = static_cast<double>(smooth)
+                * static_cast<double>(index_scale);
+            const int palette_index = scaled_index >= static_cast<double>(palette_size - 1)
+                ? palette_size - 1
+                : !std::isfinite(scaled_index) || scaled_index <= 0.0
+                    ? 0
+                    : static_cast<int>(scaled_index);
             const auto& colour = palette.rgb[static_cast<size_t>(palette_index)];
             rgb[0] = colour[0];
             rgb[1] = colour[1];
@@ -3330,6 +3622,9 @@ int fractal_colourise(
         return 0;
     } catch (const std::exception& error) {
         set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native colouriser failed with an unknown exception");
         return 1;
     }
 }
@@ -3348,8 +3643,9 @@ int fractal_crop_field(
     int threads
 ) {
     try {
-        if (!source || !output || source_width <= 0 || source_height <= 0
-            || output_width <= 0 || output_height <= 0
+        if (!source || !output || !valid_pixel_dimensions(source_width, source_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_thread_count(threads)
             || !std::isfinite(zoom_factor) || zoom_factor <= 0.0) {
             throw std::runtime_error("invalid native raw-field crop dimensions");
         }
@@ -3390,6 +3686,9 @@ int fractal_crop_field(
     } catch (const std::exception& error) {
         set_error(error.what());
         return 1;
+    } catch (...) {
+        set_error("native raw-field crop failed with an unknown exception");
+        return 1;
     }
 }
 
@@ -3409,9 +3708,11 @@ int fractal_crop_colourise(
     int threads
 ) {
     try {
-        if (!source || !output || source_width <= 0 || source_height <= 0
-            || output_width <= 0 || output_height <= 0 || max_iter <= 0
-            || !std::isfinite(zoom_factor) || zoom_factor <= 0.0) {
+        if (!source || !output || !valid_pixel_dimensions(source_width, source_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_iteration_count(max_iter) || !valid_thread_count(threads)
+            || !std::isfinite(zoom_factor) || zoom_factor <= 0.0
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)) {
             throw std::runtime_error("invalid native crop/colour dimensions or palette");
         }
         zoom_factor = std::max(zoom_factor, 1.0);
@@ -3484,8 +3785,13 @@ int fractal_crop_colourise(
                     rgb[2] = 0;
                     continue;
                 }
-                const int palette_index = std::clamp(
-                    static_cast<int>(smooth * index_scale), 0, palette_size - 1);
+                const double scaled_index = static_cast<double>(smooth)
+                    * static_cast<double>(index_scale);
+                const int palette_index = scaled_index >= static_cast<double>(palette_size - 1)
+                    ? palette_size - 1
+                    : !std::isfinite(scaled_index) || scaled_index <= 0.0
+                        ? 0
+                        : static_cast<int>(scaled_index);
                 const auto& colour = palette.rgb[static_cast<size_t>(palette_index)];
                 rgb[0] = colour[0];
                 rgb[1] = colour[1];
@@ -3496,6 +3802,9 @@ int fractal_crop_colourise(
         return 0;
     } catch (const std::exception& error) {
         set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native crop colouriser failed with an unknown exception");
         return 1;
     }
 }
@@ -3523,21 +3832,26 @@ int fractal_atlas_colourise(
 ) {
     try {
         if (!parent || !output
-            || parent_width <= 0 || parent_height <= 0
-            || output_width <= 0 || output_height <= 0
-            || parent_max_iter <= 0
+            || !valid_pixel_dimensions(parent_width, parent_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_iteration_count(parent_max_iter)
+            || !valid_thread_count(threads)
             || !std::isfinite(parent_zoom) || parent_zoom <= 0.0
             || !std::isfinite(child_fraction)
-            || child_fraction < 0.0 || child_fraction > 1.0) {
+            || child_fraction < 0.0 || child_fraction > 1.0
+            || palette_max_iter < 0 || palette_max_iter > MAX_NATIVE_ITERATIONS
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)) {
             throw std::runtime_error("invalid native atlas dimensions or controls");
         }
         const bool use_child = child != nullptr && child_fraction > 0.0;
-        if (use_child && (child_width <= 0 || child_height <= 0 || child_max_iter <= 0)) {
+        if (use_child && (!valid_pixel_dimensions(child_width, child_height)
+                          || !valid_iteration_count(child_max_iter))) {
             throw std::runtime_error("invalid native atlas child tile");
         }
+        const int effective_child_iter = use_child ? child_max_iter : 0;
         const int effective_palette_iter = std::max(
             1,
-            std::max(palette_max_iter, std::max(parent_max_iter, child_max_iter)));
+            std::max(palette_max_iter, std::max(parent_max_iter, effective_child_iter)));
         const AuroraPalette& palette = aurora_palette_for(
             effective_palette_iter, phase, vocal, instrumental, pitch);
         const int effective_palette_size = static_cast<int>(palette.rgb.size());
@@ -3734,6 +4048,9 @@ int fractal_atlas_colourise(
     } catch (const std::exception& error) {
         set_error(error.what());
         return 1;
+    } catch (...) {
+        set_error("native atlas colouriser failed with an unknown exception");
+        return 1;
     }
 }
 
@@ -3746,17 +4063,22 @@ void* fractal_create_reference(
     int series_order
 ) {
     try {
-        if (!x_center || !y_center || !viewport_zoom || max_iter <= 0
-            || series_order < 1 || series_order > 32) {
+        if (!x_center || !y_center || !viewport_zoom
+            || !valid_iteration_count(max_iter)
+            || !valid_precision_bits(precision_bits)
+            || !valid_series_parameters(series_order, 2)) {
             throw std::runtime_error("invalid reference configuration");
         }
         auto context = create_reference_context(
             x_center, y_center, viewport_zoom, max_iter, precision_bits,
             series_order, false);
         set_error("");
-        return context.release();
+        return register_reference(std::move(context));
     } catch (const std::exception& error) {
         set_error(error.what());
+        return nullptr;
+    } catch (...) {
+        set_error("native reference creation failed with an unknown exception");
         return nullptr;
     }
 }
@@ -3770,17 +4092,22 @@ void* fractal_create_reference_reusable(
     int series_order
 ) {
     try {
-        if (!x_center || !y_center || !viewport_zoom || max_iter <= 0
-            || series_order < 1 || series_order > 32) {
+        if (!x_center || !y_center || !viewport_zoom
+            || !valid_iteration_count(max_iter)
+            || !valid_precision_bits(precision_bits)
+            || !valid_series_parameters(series_order, 2)) {
             throw std::runtime_error("invalid reusable reference configuration");
         }
         auto context = create_reference_context(
             x_center, y_center, viewport_zoom, max_iter, precision_bits,
             series_order, true);
         set_error("");
-        return context.release();
+        return register_reference(std::move(context));
     } catch (const std::exception& error) {
         set_error(error.what());
+        return nullptr;
+    } catch (...) {
+        set_error("native reusable reference creation failed with an unknown exception");
         return nullptr;
     }
 }
@@ -3790,22 +4117,44 @@ void* fractal_clone_reference(void* source_handle, const char* viewport_zoom) {
         if (!source_handle || !viewport_zoom) {
             throw std::runtime_error("invalid reference tier clone configuration");
         }
+        const auto source = acquire_reference(source_handle);
+        if (!source) {
+            throw std::runtime_error("invalid or already-destroyed reference handle");
+        }
 #ifdef FRACTAL_HAVE_MPFR
         auto context = clone_reference_context(
-            *static_cast<const ReferenceContext*>(source_handle), viewport_zoom);
+            *source, viewport_zoom);
         set_error("");
-        return context.release();
+        return register_reference(std::move(context));
 #else
         throw std::runtime_error("deep reference tier cloning requires MPFR/GMP");
 #endif
     } catch (const std::exception& error) {
         set_error(error.what());
         return nullptr;
+    } catch (...) {
+        set_error("native reference clone failed with an unknown exception");
+        return nullptr;
     }
 }
 
 void fractal_destroy_reference(void* handle) {
-    delete static_cast<ReferenceContext*>(handle);
+    try {
+        if (!handle) {
+            set_error("");
+            return;
+        }
+        const auto context = remove_reference(handle);
+        if (!context) {
+            set_error("invalid or already-destroyed reference handle");
+            return;
+        }
+        set_error("");
+    } catch (const std::exception& error) {
+        set_error(error.what());
+    } catch (...) {
+        set_error("native reference destruction failed with an unknown exception");
+    }
 }
 
 int fractal_get_reference_stats(
@@ -3813,18 +4162,34 @@ int fractal_get_reference_stats(
     std::uint64_t* values,
     int capacity
 ) {
-    if (!handle || !values || capacity < 5) return -1;
-    const auto* context = static_cast<const ReferenceContext*>(handle);
-    values[0] = context->reference_build_ns;
-    values[1] = context->series_build_ns;
-    values[2] = context->bla_build_ns;
-    values[3] = context->image_series.enabled
-        ? static_cast<std::uint64_t>(context->image_series.iteration)
-        : 0;
-    values[4] = context->image_series.enabled
-        ? static_cast<std::uint64_t>(context->image_series.order)
-        : 0;
-    return 5;
+    try {
+        if (!values || capacity < 5) {
+            set_error("reference statistics buffer is too small or null");
+            return -1;
+        }
+        const auto context = acquire_reference(handle);
+        if (!context) {
+            set_error("invalid or already-destroyed reference handle");
+            return -1;
+        }
+        values[0] = context->reference_build_ns;
+        values[1] = context->series_build_ns;
+        values[2] = context->bla_build_ns;
+        values[3] = context->image_series.enabled
+            ? static_cast<std::uint64_t>(context->image_series.iteration)
+            : 0;
+        values[4] = context->image_series.enabled
+            ? static_cast<std::uint64_t>(context->image_series.order)
+            : 0;
+        set_error("");
+        return 5;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return -1;
+    } catch (...) {
+        set_error("reference statistics lookup failed with an unknown exception");
+        return -1;
+    }
 }
 
 int fractal_render_mandelbrot_reference_ex(
@@ -3840,15 +4205,20 @@ int fractal_render_mandelbrot_reference_ex(
     const FractalRenderOptions* supplied_options
 ) {
     try {
-        if (!output || !zoom_text || !handle || width <= 0 || height <= 0) {
+        if (!output || !zoom_text || !handle || !valid_pixel_dimensions(width, height)
+            || !valid_iteration_count(max_iter) || !valid_thread_count(threads)
+            || !valid_series_parameters(series_order, series_block)) {
             throw std::runtime_error("invalid native render dimensions or handle");
         }
         const FractalRenderOptions options = checked_render_options(supplied_options);
         if (options.backend != 0 && options.backend != 1 && options.backend != 2) {
             throw std::runtime_error("unknown native render backend");
         }
-        auto* context = static_cast<ReferenceContext*>(handle);
-        if (max_iter <= 0 || max_iter > context->requested_max_iter) {
+        const auto context = acquire_reference(handle);
+        if (!context) {
+            throw std::runtime_error("invalid or already-destroyed reference handle");
+        }
+        if (max_iter > context->requested_max_iter) {
             throw std::runtime_error("render iteration count exceeds prepared reference");
         }
         // series_order selects the active polynomial degree.  Values above
@@ -3904,6 +4274,9 @@ int fractal_render_mandelbrot_reference_ex(
     } catch (const std::exception& error) {
         set_error(error.what());
         return 1;
+    } catch (...) {
+        set_error("native reference render failed with an unknown exception");
+        return 1;
     }
 }
 
@@ -3926,18 +4299,32 @@ int fractal_render_points(
     const FractalRenderOptions* supplied_options
 ) {
     try {
-        if (!output || point_count <= 0 || !zoom_text
+        if (!output || point_count <= 0 || point_count > MAX_NATIVE_POINTS || !zoom_text
             || !real_mantissa || !imag_mantissa || !exponents || !handle) {
             throw std::runtime_error("invalid native point-render arguments");
+        }
+        if (!valid_iteration_count(max_iter) || !valid_thread_count(threads)
+            || !valid_series_parameters(series_order, series_block)) {
+            throw std::runtime_error("invalid native point-render limits");
         }
         const FractalRenderOptions options = checked_render_options(supplied_options);
         if (options.backend != 0 && options.backend != 1) {
             throw std::runtime_error("unknown native render backend");
         }
-        auto* context = static_cast<ReferenceContext*>(handle);
-        if (max_iter <= 0 || max_iter > context->requested_max_iter) {
+        const auto context = acquire_reference(handle);
+        if (!context) {
+            throw std::runtime_error("invalid or already-destroyed reference handle");
+        }
+        if (max_iter > context->requested_max_iter) {
             throw std::runtime_error("point render iteration count exceeds prepared reference");
         }
+        // Reject malformed zoom text before copying a potentially large point
+        // array into native memory.
+#ifdef FRACTAL_HAVE_MPFR
+        (void)parse_zoom_float_exp(zoom_text, context->precision_bits);
+#else
+        (void)parse_zoom(zoom_text);
+#endif
         std::vector<ScaledComplex> points;
         points.reserve(static_cast<size_t>(point_count));
         ScaledNorm maximum_radius{};
@@ -3953,12 +4340,12 @@ int fractal_render_points(
             const ScaledNorm radius = sc_norm_squared(point);
             if (sc_compare_norm(radius, maximum_radius) > 0) maximum_radius = radius;
         }
+#ifdef FRACTAL_HAVE_MPFR
         const FloatExp point_radius_squared{
             maximum_radius.mantissa,
             maximum_radius.exponent,
         };
         const FloatExp point_radius = fe_sqrt(point_radius_squared);
-#ifdef FRACTAL_HAVE_MPFR
         RenderStats stats;
         if (render_stats_enabled.load(std::memory_order_relaxed)) {
             render_bla_dispatch<true>(
@@ -3999,6 +4386,9 @@ int fractal_render_points(
 #endif
     } catch (const std::exception& error) {
         set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native point render failed with an unknown exception");
         return 1;
     }
 }
@@ -4051,7 +4441,11 @@ int render_fractal_ex(
 ) {
     try {
         if (!output || !zoom_text || !x_center || !y_center
-            || width <= 0 || height <= 0 || max_iter <= 0
+            || !valid_pixel_dimensions(width, height)
+            || !valid_iteration_count(max_iter)
+            || !valid_precision_bits(precision_bits)
+            || use_perturbation < 0 || use_perturbation > 1
+            || !valid_thread_count(threads)
             || !valid_formula(formula)
             || !std::isfinite(julia_real) || !std::isfinite(julia_imag)) {
             throw std::runtime_error("invalid native render dimensions, formula, or argument");
@@ -4072,8 +4466,8 @@ int render_fractal_ex(
                 width,
                 height,
                 zoom,
-                std::strtold(x_center, nullptr),
-                std::strtold(y_center, nullptr),
+                parse_coordinate(x_center, "real"),
+                parse_coordinate(y_center, "imaginary"),
                 max_iter,
                 threads,
                 options.backend,
@@ -4085,26 +4479,31 @@ int render_fractal_ex(
                 throw std::runtime_error(
                     "OpenCL backend is only valid for direct one-shot renders");
             }
-            std::unique_ptr<ReferenceContext> context(static_cast<ReferenceContext*>(
-                fractal_create_reference(
-                    x_center, y_center, zoom_text, max_iter, precision_bits, 8)));
-            if (!context) throw std::runtime_error(last_error);
+            void* context_handle = fractal_create_reference(
+                x_center, y_center, zoom_text, max_iter, precision_bits, 8);
+            if (!context_handle) throw std::runtime_error(last_error);
             const int status = fractal_render_mandelbrot_reference_ex(
                 output,
                 width,
                 height,
                 zoom_text,
-                context.get(),
+                context_handle,
                 max_iter,
                 threads,
                 8,
                 32,
                 &options);
-            if (status != 0) throw std::runtime_error(last_error);
+            const std::string render_error = last_error;
+            fractal_destroy_reference(context_handle);
+            if (status != 0) throw std::runtime_error(render_error);
         }
+        set_error("");
         return 0;
     } catch (const std::exception& error) {
         set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native render failed with an unknown exception");
         return 1;
     }
 }
