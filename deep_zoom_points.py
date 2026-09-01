@@ -28,6 +28,10 @@ class DeepZoomPoint:
     source_name: str
     screened_log10_zoom: float = 150.0
     conjugate_of: str | None = None
+    formula: str = "mandelbrot"
+    # A Julia preset is defined by both its viewport centre and its fixed c.
+    # Other formula families leave this unset.
+    julia_c: tuple[str, str] | None = None
 
 
 def _negated(value: str) -> str:
@@ -215,3 +219,267 @@ DEEP_ZOOM_POINTS = tuple(
 
 
 DEEP_ZOOM_POINTS_BY_SLUG = {point.slug: point for point in DEEP_ZOOM_POINTS}
+
+
+# These catalogues deliberately stay separate.  A coordinate in the
+# Mandelbrot parameter plane is not automatically meaningful in a Julia,
+# Burning Ship, Tricorn, or Multibrot view.  The alternate entries are
+# formula-specific starter views; unlike the Mandelbrot catalogue, they are
+# not claims of a native e150-safe path.
+BURNING_SHIP_SOURCE_URL = "https://www.mathr.co.uk/web/a-burning-ship-fractal-zoom.html"
+BURNING_SHIP_EXPLORER_URL = "https://robotmoon.com/burning-ship-fractal/"
+TRICORN_SOURCE_URL = "https://paulbourke.net/fractals/tricorn/"
+JULIA_SOURCE_URL = "https://khutchins.com/fractals/julia_explorer.html"
+JULIA_GALLERY_URL = "https://www.geogebra.org/m/xxchgex7"
+
+
+def _formula_point(
+    slug: str,
+    name: str,
+    formula: str,
+    x: str,
+    y: str,
+    recommended_log10_zoom: float,
+    source_url: str,
+    source_name: str,
+    *,
+    julia_c: tuple[str, str] | None = None,
+) -> DeepZoomPoint:
+    return DeepZoomPoint(
+        slug,
+        name,
+        x,
+        y,
+        recommended_log10_zoom,
+        source_url,
+        source_name,
+        recommended_log10_zoom,
+        None,
+        formula,
+        julia_c,
+    )
+
+
+# The Burning Ship centre below is the exact long-decimal centre published
+# with Mathr's Burning Ship zoom.  The remaining starter views are centres of
+# the mast, small ships, and real-axis structures shown by the explorer at
+# ordinary magnifications.
+BURNING_SHIP_POINTS = (
+    _formula_point(
+        "burning-ship-helm",
+        "Burning Ship Helm",
+        "burning-ship",
+        "-1.780425137323272787815501970866799220117789164950755824065998180804054216718401083082315480682414200942106597271163834162257864725732897228477210166344966847497073401e+00",
+        "-6.500377933325755658690166726343568470341357651166253908409608154945176557553463044202701111297831544836546730208444477432975243227800009643123524287621756484090422114572084021112115151e-02",
+        166.7,
+        BURNING_SHIP_SOURCE_URL,
+        "Mathr Burning Ship zoom",
+    ),
+    _formula_point(
+        "burning-ship-mast",
+        "Largest Ship Mast",
+        "burning-ship",
+        "-1.77375",
+        "-0.05825",
+        2.2,
+        BURNING_SHIP_EXPLORER_URL,
+        "Robot Moon Burning Ship explorer",
+    ),
+    _formula_point(
+        "burning-ship-expanse",
+        "Real-axis Expanse",
+        "burning-ship",
+        "-1.51003475",
+        "-0.001153875",
+        2.2,
+        BURNING_SHIP_EXPLORER_URL,
+        "Robot Moon Burning Ship explorer",
+    ),
+    _formula_point(
+        "burning-ship-small-ship",
+        "Small Ship near -1.57",
+        "burning-ship",
+        "-1.56525",
+        "-0.017",
+        2.0,
+        BURNING_SHIP_EXPLORER_URL,
+        "Robot Moon Burning Ship explorer",
+    ),
+    _formula_point(
+        "burning-ship-left-edge",
+        "Left Edge near -2",
+        "burning-ship",
+        "-1.98345",
+        "0.0",
+        1.0,
+        BURNING_SHIP_EXPLORER_URL,
+        "Robot Moon Burning Ship explorer",
+    ),
+)
+
+
+TRICORN_POINTS = (
+    _formula_point(
+        "tricorn-west-branch",
+        "West Branch",
+        "tricorn",
+        "-1.9412",
+        "0.0",
+        2.48,
+        TRICORN_SOURCE_URL,
+        "Paul Bourke Tricorn gallery",
+    ),
+    _formula_point(
+        "tricorn-angled-branch",
+        "Angled Branch",
+        "tricorn",
+        "-0.85",
+        "0.145",
+        1.48,
+        TRICORN_SOURCE_URL,
+        "Paul Bourke Tricorn gallery",
+    ),
+    _formula_point(
+        "tricorn-main-branch",
+        "Main Branch",
+        "tricorn",
+        "-1.25",
+        "0.0",
+        0.60,
+        TRICORN_SOURCE_URL,
+        "Paul Bourke Tricorn gallery",
+    ),
+    _formula_point(
+        "tricorn-centre",
+        "Centre",
+        "tricorn",
+        "-0.4",
+        "0.0",
+        0.0,
+        TRICORN_SOURCE_URL,
+        "Paul Bourke Tricorn gallery",
+    ),
+)
+
+
+MULTIBROT3_POINTS = (
+    _formula_point(
+        "multibrot3-lobe",
+        "Lower-right Lobe",
+        "multibrot3",
+        "0.8",
+        "-0.8",
+        0.60,
+        TRICORN_SOURCE_URL,
+        "Paul Bourke Multibrot gallery",
+    ),
+    _formula_point(
+        "multibrot3-centre",
+        "Centre",
+        "multibrot3",
+        "0.0",
+        "0.0",
+        0.0,
+        TRICORN_SOURCE_URL,
+        "Paul Bourke Multibrot gallery",
+    ),
+    _formula_point(
+        "multibrot3-upper-left",
+        "Upper-left Lobe",
+        "multibrot3",
+        "-0.8",
+        "0.8",
+        0.60,
+        TRICORN_SOURCE_URL,
+        "Paul Bourke Multibrot gallery",
+    ),
+)
+
+
+# For Julia sets, c is part of the preset.  The viewport centre starts at the
+# origin because that is the natural whole-set view; users can still type any
+# exact REAL,IMAG centre in the GUI or CLI.
+JULIA_POINTS = (
+    _formula_point(
+        "julia-dragon",
+        "Dragon / Connected",
+        "julia",
+        "0.0",
+        "0.0",
+        1.0,
+        JULIA_SOURCE_URL,
+        "Julia Set Explorer",
+        julia_c=("-0.8", "0.156"),
+    ),
+    _formula_point(
+        "julia-douady-rabbit",
+        "Douady Rabbit",
+        "julia",
+        "0.0",
+        "0.0",
+        1.0,
+        JULIA_GALLERY_URL,
+        "GeoGebra Super zoom Julia",
+        julia_c=("-0.123", "0.745"),
+    ),
+    _formula_point(
+        "julia-dendrite",
+        "Dendrite",
+        "julia",
+        "0.0",
+        "0.0",
+        1.0,
+        JULIA_GALLERY_URL,
+        "GeoGebra Super zoom Julia",
+        julia_c=("0.0", "1.0"),
+    ),
+    _formula_point(
+        "julia-disconnected",
+        "Disconnected Dust",
+        "julia",
+        "0.0",
+        "0.0",
+        1.0,
+        JULIA_GALLERY_URL,
+        "GeoGebra Super zoom Julia",
+        julia_c=("0.285", "-0.01"),
+    ),
+    _formula_point(
+        "julia-seahorse",
+        "Seahorse",
+        "julia",
+        "0.0",
+        "0.0",
+        1.0,
+        JULIA_SOURCE_URL,
+        "Julia Set Explorer",
+        julia_c=("-0.4", "0.6"),
+    ),
+    _formula_point(
+        "julia-basilica",
+        "Basilica",
+        "julia",
+        "0.0",
+        "0.0",
+        1.0,
+        JULIA_SOURCE_URL,
+        "Julia Set Explorer",
+        julia_c=("-1.0", "0.0"),
+    ),
+)
+
+
+FORMULA_POINT_CATALOGUES = {
+    "mandelbrot": DEEP_ZOOM_POINTS,
+    "julia": JULIA_POINTS,
+    "burning-ship": BURNING_SHIP_POINTS,
+    "tricorn": TRICORN_POINTS,
+    "multibrot3": MULTIBROT3_POINTS,
+}
+FORMULA_POINTS_BY_SLUG = {
+    formula: {point.slug: point for point in points}
+    for formula, points in FORMULA_POINT_CATALOGUES.items()
+}
+ALL_FRACTAL_POINTS = tuple(
+    point for points in FORMULA_POINT_CATALOGUES.values() for point in points
+)
