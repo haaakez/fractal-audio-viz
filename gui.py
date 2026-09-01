@@ -94,6 +94,7 @@ class RenderApp:
         self._build_widgets()
         self.profile.trace_add("write", self._profile_changed)
         self.formula.trace_add("write", self._formula_changed)
+        self.point.trace_add("write", self._point_changed)
         self._profile_changed()
         self._formula_changed()
         self.root.after(100, self._drain_output)
@@ -461,6 +462,8 @@ class RenderApp:
         command = [sys.executable, "-u", str(VISUALIZER), self.audio.get()]
         command.extend(["--output", self.output.get(), "--profile", self.profile.get()])
         formula = self.formula.get()
+        point_spec = self.point.get().strip()
+        julia_preset = FORMULA_POINTS_BY_SLUG.get(formula, {}).get(point_spec.casefold())
         command.extend([
             "--formula", formula,
             "--max-zoom", self.max_zoom.get(),
@@ -496,14 +499,23 @@ class RenderApp:
             "--cache-limit-mb", self.cache_limit_mb.get(),
         ])
         if formula == "julia":
-            # A value such as -0.8,0.156 is interpreted as an option by
-            # argparse when it is passed as a separate argv item.
-            command.append("--julia-c=" + self.julia_c.get().strip())
+            # Resolve the preset at command-build time too.  This covers a
+            # slug typed into the editable combobox, even when Tk has not
+            # emitted a ComboboxSelected event.  Random selection must not
+            # inherit a stale preset constant from the editable combobox.
+            if not self.random_point.get() and point_spec.casefold() != "random" and (
+                julia_preset is not None and julia_preset.julia_c is not None
+            ):
+                command.append("--julia-c=" + ",".join(julia_preset.julia_c))
+            elif not self.random_point.get() and point_spec.casefold() != "random":
+                # A value such as -0.8,0.156 is interpreted as an option by
+                # argparse when it is passed as a separate argv item.
+                command.append("--julia-c=" + self.julia_c.get().strip())
         if self.random_point.get():
             command.append("--random-point")
-        elif self.point.get().strip():
+        elif point_spec:
             # The same applies to negative custom Mandelbrot coordinates.
-            command.append("--point=" + self.point.get().strip())
+            command.append("--point=" + point_spec)
         if self.random_seed.get().strip():
             command.extend(["--random-seed", self.random_seed.get().strip()])
         if self.x_center.get().strip():
