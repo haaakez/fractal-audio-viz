@@ -11,7 +11,13 @@ import visualizer
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Make a labelled preview sheet of all bundled Mandelbrot points."
+        description="Make a labelled preview sheet of a formula's bundled points."
+    )
+    parser.add_argument(
+        "--formula",
+        choices=visualizer.FORMULA_CHOICES,
+        default="mandelbrot",
+        help="formula catalogue to preview",
     )
     parser.add_argument("--output", type=Path, default=Path("deep-zoom-points.png"))
     parser.add_argument("--zoom-log", type=float, default=8.0, help="preview log10 zoom")
@@ -36,7 +42,7 @@ def main() -> None:
     except ImportError as exc:  # pragma: no cover - dependency error
         raise SystemExit("Pillow is required for the point sheet") from exc
 
-    points = visualizer.DEEP_ZOOM_POINTS
+    points = visualizer.FORMULA_POINT_CATALOGUES[args.formula]
     label_height = 30
     rows = (len(points) + args.columns - 1) // args.columns
     sheet = Image.new(
@@ -49,7 +55,7 @@ def main() -> None:
     for index, point in enumerate(points):
         max_iter = visualizer.max_iterations(args.zoom_log, 384, 500, 20000)
         reference = None
-        if native_library is not None and args.zoom_log >= 12.0:
+        if args.formula == "mandelbrot" and native_library is not None and args.zoom_log >= 12.0:
             native_library, reference = visualizer._create_native_reference(
                 point.x,
                 point.y,
@@ -59,6 +65,7 @@ def main() -> None:
                 args.zoom_log,
             )
         try:
+            julia_constant = point.julia_c or visualizer.DEFAULT_JULIA_C
             field = visualizer.render_fractal(
                 args.width,
                 args.height,
@@ -69,6 +76,8 @@ def main() -> None:
                 "auto",
                 args.threads,
                 reference,
+                formula=args.formula,
+                julia_constant=julia_constant,
             )
         finally:
             if reference is not None:
