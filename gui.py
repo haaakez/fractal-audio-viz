@@ -3,8 +3,9 @@
 
 The GUI is deliberately a thin launcher: it owns the controls, process
 lifecycle, and progress log, while ``visualizer.py`` remains the single source
-of rendering behaviour. GTK's native scrolled container and expander keep the
-compact default view stable even when the technical controls are opened.
+of rendering behaviour. It uses GTK's system theme and native scrolled
+container/expander so the compact default view stays stable when technical
+controls are opened.
 """
 
 from __future__ import annotations
@@ -21,11 +22,10 @@ from pathlib import Path
 try:
     import gi
 
-    gi.require_version("Gdk", "3.0")
     gi.require_version("Gtk", "3.0")
-    from gi.repository import Gdk, GLib, Gtk
+    from gi.repository import GLib, Gtk
 except (ImportError, ValueError) as error:  # pragma: no cover - environment dependent
-    Gdk = GLib = Gtk = None  # type: ignore[assignment]
+    GLib = Gtk = None  # type: ignore[assignment]
     GTK_IMPORT_ERROR: Exception | None = error
 else:
     GTK_IMPORT_ERROR = None
@@ -74,7 +74,6 @@ if Gtk is not None:
             self.process: subprocess.Popen[str] | None = None
             self.output_queue: queue.Queue[str] = queue.Queue(maxsize=OUTPUT_QUEUE_LIMIT)
 
-            self._configure_dark_theme()
             self._build_widgets()
             self.profile.connect("changed", self._profile_changed)
             self.formula.connect("changed", self._formula_changed)
@@ -85,146 +84,6 @@ if Gtk is not None:
             self.window.show_all()
             self.technical_expander.set_expanded(False)
             self._set_technical_child_visible(False)
-
-        @staticmethod
-        def _configure_dark_theme() -> None:
-            """Use a coherent dark palette for GTK and native popovers."""
-
-            settings = Gtk.Settings.get_default()
-            if settings is not None:
-                settings.set_property("gtk-application-prefer-dark-theme", True)
-                settings.set_property("gtk-enable-animations", True)
-
-            css = b"""
-            * {
-                color: #e8eaf0;
-            }
-            window, .fractal-root, scrolledwindow, viewport {
-                background-color: #111318;
-            }
-            headerbar {
-                background-image: none;
-                background-color: #171b22;
-                border-bottom: 1px solid #343b49;
-                box-shadow: none;
-            }
-            frame {
-                border: 1px solid #343b49;
-                border-radius: 8px;
-                background-color: #191d25;
-            }
-            frame > label {
-                color: #f4f6fb;
-                background-color: #191d25;
-                padding: 0 6px;
-            }
-            label {
-                color: #e8eaf0;
-            }
-            entry, combobox box, spinbutton {
-                color: #f1f3f8;
-                background-image: none;
-                background-color: #242a35;
-                border: 1px solid #3b4555;
-                border-radius: 5px;
-                padding: 5px 7px;
-                caret-color: #ffffff;
-            }
-            entry:focus, combobox:focus, spinbutton:focus {
-                border-color: #5b9cff;
-                box-shadow: 0 0 0 1px #315b9a;
-            }
-            entry:disabled, combobox:disabled, spinbutton:disabled {
-                color: #697383;
-                background-color: #171b22;
-            }
-            button {
-                color: #f1f3f8;
-                background-image: none;
-                background-color: #252c38;
-                border: 1px solid #3b4555;
-                border-radius: 5px;
-                padding: 6px 12px;
-            }
-            button:hover {
-                background-color: #3d72bd;
-                border-color: #5b9cff;
-            }
-            button:active, button:checked {
-                background-color: #315b9a;
-            }
-            button:disabled {
-                color: #626b78;
-                background-color: #191d25;
-                border-color: #2a303b;
-            }
-            checkbutton, radiobutton {
-                color: #e8eaf0;
-            }
-            checkbutton check, radiobutton radio {
-                background-color: #242a35;
-                border: 1px solid #526073;
-            }
-            checkbutton:checked check, radiobutton:checked radio {
-                background-color: #315b9a;
-                border-color: #5b9cff;
-            }
-            scale trough {
-                background-color: #2a313e;
-                border: 1px solid #3b4555;
-                border-radius: 4px;
-                min-height: 6px;
-            }
-            scale highlight {
-                background-color: #3d72bd;
-                border-radius: 4px;
-            }
-            scale slider {
-                background-image: none;
-                background-color: #d9e6ff;
-                border: 1px solid #5b9cff;
-                min-width: 14px;
-                min-height: 14px;
-            }
-            expander title {
-                color: #f1f3f8;
-                padding: 3px 0;
-            }
-            expander arrow {
-                color: #8db9ff;
-            }
-            scrollbar trough {
-                background-color: #0b0e13;
-            }
-            scrollbar slider {
-                background-color: #3b4555;
-                border: 1px solid #526073;
-                border-radius: 6px;
-                min-width: 10px;
-                min-height: 10px;
-            }
-            scrollbar slider:hover {
-                background-color: #5b6d89;
-            }
-            textview, textview text {
-                color: #e8eaf0;
-                background-color: #0b0e13;
-            }
-            tooltip {
-                color: #f1f3f8;
-                background-color: #242a35;
-                border: 1px solid #526073;
-            }
-            """
-            provider = Gtk.CssProvider()
-            provider.load_from_data(css)
-            screen = Gdk.Screen.get_default()
-            if screen is not None:
-                Gtk.StyleContext.add_provider_for_screen(
-                    screen,
-                    provider,
-                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-                )
 
         @staticmethod
         def _entry(text: str = "") -> Gtk.Entry:
@@ -307,12 +166,6 @@ if Gtk is not None:
             return frame
 
         def _build_widgets(self) -> None:
-            header = Gtk.HeaderBar()
-            header.set_show_close_button(True)
-            header.set_title("Fractal Audio Viz")
-            header.set_subtitle("Audio-reactive deep-zoom renderer")
-            self.window.set_titlebar(header)
-
             self.audio = self._entry(str(ROOT / "song.mp3"))
             self.output = self._entry(str(ROOT / "fractal_viz.mp4"))
             self.profile = self._combo(PROFILE_CHOICES, "preview")
@@ -527,8 +380,7 @@ if Gtk is not None:
             log_scroll.add(self.log)
 
             content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-            content.get_style_context().add_class("fractal-root")
-            content.set_border_width(16)
+            content.set_border_width(12)
             content.set_hexpand(True)
             content.pack_start(self._frame("Render", render_grid), False, False, 0)
             content.pack_start(self._frame("Audio and effects", effects_grid), False, False, 0)

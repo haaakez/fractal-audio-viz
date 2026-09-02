@@ -1,20 +1,20 @@
-# Fractal Audio Viz
+# fractal audio viz
 
-[![Render preview](images/preview.GIF)](images/preview.GIF)
-[![GTK GUI](images/gui.png)](images/gui.png)
+[![render preview](images/preview.GIF)](images/preview.GIF)
 
-Fractal Audio Viz renders audio-reactive zooms through the Mandelbrot family:
-Mandelbrot, Julia, Burning Ship, and Tricorn. It reads one local
+
+fractal audio viz renders audio-reactive zooms through the Mandelbrot family:
+mandelbrot, Julia, Burning Ship, and Tricorn. It reads one local
 song, turns the audio into animation controls, renders reusable scalar
 keyframes, and sends the final RGB frames to FFmpeg. The Mandelbrot path is
 the production path for e150+ deep zooms; the other formulas are first-class
 high-precision modes with formula-specific deep boundary targets.
 
-## How it works
+## how it works
 
-The render is split into five stages.
+the render is split into five stages.
 
-1. **Audio analysis.** The input is loaded as mono audio and resampled to
+1. **audio analysis.** the input is loaded as mono audio and resampled to
    `--sample-rate`. A frame-aligned loudness envelope drives the camera. YIN
    pitch tracking controls the colour movement. With `--separation auto`, the
    program tries Demucs first; if no usable vocal/instrumental split is
@@ -22,18 +22,18 @@ The render is split into five stages.
    enables frequency-band proxies instead. An onset-strength curve is also
    cached; enable its contribution with `--beat-strength`.
 
-2. **Zoom planning.** The camera moves in logarithmic zoom space from
+2. **zoom planning.** the camera moves in logarithmic zoom space from
    `--base-zoom` to `--max-zoom`. Instrumental energy changes the speed. The
    default `--zoom-speed -0.04` allows small pullbacks during quiet passages,
    while the final frame is still placed exactly at the requested maximum.
 
-3. **Source images.** The default `atlas` mode builds a fixed ladder of nested
+3. **source images.** the default `atlas` mode builds a fixed ladder of nested
    keyframes. A keyframe covers one `--keyframe-factor` interval. Frames between
    keyframes are centred crops of the source images, so the expensive fractal
    calculation is not repeated for every video frame. The older full-field
    chunk renderer remains available as `--keyframe-mode legacy`.
 
-4. **Fractal rendering.** Shallow formula views use the direct native renderer.
+4. **fractal rendering.** shallow formula views use the direct native renderer.
    At Mandelbrot e150+ depths, the C++ backend builds a high-precision MPFR
    reference orbit and renders pixel offsets with perturbation arithmetic.
    Scaled mantissa/exponent values preserve tiny offsets, while BLA maps, an
@@ -42,21 +42,21 @@ The render is split into five stages.
    formula-aware direct iteration and a high-precision Python perturbation
    fallback for deep boundary targets.
 
-5. **Colour and encoding.** Keyframes store scalar iteration data. The native
+5. **colour and encoding.** keyframes store scalar iteration data. the native
    colour path or Pillow turns that data into RGB after cropping. Built-in or
    user-supplied palettes, optional glow, and motion blur are applied at this
    stage, and FFmpeg writes the video with the original audio. `--codec auto`
    probes available hardware encoders and falls back to `libx264`.
 
-The output dimensions are controlled by `--width` and `--height`. The fractal
+the output dimensions are controlled by `--width` and `--height`. The fractal
 source can be smaller or larger than the output: `--render-scale` multiplies
 the source size, while `--fractal-scale` sets the requested quality floor.
-For example, a 3840×2160 output with `--fractal-scale 0.5` renders 1920×1080
+for example, a 3840×2160 output with `--fractal-scale 0.5` renders 1920×1080
 source fields and still produces a 4K video.
 
-### Repository layout
+### repository layout
 
-| File | Purpose |
+| file | purpose |
 | --- | --- |
 | `visualizer.py` | Audio analysis, zoom planning, keyframes, colour, and FFmpeg. |
 | `renderer.cpp` / `renderer.h` | Native C ABI, MPFR deep rendering, BLA, OpenMP, and colour paths. |
@@ -70,10 +70,10 @@ source fields and still produces a 4K video.
 | `tests/` | Python and native correctness tests. |
 | `shell.nix` / `Makefile` | Reproducible dependencies and the native build. |
 
-## Installation and build
+## installation and build
 
-The supplied Nix shell provides Python, NumPy, librosa, Pillow, mpmath,
-FFmpeg, GCC, GMP, MPFR, GTK3, and PyGObject. OpenCL support is enabled when the host has
+the supplied Nix shell provides Python, NumPy, librosa, Pillow, mpmath,
+ffmpeg, GCC, GMP, MPFR, GTK3, and PyGObject. OpenCL support is enabled when the host has
 the headers and ICD available. A regular Python environment can use
 `pip install -r requirements.txt`, followed by `make` if GMP/MPFR and a C++
 compiler are installed.
@@ -89,51 +89,52 @@ zooms. The Python renderer is useful for shallow previews and tests, but it is
 not a replacement for the native Mandelbrot e150+ path. The GTK launcher is an
 optional desktop dependency; headless CLI renders do not need PyGObject or GTK.
 
-## Running a render
+## running a render
 
-The input song is the first positional argument. It is not fixed to
+the input song is the first positional argument. It is not fixed to
 `song.mp3`; pass any local file that librosa can decode, such as MP3, WAV, or
-FLAC. If the argument is omitted, the default is `song.mp3`.
+flac. If the argument is omitted, the default is `song.mp3`.
 
 ```sh
 python3 visualizer.py path/to/my-song.mp3 \
   --output renders/my-song.mp4
 ```
 
-Paths containing spaces should be quoted:
+paths containing spaces should be quoted:
 
 ```sh
 python3 visualizer.py "Music/Live set.flac" \
   --output "renders/Live set.mp4"
 ```
 
-The program creates the output directory when needed. Use `python3
+the program creates the output directory when needed. Use `python3
 visualizer.py --help` for the parser’s built-in summary.
 
-For a quick desktop launcher:
+for a quick desktop launcher:
 
 ```sh
 python3 gui.py
 ```
-
-The GUI only starts the same CLI in a child process, so it stays responsive
+[![gtk gui](images/gui.png)](images/gui.png)
+the GUI only starts the same CLI in a child process, so it stays responsive
 and every render can still be copied from the log and reproduced in a shell.
-Profiles, formulas, palettes, catalogue points, and the audio/effects values
+profiles, formulas, palettes, catalogue points, and the audio/effects values
 are available at the top. The complete technical options—including precision,
 iteration, native backend, encoder, cache, and manifest controls—are collapsed
 behind the `Technical options` expander by default; expand it when needed. It
-uses GTK's native dark theme and a real scrolled container, so collapsing the
-advanced section cannot leave the form at an empty scroll offset.
+uses GTK's configured system theme and standard controls, plus a real scrolled
+container, so collapsing the advanced section cannot leave the form at an
+empty scroll offset.
 
-## Constructing a command
+## constructing a command
 
-Start with this shape:
+start with this shape:
 
 ```sh
 python3 visualizer.py AUDIO --output OUTPUT [options]
 ```
 
-Then choose the parts that matter for the render:
+then choose the parts that matter for the render:
 
 1. Set the input song and output file.
 2. Set `--width`, `--height`, and `--fps`.
@@ -147,7 +148,7 @@ Then choose the parts that matter for the render:
    `--keyframe-factor`.
 7. Add `--cache-dir` if the render may be resumed or repeated.
 
-Profiles are shortcuts for a coherent set of these values. Explicit options
+profiles are shortcuts for a coherent set of these values. Explicit options
 override the profile, so this is a convenient starting point:
 
 ```sh
@@ -155,11 +156,11 @@ python3 visualizer.py music/track.mp3 --profile 4k-e150 \
   --point random --random-seed 42 --output renders/track.mp4
 ```
 
-Inspect the available presets with `python3 visualizer.py --list-profiles`.
+inspect the available presets with `python3 visualizer.py --list-profiles`.
 
-### Common examples
+### common examples
 
-A normal Full HD render using a named e150-capable point:
+a normal Full HD render using a named e150-capable point:
 
 ```sh
 python3 visualizer.py music/track.mp3 \
@@ -171,7 +172,7 @@ python3 visualizer.py music/track.mp3 \
 
 `--profile 1080p` remains available as an alias for `--profile fullhd`.
 
-A reproducible random point:
+a reproducible random point:
 
 ```sh
 python3 visualizer.py music/track.mp3 \
@@ -187,7 +188,7 @@ python3 visualizer.py music/track.mp3 \
   --random-point --random-seed 42 --max-zoom 1e150
 ```
 
-List the points for the formula you want to render:
+list the points for the formula you want to render:
 
 ```sh
 python3 visualizer.py --list-points
@@ -195,7 +196,7 @@ python3 visualizer.py --list-points --formula burning-ship
 python3 visualizer.py --list-points --formula julia
 ```
 
-Each formula has its own point list. Mandelbrot contains screened e150+ entries
+each formula has its own point list. Mandelbrot contains screened e150+ entries
 from named KFR files in the [MDZ gallery](https://mathr.co.uk/mdz/gallery/) and
 deep test views in [FractalShark](https://github.com/mattsaccount364/FractalShark),
 including labelled conjugate mirrors. Burning Ship and Tricorn use their own
@@ -206,7 +207,7 @@ the catalogue for the currently selected formula. Mandelbrot entries are
 screened for the production native e150+ path; alternate entries are screened
 as Python high-precision boundary targets at the same depth.
 
-To use your own centre, pass a comma-separated pair to `--point`. This works
+to use your own centre, pass a comma-separated pair to `--point`. This works
 for every formula and replaces that formula's preset:
 
 ```sh
@@ -215,15 +216,15 @@ python3 visualizer.py music/track.mp3 \
   --max-zoom 1e12 --allow-underspecified-center
 ```
 
-For a deep Mandelbrot render, replace that short pair with the full decimal
+for a deep Mandelbrot render, replace that short pair with the full decimal
 export from your zoom tool. The production guard requires at least
 `ceil(log10(max-zoom)) + 16` fractional decimal places in both coordinates.
-This prevents a short decimal from silently producing a different deep
+this prevents a short decimal from silently producing a different deep
 target. `--allow-underspecified-center` is for exploratory Mandelbrot renders
 only. Alternate formulas accept their own presets or exact pairs and remain
 limited to the exploratory Python path at extreme depth.
 
-The two-coordinate form is also available for scripts and Kalles exports:
+the two-coordinate form is also available for scripts and Kalles exports:
 
 ```sh
 python3 visualizer.py music/track.mp3 \
@@ -232,13 +233,13 @@ python3 visualizer.py music/track.mp3 \
   --max-zoom 1e32
 ```
 
-Use either `--point` or the `--x-center`/`--y-center` pair, not both. The
+use either `--point` or the `--x-center`/`--y-center` pair, not both. The
 `--point=...` and `--x-center=...` forms are convenient when a negative value
 would otherwise be mistaken for another command-line option.
 
-### Formula examples
+### formula examples
 
-The default is Mandelbrot. The native direct renderer also handles the
+the default is Mandelbrot. The native direct renderer also handles the
 alternate formulas below; their coordinates describe the visible viewport.
 
 ```sh
@@ -255,17 +256,17 @@ python3 visualizer.py music/track.mp3 --formula burning-ship \
 python3 visualizer.py music/track.mp3 --formula tricorn --max-zoom 1e7
 ```
 
-Use `python3 visualizer.py --list-formulas` for the complete list. The
+use `python3 visualizer.py --list-formulas` for the complete list. The
 validated MPFR/BLA e150+ accelerator is currently specific to the Mandelbrot
 parameter plane. Alternate formulas use their own Python high-precision
 perturbation path for deep targets up to about e300; they are not silently
 routed through an incompatible Mandelbrot reference.
 
-### 4K/e150 speed profile
+### 4k/e150 speed profile
 
-This profile writes 4K output while keeping the fractal source at 2K. It is a
+this profile writes 4K output while keeping the fractal source at 2K. It is a
 reasonable starting point for the ten-minute target on a six-core low-power
-CPU; actual time depends on the song, selected point, and encoder.
+cpu; actual time depends on the song, selected point, and encoder.
 
 ```sh
 python3 visualizer.py music/track.mp3 \
@@ -276,14 +277,14 @@ python3 visualizer.py music/track.mp3 \
   --cache-dir cache/track-4k-e150
 ```
 
-For a native-density master, use `--fractal-scale 1 --keyframe-factor 2`.
-That produces about 500 source levels at e150 and is substantially slower.
-The speed profile uses about 168 levels and 1920×1080 source fields. If the
+for a native-density master, use `--fractal-scale 1 --keyframe-factor 2`.
+that produces about 500 source levels at e150 and is substantially slower.
+the speed profile uses about 168 levels and 1920×1080 source fields. If the
 ten-minute ceiling matters more than the smoothest outer crop, add
 `--keyframe-factor 16`; use `--keyframe-factor 4` when source detail matters
 more than render time.
 
-Use `--estimate` to analyse the song and print the planned source resolution
+use `--estimate` to analyse the song and print the planned source resolution
 and keyframe count without rendering video:
 
 ```sh
@@ -293,16 +294,16 @@ python3 visualizer.py music/track.mp3 \
   --max-zoom 1e150 --estimate
 ```
 
-### Previews and point browsing
+### previews and point browsing
 
-After a render, the small helper chooses the newest filename containing
+after a render, the small helper chooses the newest filename containing
 `4k`/`e150` and creates a looping GIF:
 
 ```sh
 python3 make_preview.py
 ```
 
-Choose a source or make a short MP4 explicitly:
+choose a source or make a short MP4 explicitly:
 
 ```sh
 python3 make_preview.py renders/track-4k-e150.mp4 \
@@ -310,7 +311,7 @@ python3 make_preview.py renders/track-4k-e150.mp4 \
   --output renders/track-preview.mp4
 ```
 
-To browse the curated deep points visually:
+to browse the curated deep points visually:
 
 ```sh
 python3 point_sheet.py --output renders/deep-zoom-points.png
@@ -318,11 +319,11 @@ python3 point_sheet.py --output renders/deep-zoom-points.png
 
 ## `visualizer.py` argument reference
 
-Unless noted otherwise, the values in parentheses are the defaults.
+unless noted otherwise, the values in parentheses are the defaults.
 
-### Input, output, and audio
+### input, output, and audio
 
-| Argument | Description |
+| argument | description |
 | --- | --- |
 | `audio` (`song.mp3`) | Positional input audio file. This is how you choose a custom song. |
 | `--output PATH` (`fractal_viz.mp4`) | Output video path. |
@@ -334,9 +335,9 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--sample-rate HZ` (`44100`) | Sample rate used while loading and analysing audio. |
 | `--separation MODE` (`auto`) | `auto` tries Demucs and falls back to the full mix; `demucs` requires Demucs; `spectral` uses frequency-band proxies; `none` uses the full mix. |
 
-### Centre and zoom
+### centre and zoom
 
-| Argument | Description |
+| argument | description |
 | --- | --- |
 | `--point VALUE` | Select a slug from the catalogue for the chosen formula, `random`, or an exact `REAL,IMAG` decimal pair. With no point option, that formula's default centre is used. |
 | `--random-point` | Select a point at random from the chosen formula's catalogue. Equivalent to `--point random`. |
@@ -351,9 +352,9 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--max-zoom VALUE` (`1e32`) | Final zoom. Native scaled arithmetic accepts values below about `1e9800`; Mandelbrot catalogue points have individual safety limits, while alternate formula presets are exploratory. |
 | `--allow-underspecified-center` | Bypass the decimal-place guard for an exploratory render. It can follow a different deep path from the intended target. |
 
-### Audio response
+### audio response
 
-| Argument | Description |
+| argument | description |
 | --- | --- |
 | `--zoom-punch N` (`3.0`) | Contrast applied to loud instrumental events. Larger values make beats change the logarithmic zoom more strongly. |
 | `--zoom-speed N` (`-0.04`) | Quiet-time velocity in log-zoom space. `0` removes the default quiet pullback; more-negative values pull back farther between events. |
@@ -361,9 +362,9 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--release SECONDS` (`0.12`) | Release time for the audio envelope. Larger values smooth the response. |
 | `--beat-strength N` (`0`) | Add normalised spectral-onset strength to zoom speed. `0` preserves the original loudness-only motion; `1`–`1.5` is a noticeable setting. |
 
-### Quality and fractal rendering
+### quality and fractal rendering
 
-| Argument | Description |
+| argument | description |
 | --- | --- |
 | `--render-scale N` (`1.0`) | Multiplier applied to keyframe source dimensions. Must be at least `1`. |
 | `--fractal-scale N` (`1.0`) | Requested fractal source multiplier. Quality modes impose floors: atlas `draft`/`balanced` use at least `0.5`, `quality` at least `1`, and `extreme` at least `1.25`. |
@@ -379,9 +380,9 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--native-threads N` (`0`) | OpenMP worker count. `0` selects an automatic runtime/video setting. |
 | `--native-backend MODE` (`auto`) | Native backend: `auto`, `scalar`, `avx2`, or `opencl`. OpenCL is an optional direct/shallow backend and is rejected for deep perturbation renders. |
 
-### Video encoding and colour
+### video encoding and colour
 
-| Argument | Description |
+| argument | description |
 | --- | --- |
 | `--video-preset MODE` (`ultrafast`) | x264 speed/size preset. Hardware encoders map this to their own speed levels when supported. |
 | `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox where applicable, then falls back to `libx264`. |
@@ -393,9 +394,9 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--motion-blur N` (`0`) | Blend the current frame with the previous one, from `0` to below `1`. It is off by default. |
 | `--encoder-threads N` (`0`) | FFmpeg encoder thread hint. `0` lets FFmpeg choose; a smaller value leaves more CPU for fractal rendering. Hardware encoders may ignore or reinterpret it. |
 
-### Caching and inspection
+### caching and inspection
 
-| Argument | Description |
+| argument | description |
 | --- | --- |
 | `--cache-dir PATH` | Store reusable scalar keyframes and audio-analysis data in this directory. Reusing the same settings and centre allows later runs to resume completed keyframes. |
 | `--cache-limit-mb N` (`0`) | Maximum cache size in megabytes. `0` means unlimited. Eviction is incremental. |
@@ -404,9 +405,9 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--no-manifest` | Disable the automatic JSON sidecar. |
 | `--estimate` | Analyse the song and print source resolution/keyframe count without rendering the video. |
 
-### Safety and resource limits
+### safety and resource limits
 
-Public entry points validate dimensions before allocating fields (at most
+public entry points validate dimensions before allocating fields (at most
 100,000,000 pixels), decoded audio (at most 120,000,000 float32 samples),
 video frames (at most 10,000,000), frame rate (1–1,000), sample rate
 (1–768,000 Hz), and iteration budgets (1–10,000,000). Zoom exponents are
@@ -414,29 +415,29 @@ bounded to `10^-300` through `10^9800` for the native scaled path; the Python
 fallback remains limited to approximately `10^300`. Coordinate text is capped
 at 50,000 characters and each cache entry is bounded before NumPy opens it.
 
-Rendered videos, previews, manifests, and cache fields are written beside
+rendered videos, previews, manifests, and cache fields are written beside
 their final targets and replaced atomically, so an interrupted operation does
 not publish a partial result. Cache loading disables pickle and rejects
 malformed, non-finite, oversized, or zip-bomb-like entries. FFmpeg and the
 optional Demucs process drain only a bounded diagnostic tail and are started in
 a private process group so cancellation also reaches their descendants.
 
-When `--codec auto` is used, the advertised hardware encoders are filtered by
+when `--codec auto` is used, the advertised hardware encoders are filtered by
 a short real encode probe. NVENC uses `-cq`, QSV uses `-global_quality`, VAAPI
 uses `format=nv12,hwupload` with `-qp`, and VideoToolbox uses its mapped
 `-q:v` scale. If the selected hardware path is unavailable or fails its
 probe, the deterministic `libx264` software path is selected.
 
-### Reproducibility and fallback matrix
+### reproducibility and fallback matrix
 
-For reproducible output, keep the same Git revision, Python/native dependency
+for reproducible output, keep the same Git revision, Python/native dependency
 versions, command-line arguments, audio bytes, and exact centre coordinates.
-The cache namespace includes the active field-renderer implementation, but
+the cache namespace includes the active field-renderer implementation, but
 encoded bytes can still differ across FFmpeg builds, hardware encoders, CPU
 instruction sets, and parallel floating-point runtimes. Compare decoded
 frames or scalar fields when checking numerical output across machines.
 
-| Requested path | Actual path | Boundary |
+| requested path | actual path | boundary |
 | --- | --- | --- |
 | `--renderer python` | Python direct/perturbed renderer | All formulas; exploratory fallback supports up to approximately `10^300`. |
 | `--renderer auto` + shallow zoom | Native direct CPU renderer when available; Python fallback otherwise | All formulas; OpenCL is used only when explicitly selected. |
@@ -445,41 +446,42 @@ frames or scalar fields when checking numerical output across machines.
 | `--native-backend opencl` | Native OpenCL direct renderer | Mandelbrot-only shallow views; unavailable or deep paths fail clearly rather than silently changing numerical mode. |
 | `--codec auto` | First passing hardware probe, otherwise `libx264` | The selected encoder is recorded in the manifest; hardware output is not byte-for-byte portable. |
 
-## Caching and reruns
+## caching and reruns
 
-Keyframe cache entries include the centre, absolute zoom, dimensions, iteration
+keyframe cache entries include the centre, absolute zoom, dimensions, iteration
 budget, renderer identity, and approximation settings. Old entries are not
 silently reused after a numerical renderer change. Writes are atomic, so an
 interrupted tile does not replace a completed tile.
 
-The final video is assembled from the beginning on every run. This is required
+the final video is assembled from the beginning on every run. This is required
 for a valid compressed stream, even when most keyframes and the audio analysis
 are already cached.
 
-Every normal render also writes a JSON manifest beside the output. It records
+every normal render also writes a JSON manifest beside the output. It records
 the command, Git revision, audio path, formula, Julia constant, resolved point,
 zoom plan, settings, timings, and whether the render completed. Use
 `--no-manifest` when a sidecar is not wanted.
 
-## GUI and project tools
+## gui and project tools
 
-GTK3 with PyGObject provides the native dark desktop controls on Linux and
-other platforms with GTK installed. The GUI is intentionally a launcher rather
-than a second renderer, which keeps the command line reproducible:
+gtk3 with PyGObject uses the desktop's configured GTK theme—including its
+light/dark choice—on Linux and other platforms with GTK installed. The GUI is
+intentionally a launcher rather than a second renderer, which keeps the command
+line reproducible:
 
 ```sh
 python3 gui.py
 ```
 
-The repository also includes `examples/make_test_tone.py` for a dependency-free
+the repository also includes `examples/make_test_tone.py` for a dependency-free
 audio smoke test, `point_sheet.py` for catalogue previews, and
 `make_preview.py` for GIF/MP4 exports. Generated audio, videos, GIFs, caches,
 and native build products are ignored by Git.
 
-## Benchmarking
+## benchmarking
 
 `benchmark.py` measures native work without decoding audio or encoding video.
-The usual field probe is:
+the usual field probe is:
 
 ```sh
 python3 benchmark.py --renderer native \
@@ -488,7 +490,7 @@ python3 benchmark.py --renderer native \
   --threads 6 --repeat 1 --stats
 ```
 
-The benchmark can also sweep the atlas or isolate the compositor:
+the benchmark can also sweep the atlas or isolate the compositor:
 
 ```sh
 python3 benchmark.py --stage atlas --renderer native \
@@ -500,9 +502,9 @@ python3 benchmark.py --stage compositor --renderer native \
   --width 1920 --height 1080 --threads 6 --repeat 3
 ```
 
-Benchmark arguments:
+benchmark arguments:
 
-| Argument | Description |
+| argument | description |
 | --- | --- |
 | `--stage` (`field`) | `field` renders one field, `atlas` renders every ladder level, and `compositor` measures the native colour/composite pass. |
 | `--width`, `--height` (`256`) | Benchmark dimensions. |
@@ -527,9 +529,9 @@ Benchmark arguments:
 | `--verbose` | Print one line per atlas level. |
 | `--json` | Emit the result as JSON. |
 
-## Deep-zoom notes
+## deep-zoom notes
 
-The deep-zoom design follows the standard reference-orbit and perturbation
+the deep-zoom design follows the standard reference-orbit and perturbation
 approach described in [mathr’s deep-zoom
 notes](https://mathr.co.uk/web/deep-zoom.html). The renderer keeps the MPFR
 reference separate from the small per-pixel offsets, then uses scaled values
@@ -537,20 +539,20 @@ and BLA maps in the hot loop. The reference orbit is built once for a render;
 additional depth tiers reuse its compact orbit and rebuild only the
 radius-dependent approximation bounds.
 
-The bundled centre contains 129 fractional decimal places. It is suitable for
+the bundled centre contains 129 fractional decimal places. It is suitable for
 the project’s tested e100 path, but it is intentionally rejected for an
 unqualified e150 render. Use a catalogue point or provide the full-precision
 centre from a zoom tool.
 
-For further native details, see the public declarations in
+for further native details, see the public declarations in
 [`renderer.h`](renderer.h) and the source-attributed catalogue in
 [`deep_zoom_points.py`](deep_zoom_points.py).
 
-## License
+## license
 
-This project is released under the [MIT License](LICENSE).
+this project is released under the [MIT License](LICENSE).
 
-## Troubleshooting
+## troubleshooting
 
 - **Audio file not found:** pass the path as the first argument, for example
   `python3 visualizer.py "Music/track.mp3"`.
