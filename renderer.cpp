@@ -1122,7 +1122,7 @@ inline int sc_compare_norm(const ScaledNorm& a, const ScaledNorm& b) {
     if (!std::isfinite(b.mantissa)) return -1;
     if (a.mantissa == 0.0 && b.mantissa == 0.0) return 0;
     if (a.mantissa == 0.0) return -1;
-    if (b.mantissa == 0.0) return 1;
+    if (b.mantissa == 0.0) return a.mantissa > 0.0 ? 1 : -1;
     if (a.exponent != b.exponent) return a.exponent < b.exponent ? -1 : 1;
     return (a.mantissa > b.mantissa) - (a.mantissa < b.mantissa);
 }
@@ -1284,7 +1284,7 @@ inline int fe_compare(const FloatExp& a, const FloatExp& b) {
     if (!a.finite()) return b.finite() ? 1 : 0;
     if (!b.finite()) return -1;
     if (a.mantissa == 0.0) return b.mantissa == 0.0 ? 0 : -1;
-    if (b.mantissa == 0.0) return 1;
+    if (b.mantissa == 0.0) return a.mantissa > 0.0 ? 1 : -1;
     if (a.mantissa < 0.0 && b.mantissa >= 0.0) return -1;
     if (a.mantissa >= 0.0 && b.mantissa < 0.0) return 1;
     const bool negative = a.mantissa < 0.0;
@@ -1339,6 +1339,75 @@ inline FloatExpComplex fec_mul(const FloatExpComplex& a, const FloatExp& b) {
 
 inline FloatExp fec_norm_squared(const FloatExpComplex& value) {
     return fe_norm_squared(value.real, value.imag);
+}
+
+inline FloatExp fec_escape_margin_with_delta(
+    const FloatExpComplex& reference,
+    const FloatExpComplex& delta
+) {
+    const FloatExp cross = fe_mul(
+        fe_add(
+            fe_mul(reference.real, delta.real),
+            fe_mul(reference.imag, delta.imag)),
+        2.0);
+    const FloatExp reference_margin = fe_sub(
+        fec_norm_squared(reference),
+        FloatExp::from_parts(4.0, 0));
+    return fe_add(
+        fe_add(reference_margin, cross),
+        fec_norm_squared(delta));
+}
+
+inline FloatExp sc_component_as_float_exp(
+    const ScaledComplex& value,
+    bool imaginary
+) {
+    return FloatExp::from_parts(
+        imaginary ? value.imag : value.real,
+        value.exponent);
+}
+
+inline FloatExp sc_escape_margin_with_delta(
+    const ScaledComplex& reference,
+    const ScaledComplex& delta
+) {
+    // Adding a tiny delta to an O(1) reference is intentionally lossy in the
+    // compact ScaledComplex representation: the fast aligned sum discards a
+    // term more than 60 binary exponents below the reference. That is safe
+    // for ordinary orbit values, but not for a reference sitting exactly on
+    // |z|=2 (for example the Mandelbrot -2 tip), where the sign of the tiny
+    // perturbation is the escape decision itself. Compute the signed margin
+    // around the escape radius before adding it back to 4, so cancellation
+    // at the boundary remains representable.
+    const FloatExpComplex reference_parts{
+        sc_component_as_float_exp(reference, false),
+        sc_component_as_float_exp(reference, true),
+    };
+    const FloatExpComplex delta_parts{
+        sc_component_as_float_exp(delta, false),
+        sc_component_as_float_exp(delta, true),
+    };
+    return fec_escape_margin_with_delta(reference_parts, delta_parts);
+}
+
+inline ScaledNorm sc_norm_squared_with_delta(
+    const ScaledComplex& reference,
+    const ScaledComplex& delta
+) {
+    const FloatExp norm = fe_add(
+        FloatExp::from_parts(4.0, 0),
+        sc_escape_margin_with_delta(reference, delta));
+    return {norm.mantissa, norm.exponent};
+}
+
+inline bool sc_outside_escape_with_delta(
+    const ScaledComplex& reference,
+    const ScaledComplex& delta
+) {
+    const FloatExp margin = sc_escape_margin_with_delta(reference, delta);
+    return fe_compare(
+        margin,
+        FloatExp{0.0, 0}) > 0;
 }
 
 struct BlaStep {
@@ -2076,14 +2145,18 @@ bool series_probe_is_safe(
     const FloatExp allowed = fe_mul(scale, tolerance_squared);
     if (fe_compare(fec_norm_squared(error), allowed) > 0) return false;
 
-    const FloatExp escape_radius_squared = FloatExp::from_parts(4.0, 0);
     const bool exact_inside = fe_compare(
-        fec_norm_squared(fec_add(reference, exact_delta)),
-        escape_radius_squared) <= 0;
+        fec_escape_margin_with_delta(reference, exact_delta),
+        FloatExp{0.0, 0}) <= 0;
     const bool approximate_inside = fe_compare(
-        fec_norm_squared(fec_add(reference, approximate_delta)),
-        escape_radius_squared) <= 0;
-    return exact_inside == approximate_inside;
+        fec_escape_margin_with_delta(reference, approximate_delta),
+        FloatExp{0.0, 0}) <= 0;
+    // The image-wide series is a jump from iteration zero to this endpoint.
+    // Matching an already-escaped probe is not sufficient: an orbit can cross
+    // |z|=2 early and later be represented by a numerically plausible endpoint,
+    // which would turn a narrow escape band into a late, block-sized seam.
+    // Only retain a series while every validation probe is still inside.
+    return exact_inside && approximate_inside;
 }
 
 void build_image_series(
@@ -2988,10 +3061,15 @@ void render_bla_impl(
                 if (!have_total) {
                     total = sc_add(
                         context.orbit->scaled[static_cast<size_t>(reference_index)], delta);
-                    total_norm = sc_norm_squared(total);
+                    total_norm = sc_norm_squared_with_delta(
+                        context.orbit->scaled[static_cast<size_t>(reference_index)],
+                        delta);
                 }
                 have_total = false;
-                if (sc_outside_escape(total_norm)) {
+                if (sc_outside_escape(total_norm)
+                    || sc_outside_escape_with_delta(
+                        context.orbit->scaled[static_cast<size_t>(reference_index)],
+                        delta)) {
                     output[index] = smooth_escape_scaled(iteration, total_norm);
                     escaped = true;
                     break;
@@ -3245,7 +3323,9 @@ void render_bla_impl(
                     iteration += map_length;
                     const ScaledComplex endpoint = sc_add(
                         context.orbit->scaled[static_cast<size_t>(reference_index)], delta);
-                    const ScaledNorm endpoint_norm = sc_norm_squared(endpoint);
+                    const ScaledNorm endpoint_norm = sc_norm_squared_with_delta(
+                        context.orbit->scaled[static_cast<size_t>(reference_index)],
+                        delta);
                     // A block that approaches the escape boundary is replayed
                     // one iteration at a time so smooth colouring does not
                     // acquire broad BLA-sized bands.
@@ -3296,12 +3376,17 @@ void render_bla_impl(
                             }
                             replay_total = sc_add(
                                 context.orbit->scaled[static_cast<size_t>(reference_index)], delta);
-                            replay_norm = sc_norm_squared(replay_total);
+                            replay_norm = sc_norm_squared_with_delta(
+                                context.orbit->scaled[static_cast<size_t>(reference_index)],
+                                delta);
                             if (!sc_finite(delta) || !sc_finite(replay_total)) {
                                 retry_without_bla = true;
                                 break;
                             }
-                            if (sc_outside_escape(replay_norm)) {
+                            if (sc_outside_escape(replay_norm)
+                                || sc_outside_escape_with_delta(
+                                    context.orbit->scaled[static_cast<size_t>(reference_index)],
+                                    delta)) {
                                 output[index] = smooth_escape_scaled(iteration, replay_norm);
                                 escaped = true;
                                 break;

@@ -102,7 +102,7 @@ class AnimationTests(unittest.TestCase):
 
     def test_formula_point_resolution_uses_the_selected_catalogue(self):
         burning_ship = visualizer._resolve_render_point(
-            point_spec="burning-ship-left-tip",
+            point_spec="burning-ship-mini-ship",
             random_point=False,
             x_center=None,
             y_center=None,
@@ -111,7 +111,27 @@ class AnimationTests(unittest.TestCase):
             formula="burning-ship",
         )
         self.assertEqual(burning_ship[2].formula, "burning-ship")
-        self.assertEqual(burning_ship[0], "-2.0")
+        self.assertNotEqual((burning_ship[0], burning_ship[1]), ("-2.0", "0.0"))
+        self.assertNotIn(
+            "burning-ship-left-tip",
+            {point.slug for point in FORMULA_POINT_CATALOGUES["burning-ship"]},
+        )
+
+        tricorn = visualizer._resolve_render_point(
+            point_spec="tricorn-branching-junction",
+            random_point=False,
+            x_center=None,
+            y_center=None,
+            random_seed=None,
+            max_log_zoom=150.0,
+            formula="tricorn",
+        )
+        self.assertEqual(tricorn[2].formula, "tricorn")
+        self.assertNotEqual((tricorn[0], tricorn[1]), ("-2.0", "0.0"))
+        self.assertNotIn(
+            "tricorn-left-tip",
+            {point.slug for point in FORMULA_POINT_CATALOGUES["tricorn"]},
+        )
 
         julia = visualizer._resolve_render_point(
             point_spec="julia-douady-rabbit",
@@ -170,6 +190,22 @@ class AnimationTests(unittest.TestCase):
                     formula=formula,
                     julia_constant=constant,
                 )
+                # A valid deep target can have a filament thinner than this
+                # deliberately tiny smoke-test frame. Recheck those sparse
+                # targets at the source-preview geometry before rejecting the
+                # preset as a flat/blank view.
+                if float(np.ptp(field)) == 0.0:
+                    field = visualizer.render_fractal(
+                        256,
+                        192,
+                        150.0,
+                        x_center,
+                        y_center,
+                        4000,
+                        "python",
+                        formula=formula,
+                        julia_constant=constant,
+                    )
                 self.assertTrue(np.isfinite(field).all(), point.slug)
                 self.assertGreater(float(np.ptp(field)), 0.0, point.slug)
 
@@ -190,19 +226,14 @@ class AnimationTests(unittest.TestCase):
         # incorrectly reported as escaped around iteration 835.
         np.testing.assert_array_equal(field, np.full((4, 5), 1000.0, dtype=np.float32))
 
-    def test_left_tip_periodicity_does_not_hide_boundary_escape(self):
+    def test_exact_minus_two_boundary_margin_is_preserved(self):
         for formula in ("burning-ship", "tricorn"):
-            point = next(
-                point
-                for point in visualizer.FORMULA_POINT_CATALOGUES[formula]
-                if point.slug.endswith("left-tip")
-            )
             field = visualizer.render_fractal(
                 3,
                 3,
                 150.0,
-                point.x,
-                point.y,
+                "-2.0",
+                "0.0",
                 1000,
                 "python",
                 formula=formula,
@@ -210,10 +241,12 @@ class AnimationTests(unittest.TestCase):
             # The upper-right pixel is just outside the exact -2 tip and
             # escapes around iteration 251. It must not be marked bounded by
             # the period-one interior shortcut before that happens.
-            self.assertLess(float(field[0, 2]), 1000.0, formula)
+            self.assertAlmostEqual(float(field[0, 2]), 251.0, delta=2.0)
 
     def test_tricorn_e150_boundary_margin_is_preserved(self):
-        point = visualizer.FORMULA_POINT_CATALOGUES["tricorn"][0]
+        point = visualizer.FORMULA_POINTS_BY_SLUG["tricorn"][
+            "tricorn-branching-junction"
+        ]
         field = visualizer.render_fractal(
             5,
             4,
@@ -224,8 +257,9 @@ class AnimationTests(unittest.TestCase):
             "python",
             formula="tricorn",
         )
-        self.assertAlmostEqual(float(field[0, 0]), 1.5287664, places=4)
-        self.assertGreater(float(field[1, -1]), 250.0)
+        self.assertTrue(np.isfinite(field).all())
+        self.assertGreater(float(np.ptp(field)), 10.0)
+        self.assertLess(float(np.max(field)), 1000.0)
 
     def test_julia_e150_fixed_point_reference_is_stabilized(self):
         for point in visualizer.JULIA_POINTS:
@@ -417,6 +451,27 @@ class AnimationTests(unittest.TestCase):
             )
             self.assertEqual(effected.dtype, np.uint8)
             self.assertTrue(np.isfinite(effected).all())
+
+    def test_kfp_palette_import_and_bundled_default(self):
+        bundled = Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp"
+        palette = visualizer._palette_from_file(bundled, 17)
+        self.assertEqual(tuple(palette[0]), (255, 255, 255))
+        self.assertEqual(tuple(palette[-1]), (0, 0, 255))
+        self.assertEqual(
+            tuple(visualizer._custom_palette("kalles-default")[0]),
+            (255, 255, 255),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "continued.KFP"
+            path.write_text(
+                "Colors: 0,0,0,\n 255, 255, 255\nSmooth: 1\n",
+                encoding="utf-8",
+            )
+            imported = visualizer._palette_from_file(path, 3)
+            np.testing.assert_array_equal(
+                imported,
+                np.asarray([[0, 0, 0], [128, 128, 128], [255, 255, 255]], dtype=np.uint8),
+            )
 
     def test_public_limits_reject_aliases_and_unbounded_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -784,7 +839,7 @@ class AnimationTests(unittest.TestCase):
 
     def test_custom_palettes_are_cached_and_finite(self):
         field = np.linspace(0.0, 100.0, 64 * 64, dtype=np.float32).reshape(64, 64)
-        for name in ("fire", "ocean", "neon", "sunset", "mono"):
+        for name in ("fire", "ocean", "neon", "sunset", "mono", "kalles-default"):
             rgb = visualizer._colourise_custom(field, 100, 1.5, 0.8, 0.6, name)
             self.assertEqual(rgb.shape, (64, 64, 3))
             self.assertEqual(rgb.dtype, np.uint8)

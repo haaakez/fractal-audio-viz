@@ -19,6 +19,8 @@ import sys
 import threading
 from pathlib import Path
 
+import visualizer
+
 try:
     import gi
 
@@ -182,7 +184,7 @@ if Gtk is not None:
             self.height = self._entry("540")
             self.fps = self._entry("24")
             self.palette = self._combo(
-                ("aurora", "fire", "ocean", "neon", "sunset", "mono"),
+                visualizer.PALETTE_CHOICES,
                 "aurora",
             )
             self.palette_file = self._entry()
@@ -233,7 +235,7 @@ if Gtk is not None:
                 "Palette file",
                 self.palette_file,
                 action=Gtk.FileChooserAction.OPEN,
-                patterns=("*.txt",),
+                patterns=("*.txt", "*.kfp", "*.kfr"),
             )
 
             self.beat_strength, beat_value = self._scale_row(0.0, 3.0)

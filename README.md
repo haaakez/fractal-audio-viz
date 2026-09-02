@@ -61,6 +61,7 @@ source fields and still produces a 4K video.
 | `visualizer.py` | Audio analysis, zoom planning, keyframes, colour, and FFmpeg. |
 | `renderer.cpp` / `renderer.h` | Native C ABI, MPFR deep rendering, BLA, OpenMP, and colour paths. |
 | `deep_zoom_points.py` | Formula-specific point catalogues and exact decimal centres. |
+| `palettes/` | Built-in palette files, including the Kalles Fraktaler default `.kfp`. |
 | `profiles.py` | Shared render presets used by the CLI and GUI. |
 | `gui.py` | Optional GTK3/PyGObject launcher; the CLI remains the reproducible interface. |
 | `images/` | README preview and GUI screenshots/placeholders. |
@@ -200,8 +201,11 @@ each formula has its own point list. Mandelbrot contains screened e150+ entries
 from named KFR files in the [MDZ gallery](https://mathr.co.uk/mdz/gallery/) and
 deep test views in [FractalShark](https://github.com/mattsaccount364/FractalShark),
 including labelled conjugate mirrors. Burning Ship and Tricorn use their own
-formula-specific boundary targets. Julia presets also include their
-fixed `c` value, so choosing `julia-douady-rabbit`, for example, changes both
+formula-specific boundary targets: the Burning Ship list includes generated
+helm and mini-ship preperiodic roots, while Tricorn includes generated
+branching-junction roots instead of the uninformative `-2` cusp. Julia presets
+also include their fixed `c` value, so choosing `julia-douady-rabbit`, for
+example, changes both
 the preset and the Julia constant. `random` and `--random-point` select from
 the catalogue for the currently selected formula. Mandelbrot entries are
 screened for the production native e150+ path; alternate entries are screened
@@ -388,8 +392,8 @@ unless noted otherwise, the values in parentheses are the defaults.
 | `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox where applicable, then falls back to `libx264`. |
 | `--crf N` (`18`) | Quality value from `0` to `51`. It is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
 | `--resample MODE` (`bilinear`) | Crop filter: `bilinear` is faster; `lanczos` gives a smoother, slower resize. |
-| `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, or `mono`. `aurora` uses the fused native colour path. |
-| `--palette-file PATH` | Read at least two `#rrggbb` or `r g b` stops from a text file and interpolate them. This selects the Python colour path. |
+| `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, `mono`, or `kalles-default`. The last one matches the bundled Kalles Fraktaler stops in `palettes/kalles-default.kfp`. |
+| `--palette-file PATH` | Read at least two `#rrggbb` or `r g b` stops from a text file, or import the `Colors:` field from a Kalles `.kfp` file, and interpolate them. This selects the Python colour path. |
 | `--glow N` (`0`) | Add a low-resolution bloom pass after colourisation, from `0` to `1`. It is off by default for the 10-minute target. |
 | `--motion-blur N` (`0`) | Blend the current frame with the previous one, from `0` to below `1`. It is off by default. |
 | `--encoder-threads N` (`0`) | FFmpeg encoder thread hint. `0` lets FFmpeg choose; a smaller value leaves more CPU for fractal rendering. Hardware encoders may ignore or reinterpret it. |

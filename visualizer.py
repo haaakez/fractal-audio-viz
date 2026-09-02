@@ -115,6 +115,25 @@ FORMULA_CHOICES = (
     "burning-ship",
     "tricorn",
 )
+PALETTE_CHOICES = (
+    "aurora",
+    "fire",
+    "ocean",
+    "neon",
+    "sunset",
+    "mono",
+    "kalles-default",
+)
+KALLES_DEFAULT_PALETTE_STOPS = (
+    (255, 255, 255),
+    (128, 0, 64),
+    (160, 0, 0),
+    (192, 128, 0),
+    (64, 128, 0),
+    (0, 255, 255),
+    (64, 128, 255),
+    (0, 0, 255),
+)
 FORMULA_IDS = {
     "mandelbrot": 0,
     "julia": 1,
@@ -4260,6 +4279,31 @@ def render_fractal(
     formula = _formula_name(formula)
     if renderer not in {"auto", "native", "python"}:
         raise ValueError(f"unknown renderer: {renderer}")
+    # The native direct ABI is intentionally a float64 preview path.  At
+    # roughly e7 and deeper, an alternate-formula centre can be rounded by
+    # more than a visible pixel before its orbit is iterated; the resulting
+    # view is a valid image of a *different* coordinate and becomes especially
+    # obvious as a blank Burning Ship/Julia zoom.  Native deep references are
+    # Mandelbrot-only, so use the already vectorised high-precision reference
+    # path for alternate formulas as soon as the pixel spacing needs it.  An
+    # explicit native request remains an error rather than silently changing
+    # backends.
+    if formula != "mandelbrot" and log10_zoom >= 7.0 and renderer == "native":
+        raise RuntimeError(
+            f"native alternate-formula rendering is only precise below 1e7; "
+            f"use renderer=auto or python for {formula} at deeper zooms"
+        )
+    if formula != "mandelbrot" and log10_zoom >= 7.0:
+        return _render_perturbed(
+            width,
+            height,
+            log10_zoom,
+            x_center,
+            y_center,
+            max_iter,
+            formula,
+            julia_constant,
+        )
     if renderer != "python":
         try:
             # Long-double direct iteration remains accurate while the pixel
@@ -5645,7 +5689,12 @@ def _atlas_tile_field(
     watchdog.start()
     try:
         field = None
-        if native_library is not None:
+        # The adaptive local-reference machinery is a Mandelbrot BLA path.
+        # Calling it for an alternate formula silently rendered its cells with
+        # the default Mandelbrot recurrence (and, in draft mode, could then
+        # copy those wrong cells into a square fallback).  Alternate formulas
+        # must go through their own direct/high-precision renderer instead.
+        if native_library is not None and formula == "mandelbrot":
             try:
                 field = _atlas_local_reference_field(
                     render_width=render_width,
@@ -6686,6 +6735,7 @@ def _custom_palette(name: str, size: int = 4096) -> Any:
         "neon": ((10, 0, 35), (170, 0, 180), (0, 220, 255), (220, 255, 40), (255, 255, 255)),
         "sunset": ((18, 2, 30), (100, 8, 70), (235, 45, 55), (255, 150, 40), (255, 245, 180)),
         "mono": ((0, 0, 0), (80, 80, 80), (180, 180, 180), (255, 255, 255)),
+        "kalles-default": KALLES_DEFAULT_PALETTE_STOPS,
     }
     if name not in stops:
         raise ValueError(f"unknown palette: {name}")
@@ -6718,6 +6768,79 @@ def _parse_palette_colour(value: str) -> tuple[int, int, int]:
     return channels  # type: ignore[return-value]
 
 
+def _parse_kfp_integer_values(value: str, path: Path) -> list[int]:
+    """Parse one comma-separated KFP ``Colors`` fragment."""
+
+    value = value.split("#", 1)[0]
+    tokens = value.replace(",", " ").split()
+    try:
+        values = [int(token, 10) for token in tokens]
+    except ValueError as error:
+        raise ValueError(f"invalid KFP Colors field: {path}") from error
+    if len(values) > MAX_PALETTE_STOPS * 3:
+        raise ValueError(
+            f"palette file exceeds the {MAX_PALETTE_STOPS:,}-stop limit: {path}"
+        )
+    return values
+
+
+def _parse_kfp_stops(palette_text: str, path: Path) -> list[tuple[int, int, int]]:
+    """Read Kalles Fraktaler's text ``Colors: r,g,b,...`` field.
+
+    KFP files also contain transfer-function and renderer settings. Those
+    settings describe Kalles' colouring pipeline, not this renderer's scalar
+    iteration field, so only the portable RGB stop list is imported.
+    """
+
+    values: list[int] = []
+    in_colors = False
+    found_colors = False
+    for raw_line in palette_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        key, separator, value = line.partition(":")
+        if separator:
+            if key.strip().casefold() == "colors":
+                found_colors = True
+                in_colors = True
+                values.extend(_parse_kfp_integer_values(value, path))
+            else:
+                in_colors = False
+            continue
+        if in_colors:
+            values.extend(_parse_kfp_integer_values(line, path))
+
+    if not found_colors:
+        raise ValueError(f"KFP palette is missing a Colors field: {path}")
+    if len(values) < 6 or len(values) % 3:
+        raise ValueError(
+            f"KFP Colors field needs at least two complete RGB stops: {path}"
+        )
+    stops = []
+    for index in range(0, len(values), 3):
+        channels = tuple(values[index:index + 3])
+        if not all(0 <= channel <= 255 for channel in channels):
+            raise ValueError(f"KFP RGB values must be between 0 and 255: {path}")
+        stops.append(channels)  # type: ignore[arg-type]
+    return stops
+
+
+def _interpolate_palette_stops(
+    stops: list[tuple[int, int, int]], size: int, np: Any
+) -> Any:
+    anchors = np.linspace(0.0, 1.0, len(stops), dtype=np.float32)
+    positions = np.linspace(0.0, 1.0, size, dtype=np.float32)
+    output = np.empty((size, 3), dtype=np.float32)
+    for channel in range(3):
+        output[:, channel] = np.interp(
+            positions,
+            anchors,
+            [stop[channel] for stop in stops],
+        )
+    return np.asarray(np.rint(output), dtype=np.uint8)
+
+
 @lru_cache(maxsize=16)
 def _palette_file_palette(path_text: str, mtime_ns: int, size: int = 4096) -> Any:
     """Load ``#rrggbb`` or ``r g b`` stops and interpolate them once."""
@@ -6745,6 +6868,10 @@ def _palette_file_palette(path_text: str, mtime_ns: int, size: int = 4096) -> An
         palette_text = raw_text.decode("utf-8")
     except UnicodeDecodeError as error:
         raise ValueError(f"palette file is not valid UTF-8: {path}") from error
+    if path.suffix.casefold() == ".kfp":
+        stops = _parse_kfp_stops(palette_text, path)
+        return _interpolate_palette_stops(stops, size, np)
+
     stops = []
     for line in palette_text.splitlines():
         line = line.strip()
@@ -6763,16 +6890,7 @@ def _palette_file_palette(path_text: str, mtime_ns: int, size: int = 4096) -> An
             )
     if len(stops) < 2:
         raise ValueError(f"palette file needs at least two colour stops: {path}")
-    anchors = np.linspace(0.0, 1.0, len(stops), dtype=np.float32)
-    positions = np.linspace(0.0, 1.0, size, dtype=np.float32)
-    output = np.empty((size, 3), dtype=np.float32)
-    for channel in range(3):
-        output[:, channel] = np.interp(
-            positions,
-            anchors,
-            [stop[channel] for stop in stops],
-        )
-    return np.asarray(np.rint(output), dtype=np.uint8)
+    return _interpolate_palette_stops(stops, size, np)
 
 
 def _palette_from_file(path: Path, size: int = 4096) -> Any:
@@ -8435,15 +8553,15 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--palette",
-        choices=("aurora", "fire", "ocean", "neon", "sunset", "mono"),
+        choices=PALETTE_CHOICES,
         default="aurora",
-        help="colour palette; aurora uses the fused native colour path",
+        help="colour palette; kalles-default matches Kalles Fraktaler's default stops",
     )
     parser.add_argument(
         "--palette-file",
         type=Path,
         default=None,
-        help="optional text file of colour stops (#rrggbb or r g b), interpolated per frame",
+        help="optional .txt or KFP colour-stop file, interpolated per frame",
     )
     parser.add_argument(
         "--glow",

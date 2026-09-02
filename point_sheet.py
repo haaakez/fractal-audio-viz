@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument(
         "--palette",
-        choices=("aurora", "fire", "ocean", "neon", "sunset", "mono"),
+        choices=visualizer.PALETTE_CHOICES,
         default="aurora",
     )
     return parser
