@@ -111,8 +111,11 @@ if Gtk is not None:
             self.profile.connect("changed", self._profile_changed)
             self.formula.connect("changed", self._formula_changed)
             self.point_combo.connect("changed", self._point_changed)
+            self.palette.connect("changed", self._palette_changed)
+            self.palette_file.connect("changed", self._palette_changed)
             self._profile_changed()
             self._formula_changed()
+            self._palette_changed()
             GLib.timeout_add(100, self._drain_output)
             self.window.show_all()
             self.technical_expander.set_expanded(False)
@@ -219,6 +222,13 @@ if Gtk is not None:
                 "aurora",
             )
             self.palette_file = self._entry()
+            self.palette_preview = Gtk.DrawingArea()
+            self.palette_preview.set_hexpand(True)
+            self.palette_preview.set_size_request(-1, 54)
+            self.palette_preview.set_tooltip_text(
+                "live preview of the selected theme; the lower strip is the interior colour"
+            )
+            self.palette_preview.connect("draw", self._draw_palette_preview)
 
             render_grid = self._grid()
             row = 0
@@ -260,6 +270,12 @@ if Gtk is not None:
                 dimensions.pack_start(entry, True, True, 0)
             row = self._add_widget_row(render_grid, row, "Video", dimensions)
             row = self._add_widget_row(render_grid, row, "Palette", self.palette)
+            row = self._add_widget_row(
+                render_grid,
+                row,
+                "Theme preview",
+                self.palette_preview,
+            )
             self._add_path_row(
                 render_grid,
                 row,
@@ -612,6 +628,101 @@ if Gtk is not None:
             preset = FORMULA_POINTS_BY_SLUG.get(self._combo_text(self.formula), {}).get(point)
             if preset is not None and preset.julia_c is not None:
                 self.julia_c.set_text(",".join(preset.julia_c))
+
+        def _palette_changed(self, *_args: object) -> None:
+            self.palette_preview.queue_draw()
+
+        def _palette_preview_samples(self) -> tuple[tuple[int, int, int], ...]:
+            name = self._combo_text(self.palette)
+            file_text = self.palette_file.get_text().strip()
+            palette_file = Path(file_text).expanduser() if file_text else None
+            try:
+                profile = visualizer._kfp_profile_for_selection(name, palette_file)
+                if profile is not None:
+                    lut = visualizer._kfp_palette_lut(profile, 128)
+                    return tuple(tuple(int(channel) for channel in row) for row in lut)
+                if palette_file is not None:
+                    palette = visualizer._palette_from_file(palette_file, 128)
+                    return tuple(
+                        tuple(int(channel) for channel in row) for row in palette
+                    )
+                if name == "aurora":
+                    # Aurora is a field-driven liquid gradient rather than a
+                    # fixed stop list; these representative anchors keep the
+                    # preview honest without running a render during repaint.
+                    stops = (
+                        (1, 4, 18),
+                        (24, 54, 130),
+                        (92, 188, 255),
+                        (255, 255, 255),
+                    )
+                else:
+                    stops = visualizer.BUILTIN_AURORA_ACCENTS.get(
+                        name,
+                        visualizer.BUILTIN_PALETTE_STOPS[name],
+                    )
+                samples = []
+                for index in range(128):
+                    position = index * (len(stops) - 1) / 127.0
+                    left = min(len(stops) - 2, int(position))
+                    fraction = position - left
+                    samples.append(tuple(
+                        int(round(
+                            stops[left][channel] * (1.0 - fraction)
+                            + stops[left + 1][channel] * fraction
+                        ))
+                        for channel in range(3)
+                    ))
+                return tuple(samples)
+            except (OSError, KeyError, ValueError, TypeError):
+                return ((32, 32, 32), (96, 96, 96), (192, 192, 192))
+
+        def _draw_palette_preview(
+            self,
+            widget: Gtk.DrawingArea,
+            context: object,
+        ) -> bool:
+            width = max(1, widget.get_allocated_width())
+            height = max(1, widget.get_allocated_height())
+            samples = self._palette_preview_samples()
+            cairo = context
+            gradient_height = max(1, height - 12)
+            count = max(1, len(samples))
+            for index, colour in enumerate(samples):
+                x0 = width * index / count
+                x1 = width * (index + 1) / count
+                cairo.set_source_rgb(
+                    colour[0] / 255.0,
+                    colour[1] / 255.0,
+                    colour[2] / 255.0,
+                )
+                cairo.rectangle(x0, 0, max(1.0, x1 - x0), gradient_height)
+                cairo.fill()
+            name = self._combo_text(self.palette)
+            file_text = self.palette_file.get_text().strip()
+            palette_file = Path(file_text).expanduser() if file_text else None
+            profile = None
+            try:
+                profile = visualizer._kfp_profile_for_selection(name, palette_file)
+            except (OSError, ValueError):
+                pass
+            interior = (
+                profile.interior_color
+                if profile is not None
+                else visualizer._ordinary_interior_color(name, palette_file)
+            )
+            cairo.set_source_rgb(
+                interior[0] / 255.0,
+                interior[1] / 255.0,
+                interior[2] / 255.0,
+            )
+            cairo.rectangle(0, gradient_height, width, height - gradient_height)
+            cairo.fill()
+            cairo.set_source_rgba(0.0, 0.0, 0.0, 0.6)
+            cairo.rectangle(0.5, 0.5, width - 1.0, height - 1.0)
+            cairo.set_line_width(1.0)
+            cairo.stroke()
+            return False
 
         def _profile_changed(self, *_args: object) -> None:
             values = PROFILE_DEFAULTS.get(self._combo_text(self.profile), {})

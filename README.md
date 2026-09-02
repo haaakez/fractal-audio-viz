@@ -46,7 +46,9 @@ the render is split into five stages.
    colour path or Pillow turns that data into RGB after cropping. ordinary
    palettes reuse Aurora's detail-preserving waves with their own RGB accents;
    `.kfp` files keep Kalles' cyclic transfer, distance, multi-colour, and slope
-   settings. optional glow and motion blur are applied at this stage, and
+   settings, including the bundled default key colours. atlas handoffs are
+   cross-faded so a freshly resolved child tile does not visibly pop. optional
+   glow and motion blur are applied at this stage, and
    FFmpeg writes the video with the original audio. `--codec auto` probes
    available hardware encoders and falls back to `libx264`.
 
@@ -127,7 +129,8 @@ iteration, native backend, encoder, cache, and manifest controls—are collapsed
 behind the `Technical options` expander by default; expand it when needed. It
 uses GTK's configured system theme and standard controls, plus a real scrolled
 container, so collapsing the advanced section cannot leave the form at an
-empty scroll offset.
+empty scroll offset. The selected palette also has a live preview strip; for
+KFP themes it shows the cyclic Kalles gradient and its interior colour.
 
 ## constructing a command
 
@@ -394,7 +397,7 @@ unless noted otherwise, the values in parentheses are the defaults.
 | `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox where applicable, then falls back to `libx264`. |
 | `--crf N` (`18`) | Quality value from `0` to `51`. It is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
 | `--resample MODE` (`bilinear`) | Crop filter: `bilinear` is faster; `lanczos` gives a smoother, slower resize. |
-| `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, `mono`, or `kalles-default`. The last one matches the bundled Kalles Fraktaler profile in `palettes/kalles-default.kfp`. |
+| `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, `mono`, `midnight`, `ember-night`, `terminal`, or `kalles-default`. The night themes use dark exteriors with white interiors; `kalles-default` matches the bundled Kalles Fraktaler profile in `palettes/kalles-default.kfp`. Its first exterior key is intentionally white and its separate interior colour is black, matching Kalles' defaults. |
 | `--palette-file PATH` | Read at least two `#rrggbb` or `r g b` stops from a text file, or import a Kalles `.kfp` gradient and its colour settings. ordinary text palettes use the fast Aurora wave path; `.kfp` uses the Kalles-style transfer path. |
 | `--glow N` (`0`) | Add a low-resolution bloom pass after colourisation, from `0` to `1`. It is off by default for the 10-minute target. |
 | `--motion-blur N` (`0`) | Blend the current frame with the previous one, from `0` to below `1`. It is off by default. |

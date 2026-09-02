@@ -230,6 +230,29 @@ int fractal_colourise_kfp(
     int lut_size,
     int threads
 );
+int fractal_atlas_colourise_kfp(
+    const float *parent,
+    int parent_width,
+    int parent_height,
+    const float *child,
+    int child_width,
+    int child_height,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    int max_iter,
+    int child_left,
+    int child_top,
+    int feather,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions *options,
+    const uint8_t *lut,
+    int lut_size,
+    int threads
+);
 int fractal_crop_field(
     const float *source,
     int source_width,

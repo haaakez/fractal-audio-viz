@@ -990,6 +990,11 @@ inline double kfp_safe_sample(
     return std::clamp(static_cast<double>(value), 0.0, static_cast<double>(max_iter));
 }
 
+inline bool kfp_inside_value(float value, int max_iter) noexcept {
+    return !std::isfinite(value)
+        || value >= static_cast<float>(max_iter) - 0.5F;
+}
+
 inline double kfp_reflected_sample(
     const float* field,
     int width,
@@ -1036,7 +1041,7 @@ inline double kfp_difference_magnitude(
         return std::abs(left - centre) * std::sqrt(2.0)
             + std::abs(up - centre) * std::sqrt(2.0)
             + std::abs(top_left - centre)
-            + std::abs(top_right - centre);
+            + std::abs(bottom_left - centre);
     }
     if (differences == 1) {
         const double squared =
@@ -1143,6 +1148,11 @@ inline void kfp_hsv_to_rgb(
     }
 }
 
+struct KfpSlopeDirection {
+    double cosine = 1.0;
+    double sine = 0.0;
+};
+
 inline void write_kfp_pixel(
     const float* field,
     int width,
@@ -1150,19 +1160,17 @@ inline void write_kfp_pixel(
     int x,
     int y,
     int max_iter,
-    double vocal,
-    double pitch,
     const FractalKfpOptions& options,
     const std::uint8_t* lut,
     int lut_size,
     double transfer_minimum,
     double transfer_maximum,
+    const KfpSlopeDirection& slope_direction,
     std::uint8_t* destination
 ) {
     const float raw_value = field[static_cast<size_t>(y) * static_cast<size_t>(width)
         + static_cast<size_t>(x)];
-    const bool inside = !std::isfinite(raw_value)
-        || raw_value >= static_cast<float>(max_iter) - 0.5F;
+    const bool inside = kfp_inside_value(raw_value, max_iter);
     if (inside) {
         destination[0] = static_cast<std::uint8_t>(options.interior_color[0]);
         destination[1] = static_cast<std::uint8_t>(options.interior_color[1]);
@@ -1237,7 +1245,12 @@ inline void write_kfp_pixel(
             transfer = std::min(distance, 1024.0);
             break;
         case 6: {
-            const double distance_transfer = std::min(distance, 1024.0);
+            // Kalles applies the distance-square-root transfer before the
+            // DE-plus-standard threshold check.  Omitting the root makes
+            // imported ColorMethod 6 profiles switch to iteration colours
+            // far too early, especially on deep fields.
+            const double distance_transfer = std::min(
+                std::sqrt(std::max(0.0, distance)), 1024.0);
             transfer = distance_transfer > options.iter_div
                 ? colour_iter : distance_transfer;
             break;
@@ -1346,10 +1359,9 @@ inline void write_kfp_pixel(
     }
 
     if (needs_slopes) {
-        const double angle = options.slope_angle * 3.14159265358979323846 / 180.0;
         const double projected = (
-            ((x == 0 ? centre - right : left - centre) * std::cos(angle))
-            + ((y == 0 ? centre - down : up - centre) * std::sin(angle)))
+            ((x == 0 ? centre - right : left - centre) * slope_direction.cosine)
+            + ((y == 0 ? centre - down : up - centre) * slope_direction.sine))
             * options.slope_power * static_cast<double>(width) / 640.0;
         const double strength = std::clamp(
             std::atan(std::abs(projected)) / (3.14159265358979323846 / 2.0)
@@ -1367,23 +1379,43 @@ inline void write_kfp_pixel(
         }
     }
 
-    const double vocal_mix = std::clamp(vocal, 0.0, 1.0);
-    const double saturation = 1.0 + 0.18 * vocal_mix;
-    const double luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
-    red = luminance + (red - luminance) * saturation;
-    green = luminance + (green - luminance) * saturation;
-    blue = luminance + (blue - luminance) * saturation;
-    const double hue_angle = pitch_hue_angle(pitch);
-    if (std::abs(hue_angle) > 1.0e-15) {
-        const auto rotated = rotate_hue_rgb(
-            {{red, green, blue}}, std::cos(hue_angle), std::sin(hue_angle));
-        red = rotated[0];
-        green = rotated[1];
-        blue = rotated[2];
-    }
     destination[0] = kfp_dithered_colour_byte(red, x, y, 0);
     destination[1] = kfp_dithered_colour_byte(green, x, y, 1);
     destination[2] = kfp_dithered_colour_byte(blue, x, y, 2);
+}
+
+struct KfpTransferBounds {
+    double minimum = 0.0;
+    double maximum = 1.0;
+};
+
+KfpTransferBounds kfp_transfer_bounds(
+    const float* field,
+    int width,
+    int height,
+    int max_iter
+) {
+    double minimum = std::numeric_limits<double>::infinity();
+    double maximum = -std::numeric_limits<double>::infinity();
+#ifdef _OPENMP
+#pragma omp parallel for reduction(min:minimum) reduction(max:maximum) schedule(static)
+#endif
+    for (int pixel = 0; pixel < width * height; ++pixel) {
+        const float raw_value = field[pixel];
+        if (kfp_inside_value(raw_value, max_iter)) continue;
+        const double safe = std::clamp(
+            static_cast<double>(raw_value), 0.0, static_cast<double>(max_iter));
+        // CFraktalSFT::GetIterations reports the integer nIter0 range for
+        // ColorMethod_Stretched; the fractional transition is applied only
+        // after that range has been selected.
+        const double value = std::floor(safe);
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+    }
+    if (!std::isfinite(minimum) || !std::isfinite(maximum)) {
+        return {};
+    }
+    return {minimum, maximum};
 }
 
 bool valid_kfp_options(const FractalKfpOptions* options, int lut_size) noexcept {
@@ -1421,6 +1453,13 @@ bool valid_kfp_options(const FractalKfpOptions* options, int lut_size) noexcept 
     return options->interior_color[0] >= 0 && options->interior_color[0] <= 255
         && options->interior_color[1] >= 0 && options->interior_color[1] <= 255
         && options->interior_color[2] >= 0 && options->interior_color[2] <= 255;
+}
+
+KfpSlopeDirection kfp_slope_direction(const FractalKfpOptions& options) noexcept {
+    if (!options.slopes) return {};
+    const double angle = options.slope_angle
+        * 3.14159265358979323846 / 180.0;
+    return {std::cos(angle), std::sin(angle)};
 }
 
 long double parse_zoom(const char* text) {
@@ -4362,39 +4401,19 @@ int fractal_colourise_kfp(
             throw std::runtime_error("invalid native KFP colour dimensions or controls");
         }
         const FractalKfpOptions& transfer_options = *options;
+        const KfpSlopeDirection slope_direction = kfp_slope_direction(transfer_options);
         double transfer_minimum = 0.0;
         double transfer_maximum = 1.0;
-        if (transfer_options.color_method == 4) {
-            transfer_minimum = std::numeric_limits<double>::infinity();
-            transfer_maximum = -std::numeric_limits<double>::infinity();
-#ifdef _OPENMP
-#pragma omp parallel for reduction(min:transfer_minimum) reduction(max:transfer_maximum) schedule(static)
-#endif
-            for (int pixel = 0; pixel < width * height; ++pixel) {
-                const float raw_value = field[pixel];
-                if (!std::isfinite(raw_value)
-                    || raw_value >= static_cast<float>(max_iter) - 0.5F) {
-                    continue;
-                }
-                const double safe = std::clamp(
-                    static_cast<double>(raw_value), 0.0, static_cast<double>(max_iter));
-                // CFraktalSFT::GetIterations reports the integer nIter0 range
-                // for ColorMethod_Stretched; the fractional transition is
-                // applied only after that range has been selected.
-                const double value = std::floor(safe);
-                transfer_minimum = std::min(transfer_minimum, value);
-                transfer_maximum = std::max(transfer_maximum, value);
-            }
-            if (!std::isfinite(transfer_minimum)
-                || !std::isfinite(transfer_maximum)) {
-                transfer_minimum = 0.0;
-                transfer_maximum = 1.0;
-            }
-        }
         if (threads > 0) {
 #ifdef _OPENMP
             omp_set_num_threads(threads);
 #endif
+        }
+        if (transfer_options.color_method == 4) {
+            const KfpTransferBounds bounds = kfp_transfer_bounds(
+                field, width, height, max_iter);
+            transfer_minimum = bounds.minimum;
+            transfer_maximum = bounds.maximum;
         }
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -4410,13 +4429,12 @@ int fractal_colourise_kfp(
                     x,
                     y,
                     max_iter,
-                    vocal,
-                    pitch,
                     transfer_options,
                     lut,
                     lut_size,
                     transfer_minimum,
                     transfer_maximum,
+                    slope_direction,
                     destination);
             }
         }
@@ -4427,6 +4445,274 @@ int fractal_colourise_kfp(
         return 1;
     } catch (...) {
         set_error("native KFP colouriser failed with an unknown exception");
+        return 1;
+    }
+}
+
+int fractal_atlas_colourise_kfp(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    const float* child,
+    int child_width,
+    int child_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    int max_iter,
+    int child_left,
+    int child_top,
+    int feather,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    try {
+        if (!parent || !output
+            || !valid_pixel_dimensions(parent_width, parent_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || parent_width != output_width
+            || parent_height != output_height
+            || !valid_iteration_count(max_iter)
+            || !valid_thread_count(threads)
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)
+            || !lut || !valid_kfp_options(options, lut_size)) {
+            throw std::runtime_error("invalid native KFP atlas dimensions or controls");
+        }
+
+        const bool use_child = child != nullptr;
+        if (use_child) {
+            if (!valid_pixel_dimensions(child_width, child_height)
+                || child_left < 0 || child_top < 0
+                || child_width > output_width - child_left
+                || child_height > output_height - child_top
+                || feather < 0
+                || feather > std::min(child_width, child_height)) {
+                throw std::runtime_error("invalid native KFP atlas child rectangle");
+            }
+        } else if (child_width != 0 || child_height != 0
+                   || child_left != 0 || child_top != 0 || feather != 0) {
+            throw std::runtime_error("invalid native KFP atlas child absence");
+        }
+
+        if (threads > 0) {
+#ifdef _OPENMP
+            omp_set_num_threads(threads);
+#endif
+        }
+        const FractalKfpOptions& transfer_options = *options;
+        const KfpSlopeDirection slope_direction = kfp_slope_direction(transfer_options);
+        const KfpTransferBounds parent_bounds = transfer_options.color_method == 4
+            ? kfp_transfer_bounds(parent, parent_width, parent_height, max_iter)
+            : KfpTransferBounds{};
+        const KfpTransferBounds child_bounds = use_child && transfer_options.color_method == 4
+            ? kfp_transfer_bounds(child, child_width, child_height, max_iter)
+            : KfpTransferBounds{};
+
+        std::vector<float> child_edge_x;
+        std::vector<float> child_edge_y;
+        if (use_child && feather >= 2) {
+            child_edge_x.resize(static_cast<size_t>(child_width));
+            child_edge_y.resize(static_cast<size_t>(child_height));
+            for (int x = 0; x < child_width; ++x) {
+                const int edge = std::min(x, child_width - 1 - x);
+                child_edge_x[static_cast<size_t>(x)] = std::min(
+                    1.0F, static_cast<float>(edge) / static_cast<float>(feather));
+            }
+            for (int y = 0; y < child_height; ++y) {
+                const int edge = std::min(y, child_height - 1 - y);
+                child_edge_y[static_cast<size_t>(y)] = std::min(
+                    1.0F, static_cast<float>(edge) / static_cast<float>(feather));
+            }
+        }
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int y = 0; y < output_height; ++y) {
+            for (int x = 0; x < output_width; ++x) {
+                std::uint8_t* destination = output + static_cast<size_t>(
+                    y * output_width + x) * 3U;
+                const bool in_child = use_child
+                    && x >= child_left && x < child_left + child_width
+                    && y >= child_top && y < child_top + child_height;
+                if (!in_child) {
+                    write_kfp_pixel(
+                        parent,
+                        parent_width,
+                        parent_height,
+                        x,
+                        y,
+                        max_iter,
+                        transfer_options,
+                        lut,
+                        lut_size,
+                        parent_bounds.minimum,
+                        parent_bounds.maximum,
+                        slope_direction,
+                        destination);
+                    continue;
+                }
+
+                const int child_x = x - child_left;
+                const int child_y = y - child_top;
+                const float child_raw = child[static_cast<size_t>(child_y)
+                    * static_cast<size_t>(child_width) + static_cast<size_t>(child_x)];
+                const bool child_inside = kfp_inside_value(child_raw, max_iter);
+
+                // The deeper tile owns classification. This rule is what
+                // prevents an interior child from becoming a rectangular
+                // parent-coloured fill at the edge of an atlas tile.
+                if (child_inside) {
+                    write_kfp_pixel(
+                        child,
+                        child_width,
+                        child_height,
+                        child_x,
+                        child_y,
+                        max_iter,
+                        transfer_options,
+                        lut,
+                        lut_size,
+                        child_bounds.minimum,
+                        child_bounds.maximum,
+                        slope_direction,
+                        destination);
+                    continue;
+                }
+
+                if (feather < 2) {
+                    const float parent_raw = parent[static_cast<size_t>(y)
+                        * static_cast<size_t>(parent_width) + static_cast<size_t>(x)];
+                    if (!kfp_inside_value(parent_raw, max_iter)) {
+                        write_kfp_pixel(
+                            parent,
+                            parent_width,
+                            parent_height,
+                            x,
+                            y,
+                            max_iter,
+                            transfer_options,
+                            lut,
+                            lut_size,
+                            parent_bounds.minimum,
+                            parent_bounds.maximum,
+                            slope_direction,
+                            destination);
+                    } else {
+                        write_kfp_pixel(
+                            child,
+                            child_width,
+                            child_height,
+                            child_x,
+                            child_y,
+                            max_iter,
+                            transfer_options,
+                            lut,
+                            lut_size,
+                            child_bounds.minimum,
+                            child_bounds.maximum,
+                            slope_direction,
+                            destination);
+                    }
+                    continue;
+                }
+
+                const float alpha = std::min(
+                    child_edge_x[static_cast<size_t>(child_x)],
+                    child_edge_y[static_cast<size_t>(child_y)]);
+                if (alpha >= 0.999999F) {
+                    write_kfp_pixel(
+                        child,
+                        child_width,
+                        child_height,
+                        child_x,
+                        child_y,
+                        max_iter,
+                        transfer_options,
+                        lut,
+                        lut_size,
+                        child_bounds.minimum,
+                        child_bounds.maximum,
+                        slope_direction,
+                        destination);
+                    continue;
+                }
+
+                const float parent_raw = parent[static_cast<size_t>(y)
+                    * static_cast<size_t>(parent_width) + static_cast<size_t>(x)];
+                const bool parent_inside = kfp_inside_value(parent_raw, max_iter);
+                if (parent_inside) {
+                    write_kfp_pixel(
+                        child,
+                        child_width,
+                        child_height,
+                        child_x,
+                        child_y,
+                        max_iter,
+                        transfer_options,
+                        lut,
+                        lut_size,
+                        child_bounds.minimum,
+                        child_bounds.maximum,
+                        slope_direction,
+                        destination);
+                    continue;
+                }
+
+                std::uint8_t parent_rgb[3];
+                std::uint8_t child_rgb[3];
+                write_kfp_pixel(
+                    parent,
+                    parent_width,
+                    parent_height,
+                    x,
+                    y,
+                    max_iter,
+                    transfer_options,
+                    lut,
+                    lut_size,
+                    parent_bounds.minimum,
+                    parent_bounds.maximum,
+                    slope_direction,
+                    parent_rgb);
+                write_kfp_pixel(
+                    child,
+                    child_width,
+                    child_height,
+                    child_x,
+                    child_y,
+                    max_iter,
+                    transfer_options,
+                    lut,
+                    lut_size,
+                    child_bounds.minimum,
+                    child_bounds.maximum,
+                    slope_direction,
+                    child_rgb);
+                destination[0] = rounded_colour_byte(
+                    static_cast<double>(parent_rgb[0]) * (1.0 - alpha)
+                    + static_cast<double>(child_rgb[0]) * alpha);
+                destination[1] = rounded_colour_byte(
+                    static_cast<double>(parent_rgb[1]) * (1.0 - alpha)
+                    + static_cast<double>(child_rgb[1]) * alpha);
+                destination[2] = rounded_colour_byte(
+                    static_cast<double>(parent_rgb[2]) * (1.0 - alpha)
+                    + static_cast<double>(child_rgb[2]) * alpha);
+            }
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native KFP atlas colouriser failed with an unknown exception");
         return 1;
     }
 }

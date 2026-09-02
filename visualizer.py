@@ -122,6 +122,9 @@ PALETTE_CHOICES = (
     "neon",
     "sunset",
     "mono",
+    "midnight",
+    "ember-night",
+    "terminal",
     "kalles-default",
 )
 KALLES_DEFAULT_PALETTE_STOPS = (
@@ -213,6 +216,25 @@ BUILTIN_AURORA_ACCENTS = {
         (170, 170, 170),
         (255, 255, 255),
     ),
+    # These themes deliberately keep the exterior near-black while retaining
+    # three distinct Aurora wave accents. Their white interiors are applied
+    # separately, so the set remains legible instead of blending into the
+    # dark exterior.
+    "midnight": (
+        (2, 4, 12),
+        (12, 48, 96),
+        (90, 180, 255),
+    ),
+    "ember-night": (
+        (8, 0, 2),
+        (68, 4, 8),
+        (255, 105, 25),
+    ),
+    "terminal": (
+        (0, 8, 0),
+        (0, 90, 20),
+        (170, 255, 170),
+    ),
 }
 # Keep the non-liquid palettes punchy at their source instead of trying to
 # recover contrast after audio effects and integer quantisation.  The first
@@ -265,7 +287,33 @@ BUILTIN_PALETTE_STOPS = {
         (248, 248, 248),
         (255, 255, 255),
     ),
+    "midnight": (
+        (1, 2, 8),
+        (3, 12, 36),
+        (12, 55, 120),
+        (70, 170, 255),
+        (232, 250, 255),
+    ),
+    "ember-night": (
+        (4, 0, 1),
+        (35, 2, 5),
+        (120, 10, 12),
+        (255, 90, 15),
+        (255, 255, 230),
+    ),
+    "terminal": (
+        (0, 3, 0),
+        (0, 22, 4),
+        (0, 90, 20),
+        (40, 220, 90),
+        (220, 255, 220),
+    ),
     "kalles-default": KALLES_DEFAULT_PALETTE_STOPS,
+}
+BUILTIN_INTERIOR_COLORS = {
+    "midnight": (255, 255, 255),
+    "ember-night": (255, 255, 255),
+    "terminal": (255, 255, 255),
 }
 FORMULA_IDS = {
     "mandelbrot": 0,
@@ -688,6 +736,31 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_colourise_kfp.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_colourise_kfp"):
+                    library.fractal_atlas_colourise_kfp.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(NativeKfpOptions),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_colourise_kfp.restype = ctypes.c_int
                 if hasattr(library, "fractal_crop_field"):
                     library.fractal_crop_field.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -6231,6 +6304,12 @@ def _atlas_colourise_native(
     return output
 
 
+def _atlas_feather(width: int, height: int) -> int:
+    """Return the shared scalar/RGB atlas seam width."""
+
+    return min(16, max(0, int(width) // 8), max(0, int(height) // 8))
+
+
 def _atlas_colour_frame(
     parent: Any,
     child: Any,
@@ -6375,6 +6454,29 @@ def _atlas_colour_frame(
     bottom = top + child_height
     kfp_profile = _kfp_profile_for_selection(palette_name, palette_file)
     if kfp_profile is not None:
+        feather = _atlas_feather(child_width, child_height)
+        if (
+            native_library is not None
+            and hasattr(native_library, "fractal_atlas_colourise_kfp")
+            and resample == "bilinear"
+        ):
+            return _atlas_colourise_kfp_native(
+                parent_view,
+                child_view,
+                output_width,
+                output_height,
+                effective_iter,
+                left,
+                top,
+                feather,
+                phase,
+                vocal,
+                instrumental,
+                pitch,
+                kfp_profile,
+                native_library,
+                native_threads,
+            )
         # KFP slope shading is derived from spatial gradients. Computing that
         # gradient after splicing a child into the parent manufactures a
         # rectangle at the tile boundary, even when both scalar fields are
@@ -6406,7 +6508,6 @@ def _atlas_colour_frame(
         )
         region_rgb = parent_rgb[top:bottom, left:right]
         parent_inside = parent_inside_region[top:bottom, left:right]
-        feather = min(16, child_width // 8, child_height // 8)
         if feather < 2:
             small_child = np.where(
                 child_inside[..., None],
@@ -6436,7 +6537,7 @@ def _atlas_colour_frame(
         )
         return parent_rgb
     region = parent_view[top:bottom, left:right]
-    feather = min(16, child_width // 8, child_height // 8)
+    feather = _atlas_feather(child_width, child_height)
     if feather < 2:
         region[...] = child_view
         return _colourise_view(
@@ -6715,6 +6816,9 @@ def _render_video_atlas(
     frame_seconds = 0.0
     encoder_seconds = 0.0
     previous_rgb = None
+    handoff_source = None
+    handoff_remaining = 0
+    handoff_total = 0
     render_started = time.perf_counter()
     active_level = None
     render_succeeded = False
@@ -6735,6 +6839,10 @@ def _render_video_atlas(
             frame_log_zoom = float(zooms[frame_index])
             level = _atlas_level_for_zoom(frame_log_zoom, origin, step, level_count)
             if level != active_level:
+                if previous_rgb is not None and active_level is not None:
+                    handoff_source = np.array(previous_rgb, dtype=np.uint8, copy=True)
+                    handoff_total = max(2, min(6, int(round(fps * 0.12))))
+                    handoff_remaining = handoff_total
                 active_level = level
                 print(
                     f"Entering atlas level {level}/{level_count} at "
@@ -6780,6 +6888,14 @@ def _render_video_atlas(
                 pitch,
                 palette_file,
             )
+            if handoff_source is not None and handoff_remaining > 0:
+                alpha = (
+                    handoff_total - handoff_remaining
+                ) / max(1, handoff_total - 1)
+                rgb = _blend_atlas_handoff(handoff_source, rgb, alpha)
+                handoff_remaining -= 1
+                if handoff_remaining == 0:
+                    handoff_source = None
             rgb = _apply_frame_effects(rgb, glow, motion_blur, previous_rgb)
             previous_rgb = rgb
             enqueue_frame(rgb)
@@ -7634,6 +7750,35 @@ def _aurora_accents_for_selection(
         raise ValueError(f"unknown ordinary palette: {palette_name}") from error
 
 
+def _ordinary_interior_color(
+    palette_name: str,
+    palette_file: Optional[Path] = None,
+) -> tuple[int, int, int]:
+    """Return the set colour for an ordinary (non-KFP) palette."""
+
+    if palette_file is not None:
+        return (0, 0, 0)
+    return BUILTIN_INTERIOR_COLORS.get(palette_name, (0, 0, 0))
+
+
+def _apply_interior_color(
+    rgb: Any,
+    field: Any,
+    max_iter: int,
+    colour: tuple[int, int, int],
+) -> Any:
+    """Paint interior samples without allocating a second RGB frame."""
+
+    np = _require_numpy()
+    output = np.asarray(rgb, dtype=np.uint8)
+    scalar = np.asarray(field, dtype=np.float32)
+    if output.ndim != 3 or output.shape[-1] != 3 or output.shape[:2] != scalar.shape:
+        raise ValueError("interior colour input shapes do not match")
+    inside = ~np.isfinite(scalar) | (scalar >= float(max_iter) - 0.5)
+    output[inside] = np.asarray(colour, dtype=np.uint8)
+    return output
+
+
 def _apply_aurora_accents(
     base_rgb: Any,
     accents: tuple[tuple[int, int, int], ...],
@@ -7701,6 +7846,7 @@ def _colourise_aurora_accents(
     vocal: float,
     accents: tuple[tuple[int, int, int], ...],
     pitch: float = 0.5,
+    interior_color: tuple[int, int, int] = (0, 0, 0),
 ) -> Any:
     """Python fallback for ordinary palettes using Aurora's raw phase waves."""
 
@@ -7722,7 +7868,7 @@ def _colourise_aurora_accents(
         0.5 - 0.5 * np.cos(angle - (float(phase) + split)),
     ), axis=-1).astype(np.float32)
     rgb = _apply_aurora_accents(waves * 140.0, accents, pitch)
-    rgb[inside] = 0
+    rgb[inside] = np.asarray(interior_color, dtype=np.uint8)
     return rgb
 
 
@@ -7808,7 +7954,7 @@ def _kfp_difference_magnitude(field: Any, differences: int, np: Any) -> Any:
             np.abs(left - centre) * math.sqrt(2.0)
             + np.abs(up - centre) * math.sqrt(2.0)
             + np.abs(top_left - centre)
-            + np.abs(top_right - centre)
+            + np.abs(bottom_left - centre)
         )
     if differences == 1:  # Forward 3x3, eight radial differences.
         squared = (
@@ -7927,7 +8073,11 @@ def _colourise_kfp(
 ) -> Any:
     """Apply the portable Kalles transfer, multi-colour, and slope stages."""
 
-    del phase, instrumental  # KFP's own transfer owns colour phase/brightness.
+    # A KFP is a complete colour recipe.  Kalles applies the imported colours
+    # and slope pass directly; the visualizer's audio/pitch colour transforms
+    # belong to the ordinary Aurora palettes and would otherwise make the
+    # bundled Kalles defaults drift into a different palette while rendering.
+    del phase, vocal, instrumental, pitch
     np = _require_numpy()
     field = np.asarray(field, dtype=np.float32)
     inside = ~np.isfinite(field) | (field >= float(max_iter) - 0.5)
@@ -7987,7 +8137,12 @@ def _colourise_kfp(
     elif method == 5:
         transfer = np.minimum(distance, 1024.0)
     elif method == 6:
-        distance_transfer = np.minimum(distance, 1024.0)
+        # Kalles uses the square-root distance transfer for DEPlusStandard
+        # before deciding whether to fall back to the ordinary iteration.
+        distance_transfer = np.minimum(
+            np.sqrt(np.maximum(0.0, distance)),
+            1024.0,
+        )
         transfer = np.where(
             distance_transfer > profile.iter_div,
             colour_iter,
@@ -8071,17 +8226,7 @@ def _colourise_kfp(
             rgb * (1.0 - strength) + 255.0 * strength,
         )
 
-    # Keep audio influence deliberately mild. The KFP transfer remains stable
-    # at e150+ instead of becoming the old max_iter-normalised pastel wash.
-    saturation = 1.0 + 0.18 * float(np.clip(vocal, 0.0, 1.0))
-    rgb_luminance = np.sum(
-        rgb * np.asarray([0.2126, 0.7152, 0.0722]), axis=-1, keepdims=True
-    )
-    rgb = rgb_luminance + (rgb - rgb_luminance) * saturation
     rgb = np.clip(rgb, 0.0, 255.0)
-    if abs(float(pitch) - 0.5) > 1.0e-12:
-        shape = rgb.shape
-        rgb = _rotate_hue_rgb(rgb.reshape(-1, 3), pitch).reshape(shape)
     rgb = _kfp_dither_rgb(rgb, np)
     rgb[inside] = np.asarray(profile.interior_color, dtype=np.uint8)
     return rgb
@@ -8140,6 +8285,68 @@ def _colourise_kfp_native(
     return output
 
 
+def _atlas_colourise_kfp_native(
+    parent: Any,
+    child: Any,
+    output_width: int,
+    output_height: int,
+    max_iter: int,
+    child_left: int,
+    child_top: int,
+    feather: int,
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    pitch: float,
+    profile: KfpPalette,
+    native_library: Any,
+    native_threads: int,
+) -> Any:
+    """Colour a nested KFP frame without materialising two RGB atlases."""
+
+    function = getattr(native_library, "fractal_atlas_colourise_kfp", None)
+    if function is None:
+        raise RuntimeError("native KFP atlas colourizer is unavailable")
+    np = _require_numpy()
+    parent_array = np.ascontiguousarray(parent, dtype=np.float32)
+    child_array = np.ascontiguousarray(child, dtype=np.float32)
+    if parent_array.shape != (int(output_height), int(output_width)):
+        raise ValueError("native KFP atlas parent does not match output dimensions")
+    if child_array.ndim != 2:
+        raise ValueError("native KFP atlas child must be two-dimensional")
+    child_height, child_width = child_array.shape
+    output = np.empty((int(output_height), int(output_width), 3), dtype=np.uint8)
+    lut = np.ascontiguousarray(_kfp_palette_lut(profile), dtype=np.uint8)
+    options = _native_kfp_options(profile)
+    status = function(
+        parent_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(output_width),
+        int(output_height),
+        child_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(child_width),
+        int(child_height),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(output_width),
+        int(output_height),
+        int(max_iter),
+        int(child_left),
+        int(child_top),
+        int(feather),
+        float(phase),
+        float(vocal),
+        float(instrumental),
+        float(pitch),
+        ctypes.byref(options),
+        lut.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(lut.shape[0]),
+        int(native_threads),
+    )
+    if status != 0:
+        message = native_library.fractal_last_error() or b"unknown native KFP atlas colourizer error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
 def _colourise_custom(
     field: Any,
     max_iter: int,
@@ -8162,6 +8369,7 @@ def _colourise_custom(
         vocal,
         _aurora_accents_for_selection(palette_name, palette_file),
         pitch,
+        _ordinary_interior_color(palette_name, palette_file),
     )
 
 
@@ -8550,7 +8758,22 @@ def _colourise_view(
         accented = _native_apply_aurora_accents(
             base, accents, pitch, native_library, native_threads
         )
-        return base if accented is None else accented
+        if accented is None:
+            accented = _colourise_aurora_accents(
+                view,
+                max_iter,
+                phase,
+                vocal,
+                accents,
+                pitch,
+                _ordinary_interior_color(palette_name, palette_file),
+            )
+        return _apply_interior_color(
+            accented,
+            view,
+            max_iter,
+            _ordinary_interior_color(palette_name, palette_file),
+        )
     if palette_name != "aurora" or palette_file is not None:
         return _colourise_custom(
             view,
@@ -8604,6 +8827,7 @@ def _colour_frame(
         native_library is not None
         and resample == "bilinear"
         and _kfp_profile_for_selection(palette_name, palette_file) is None
+        and _ordinary_interior_color(palette_name, palette_file) == (0, 0, 0)
     ):
         base = _crop_and_colourise_native(
             field,
@@ -8642,6 +8866,32 @@ def _colour_frame(
         palette_name,
         pitch,
         palette_file,
+    )
+
+
+def _blend_atlas_handoff(previous: Any, current: Any, alpha: float) -> Any:
+    """Blend an atlas level handoff in RGB space to hide tile replacement pops."""
+
+    np = _require_numpy()
+    previous_array = np.asarray(previous, dtype=np.uint8)
+    current_array = np.asarray(current, dtype=np.uint8)
+    if previous_array.shape != current_array.shape or previous_array.ndim != 3:
+        raise ValueError("atlas handoff frames must have the same RGB shape")
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    if alpha <= 0.0:
+        return np.ascontiguousarray(previous_array, dtype=np.uint8)
+    if alpha >= 1.0:
+        return np.ascontiguousarray(current_array, dtype=np.uint8)
+    return np.ascontiguousarray(
+        np.clip(
+            np.rint(
+                previous_array.astype(np.float32) * (1.0 - alpha)
+                + current_array.astype(np.float32) * alpha
+            ),
+            0.0,
+            255.0,
+        ),
+        dtype=np.uint8,
     )
 
 

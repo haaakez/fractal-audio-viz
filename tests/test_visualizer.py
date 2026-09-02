@@ -464,6 +464,27 @@ class AnimationTests(unittest.TestCase):
         palette = visualizer._palette_from_file(bundled, 17)
         self.assertEqual(tuple(palette[0]), (255, 255, 255))
         self.assertEqual(tuple(palette[-1]), (0, 0, 255))
+        profile = visualizer._kfp_profile_for_selection("kalles-default", None)
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        file_profile = visualizer._kfp_profile_for_selection("aurora", bundled)
+        self.assertEqual(file_profile, profile)
+        self.assertEqual(profile.stops, (
+            (255, 255, 255),
+            (128, 0, 64),
+            (160, 0, 0),
+            (192, 128, 0),
+            (64, 128, 0),
+            (0, 255, 255),
+            (64, 128, 255),
+            (0, 0, 255),
+        ))
+        self.assertEqual(
+            (profile.iter_div, profile.color_method, profile.differences),
+            (0.01, 7, 3),
+        )
+        self.assertTrue(profile.slopes)
+        self.assertEqual(profile.interior_color, (0, 0, 0))
         self.assertEqual(
             tuple(visualizer._custom_palette("kalles-default")[0]),
             (255, 255, 255),
@@ -509,11 +530,73 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(tuple(lut[0]), (0, 0, 0))
         self.assertLess(int(lut[-1, 0]), 255)
 
+    def test_kfp_zero_distance_uses_the_imported_first_colour(self):
+        field = np.zeros((5, 7), dtype=np.float32)
+        rgb = visualizer._colourise_kfp(
+            field, 200, 0.0, 0.0, 0.0, 0.5, visualizer.KALLES_DEFAULT_KFP
+        )
+        np.testing.assert_array_equal(rgb, np.full_like(rgb, (255, 255, 255)))
+
+    def test_dark_builtin_themes_have_white_interiors(self):
+        field = np.asarray([[20.0, 100.0]], dtype=np.float32)
+        for name in ("midnight", "ember-night", "terminal"):
+            rgb = visualizer._colourise_custom(field, 100, 0.0, 0.5, 0.5, name)
+            self.assertEqual(tuple(rgb[0, 1]), (255, 255, 255), name)
+            self.assertLess(int(np.mean(rgb[0, 0])), 220, name)
+
+    def test_atlas_handoff_blends_without_mutating_inputs(self):
+        previous = np.zeros((3, 4, 3), dtype=np.uint8)
+        current = np.full((3, 4, 3), 255, dtype=np.uint8)
+        midpoint = visualizer._blend_atlas_handoff(previous, current, 0.5)
+        self.assertTrue(np.all(midpoint == 128))
+        np.testing.assert_array_equal(previous, 0)
+        np.testing.assert_array_equal(current, 255)
+
     def test_kfp_difference_matches_kalles_traditional_stencil(self):
-        field = np.arange(9, dtype=np.float32).reshape(3, 3)
+        field = np.asarray(
+            [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [20.0, 7.0, 8.0]],
+            dtype=np.float32,
+        )
         gradient = visualizer._kfp_difference_magnitude(field, 0, np)
-        expected = 6.0 + 4.0 * math.sqrt(2.0)
+        expected = 20.0 + 4.0 * math.sqrt(2.0)
         self.assertAlmostEqual(float(gradient[1, 1]), expected, places=12)
+
+    def test_kfp_de_plus_standard_uses_kalles_sqrt_distance(self):
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 255, 255)),
+            iter_div=11.0,
+            color_offset=256.0,
+            color_method=6,
+            smooth=False,
+            slopes=False,
+            differences=0,
+        )
+        field = np.asarray([[0.0, 5000.0, 20000.0]], dtype=np.float32)
+        sqrt_rgb = visualizer._colourise_kfp(
+            field, 100000, 0.0, 0.0, 0.0, 0.5, profile
+        )
+        linear_rgb = visualizer._colourise_kfp(
+            field,
+            100000,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            visualizer.KfpPalette(
+                stops=profile.stops,
+                iter_div=profile.iter_div,
+                color_offset=profile.color_offset,
+                color_method=5,
+                smooth=False,
+                slopes=False,
+                differences=profile.differences,
+            ),
+        )
+        # The left sample sees a non-zero traditional distance.  Kalles'
+        # square root keeps DEPlusStandard below IterDiv here, while
+        # DistanceLinear retains the unrooted distance, so the two colours
+        # must differ.
+        self.assertGreater(int(linear_rgb[0, 0, 0]), int(sqrt_rgb[0, 0, 0]))
 
     def test_native_kfp_colouriser_matches_portable_boundary_stencils(self):
         library = visualizer._get_native_library()
@@ -540,6 +623,87 @@ class AnimationTests(unittest.TestCase):
             visualizer.KALLES_DEFAULT_KFP,
             library,
             2,
+        )
+        difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 1)
+
+        # Exercise a non-default imported transfer as well; this protects the
+        # native DEPlusStandard square-root path from drifting away from the
+        # portable Kalles reference.
+        de_profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 255, 255)),
+            iter_div=1000.0,
+            color_offset=128.0,
+            color_method=6,
+            smooth=False,
+            slopes=True,
+            slope_power=30.0,
+            slope_ratio=20.0,
+            differences=0,
+        )
+        portable = visualizer._colourise_kfp(
+            field, 200, 0.0, 0.0, 0.0, 0.5, de_profile
+        )
+        native = visualizer._colourise_kfp_native(
+            field,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            de_profile,
+            library,
+            2,
+        )
+        difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 1)
+
+    def test_native_kfp_atlas_colouriser_matches_portable_compositor(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_atlas_colourise_kfp"):
+            raise unittest.SkipTest("native KFP atlas colouriser is unavailable")
+        rng = np.random.default_rng(901)
+        parent = rng.uniform(0.0, 180.0, size=(24, 32)).astype(np.float32)
+        child = rng.uniform(0.0, 180.0, size=(12, 16)).astype(np.float32)
+        parent[0, 0] = 200.0
+        child[3, 4] = 200.0
+        portable = visualizer._atlas_colour_frame(
+            parent,
+            child,
+            32,
+            24,
+            1.0,
+            0.5,
+            200,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            2,
+            "bilinear",
+            "aurora",
+            0.5,
+            Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp",
+        )
+        native = visualizer._atlas_colour_frame(
+            parent,
+            child,
+            32,
+            24,
+            1.0,
+            0.5,
+            200,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            library,
+            2,
+            "bilinear",
+            "aurora",
+            0.5,
+            Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp",
         )
         difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
         self.assertLessEqual(int(np.max(difference)), 1)
@@ -1062,6 +1226,16 @@ class AnimationTests(unittest.TestCase):
         )
         self.assertGreater(np.unique(rgb.reshape(-1, 3), axis=0).shape[0], 4)
         self.assertTrue(np.isfinite(rgb).all())
+
+        # KFP owns its colours. Audio pitch/loudness controls must not turn
+        # Kalles' imported default gradient into a different palette.
+        baseline = visualizer._colourise_kfp(
+            field, 200, 0.0, 0.0, 0.0, 0.5, profile
+        )
+        varied = visualizer._colourise_kfp(
+            field, 200, 1.7, 1.0, 0.9, 0.0, profile
+        )
+        np.testing.assert_array_equal(varied, baseline)
 
     def test_ordinary_palettes_keep_aurora_detail_beyond_iteration_cap(self):
         field = np.asarray([[10.0, 11.0, 1000.0, 1001.0]], dtype=np.float32)
