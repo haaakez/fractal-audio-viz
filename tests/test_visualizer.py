@@ -213,7 +213,7 @@ class AnimationTests(unittest.TestCase):
         point = visualizer.FORMULA_POINT_CATALOGUES["burning-ship"][0]
         field = visualizer.render_fractal(
             5,
-            4,
+            5,
             150.0,
             point.x,
             point.y,
@@ -221,10 +221,13 @@ class AnimationTests(unittest.TestCase):
             "python",
             formula="burning-ship",
         )
-        # An independent high-precision orbit stays bounded for this whole
-        # tiny viewport.  Before the axis-crossing fix, the first pixel was
-        # incorrectly reported as escaped around iteration 835.
-        np.testing.assert_array_equal(field, np.full((4, 5), 1000.0, dtype=np.float32))
+        # The exported target is a repelling boundary cycle.  Stabilizing the
+        # reference keeps the exact centre bounded while nearby pixels still
+        # escape; carrying an incorrect absolute-value sign into the
+        # perturbation path used to turn this whole sample into one flat cap.
+        self.assertEqual(float(field[2, 2]), 1000.0)
+        self.assertLess(float(np.min(field)), 400.0)
+        self.assertGreater(float(np.ptp(field)), 500.0)
 
     def test_exact_minus_two_boundary_margin_is_preserved(self):
         for formula in ("burning-ship", "tricorn"):
@@ -249,7 +252,7 @@ class AnimationTests(unittest.TestCase):
         ]
         field = visualizer.render_fractal(
             5,
-            4,
+            5,
             150.0,
             point.x,
             point.y,
@@ -258,8 +261,12 @@ class AnimationTests(unittest.TestCase):
             formula="tricorn",
         )
         self.assertTrue(np.isfinite(field).all())
+        # The exact odd-sized centre is the stabilized boundary target. Its
+        # neighbours must still escape, proving that the cycle repair did not
+        # flatten the whole Tricorn viewport into one interior block.
+        self.assertEqual(float(field[2, 2]), 1000.0)
         self.assertGreater(float(np.ptp(field)), 10.0)
-        self.assertLess(float(np.max(field)), 1000.0)
+        self.assertLess(float(np.min(field)), 900.0)
 
     def test_julia_e150_fixed_point_reference_is_stabilized(self):
         for point in visualizer.JULIA_POINTS:
@@ -472,6 +479,35 @@ class AnimationTests(unittest.TestCase):
                 imported,
                 np.asarray([[0, 0, 0], [128, 128, 128], [255, 255, 255]], dtype=np.uint8),
             )
+            profile = visualizer._kfp_profile_for_selection("aurora", path)
+            self.assertIsNotNone(profile)
+            assert profile is not None
+            self.assertEqual(profile.interior_color, (0, 0, 0))
+
+            extended = Path(directory) / "extended.kfp"
+            extended.write_text(
+                "Colors: 0,0,0,255,255,255,\n"
+                "InteriorColor: 1,2,3,\n"
+                "ColorMethod: 11\nFlat: 1\nInverseTransition: 1\n",
+                encoding="utf-8",
+            )
+            extended_profile = visualizer._kfp_profile_for_selection(
+                "aurora", extended
+            )
+            self.assertIsNotNone(extended_profile)
+            assert extended_profile is not None
+            self.assertEqual(extended_profile.color_method, 11)
+            self.assertTrue(extended_profile.flat)
+            self.assertTrue(extended_profile.inverse_transition)
+            self.assertEqual(extended_profile.interior_color, (1, 2, 3))
+
+    def test_kfp_palette_lut_wraps_from_last_stop_to_first(self):
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 255, 255)),
+        )
+        lut = visualizer._kfp_palette_lut(profile, 16)
+        self.assertEqual(tuple(lut[0]), (0, 0, 0))
+        self.assertLess(int(lut[-1, 0]), 255)
 
     def test_public_limits_reject_aliases_and_unbounded_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -837,6 +873,79 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(int(result[0, 0, 0]), 10)
         self.assertEqual(int(result[16, 16, 0]), 20)
 
+    def test_atlas_compositor_normalizes_parent_and_child_interior_caps(self):
+        """A deeper child cap must not turn the parent interior into a rectangle."""
+
+        parent = np.full((8, 8), 100.0, dtype=np.float32)
+        child = np.full((8, 8), 200.0, dtype=np.float32)
+        original = visualizer._colourise_view
+
+        def fake_colour(view, max_iter, *args):
+            result = np.full((*view.shape, 3), 31, dtype=np.uint8)
+            result[view >= float(max_iter) - 0.5] = 0
+            return result
+
+        visualizer._colourise_view = fake_colour
+        try:
+            result = visualizer._atlas_colour_frame(
+                parent,
+                child,
+                64,
+                64,
+                1.0,
+                0.5,
+                100,
+                200,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                1,
+                "bilinear",
+                "aurora",
+                0.5,
+            )
+        finally:
+            visualizer._colourise_view = original
+        np.testing.assert_array_equal(result, np.zeros((64, 64, 3), dtype=np.uint8))
+
+    def test_atlas_compositor_prefers_deeper_child_interior(self):
+        """A child cap must win when the coarse parent escaped the same pixel."""
+
+        parent = np.full((8, 8), 10.0, dtype=np.float32)
+        child = np.full((8, 8), 200.0, dtype=np.float32)
+        original = visualizer._colourise_view
+
+        def fake_colour(view, max_iter, *args):
+            result = np.full((*view.shape, 3), 31, dtype=np.uint8)
+            result[view >= float(max_iter) - 0.5] = 0
+            return result
+
+        visualizer._colourise_view = fake_colour
+        try:
+            result = visualizer._atlas_colour_frame(
+                parent,
+                child,
+                64,
+                64,
+                1.0,
+                0.5,
+                100,
+                200,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                1,
+                "bilinear",
+                "aurora",
+                0.5,
+            )
+        finally:
+            visualizer._colourise_view = original
+        self.assertEqual(tuple(result[32, 32]), (0, 0, 0))
+        self.assertEqual(tuple(result[0, 0]), (31, 31, 31))
+
     def test_custom_palettes_are_cached_and_finite(self):
         field = np.linspace(0.0, 100.0, 64 * 64, dtype=np.float32).reshape(64, 64)
         for name in ("fire", "ocean", "neon", "sunset", "mono", "kalles-default"):
@@ -845,6 +954,38 @@ class AnimationTests(unittest.TestCase):
             self.assertEqual(rgb.dtype, np.uint8)
             self.assertTrue(np.isfinite(rgb).all())
         self.assertIs(visualizer._custom_palette("fire"), visualizer._custom_palette("fire"))
+
+    def test_kfp_profile_preserves_transfer_and_slope_settings(self):
+        bundled = Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp"
+        profile = visualizer._kfp_profile_for_selection("aurora", bundled)
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertAlmostEqual(profile.iter_div, 0.01)
+        self.assertEqual(profile.color_method, 7)
+        self.assertTrue(profile.slopes)
+        self.assertEqual(profile.differences, 3)
+
+        field = visualizer.render_fractal(
+            24,
+            18,
+            0.0,
+            "-1.0",
+            "0.1",
+            200,
+            "python",
+            formula="tricorn",
+        )
+        rgb = visualizer._colourise_custom(
+            field, 200, 0.0, 0.5, 0.5, "aurora", palette_file=bundled
+        )
+        self.assertGreater(np.unique(rgb.reshape(-1, 3), axis=0).shape[0], 4)
+        self.assertTrue(np.isfinite(rgb).all())
+
+    def test_ordinary_palettes_keep_aurora_detail_beyond_iteration_cap(self):
+        field = np.asarray([[10.0, 11.0, 1000.0, 1001.0]], dtype=np.float32)
+        rgb = visualizer._colourise_custom(field, 2000, 0.0, 0.8, 0.5, "fire")
+        self.assertFalse(np.array_equal(rgb[0, 0], rgb[0, 2]))
+        self.assertGreater(np.unique(rgb.reshape(-1, 3), axis=0).shape[0], 2)
 
     def test_non_aurora_palettes_reach_high_contrast_anchors(self):
         luminance_weights = np.asarray([0.2126, 0.7152, 0.0722])
@@ -929,6 +1070,40 @@ class AnimationTests(unittest.TestCase):
         view = visualizer._crop_and_resize(field, 32, 32, 2.0, "bilinear")
         self.assertEqual(view.shape, (32, 32))
         self.assertTrue(np.isfinite(view).all())
+
+    def test_crop_resampling_preserves_partial_interior_coverage(self):
+        field = np.asarray(
+            [[100.0, 0.0], [0.0, 0.0]],
+            dtype=np.float32,
+        )
+        view, inside = visualizer._crop_and_resize_preserving_interior(
+            field,
+            2,
+            2,
+            1.0,
+            100,
+            "bilinear",
+        )
+        self.assertTrue(inside[0, 0])
+        self.assertEqual(float(view[0, 0]), 100.0)
+        self.assertFalse(inside[1, 1])
+
+    def test_crop_resampling_does_not_leak_subhalf_interior_into_exterior(self):
+        field = np.asarray(
+            [[100.0, 10.0], [10.0, 10.0]],
+            dtype=np.float32,
+        )
+        view, inside = visualizer._crop_and_resize_preserving_interior(
+            field,
+            8,
+            8,
+            1.0,
+            100,
+            "lanczos",
+        )
+        exterior = view[~inside]
+        self.assertTrue(exterior.size > 0)
+        self.assertLessEqual(float(np.max(exterior)), 20.0)
 
     def test_scaled_exponential_radius_preserves_e4000(self):
         mantissa, exponent = visualizer._scaled_log10_radius(-4000.0)

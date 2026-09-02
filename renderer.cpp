@@ -819,9 +819,6 @@ struct BilinearWorkspace {
     BilinearAxis parent_y_axis;
     BilinearAxis child_x_axis;
     BilinearAxis child_y_axis;
-    std::vector<int> crop_x0;
-    std::vector<int> crop_x1;
-    std::vector<double> crop_x_fraction;
     std::vector<float> child_edge_x;
     std::vector<float> child_edge_y;
 };
@@ -849,6 +846,65 @@ inline float sample_bilinear_mapped(
     const float bottom_value = bottom[x_index] * (1.0F - x_weight)
         + bottom[x_next] * x_weight;
     return top_value * (1.0F - y_weight) + bottom_value * y_weight;
+}
+
+// An iteration cap is an interior sentinel, not a colourable scalar.  A
+// normal bilinear average can turn one interior corner and three escaping
+// corners into an ordinary-looking iteration count, which leaks the tile
+// boundary into the final image.  Keep a conservative coverage mask beside
+// the interpolation and only average exterior samples.
+inline float sample_bilinear_mapped_preserving_interior(
+    const float* source,
+    int source_width,
+    const BilinearAxis& x_axis,
+    const BilinearAxis& y_axis,
+    int x,
+    int y,
+    int source_max_iter,
+    bool& inside
+) {
+    const int x_index = x_axis.index0[static_cast<size_t>(x)];
+    const int x_next = x_axis.index1[static_cast<size_t>(x)];
+    const double x_weight = static_cast<double>(
+        x_axis.weight[static_cast<size_t>(x)]);
+    const int y_index = y_axis.index0[static_cast<size_t>(y)];
+    const int y_next = y_axis.index1[static_cast<size_t>(y)];
+    const double y_weight = static_cast<double>(
+        y_axis.weight[static_cast<size_t>(y)]);
+    const float* top = source + static_cast<size_t>(y_index) * source_width;
+    const float* bottom = source + static_cast<size_t>(y_next) * source_width;
+    const float values[4] = {
+        top[x_index],
+        top[x_next],
+        bottom[x_index],
+        bottom[x_next],
+    };
+    const double weights[4] = {
+        (1.0 - y_weight) * (1.0 - x_weight),
+        (1.0 - y_weight) * x_weight,
+        y_weight * (1.0 - x_weight),
+        y_weight * x_weight,
+    };
+    double interior_weight = 0.0;
+    double exterior_weight = 0.0;
+    double exterior_value = 0.0;
+    for (int index = 0; index < 4; ++index) {
+        const float value = values[index];
+        const double weight = weights[index];
+        if (!std::isfinite(value)
+            || value >= static_cast<float>(source_max_iter) - 0.5F) {
+            interior_weight += weight;
+        } else {
+            exterior_weight += weight;
+            exterior_value += static_cast<double>(value) * weight;
+        }
+    }
+    if (interior_weight >= 0.5 || exterior_weight <= 1.0e-12) {
+        inside = true;
+        return static_cast<float>(source_max_iter);
+    }
+    inside = false;
+    return static_cast<float>(exterior_value / exterior_weight);
 }
 
 inline void write_colour_pixel(
@@ -3791,70 +3847,36 @@ int fractal_crop_colourise(
             throw std::runtime_error("invalid native crop/colour dimensions or palette");
         }
         zoom_factor = std::max(zoom_factor, 1.0);
-        const double inverse_zoom = 1.0 / zoom_factor;
-        const double crop_width = static_cast<double>(source_width) * inverse_zoom;
-        const double crop_height = static_cast<double>(source_height) * inverse_zoom;
-        const double left = (static_cast<double>(source_width) - crop_width) * 0.5;
-        const double top = (static_cast<double>(source_height) - crop_height) * 0.5;
         const AuroraPalette& palette = aurora_palette_for(
             max_iter, phase, vocal, instrumental, pitch);
         const int palette_size = static_cast<int>(palette.rgb.size());
         const float index_scale = static_cast<float>(palette_size - 1)
             / static_cast<float>(max_iter);
-        // The horizontal crop mapping is identical for every output row.
-        // Compute the floor/clamp work once instead of repeating it for every
-        // pixel in the inner loop.
         BilinearWorkspace& workspace = bilinear_workspace;
-        std::vector<int>& x0_map = workspace.crop_x0;
-        std::vector<int>& x1_map = workspace.crop_x1;
-        std::vector<double>& x_fraction_map = workspace.crop_x_fraction;
-        x0_map.resize(static_cast<size_t>(output_width));
-        x1_map.resize(static_cast<size_t>(output_width));
-        x_fraction_map.resize(static_cast<size_t>(output_width));
-        for (int output_x = 0; output_x < output_width; ++output_x) {
-            double source_x = left
-                + (static_cast<double>(output_x) + 0.5) * crop_width
-                    / static_cast<double>(output_width)
-                - 0.5;
-            source_x = std::clamp(source_x, 0.0, static_cast<double>(source_width - 1));
-            const int x0 = static_cast<int>(std::floor(source_x));
-            x0_map[static_cast<size_t>(output_x)] = x0;
-            x1_map[static_cast<size_t>(output_x)] = std::min(x0 + 1, source_width - 1);
-            x_fraction_map[static_cast<size_t>(output_x)] = source_x - static_cast<double>(x0);
-        }
+        BilinearAxis& x_axis = workspace.parent_x_axis;
+        BilinearAxis& y_axis = workspace.parent_y_axis;
+        fill_bilinear_axis(x_axis, source_width, output_width, zoom_factor);
+        fill_bilinear_axis(y_axis, source_height, output_height, zoom_factor);
 
 #ifdef _OPENMP
         if (threads > 0) omp_set_num_threads(threads);
 #pragma omp parallel for schedule(static)
 #endif
         for (int output_y = 0; output_y < output_height; ++output_y) {
-            double source_y = top
-                + (static_cast<double>(output_y) + 0.5) * crop_height
-                    / static_cast<double>(output_height)
-                - 0.5;
-            source_y = std::clamp(source_y, 0.0, static_cast<double>(source_height - 1));
-            const int y0 = static_cast<int>(std::floor(source_y));
-            const int y1 = std::min(y0 + 1, source_height - 1);
-            const double y_fraction = source_y - static_cast<double>(y0);
-            const float* top_row = source + static_cast<size_t>(y0) * source_width;
-            const float* bottom_row = source + static_cast<size_t>(y1) * source_width;
             for (int output_x = 0; output_x < output_width; ++output_x) {
-                const size_t x_index = static_cast<size_t>(output_x);
-                const int x0 = x0_map[x_index];
-                const int x1 = x1_map[x_index];
-                const double x_fraction = x_fraction_map[x_index];
-                const double top_value =
-                    static_cast<double>(top_row[x0]) * (1.0 - x_fraction)
-                    + static_cast<double>(top_row[x1]) * x_fraction;
-                const double bottom_value =
-                    static_cast<double>(bottom_row[x0]) * (1.0 - x_fraction)
-                    + static_cast<double>(bottom_row[x1]) * x_fraction;
-                const float smooth = static_cast<float>(
-                    top_value * (1.0 - y_fraction) + bottom_value * y_fraction);
+                bool inside = false;
+                const float smooth = sample_bilinear_mapped_preserving_interior(
+                    source,
+                    source_width,
+                    x_axis,
+                    y_axis,
+                    output_x,
+                    output_y,
+                    max_iter,
+                    inside);
                 std::uint8_t* rgb = output + static_cast<size_t>(
                     output_y * output_width + output_x) * 3U;
-                if (!std::isfinite(smooth)
-                    || smooth >= static_cast<float>(max_iter) - 0.5F) {
+                if (inside) {
                     rgb[0] = 0;
                     rgb[1] = 0;
                     rgb[2] = 0;
@@ -3986,18 +4008,23 @@ int fractal_atlas_colourise(
 
         auto render_parent_span = [&](int output_y, int begin_x, int end_x) {
             for (int output_x = begin_x; output_x < end_x; ++output_x) {
-                const float smooth = sample_bilinear_mapped(
+                bool parent_inside = false;
+                const float smooth = sample_bilinear_mapped_preserving_interior(
                     parent,
                     parent_width,
                     parent_x_axis,
                     parent_y_axis,
                     output_x,
-                    output_y);
+                    output_y,
+                    parent_max_iter,
+                    parent_inside);
                 std::uint8_t* destination = output + static_cast<size_t>(
                     output_y * output_width + output_x) * 3U;
                 write_colour_pixel(
-                    smooth,
-                    parent_max_iter,
+                    parent_inside
+                        ? static_cast<float>(effective_palette_iter)
+                        : smooth,
+                    effective_palette_iter,
                     palette,
                     palette_index_scale,
                     destination);
@@ -4011,18 +4038,23 @@ int fractal_atlas_colourise(
         for (int output_y = 0; output_y < output_height; ++output_y) {
             if (full_child) {
                 for (int output_x = 0; output_x < output_width; ++output_x) {
-                    const float smooth = sample_bilinear_mapped(
+                    bool child_inside = false;
+                    const float smooth = sample_bilinear_mapped_preserving_interior(
                         child,
                         child_width,
                         child_x_axis,
                         child_y_axis,
                         output_x,
-                        output_y);
+                        output_y,
+                        child_max_iter,
+                        child_inside);
                     std::uint8_t* destination = output + static_cast<size_t>(
                         output_y * output_width + output_x) * 3U;
                     write_colour_pixel(
-                        smooth,
-                        child_max_iter,
+                        child_inside
+                            ? static_cast<float>(effective_palette_iter)
+                            : smooth,
+                        effective_palette_iter,
                         palette,
                         palette_index_scale,
                         destination);
@@ -4040,13 +4072,16 @@ int fractal_atlas_colourise(
             for (int output_x = child_left; output_x < child_right; ++output_x) {
                 const int child_x = output_x - child_left;
                 const int child_y = output_y - child_top;
-                const float child_smooth = sample_bilinear_mapped(
+                bool child_inside = false;
+                const float child_smooth = sample_bilinear_mapped_preserving_interior(
                     child,
                     child_width,
                     child_x_axis,
                     child_y_axis,
                     child_x,
-                    child_y);
+                    child_y,
+                    child_max_iter,
+                    child_inside);
                 const float alpha = feather >= 2
                     ? std::min(
                         child_edge_x[static_cast<size_t>(child_x)],
@@ -4054,57 +4089,39 @@ int fractal_atlas_colourise(
                     : 1.0F;
                 std::uint8_t* destination = output + static_cast<size_t>(
                     output_y * output_width + output_x) * 3U;
-                const bool child_inside = !std::isfinite(child_smooth)
-                    || child_smooth >= static_cast<float>(child_max_iter) - 0.5F;
                 // Away from the feather band the child completely replaces
-                // the parent.  Avoid sampling the parent for those pixels;
-                // only an interior child still needs the parent as a
-                // fallback for a mismatched escape classification.
+                // the parent.  Avoid sampling the parent for those pixels:
+                // the deeper child is authoritative for both escape and
+                // interior classification in its visible region.
                 if (alpha >= 0.999999F) {
-                    if (!child_inside) {
-                        write_colour_pixel(
-                            child_smooth,
-                            effective_palette_iter,
-                            palette,
-                            palette_index_scale,
-                            destination);
-                        continue;
-                    }
-                    const float parent_smooth = sample_bilinear_mapped(
-                        parent,
-                        parent_width,
-                        parent_x_axis,
-                        parent_y_axis,
-                        output_x,
-                        output_y);
-                    const bool parent_inside = !std::isfinite(parent_smooth)
-                        || parent_smooth >= static_cast<float>(parent_max_iter) - 0.5F;
                     write_colour_pixel(
-                        parent_inside
+                        child_inside
                             ? static_cast<float>(effective_palette_iter)
-                            : parent_smooth,
+                            : child_smooth,
                         effective_palette_iter,
                         palette,
                         palette_index_scale,
                         destination);
                     continue;
                 }
-                const float parent_smooth = sample_bilinear_mapped(
+                bool parent_inside = false;
+                const float parent_smooth = sample_bilinear_mapped_preserving_interior(
                     parent,
                     parent_width,
                     parent_x_axis,
                     parent_y_axis,
                     output_x,
-                    output_y);
-                const bool parent_inside = !std::isfinite(parent_smooth)
-                    || parent_smooth >= static_cast<float>(parent_max_iter) - 0.5F;
-                const float blended_smooth = parent_inside && child_inside
+                    output_y,
+                    parent_max_iter,
+                    parent_inside);
+                // The deeper child is authoritative inside its visible
+                // rectangle. Falling back to an escaped parent value when
+                // only the child is interior creates a hard rectangular fill.
+                const float blended_smooth = child_inside
                     ? static_cast<float>(effective_palette_iter)
                     : parent_inside
                         ? child_smooth
-                        : child_inside
-                            ? parent_smooth
-                            : parent_smooth * (1.0F - alpha) + child_smooth * alpha;
+                        : parent_smooth * (1.0F - alpha) + child_smooth * alpha;
                 // Blend the scalar iteration field before colourisation. RGB
                 // blending mixed two independently indexed hues and produced
                 // a visible seam whenever adjacent tiles had different

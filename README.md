@@ -43,10 +43,12 @@ the render is split into five stages.
    fallback for deep boundary targets.
 
 5. **colour and encoding.** keyframes store scalar iteration data. the native
-   colour path or Pillow turns that data into RGB after cropping. Built-in or
-   user-supplied palettes, optional glow, and motion blur are applied at this
-   stage, and FFmpeg writes the video with the original audio. `--codec auto`
-   probes available hardware encoders and falls back to `libx264`.
+   colour path or Pillow turns that data into RGB after cropping. ordinary
+   palettes reuse Aurora's detail-preserving waves with their own RGB accents;
+   `.kfp` files keep Kalles' cyclic transfer, distance, multi-colour, and slope
+   settings. optional glow and motion blur are applied at this stage, and
+   FFmpeg writes the video with the original audio. `--codec auto` probes
+   available hardware encoders and falls back to `libx264`.
 
 the output dimensions are controlled by `--width` and `--height`. The fractal
 source can be smaller or larger than the output: `--render-scale` multiplies
@@ -392,8 +394,8 @@ unless noted otherwise, the values in parentheses are the defaults.
 | `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox where applicable, then falls back to `libx264`. |
 | `--crf N` (`18`) | Quality value from `0` to `51`. It is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
 | `--resample MODE` (`bilinear`) | Crop filter: `bilinear` is faster; `lanczos` gives a smoother, slower resize. |
-| `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, `mono`, or `kalles-default`. The last one matches the bundled Kalles Fraktaler stops in `palettes/kalles-default.kfp`. |
-| `--palette-file PATH` | Read at least two `#rrggbb` or `r g b` stops from a text file, or import the `Colors:` field from a Kalles `.kfp` file, and interpolate them. This selects the Python colour path. |
+| `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, `mono`, or `kalles-default`. The last one matches the bundled Kalles Fraktaler profile in `palettes/kalles-default.kfp`. |
+| `--palette-file PATH` | Read at least two `#rrggbb` or `r g b` stops from a text file, or import a Kalles `.kfp` gradient and its colour settings. ordinary text palettes use the fast Aurora wave path; `.kfp` uses the Kalles-style transfer path. |
 | `--glow N` (`0`) | Add a low-resolution bloom pass after colourisation, from `0` to `1`. It is off by default for the 10-minute target. |
 | `--motion-blur N` (`0`) | Blend the current frame with the previous one, from `0` to below `1`. It is off by default. |
 | `--encoder-threads N` (`0`) | FFmpeg encoder thread hint. `0` lets FFmpeg choose; a smaller value leaves more CPU for fractal rendering. Hardware encoders may ignore or reinterpret it. |

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import shlex
 import signal
 import subprocess
@@ -41,6 +42,31 @@ VISUALIZER = ROOT / "visualizer.py"
 OUTPUT_QUEUE_LIMIT = 2048
 MAX_LOG_LINES = 20_000
 MAX_LOG_LINE_CHARS = 16_384
+
+_PROGRESS_PERCENT_RE = re.compile(r"(?<![\w.])(?P<percent>\d+(?:\.\d+)?)\s*%")
+_PROGRESS_FRAME_RE = re.compile(
+    r"\b(?:frame|frames)\s+(?P<current>\d+)\s*(?:/|of)\s*(?P<total>\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _progress_from_output_line(line: str) -> tuple[float | None, str | None]:
+    """Extract a determinate renderer progress value from one log line."""
+
+    text = line.strip()
+    percent_match = _PROGRESS_PERCENT_RE.search(text)
+    if percent_match is not None:
+        percent = float(percent_match.group("percent"))
+        if percent <= 100.0:
+            return max(0.0, percent / 100.0), f"{percent:.1f}%"
+    frame_match = _PROGRESS_FRAME_RE.search(text)
+    if frame_match is not None:
+        current = int(frame_match.group("current"))
+        total = int(frame_match.group("total"))
+        if total > 0:
+            fraction = min(1.0, max(0.0, current / total))
+            return fraction, f"Frame {current:,} / {total:,} ({fraction * 100.0:.1f}%)"
+    return None, None
 
 
 def _read_bounded_line(stream: object, limit: int) -> str | None:
@@ -75,6 +101,11 @@ if Gtk is not None:
             self.window.connect("delete-event", self._on_delete_event)
             self.process: subprocess.Popen[str] | None = None
             self.output_queue: queue.Queue[str] = queue.Queue(maxsize=OUTPUT_QUEUE_LIMIT)
+            self._log_follow_tail = True
+            self._log_scroll_pending = False
+            self._log_programmatic_scroll = False
+            self._progress_determinate = False
+            self._process_exit_code: int | None = None
 
             self._build_widgets()
             self.profile.connect("changed", self._profile_changed)
@@ -375,11 +406,19 @@ if Gtk is not None:
             self.log.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
             self.log.set_vexpand(True)
             self.log.set_size_request(-1, 240)
-            log_scroll = Gtk.ScrolledWindow()
-            log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-            log_scroll.set_min_content_height(240)
-            log_scroll.set_vexpand(True)
-            log_scroll.add(self.log)
+            self.log_scroll = Gtk.ScrolledWindow()
+            self.log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            self.log_scroll.set_min_content_height(240)
+            self.log_scroll.set_vexpand(True)
+            self.log_scroll.add(self.log)
+            self.log_adjustment = self.log_scroll.get_vadjustment()
+            self.log_adjustment.connect("value-changed", self._log_adjustment_changed)
+
+            self.progress = Gtk.ProgressBar()
+            self.progress.set_hexpand(True)
+            self.progress.set_show_text(True)
+            self.progress.set_fraction(0.0)
+            self.progress.set_text("Ready")
 
             content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
             content.set_border_width(12)
@@ -388,8 +427,10 @@ if Gtk is not None:
             content.pack_start(self._frame("Audio and effects", effects_grid), False, False, 0)
             content.pack_start(self.technical_expander, False, False, 0)
             content.pack_start(buttons, False, False, 0)
+            content.pack_start(self._label("Progress"), False, False, 0)
+            content.pack_start(self.progress, False, False, 0)
             content.pack_start(self._label("Renderer output"), False, False, 0)
-            content.pack_start(log_scroll, True, True, 0)
+            content.pack_start(self.log_scroll, True, True, 0)
 
             scrolled = Gtk.ScrolledWindow()
             scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -441,6 +482,61 @@ if Gtk is not None:
         def _reset_scroll_position(self) -> bool:
             self.scroll_adjustment.set_value(self.scroll_adjustment.get_lower())
             return False
+
+        def _log_at_bottom(self) -> bool:
+            upper = self.log_adjustment.get_upper()
+            page_size = self.log_adjustment.get_page_size()
+            value = self.log_adjustment.get_value()
+            remaining = upper - page_size - value
+            return remaining <= max(2.0, self.log_adjustment.get_step_increment())
+
+        def _log_adjustment_changed(self, _adjustment: Gtk.Adjustment) -> None:
+            if not self._log_programmatic_scroll:
+                self._log_follow_tail = self._log_at_bottom()
+
+        def _schedule_log_tail(self) -> None:
+            if self._log_scroll_pending:
+                return
+            self._log_scroll_pending = True
+            GLib.idle_add(self._scroll_log_to_tail)
+
+        def _scroll_log_to_tail(self) -> bool:
+            self._log_scroll_pending = False
+            if not self._log_follow_tail:
+                return False
+            self._log_programmatic_scroll = True
+            try:
+                end = self.log_buffer.get_end_iter()
+                self.log.scroll_to_iter(end, 0.0, False, 0.0, 1.0)
+                lower = self.log_adjustment.get_lower()
+                upper = self.log_adjustment.get_upper()
+                page_size = self.log_adjustment.get_page_size()
+                target = max(lower, upper - page_size)
+                self.log_adjustment.set_value(target)
+            finally:
+                self._log_programmatic_scroll = False
+            return False
+
+        def _set_progress(self, fraction: float | None, text: str) -> None:
+            if fraction is None:
+                self._progress_determinate = False
+                self.progress.set_fraction(0.0)
+                self.progress.set_text(text)
+                self.progress.pulse()
+                return
+            self._progress_determinate = True
+            fraction = min(1.0, max(0.0, float(fraction)))
+            self.progress.set_fraction(fraction)
+            self.progress.set_text(text)
+
+        def _update_progress_from_output(self, text: str) -> bool:
+            found = False
+            for line in text.splitlines():
+                fraction, label = _progress_from_output_line(line)
+                if fraction is not None and label is not None:
+                    self._set_progress(fraction, label)
+                    found = True
+            return found
 
         def _choose_path(
             self,
@@ -698,6 +794,7 @@ if Gtk is not None:
                 return
             try:
                 command = self._command(estimate=estimate)
+                self._process_exit_code = None
                 self.process = subprocess.Popen(
                     command,
                     cwd=ROOT,
@@ -710,6 +807,7 @@ if Gtk is not None:
             except (OSError, ValueError) as error:
                 self._show_error("Could not start renderer", str(error))
                 return
+            self._set_progress(None, "Estimating…" if estimate else "Starting…")
             self._set_running(True)
             prefix = "Estimate command: " if estimate else "Command: "
             self._append(prefix + shlex.join(command) + "\n")
@@ -730,6 +828,7 @@ if Gtk is not None:
                     break
                 self._queue_output(line)
             code = process.wait()
+            self._process_exit_code = code
             self._queue_output(f"\nProcess exited with status {code}.\n")
             self._queue_output("__FRACTAL_PROCESS_DONE__")
 
@@ -765,21 +864,34 @@ if Gtk is not None:
             except queue.Empty:
                 pass
             if chunks:
-                self._append("".join(chunks))
+                output = "".join(chunks)
+                self._update_progress_from_output(output)
+                self._append(output)
+            if self.process is not None and not self._progress_determinate:
+                self.progress.pulse()
             if completed:
+                code = self._process_exit_code
+                if code == 0:
+                    self._set_progress(1.0, "Complete")
+                elif code is None:
+                    self._set_progress(None, "Finished without an exit status")
+                else:
+                    self._set_progress(0.0, f"Failed (status {code})")
                 self.process = None
                 self._set_running(False)
             return True
 
         def _append(self, text: str) -> None:
+            follow_tail = self._log_follow_tail or self._log_at_bottom()
             self.log_buffer.insert(self.log_buffer.get_end_iter(), text)
             line_count = self.log_buffer.get_line_count()
             if line_count > MAX_LOG_LINES:
                 start = self.log_buffer.get_start_iter()
                 trim_end = self.log_buffer.get_iter_at_line(line_count - MAX_LOG_LINES)
                 self.log_buffer.delete(start, trim_end)
-            end = self.log_buffer.get_end_iter()
-            self.log.scroll_to_iter(end, 0.0, False, 0.0, 1.0)
+            if follow_tail:
+                self._log_follow_tail = True
+                self._schedule_log_tail()
 
         def _set_running(self, running: bool) -> None:
             self.start_button.set_sensitive(not running)
@@ -788,6 +900,7 @@ if Gtk is not None:
 
         def _stop(self, _button: Gtk.Button | None = None) -> None:
             if self.process is not None and self.process.poll() is None:
+                self._set_progress(None, "Stopping…")
                 self._terminate_process(self.process)
                 self._append("Stopping renderer…\n")
 

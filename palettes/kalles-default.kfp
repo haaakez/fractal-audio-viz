@@ -1,7 +1,12 @@
+IterDiv: 0.010000
+SmoothMethod: 0
+ColorMethod: 7
+Differences: 3
 ColorOffset: 0
 Rotate: 0.000000
 Ratio: 360.000000
 Colors: 255,255,255,128,0,64,160,0,0,192,128,0,64,128,0,0,255,255,64,128,255,0,0,255
+InteriorColor: 0,0,0
 Smooth: 1
 MultiColor: 0
 BlendMC: 0

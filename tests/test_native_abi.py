@@ -605,6 +605,76 @@ class NativeRendererTests(unittest.TestCase):
         centre = tuple(output[centre_offset:centre_offset + 3])
         self.assertNotEqual(corner, centre)
 
+    def test_native_atlas_resampling_keeps_partial_interior_black(self):
+        """A cap mixed with exterior samples must not become a coloured tile."""
+
+        if not hasattr(self.library, "fractal_atlas_colourise"):
+            raise unittest.SkipTest("atlas ABI entry point is not available")
+        field_type = ctypes.c_float * 4
+        output_type = ctypes.c_uint8 * (2 * 2 * 3)
+        source = field_type(100.0, 10.0, 10.0, 10.0)
+        output = output_type()
+        status = self.library.fractal_atlas_colourise(
+            source,
+            2,
+            2,
+            100,
+            ctypes.POINTER(ctypes.c_float)(),
+            0,
+            0,
+            0,
+            output,
+            2,
+            2,
+            1.0,
+            0.0,
+            100,
+            0.0,
+            0.5,
+            0.5,
+            0.5,
+            1,
+        )
+        self.assertEqual(status, 0, self.library.fractal_last_error())
+        self.assertEqual(tuple(output[:3]), (0, 0, 0))
+        self.assertNotEqual(tuple(output[3:6]), (0, 0, 0))
+
+    def test_native_atlas_prefers_deeper_child_interior(self):
+        """A deeper child cap must not be replaced by an escaped parent."""
+
+        if not hasattr(self.library, "fractal_atlas_colourise"):
+            raise unittest.SkipTest("atlas ABI entry point is not available")
+        field_type = ctypes.c_float * 64
+        output_type = ctypes.c_uint8 * (8 * 8 * 3)
+        parent = field_type(*([10.0] * 64))
+        child = field_type(*([200.0] * 64))
+        output = output_type()
+        status = self.library.fractal_atlas_colourise(
+            parent,
+            8,
+            8,
+            100,
+            child,
+            8,
+            8,
+            200,
+            output,
+            8,
+            8,
+            1.0,
+            0.5,
+            200,
+            0.0,
+            0.5,
+            0.5,
+            0.5,
+            1,
+        )
+        self.assertEqual(status, 0, self.library.fractal_last_error())
+        centre = (8 * 4 + 4) * 3
+        self.assertEqual(tuple(output[centre:centre + 3]), (0, 0, 0))
+        self.assertNotEqual(tuple(output[:3]), (0, 0, 0))
+
     def test_optimized_atlas_parent_matches_crop_colour_path(self):
         """The mapped hot loop must preserve the previous crop semantics."""
 

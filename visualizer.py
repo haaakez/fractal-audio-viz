@@ -107,7 +107,7 @@ DEFAULT_Y_CENTER = (
 # renderer from silently reusing an old, under-resolved .npy keyframe.
 KEYFRAME_CACHE_SCHEMA = "raw-field-series-v11-safe-alternate"
 AUDIO_CACHE_SCHEMA = "audio-controls-v10-onset-sync"
-ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v11-safe-alternate"
+ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v12-normalized-interior"
 
 FORMULA_CHOICES = (
     "mandelbrot",
@@ -134,6 +134,86 @@ KALLES_DEFAULT_PALETTE_STOPS = (
     (64, 128, 255),
     (0, 0, 255),
 )
+
+
+@dataclass(frozen=True)
+class KfpPalette:
+    """Portable Kalles Fraktaler palette plus its colour-pipeline settings."""
+
+    stops: tuple[tuple[int, int, int], ...]
+    iter_div: float = 1.0
+    color_offset: float = 0.0
+    ratio: float = 360.0
+    color_method: int = 0
+    smooth_method: int = 0
+    smooth: bool = True
+    flat: bool = False
+    inverse_transition: bool = False
+    phase_color_strength: float = 0.0
+    multi_color: bool = False
+    blend_multi_color: bool = False
+    multi_colors: tuple[tuple[int, int, int], ...] = ()
+    power: float = 2.0
+    slopes: bool = False
+    slope_power: float = 50.0
+    slope_ratio: float = 20.0
+    slope_angle: float = 45.0
+    differences: int = 3
+    interior_color: tuple[int, int, int] = (0, 0, 0)
+
+
+# These are the settings written by Kalles Fraktaler's own default palette.
+# Keeping them with the imported key colours is important: a KFP is more than
+# a gradient, and its short iteration cycle plus slope pass is what produces
+# the characteristic layered, high-contrast deep-zoom appearance.
+KALLES_DEFAULT_KFP = KfpPalette(
+    stops=KALLES_DEFAULT_PALETTE_STOPS,
+    iter_div=0.01,
+    ratio=360.0,
+    color_method=7,
+    smooth_method=0,
+    smooth=True,
+    power=2.0,
+    slopes=True,
+    slope_power=50.0,
+    slope_ratio=20.0,
+    slope_angle=45.0,
+    differences=3,
+    interior_color=(0, 0, 0),
+)
+
+
+# Ordinary palettes intentionally reuse Aurora's three flowing waves.  These
+# are three real RGB accents, rather than one hue rotation applied to Aurora;
+# the waves are composited through all three accents so each palette retains a
+# distinct colour language while keeping the fast native colour path.
+BUILTIN_AURORA_ACCENTS = {
+    "fire": (
+        (255, 20, 0),
+        (255, 150, 0),
+        (255, 245, 170),
+    ),
+    "ocean": (
+        (0, 55, 255),
+        (0, 220, 255),
+        (160, 255, 235),
+    ),
+    "neon": (
+        (255, 0, 160),
+        (85, 0, 255),
+        (0, 255, 170),
+    ),
+    "sunset": (
+        (255, 20, 115),
+        (255, 105, 0),
+        (255, 240, 75),
+    ),
+    "mono": (
+        (32, 32, 32),
+        (170, 170, 170),
+        (255, 255, 255),
+    ),
+}
 # Keep the non-liquid palettes punchy at their source instead of trying to
 # recover contrast after audio effects and integer quantisation.  The first
 # and last stops deliberately reach near-black and near-white so fractal
@@ -3242,6 +3322,94 @@ def _reference_orbit(
     return real, imag, margins
 
 
+def _stabilize_alternate_reference_cycle(
+    reference_real: Any,
+    reference_imag: Any,
+    reference_margin: Any,
+) -> Optional[int]:
+    """Hold a detected bounded cycle instead of amplifying decimal roundoff.
+
+    Alternate-formula catalogue targets are often repelling preperiodic
+    points.  A finite decimal export is mathematically close to the target,
+    but a repelling cycle amplifies its last few rounding digits until the
+    centre falsely escapes after a few thousand iterations.  Three matching
+    bounded cycles in the high-precision reference are enough evidence to
+    repeat that cycle; neighbouring pixel perturbations still decide which
+    side of the boundary they occupy.
+    """
+
+    np = _require_numpy()
+    real = np.asarray(reference_real)
+    imag = np.asarray(reference_imag)
+    margins = np.asarray(reference_margin)
+    if real.ndim != 1 or imag.shape != real.shape or margins.shape != real.shape:
+        raise ValueError("alternate reference arrays must have matching vectors")
+    finite = np.isfinite(real) & np.isfinite(imag)
+    finite_indices = np.flatnonzero(finite)
+    if finite_indices.size < 6:
+        return None
+    last_finite = int(finite_indices[-1])
+    scan_limit = min(last_finite, 1024)
+    tolerance = 1.0e-12
+    max_period = min(64, (scan_limit + 1) // 4)
+    for period in range(1, max_period + 1):
+        # Compare three complete cycles, beginning at the earliest candidate
+        # that leaves room for a preperiod and two independent repeats. This
+        # avoids treating one coincident pair in a chaotic transient as a
+        # proof that the reference is periodic.
+        for end in range(4 * period - 1, scan_limit + 1):
+            cycle_start = end - 3 * period + 1
+            previous = slice(cycle_start, cycle_start + period)
+            current = slice(cycle_start + period, cycle_start + 2 * period)
+            following = slice(cycle_start + 2 * period, cycle_start + 3 * period)
+            if not (
+                finite[previous].all()
+                and finite[current].all()
+                and finite[following].all()
+            ):
+                continue
+            cycle_real = real[previous]
+            cycle_imag = imag[previous]
+            current_real = real[current]
+            current_imag = imag[current]
+            following_real = real[following]
+            following_imag = imag[following]
+            radius_squared = cycle_real * cycle_real + cycle_imag * cycle_imag
+            if not np.isfinite(radius_squared).all() or float(np.max(radius_squared)) >= 4.0:
+                continue
+            difference = np.hypot(
+                current_real - cycle_real,
+                current_imag - cycle_imag,
+            )
+            following_difference = np.hypot(
+                following_real - current_real,
+                following_imag - current_imag,
+            )
+            scale = np.maximum(
+                1.0,
+                np.maximum(
+                    np.hypot(cycle_real, cycle_imag),
+                    np.maximum(
+                        np.hypot(current_real, current_imag),
+                        np.hypot(following_real, following_imag),
+                    ),
+                ),
+            )
+            if not (
+                np.all(difference <= tolerance * scale)
+                and np.all(following_difference <= tolerance * scale)
+            ):
+                continue
+            repeated_real = np.resize(cycle_real, real.size - cycle_start)
+            repeated_imag = np.resize(cycle_imag, imag.size - cycle_start)
+            repeated_margin = np.resize(margins[previous], margins.size - cycle_start)
+            real[cycle_start:] = repeated_real
+            imag[cycle_start:] = repeated_imag
+            margins[cycle_start:] = repeated_margin
+            return period
+    return None
+
+
 ALTERNATE_CYCLE_MAX_PERIOD = 4096
 ALTERNATE_CYCLE_TOLERANCE = 1.0e-13
 ALTERNATE_CYCLE_CONFIRMATIONS = 3
@@ -3639,6 +3807,11 @@ def _render_perturbed_alternate(
         formula,
         julia_constant,
         include_margins=True,
+    )
+    _stabilize_alternate_reference_cycle(
+        reference_real,
+        reference_imag,
+        reference_margin,
     )
     offset = x_offset.ravel() + 1j * y_offset.ravel()
     reference = np.full(reference_real.shape, np.inf + 0j, dtype=np.complex128)
@@ -4603,6 +4776,94 @@ def _crop_and_resize(
     return np.asarray(resized, dtype=np.float32)
 
 
+def _crop_and_resize_preserving_interior(
+    field: Any,
+    output_width: int,
+    output_height: int,
+    zoom_factor: float,
+    max_iter: int,
+    resample: str = "lanczos",
+) -> tuple[Any, Any]:
+    """Resize a scalar field without interpolating its interior sentinel.
+
+    Iteration fields use ``max_iter`` as a lossless interior marker.  Treating
+    that marker as an ordinary number lets a bilinear/bicubic kernel blend it
+    with an escaping neighbour; the resulting value looks like an escaped
+    sample and can expose a sharp rectangular tile boundary.  Resample a
+    separate coverage mask and keep a conservative half-covered sample as
+    interior.  The scalar value remains interpolated only where all of the
+    contributing coverage is exterior.
+    """
+
+    np = _require_numpy()
+    field_array = np.asarray(field)
+    if field_array.ndim != 2:
+        raise ValueError("interior-aware crop source must be two-dimensional")
+    max_iter = _validate_iteration_count(max_iter, "interior iteration cap")
+    source_inside = (
+        ~np.isfinite(field_array)
+        | (np.asarray(field_array, dtype=np.float64) >= float(max_iter) - 0.5)
+    )
+    if not np.any(source_inside):
+        return (
+            np.asarray(
+                _crop_and_resize(
+                    field_array,
+                    output_width,
+                    output_height,
+                    zoom_factor,
+                    resample,
+                ),
+                dtype=np.float32,
+            ).copy(),
+            np.zeros((output_height, output_width), dtype=bool),
+        )
+
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - checked by _crop_and_resize
+        raise RuntimeError("Pillow is required for high-resolution crop animation") from exc
+    source_height, source_width = field_array.shape
+    zoom_factor = max(float(zoom_factor), 1.0)
+    inverse_zoom = 1.0 / zoom_factor
+    crop_width = source_width * inverse_zoom
+    crop_height = source_height * inverse_zoom
+    left = (source_width - crop_width) * 0.5
+    top = (source_height - crop_height) * 0.5
+    # Resample exterior values and their coverage separately.  If the cap is
+    # left in the scalar source, even a sub-half interior contribution can be
+    # averaged into a high escaped count and reveal a rectangular tile edge.
+    # Dividing by exterior coverage makes every non-interior result a true
+    # average of exterior samples only, matching the native compositor.
+    exterior = np.where(source_inside, 0.0, np.asarray(field_array, dtype=np.float32))
+    exterior_coverage = np.asarray(~source_inside, dtype=np.float32)
+    resized_exterior = np.asarray(
+        _crop_and_resize(exterior, output_width, output_height, zoom_factor, resample),
+        dtype=np.float64,
+    )
+    resized_coverage = np.asarray(
+        _crop_and_resize(
+            exterior_coverage,
+            output_width,
+            output_height,
+            zoom_factor,
+            resample,
+        ),
+        dtype=np.float64,
+    )
+    resized_coverage = np.clip(resized_coverage, 0.0, 1.0)
+    interior_coverage = 1.0 - resized_coverage
+    inside = interior_coverage >= 0.5
+    valid_exterior = resized_coverage > 1.0e-6
+    resized = np.zeros(resized_coverage.shape, dtype=np.float64)
+    resized[valid_exterior] = (
+        resized_exterior[valid_exterior] / resized_coverage[valid_exterior]
+    )
+    resized[inside] = float(max_iter)
+    resized = np.asarray(np.nan_to_num(resized, nan=0.0, posinf=float(max_iter), neginf=0.0), dtype=np.float32)
+    return resized, inside
+
+
 def _zoom_chunks(zooms: Any, keyframe_factor: float) -> Any:
     """Partition an arbitrary zoom path into crop-safe keyframe ranges.
 
@@ -5004,16 +5265,15 @@ def _atlas_glitch_reference_field(
             raise ValueError("glitch recovery fallback must be a non-empty field")
     parent_fallback = None
     if fallback_array is not None:
-        parent_fallback = np.asarray(
-            _crop_and_resize(
-                fallback_array,
-                render_width,
-                render_height,
-                max(float(fallback_zoom_factor), 1.0),
-                "bilinear",
-            ),
-            dtype=np.float32,
+        parent_fallback, _ = _crop_and_resize_preserving_interior(
+            fallback_array,
+            render_width,
+            render_height,
+            max(float(fallback_zoom_factor), 1.0),
+            fallback_max_iter if fallback_max_iter is not None else max_iter,
+            "bilinear",
         )
+        parent_fallback = np.asarray(parent_fallback, dtype=np.float32)
         if fallback_max_iter is not None:
             parent_fallback = np.where(
                 parent_fallback >= float(fallback_max_iter) - 0.5,
@@ -5528,16 +5788,15 @@ def _atlas_local_reference_field(
         # A child atlas tile is one fixed zoom factor narrower than its
         # parent. Resample the parent's central crop once, lazily, only when
         # the deadline/recovery path is actually needed.
-        parent_fallback = np.asarray(
-            _crop_and_resize(
-                fallback_array,
-                render_width,
-                render_height,
-                max(float(fallback_zoom_factor), 1.0),
-                "bilinear",
-            ),
-            dtype=np.float32,
+        parent_fallback, _ = _crop_and_resize_preserving_interior(
+            fallback_array,
+            render_width,
+            render_height,
+            max(float(fallback_zoom_factor), 1.0),
+            fallback_max_iter if fallback_max_iter is not None else max_iter,
+            "bilinear",
         )
+        parent_fallback = np.asarray(parent_fallback, dtype=np.float32)
         if fallback_max_iter is not None:
             # Interior pixels in the parent are encoded at its iteration cap.
             # Translate that sentinel to the current tile's cap instead of
@@ -5911,36 +6170,55 @@ def _atlas_colour_frame(
         native_library is not None
         and hasattr(native_library, "fractal_atlas_colourise")
         and resample == "bilinear"
-        and palette_name == "aurora"
-        and palette_file is None
     ):
-        return _atlas_colourise_native(
-            parent,
-            child,
-            output_width,
-            output_height,
-            parent_zoom,
-            child_fraction,
-            parent_iter,
-            child_iter,
-            phase,
-            vocal,
-            instrumental,
-            native_threads,
-            native_library,
-            pitch,
-        )
-    parent_view = np.array(
-        _crop_and_resize(
-            parent,
-            output_width,
-            output_height,
-            max(float(parent_zoom), 1.0),
-            resample,
-        ),
-        dtype=np.float32,
-        copy=True,
+        if palette_name == "aurora" and palette_file is None:
+            return _atlas_colourise_native(
+                parent,
+                child,
+                output_width,
+                output_height,
+                parent_zoom,
+                child_fraction,
+                parent_iter,
+                child_iter,
+                phase,
+                vocal,
+                instrumental,
+                native_threads,
+                native_library,
+                pitch,
+            )
+        if _kfp_profile_for_selection(palette_name, palette_file) is None:
+            base = _atlas_colourise_native(
+                parent,
+                child,
+                output_width,
+                output_height,
+                parent_zoom,
+                child_fraction,
+                parent_iter,
+                child_iter,
+                phase,
+                vocal,
+                instrumental,
+                native_threads,
+                native_library,
+                0.5,
+            )
+            return _apply_aurora_accents(
+                base,
+                _aurora_accents_for_selection(palette_name, palette_file),
+                pitch,
+            )
+    parent_view, parent_inside_full = _crop_and_resize_preserving_interior(
+        parent,
+        output_width,
+        output_height,
+        max(float(parent_zoom), 1.0),
+        parent_iter,
+        resample,
     )
+    parent_view = np.asarray(parent_view, dtype=np.float32)
     if child is None or child_iter is None or child_fraction <= 0.0:
         return _colourise_view(
             parent_view,
@@ -5956,13 +6234,15 @@ def _atlas_colour_frame(
         )
     child_fraction = min(float(child_fraction), 1.0)
     if child_fraction >= 0.999999:
-        child_view = _crop_and_resize(
+        child_view, _ = _crop_and_resize_preserving_interior(
             child,
             output_width,
             output_height,
             1.0,
+            child_iter,
             resample,
         )
+        child_view = np.asarray(child_view, dtype=np.float32)
         return _colourise_view(
             child_view,
             child_iter,
@@ -5978,24 +6258,97 @@ def _atlas_colour_frame(
 
     child_width = max(1, int(round(output_width * child_fraction)))
     child_height = max(1, int(round(output_height * child_fraction)))
-    child_view = _crop_and_resize(
+    child_view, child_inside = _crop_and_resize_preserving_interior(
         child,
         child_width,
         child_height,
         1.0,
+        child_iter,
         resample,
     )
+    child_view = np.asarray(child_view, dtype=np.float32)
+    effective_iter = max(int(parent_iter), int(child_iter))
+    # Parent and child tiles have different iteration caps. Once the child is
+    # composited, colourise the complete frame against one cap; otherwise the
+    # old parent sentinel becomes an escaped value outside the child rectangle
+    # and draws a crisp square/black fill. Normalize every interior sample,
+    # including parent pixels outside the visible child, before that pass.
+    parent_inside_region = parent_inside_full
+    parent_view[parent_inside_full] = float(effective_iter)
+    child_view[child_inside] = float(effective_iter)
     left = (output_width - child_width) // 2
     top = (output_height - child_height) // 2
     right = left + child_width
     bottom = top + child_height
+    kfp_profile = _kfp_profile_for_selection(palette_name, palette_file)
+    if kfp_profile is not None:
+        # KFP slope shading is derived from spatial gradients. Computing that
+        # gradient after splicing a child into the parent manufactures a
+        # rectangle at the tile boundary, even when both scalar fields are
+        # mathematically aligned. Colourise each tile in its own coordinate
+        # system, then feather RGB values at the seam instead.
+        parent_rgb = _colourise_view(
+            parent_view,
+            effective_iter,
+            phase,
+            vocal,
+            instrumental,
+            native_library,
+            native_threads,
+            palette_name,
+            pitch,
+            palette_file,
+        )
+        child_rgb = _colourise_view(
+            child_view,
+            effective_iter,
+            phase,
+            vocal,
+            instrumental,
+            native_library,
+            native_threads,
+            palette_name,
+            pitch,
+            palette_file,
+        )
+        region_rgb = parent_rgb[top:bottom, left:right]
+        parent_inside = parent_inside_region[top:bottom, left:right]
+        feather = min(16, child_width // 8, child_height // 8)
+        if feather < 2:
+            small_child = np.where(
+                child_inside[..., None],
+                child_rgb,
+                np.where(parent_inside[..., None], child_rgb, region_rgb),
+            )
+            region_rgb[...] = small_child
+            return parent_rgb
+        yy, xx = np.ogrid[:child_height, :child_width]
+        edge_distance = np.minimum(
+            np.minimum(xx, yy),
+            np.minimum(child_width - 1 - xx, child_height - 1 - yy),
+        )
+        alpha = np.clip(edge_distance.astype(np.float32) / float(feather), 0.0, 1.0)
+        blended_rgb = (
+            region_rgb.astype(np.float32) * (1.0 - alpha[..., None])
+            + child_rgb.astype(np.float32) * alpha[..., None]
+        )
+        blended_rgb = np.where(
+            child_inside[..., None],
+            child_rgb,
+            np.where(parent_inside[..., None], child_rgb, blended_rgb),
+        )
+        region_rgb[...] = np.asarray(
+            np.clip(np.rint(blended_rgb), 0.0, 255.0),
+            dtype=np.uint8,
+        )
+        return parent_rgb
     region = parent_view[top:bottom, left:right]
     feather = min(16, child_width // 8, child_height // 8)
     if feather < 2:
         region[...] = child_view
         return _colourise_view(
             parent_view,
-            max(int(parent_iter), int(child_iter)),
+            effective_iter,
             phase,
             vocal,
             instrumental,
@@ -6012,20 +6365,18 @@ def _atlas_colour_frame(
         np.minimum(child_width - 1 - xx, child_height - 1 - yy),
     )
     alpha = np.clip(edge_distance.astype(np.float32) / float(feather), 0.0, 1.0)
-    parent_inside = ~np.isfinite(region) | (region >= float(parent_iter) - 0.5)
-    child_inside = ~np.isfinite(child_view) | (child_view >= float(child_iter) - 0.5)
+    parent_inside = parent_inside_region[top:bottom, left:right]
     blended = (
         region.astype(np.float32) * (1.0 - alpha)
         + child_view.astype(np.float32) * alpha
     )
     blended = np.where(parent_inside & ~child_inside, child_view, blended)
-    blended = np.where(child_inside & ~parent_inside, region, blended)
-    effective_iter = max(int(parent_iter), int(child_iter))
-    blended = np.where(
-        parent_inside & child_inside,
-        float(effective_iter),
-        blended,
-    )
+    # The deeper child has the authoritative classification in its visible
+    # region. In particular, an interior child must remain an interior pixel
+    # even when the lower-resolution parent escaped it; choosing ``region``
+    # here turns a valid child interior into the parent-coloured half of a
+    # rectangular tile seam.
+    blended = np.where(child_inside, child_view, blended)
     region[...] = np.asarray(blended, dtype=np.float32)
     return _colourise_view(
         parent_view,
@@ -6830,35 +7181,40 @@ def _parse_kfp_integer_values(value: str, path: Path) -> list[int]:
     return values
 
 
-def _parse_kfp_stops(palette_text: str, path: Path) -> list[tuple[int, int, int]]:
-    """Read Kalles Fraktaler's text ``Colors: r,g,b,...`` field.
+def _parse_kfp_fields(palette_text: str) -> dict[str, str]:
+    """Parse KFP ``key: value`` rows and wrapped continuation values."""
 
-    KFP files also contain transfer-function and renderer settings. Those
-    settings describe Kalles' colouring pipeline, not this renderer's scalar
-    iteration field, so only the portable RGB stop list is imported.
-    """
-
-    values: list[int] = []
-    in_colors = False
-    found_colors = False
+    fields: dict[str, str] = {}
+    current_key: Optional[str] = None
     for raw_line in palette_text.splitlines():
         line = raw_line.strip()
-        if not line:
+        if not line or line.startswith("#"):
             continue
         key, separator, value = line.partition(":")
         if separator:
-            if key.strip().casefold() == "colors":
-                found_colors = True
-                in_colors = True
-                values.extend(_parse_kfp_integer_values(value, path))
-            else:
-                in_colors = False
-            continue
-        if in_colors:
-            values.extend(_parse_kfp_integer_values(line, path))
+            current_key = key.strip().casefold()
+            fields[current_key] = value.strip()
+        elif current_key is not None:
+            previous = fields.get(current_key, "")
+            fields[current_key] = f"{previous} {line}".strip()
+    return fields
 
-    if not found_colors:
+
+def _parse_kfp_stops(palette_text: str, path: Path) -> list[tuple[int, int, int]]:
+    """Read Kalles Fraktaler's text ``Colors: r,g,b,...`` field."""
+
+    fields = _parse_kfp_fields(palette_text)
+    if "colors" not in fields:
         raise ValueError(f"KFP palette is missing a Colors field: {path}")
+    values = _parse_kfp_integer_values(fields["colors"], path)
+    # Some third-party exporters prefix the RGB stream with the number of
+    # stops. Kalles' own files do not, but accepting this form is inexpensive.
+    if (
+        len(values) >= 7
+        and 2 <= values[0] <= MAX_PALETTE_STOPS
+        and len(values) == 1 + values[0] * 3
+    ):
+        values = values[1:]
     if len(values) < 6 or len(values) % 3:
         raise ValueError(
             f"KFP Colors field needs at least two complete RGB stops: {path}"
@@ -6872,27 +7228,168 @@ def _parse_kfp_stops(palette_text: str, path: Path) -> list[tuple[int, int, int]
     return stops
 
 
-def _interpolate_palette_stops(
-    stops: list[tuple[int, int, int]], size: int, np: Any
-) -> Any:
-    anchors = np.linspace(0.0, 1.0, len(stops), dtype=np.float32)
-    positions = np.linspace(0.0, 1.0, size, dtype=np.float32)
-    output = np.empty((size, 3), dtype=np.float32)
-    for channel in range(3):
-        output[:, channel] = np.interp(
-            positions,
-            anchors,
-            [stop[channel] for stop in stops],
-        )
-    return np.asarray(np.rint(output), dtype=np.uint8)
+def _parse_kfp_float(
+    fields: dict[str, str],
+    key: str,
+    default: float,
+    path: Path,
+    *,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    value = fields.get(key.casefold())
+    if value is None or not value.strip():
+        return float(default)
+    token = value.replace(",", " ").split()[0]
+    try:
+        result = float(token)
+    except ValueError as error:
+        raise ValueError(f"invalid KFP {key} field: {path}") from error
+    if not math.isfinite(result):
+        raise ValueError(f"KFP {key} must be finite: {path}")
+    if minimum is not None and result < minimum:
+        raise ValueError(f"KFP {key} is below its supported range: {path}")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"KFP {key} is above its supported range: {path}")
+    return result
 
 
-@lru_cache(maxsize=16)
-def _palette_file_palette(path_text: str, mtime_ns: int, size: int = 4096) -> Any:
-    """Load ``#rrggbb`` or ``r g b`` stops and interpolate them once."""
+def _parse_kfp_int(
+    fields: dict[str, str],
+    key: str,
+    default: int,
+    path: Path,
+    *,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    value = fields.get(key.casefold())
+    if value is None or not value.strip():
+        return int(default)
+    token = value.replace(",", " ").split()[0]
+    try:
+        result = int(token, 10)
+    except ValueError as error:
+        raise ValueError(f"invalid KFP {key} field: {path}") from error
+    if minimum is not None and result < minimum:
+        raise ValueError(f"KFP {key} is below its supported range: {path}")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"KFP {key} is above its supported range: {path}")
+    return result
 
-    np = _require_numpy()
-    path = Path(path_text)
+
+def _parse_kfp_bool(
+    fields: dict[str, str],
+    key: str,
+    default: bool,
+    path: Path,
+) -> bool:
+    value = fields.get(key.casefold())
+    if value is None or not value.strip():
+        return bool(default)
+    token = value.strip().casefold()
+    if token in {"1", "true", "yes", "on"}:
+        return True
+    if token in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid KFP {key} field: {path}")
+
+
+def _parse_kfp_multi_colors(
+    value: str,
+    path: Path,
+) -> tuple[tuple[int, int, int], ...]:
+    """Parse Kalles' ``period,start,type`` multi-colour triples."""
+
+    if not value.strip():
+        return ()
+    tokens = value.replace(",", " ").replace(";", " ").split()
+    if len(tokens) % 3:
+        raise ValueError(f"KFP MultiColors needs period,start,type triples: {path}")
+    if len(tokens) > 3 * 256:
+        raise ValueError(f"KFP MultiColors field is too large: {path}")
+    triples: list[tuple[int, int, int]] = []
+    for index in range(0, len(tokens), 3):
+        try:
+            period = float(tokens[index])
+            start = float(tokens[index + 1])
+            colour_type = int(tokens[index + 2], 10)
+        except ValueError as error:
+            raise ValueError(f"invalid KFP MultiColors field: {path}") from error
+        if (
+            not math.isfinite(period)
+            or not math.isfinite(start)
+            or period == 0.0
+            or abs(period) > 1.0e12
+            or abs(start) > 1.0e12
+            or colour_type not in {0, 1, 2}
+        ):
+            raise ValueError(f"invalid KFP MultiColors value: {path}")
+        if not period.is_integer() or not start.is_integer():
+            raise ValueError(f"KFP MultiColors values must be integers: {path}")
+        triples.append((int(period), int(start), colour_type))
+    return tuple(triples)
+
+
+def _parse_kfp_profile(palette_text: str, path: Path) -> KfpPalette:
+    """Read a KFP gradient and the transfer settings that give it its look."""
+
+    fields = _parse_kfp_fields(palette_text)
+    stops = tuple(_parse_kfp_stops(palette_text, path))
+    interior_text = fields.get("interiorcolor", "0,0,0").rstrip(" ,;")
+    try:
+        interior_color = _parse_palette_colour(interior_text)
+    except ValueError as error:
+        raise ValueError(f"invalid KFP InteriorColor field: {path}") from error
+    return KfpPalette(
+        stops=stops,
+        iter_div=_parse_kfp_float(
+            fields, "IterDiv", 1.0, path, minimum=1.0e-12, maximum=1.0e12
+        ),
+        color_offset=_parse_kfp_float(
+            fields, "ColorOffset", 0.0, path, minimum=-1.0e12, maximum=1.0e12
+        ),
+        ratio=_parse_kfp_float(
+            fields, "Ratio", 360.0, path, minimum=0.0, maximum=1.0e6
+        ),
+        color_method=_parse_kfp_int(
+            fields, "ColorMethod", 0, path, minimum=0, maximum=11
+        ),
+        smooth_method=_parse_kfp_int(
+            fields, "SmoothMethod", 0, path, minimum=0, maximum=2
+        ),
+        smooth=_parse_kfp_bool(fields, "Smooth", True, path),
+        flat=_parse_kfp_bool(fields, "Flat", False, path),
+        inverse_transition=_parse_kfp_bool(
+            fields, "InverseTransition", False, path
+        ),
+        phase_color_strength=_parse_kfp_float(
+            fields, "ColorPhaseStrength", 0.0, path, minimum=0.0, maximum=100.0
+        ),
+        multi_color=_parse_kfp_bool(fields, "MultiColor", False, path),
+        blend_multi_color=_parse_kfp_bool(fields, "BlendMC", False, path),
+        multi_colors=_parse_kfp_multi_colors(fields.get("multicolors", ""), path),
+        power=_parse_kfp_float(fields, "Power", 2.0, path, minimum=1.0e-6, maximum=64.0),
+        slopes=_parse_kfp_bool(fields, "Slopes", False, path),
+        slope_power=_parse_kfp_float(
+            fields, "SlopePower", 50.0, path, minimum=0.0, maximum=1.0e4
+        ),
+        slope_ratio=_parse_kfp_float(
+            fields, "SlopeRatio", 20.0, path, minimum=0.0, maximum=1.0e4
+        ),
+        slope_angle=_parse_kfp_float(
+            fields, "SlopeAngle", 45.0, path, minimum=-360.0, maximum=360.0
+        ),
+        differences=_parse_kfp_int(
+            fields, "Differences", 3, path, minimum=0, maximum=16
+        ),
+        interior_color=interior_color,
+    )
+
+
+def _read_palette_text(path: Path) -> str:
+    """Read a bounded UTF-8 palette file once its path has been validated."""
+
     try:
         file_size = path.stat().st_size
     except OSError as error:
@@ -6911,9 +7408,62 @@ def _palette_file_palette(path_text: str, mtime_ns: int, size: int = 4096) -> An
             f"palette file exceeds the {MAX_PALETTE_FILE_BYTES:,}-byte limit: {path}"
         )
     try:
-        palette_text = raw_text.decode("utf-8")
+        return raw_text.decode("utf-8")
     except UnicodeDecodeError as error:
         raise ValueError(f"palette file is not valid UTF-8: {path}") from error
+
+
+@lru_cache(maxsize=16)
+def _kfp_file_profile(path_text: str, mtime_ns: int) -> KfpPalette:
+    path = Path(path_text)
+    return _parse_kfp_profile(_read_palette_text(path), path)
+
+
+def _interpolate_palette_stops(
+    stops: Any, size: int, np: Any
+) -> Any:
+    anchors = np.linspace(0.0, 1.0, len(stops), dtype=np.float32)
+    positions = np.linspace(0.0, 1.0, size, dtype=np.float32)
+    output = np.empty((size, 3), dtype=np.float32)
+    for channel in range(3):
+        output[:, channel] = np.interp(
+            positions,
+            anchors,
+            [stop[channel] for stop in stops],
+        )
+    return np.asarray(np.rint(output), dtype=np.uint8)
+
+
+@lru_cache(maxsize=16)
+def _kfp_palette_lut(profile: KfpPalette, size: int = 1024) -> Any:
+    """Expand KFP key colours with Kalles' cyclic interpolation."""
+
+    np = _require_numpy()
+    size = max(2, int(size))
+    stops = np.asarray(profile.stops, dtype=np.float32)
+    if stops.shape[0] < 2:
+        raise ValueError("KFP palette needs at least two colour stops")
+    # Kalles treats the key colours as a cycle.  The final table entry blends
+    # the last key back into the first; a non-cyclic linspace leaves a visible
+    # discontinuity whenever ColorOffset crosses 1024.
+    position = (
+        np.arange(size, dtype=np.float32) * float(stops.shape[0]) / float(size)
+    )
+    left = np.floor(position).astype(np.intp)
+    right = (left + 1) % stops.shape[0]
+    fraction = position - left.astype(np.float32)
+    fraction = 0.5 - 0.5 * np.cos(np.pi * fraction)
+    lut = stops[left] * (1.0 - fraction[:, None]) + stops[right] * fraction[:, None]
+    return np.asarray(np.rint(np.clip(lut, 0.0, 255.0)), dtype=np.uint8)
+
+
+@lru_cache(maxsize=16)
+def _palette_file_palette(path_text: str, mtime_ns: int, size: int = 4096) -> Any:
+    """Load ``#rrggbb`` or ``r g b`` stops and interpolate them once."""
+
+    np = _require_numpy()
+    path = Path(path_text)
+    palette_text = _read_palette_text(path)
     if path.suffix.casefold() == ".kfp":
         stops = _parse_kfp_stops(palette_text, path)
         return _interpolate_palette_stops(stops, size, np)
@@ -6945,6 +7495,382 @@ def _palette_from_file(path: Path, size: int = 4096) -> Any:
     return _palette_file_palette(str(path), int(stat.st_mtime_ns), int(size))
 
 
+def _kfp_profile_for_selection(
+    palette_name: str,
+    palette_file: Optional[Path],
+) -> Optional[KfpPalette]:
+    """Return the full KFP profile, leaving ordinary files on the Aurora path."""
+
+    if palette_file is not None:
+        path = Path(palette_file).expanduser().resolve()
+        if path.suffix.casefold() != ".kfp":
+            return None
+        stat = path.stat()
+        return _kfp_file_profile(str(path), int(stat.st_mtime_ns))
+    if palette_name == "kalles-default":
+        return KALLES_DEFAULT_KFP
+    return None
+
+
+@lru_cache(maxsize=16)
+def _palette_file_aurora_accents(path_text: str, mtime_ns: int) -> tuple[tuple[int, int, int], ...]:
+    """Convert a normal RGB-stop file into three Aurora wave accents."""
+
+    palette = _palette_file_palette(path_text, mtime_ns, 64)
+    indices = (8, 32, 56)
+    return tuple(
+        tuple(int(value) for value in palette[index])
+        for index in indices
+    )
+
+
+def _aurora_accents_for_selection(
+    palette_name: str,
+    palette_file: Optional[Path],
+) -> tuple[tuple[int, int, int], ...]:
+    if palette_file is not None:
+        path = Path(palette_file).expanduser().resolve()
+        stat = path.stat()
+        return _palette_file_aurora_accents(str(path), int(stat.st_mtime_ns))
+    try:
+        return BUILTIN_AURORA_ACCENTS[palette_name]
+    except KeyError as error:
+        raise ValueError(f"unknown ordinary palette: {palette_name}") from error
+
+
+def _apply_aurora_accents(
+    base_rgb: Any,
+    accents: tuple[tuple[int, int, int], ...],
+    pitch: float = 0.5,
+) -> Any:
+    """Recolour Aurora's three waves without throwing away their phase detail."""
+
+    np = _require_numpy()
+    base = np.asarray(base_rgb, dtype=np.float32)
+    if base.ndim != 3 or base.shape[-1] != 3:
+        raise ValueError("Aurora accent input must have shape (height, width, 3)")
+    accent_array = np.asarray(accents, dtype=np.float32)
+    if accent_array.shape != (3, 3):
+        raise ValueError("Aurora accents must contain three RGB colours")
+    # Native Aurora emits one 0..140 wave per channel.  The weighted sum keeps
+    # all three waves visible; dividing by 1.8 leaves headroom so a broad band
+    # does not collapse into a clipped rectangle of one solid colour.
+    weights = np.clip(base / 140.0, 0.0, 1.0)
+    rgb = np.einsum("...c,cd->...d", weights, accent_array) / 1.8
+    if abs(float(pitch) - 0.5) > 1.0e-12:
+        shape = rgb.shape
+        rgb = _rotate_hue_rgb(rgb.reshape(-1, 3), pitch).reshape(shape)
+    return np.asarray(np.clip(np.rint(rgb), 0.0, 255.0), dtype=np.uint8)
+
+
+def _colourise_aurora_accents(
+    field: Any,
+    max_iter: int,
+    phase: float,
+    vocal: float,
+    accents: tuple[tuple[int, int, int], ...],
+    pitch: float = 0.5,
+) -> Any:
+    """Python fallback for ordinary palettes using Aurora's raw phase waves."""
+
+    np = _require_numpy()
+    field = np.asarray(field, dtype=np.float32)
+    inside = ~np.isfinite(field) | (field >= float(max_iter) - 0.5)
+    safe_field = np.nan_to_num(
+        np.asarray(field, dtype=np.float64),
+        nan=0.0,
+        posinf=float(max_iter),
+        neginf=0.0,
+    )
+    safe_field = np.clip(safe_field, 0.0, float(max_iter))
+    angle = AURORA_BAND_THICKNESS * safe_field
+    split = AURORA_COLOUR_SPLIT * float(np.clip(vocal, 0.0, 1.0)) ** 2.0
+    waves = np.stack((
+        0.5 - 0.5 * np.cos(angle - float(phase)),
+        0.5 - 0.5 * np.cos(angle - (float(phase) + split * AURORA_GREEN_SPLIT)),
+        0.5 - 0.5 * np.cos(angle - (float(phase) + split)),
+    ), axis=-1).astype(np.float32)
+    rgb = _apply_aurora_accents(waves * 140.0, accents, pitch)
+    rgb[inside] = 0
+    return rgb
+
+
+def _kfp_slope_gradient(field: Any, np: Any) -> tuple[Any, Any]:
+    """Return Kalles' one-sided gradient used by the slope pass."""
+
+    height, width = field.shape
+    dx = np.zeros_like(field, dtype=np.float64)
+    dy = np.zeros_like(field, dtype=np.float64)
+    if width > 1:
+        # SetColor prefers the previous neighbour and falls forward only at
+        # the left edge.  Keep that sign convention because it chooses the
+        # same light/dark side of a KFP slope.
+        dx[:, 0] = field[:, 0] - field[:, 1]
+        dx[:, 1:] = field[:, :-1] - field[:, 1:]
+    if height > 1:
+        dy[0, :] = field[0, :] - field[1, :]
+        dy[1:, :] = field[:-1, :] - field[1:, :]
+    return dx, dy
+
+
+def _kfp_difference_magnitude(field: Any, differences: int, np: Any) -> Any:
+    """Approximate Kalles' selectable 3x3 difference operators.
+
+    A scalar iteration image cannot provide Kalles' analytic distance
+    derivative, but using the selected finite-difference stencil preserves the
+    same local scale and, importantly, avoids manufacturing a rectangle when
+    the field is reprojected at deep zoom.
+    """
+
+    values = np.asarray(field, dtype=np.float64)
+    padded = np.pad(values, 1, mode="edge")
+    centre = padded[1:-1, 1:-1]
+    left = padded[1:-1, :-2]
+    right = padded[1:-1, 2:]
+    up = padded[:-2, 1:-1]
+    down = padded[2:, 1:-1]
+    top_left = padded[:-2, :-2]
+    top_right = padded[:-2, 2:]
+    bottom_left = padded[2:, :-2]
+    bottom_right = padded[2:, 2:]
+    diagonal_distance_squared = 2.0
+    inv_sqrt_two = 1.0 / math.sqrt(2.0)
+    if differences == 0:  # Traditional: forward x/y differences.
+        return (
+            np.abs(left - centre) * math.sqrt(2.0)
+            + np.abs(up - centre) * math.sqrt(2.0)
+            + np.abs(top_left - centre)
+            + np.abs(bottom_left - centre)
+        )
+    if differences == 1:  # Forward 3x3, eight radial differences.
+        squared = (
+            (left - centre) ** 2
+            + (right - centre) ** 2
+            + (up - centre) ** 2
+            + (down - centre) ** 2
+            + ((top_left - centre) ** 2 + (bottom_right - centre) ** 2)
+                * inv_sqrt_two ** 2
+            + ((bottom_left - centre) ** 2 + (top_right - centre) ** 2)
+                * inv_sqrt_two ** 2
+        )
+        return np.sqrt(np.maximum(0.0, squared * 0.25)) * 2.8284271247461903
+    if differences == 2:  # Central 3x3, four diameter differences.
+        squared = (
+            (right - left) ** 2 / 4.0
+            + (down - up) ** 2 / 4.0
+            + (bottom_right - top_left) ** 2 / 8.0
+            + (top_right - bottom_left) ** 2 / 8.0
+        )
+        return np.sqrt(np.maximum(0.0, squared * 0.5)) * 2.8284271247461903
+    if differences == 3:  # Diagonal 2x2 / Roberts Cross.
+        squared = (
+            (top_left - centre) ** 2 / diagonal_distance_squared
+            + (left - up) ** 2 / diagonal_distance_squared
+        )
+        return np.sqrt(np.maximum(0.0, squared)) * 2.8284271247461903
+    if differences == 4:  # Least-squares 2x2.
+        # The 2x2 stencil is centred at (+/-0.5,+/-0.5), so its two
+        # least-squares slopes reduce to these two four-sample contrasts.
+        dx = ((up - top_left) + (centre - left)) * 0.5
+        dy = ((left - top_left) + (centre - up)) * 0.5
+        return np.hypot(dx, dy) * 2.8284271247461903
+    if differences == 5:  # Least-squares 3x3.
+        dx = (right + top_right + bottom_right - left - top_left - bottom_left) / 6.0
+        dy = (down + bottom_left + bottom_right - up - top_left - top_right) / 6.0
+        return np.hypot(dx, dy) * 2.8284271247461903
+    if differences == 6:  # Laplacian 3x3.
+        laplacian = (
+            top_left + 4.0 * up + top_right
+            + 4.0 * left - 20.0 * centre + 4.0 * right
+            + bottom_left + 4.0 * down + bottom_right
+        )
+        return np.sqrt(np.abs(laplacian / 6.0 * 1.4426950408889634)) * 2.8284271247461903
+    # Analytic (7) is not available from a scalar field. Central differences
+    # are the least surprising fallback for imported profiles using it.
+    return np.sqrt(
+        np.maximum(
+            0.0,
+            (right - left) ** 2 / 4.0 + (down - up) ** 2 / 4.0,
+        )
+    ) * 2.8284271247461903
+
+
+def _hsv_to_rgb(hue: Any, saturation: Any, value: Any, np: Any) -> Any:
+    """Vectorised HSV conversion matching Kalles' 0..1 colour coordinates."""
+
+    hue = np.mod(hue, 1.0)
+    saturation = np.clip(saturation, 0.0, 1.0)
+    value = np.clip(value, 0.0, 1.0)
+    scaled_hue = hue * 6.0
+    sector = np.floor(scaled_hue).astype(np.intp)
+    fraction = scaled_hue - np.floor(scaled_hue)
+    fraction = np.where((sector & 1) == 0, 1.0 - fraction, fraction)
+    minimum = value * (1.0 - saturation)
+    transition = value * (1.0 - saturation * fraction)
+    choices = (
+        np.stack((minimum, transition, value), axis=-1),
+        np.stack((minimum, value, transition), axis=-1),
+        np.stack((transition, value, minimum), axis=-1),
+        np.stack((value, transition, minimum), axis=-1),
+        np.stack((value, minimum, transition), axis=-1),
+        np.stack((transition, minimum, value), axis=-1),
+    )
+    output = np.empty(hue.shape + (3,), dtype=np.float64)
+    for index, choice in enumerate(choices):
+        output[sector == index] = choice[sector == index]
+    return output
+
+
+def _colourise_kfp(
+    field: Any,
+    max_iter: int,
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    pitch: float,
+    profile: KfpPalette,
+) -> Any:
+    """Apply the portable Kalles transfer, multi-colour, and slope stages."""
+
+    del phase, instrumental  # KFP's own transfer owns colour phase/brightness.
+    np = _require_numpy()
+    field = np.asarray(field, dtype=np.float32)
+    inside = ~np.isfinite(field) | (field >= float(max_iter) - 0.5)
+    safe = np.nan_to_num(
+        np.asarray(field, dtype=np.float64),
+        nan=float(max_iter),
+        posinf=float(max_iter),
+        neginf=0.0,
+    )
+    safe = np.clip(safe, 0.0, float(max_iter))
+    smooth_iter = np.maximum(0.0, safe)
+    colour_iter = np.floor(smooth_iter) if profile.flat else smooth_iter
+    slope_dx, slope_dy = _kfp_slope_gradient(smooth_iter, np)
+    gradient = _kfp_difference_magnitude(smooth_iter, profile.differences, np)
+    width = max(1, int(field.shape[1]))
+    # A scalar iteration field does not carry Kalles' analytic DE derivatives.
+    # Its selected finite-difference magnitude is the closest portable local
+    # distance proxy and, unlike normalising by max_iter, retains detail at any
+    # absolute zoom depth.
+    # The individual Kalles difference operators return their own native
+    # scale (some include the historical 2*sqrt(2) factor); only the image
+    # width normalization belongs here.
+    distance = gradient * width / 640.0
+    distance = np.nan_to_num(distance, nan=0.0, posinf=1.0e12, neginf=0.0)
+    method = int(profile.color_method)
+    if method == 1:
+        transfer = np.sqrt(colour_iter)
+    elif method == 2:
+        transfer = np.cbrt(colour_iter)
+    elif method == 3:
+        transfer = np.log(np.maximum(1.0, colour_iter))
+    elif method == 4:
+        escaped = colour_iter[~inside]
+        minimum = float(np.min(escaped)) if escaped.size else 0.0
+        maximum = float(np.max(escaped)) if escaped.size else minimum + 1.0
+        transfer = 1024.0 * (colour_iter - minimum) / max(maximum - minimum, 1.0e-12)
+    elif method == 5:
+        transfer = np.minimum(distance, 1024.0)
+    elif method == 6:
+        distance_transfer = np.minimum(distance, 1024.0)
+        transfer = np.where(
+            distance_transfer > profile.iter_div,
+            colour_iter,
+            distance_transfer,
+        )
+    elif method == 7:
+        transfer = np.log(np.maximum(1.0, distance + 1.0))
+    elif method == 8:
+        transfer = np.sqrt(np.maximum(0.0, distance))
+    elif method == 9:
+        transfer = np.log1p(np.log1p(colour_iter))
+    elif method == 10:
+        transfer = np.arctan(colour_iter)
+    elif method == 11:
+        transfer = np.power(colour_iter, 0.25)
+    else:
+        transfer = colour_iter
+    transfer = np.nan_to_num(
+        transfer,
+        nan=0.0,
+        posinf=float(max(max_iter, 1024)),
+        neginf=0.0,
+    )
+    if method in {5, 7, 8}:
+        transfer = np.clip(transfer, 0.0, 1024.0)
+
+    lut = _kfp_palette_lut(profile)
+    position = np.mod(transfer / profile.iter_div + profile.color_offset, 1024.0)
+    lower = np.floor(position).astype(np.intp) % 1024
+    if profile.smooth:
+        fraction = position - np.floor(position)
+        if profile.inverse_transition:
+            fraction = 1.0 - fraction
+        upper = (lower + 1) % 1024
+        rgb = lut[lower].astype(np.float64) * (1.0 - fraction[..., None])
+        rgb += lut[upper].astype(np.float64) * fraction[..., None]
+    else:
+        rgb = lut[lower].astype(np.float64)
+
+    if profile.multi_color and profile.multi_colors:
+        hues: list[Any] = []
+        saturations: list[Any] = []
+        values: list[Any] = []
+        wave_input = transfer / profile.iter_div + profile.color_offset
+        if not profile.smooth:
+            wave_input = np.floor(wave_input)
+        for period, _start, colour_type in profile.multi_colors:
+            if period < 0:
+                wave = np.full_like(transfer, -float(period) / 100.0)
+            else:
+                wave = 0.5 + 0.5 * np.sin(
+                    np.pi * wave_input / float(period)
+                )
+            if colour_type == 0:
+                hues.append(wave)
+            elif colour_type == 1:
+                saturations.append(wave)
+            else:
+                values.append(wave)
+        hue = np.mean(hues, axis=0) if hues else np.zeros_like(transfer)
+        saturation = np.mean(saturations, axis=0) if saturations else np.ones_like(transfer)
+        value = np.mean(values, axis=0) if values else np.ones_like(transfer)
+        multi_rgb = _hsv_to_rgb(hue, saturation, value, np) * 255.0
+        rgb = (rgb + multi_rgb) * 0.5 if profile.blend_multi_color else multi_rgb
+
+    if profile.slopes and profile.slope_power > 0.0 and profile.slope_ratio > 0.0:
+        angle = math.radians(profile.slope_angle)
+        projected = slope_dx * math.cos(angle) + slope_dy * math.sin(angle)
+        projected *= profile.slope_power * width / 640.0
+        strength = np.clip(
+            np.arctan(np.abs(projected)) / (math.pi / 2.0)
+            * profile.slope_ratio / 100.0,
+            0.0,
+            1.0,
+        )[..., None]
+        dark = projected >= 0.0
+        rgb = np.where(
+            dark[..., None],
+            rgb * (1.0 - strength),
+            rgb * (1.0 - strength) + 255.0 * strength,
+        )
+
+    # Keep audio influence deliberately mild. The KFP transfer remains stable
+    # at e150+ instead of becoming the old max_iter-normalised pastel wash.
+    saturation = 1.0 + 0.18 * float(np.clip(vocal, 0.0, 1.0))
+    rgb_luminance = np.sum(
+        rgb * np.asarray([0.2126, 0.7152, 0.0722]), axis=-1, keepdims=True
+    )
+    rgb = rgb_luminance + (rgb - rgb_luminance) * saturation
+    rgb = np.clip(rgb, 0.0, 255.0)
+    if abs(float(pitch) - 0.5) > 1.0e-12:
+        shape = rgb.shape
+        rgb = _rotate_hue_rgb(rgb.reshape(-1, 3), pitch).reshape(shape)
+    rgb = np.asarray(np.clip(np.rint(rgb), 0.0, 255.0), dtype=np.uint8)
+    rgb[inside] = np.asarray(profile.interior_color, dtype=np.uint8)
+    return rgb
+
+
 def _colourise_custom(
     field: Any,
     max_iter: int,
@@ -6955,38 +7881,19 @@ def _colourise_custom(
     pitch: float = 0.5,
     palette_file: Optional[Path] = None,
 ) -> Any:
-    np = _require_numpy()
-    palette = (
-        _palette_from_file(palette_file)
-        if palette_file is not None
-        else _custom_palette(palette_name)
+    profile = _kfp_profile_for_selection(palette_name, palette_file)
+    if profile is not None:
+        return _colourise_kfp(
+            field, max_iter, phase, vocal, instrumental, pitch, profile
+        )
+    return _colourise_aurora_accents(
+        field,
+        max_iter,
+        phase,
+        vocal,
+        _aurora_accents_for_selection(palette_name, palette_file),
+        pitch,
     )
-    field = np.asarray(field, dtype=np.float32)
-    inside = ~np.isfinite(field) | (field >= max_iter - 0.5)
-    safe_field = np.nan_to_num(
-        np.asarray(field, dtype=np.float64),
-        nan=0.0,
-        posinf=float(max_iter),
-        neginf=0.0,
-    )
-    position = safe_field / max(float(max_iter), 1.0)
-    position = np.mod(position + phase * 0.006 + vocal * 0.08 + float(pitch) * 0.12, 1.0)
-    position = np.nan_to_num(position, nan=0.0, posinf=1.0, neginf=0.0)
-    indices = np.clip(
-        position * (palette.shape[0] - 1), 0, palette.shape[0] - 1
-    ).astype(np.intp)
-    rgb = palette[indices].astype(np.float32)
-    saturation = 0.75 + 0.45 * float(vocal)
-    brightness = 0.75 + 0.35 * float(instrumental)
-    luminance = np.sum(
-        rgb * np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32),
-        axis=-1,
-        keepdims=True,
-    )
-    rgb = luminance + (rgb - luminance) * saturation
-    rgb = np.clip(rgb * brightness, 0.0, 255.0).astype(np.uint8)
-    rgb[inside] = 0
-    return rgb
 
 
 def _colourise_native(
@@ -7324,7 +8231,7 @@ def _colourise_view(
 ) -> Any:
     """Colour an already-resampled scalar iteration field."""
 
-    if palette_file is not None:
+    if _kfp_profile_for_selection(palette_name, palette_file) is not None:
         return _colourise_custom(
             view,
             max_iter,
@@ -7335,7 +8242,7 @@ def _colourise_view(
             pitch,
             palette_file,
         )
-    if native_library is not None and palette_name == "aurora":
+    if native_library is not None and palette_name == "aurora" and palette_file is None:
         return _colourise_native(
             view,
             max_iter,
@@ -7346,8 +8253,33 @@ def _colourise_view(
             native_library,
             pitch,
         )
-    if palette_name != "aurora":
-        return _colourise_custom(view, max_iter, phase, vocal, instrumental, palette_name, pitch)
+    if native_library is not None:
+        base = _colourise_native(
+            view,
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            native_threads,
+            native_library,
+            0.5,
+        )
+        return _apply_aurora_accents(
+            base,
+            _aurora_accents_for_selection(palette_name, palette_file),
+            pitch,
+        )
+    if palette_name != "aurora" or palette_file is not None:
+        return _colourise_custom(
+            view,
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            palette_name,
+            pitch,
+            palette_file,
+        )
     return _colourise(view, max_iter, phase, vocal, instrumental, pitch)
 
 
@@ -7386,7 +8318,37 @@ def _colour_frame(
             native_library,
             pitch,
         )
-    view = _crop_and_resize(field, output_width, output_height, zoom_factor, resample)
+    if (
+        native_library is not None
+        and resample == "bilinear"
+        and _kfp_profile_for_selection(palette_name, palette_file) is None
+    ):
+        base = _crop_and_colourise_native(
+            field,
+            output_width,
+            output_height,
+            zoom_factor,
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            native_threads,
+            native_library,
+            0.5,
+        )
+        return _apply_aurora_accents(
+            base,
+            _aurora_accents_for_selection(palette_name, palette_file),
+            pitch,
+        )
+    view, _ = _crop_and_resize_preserving_interior(
+        field,
+        output_width,
+        output_height,
+        zoom_factor,
+        max_iter,
+        resample,
+    )
     return _colourise_view(
         view,
         max_iter,
