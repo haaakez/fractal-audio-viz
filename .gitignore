@@ -10,5 +10,8 @@ __pycache__/
 *.gif
 # Render caches and generated keyframes
 keyframes*/
+cache/
+renders/
+*.json
 .cache/
 .gitdata/
