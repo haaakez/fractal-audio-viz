@@ -78,7 +78,7 @@ constexpr long double MAX_NATIVE_LOG10_ZOOM = 9800.0L;
 
 bool valid_formula(int formula) noexcept {
     return formula >= FRACTAL_FORMULA_MANDELBROT
-        && formula <= FRACTAL_FORMULA_MULTIBROT3;
+        && formula <= FRACTAL_FORMULA_TRICORN;
 }
 
 bool valid_pixel_dimensions(int width, int height) noexcept {
@@ -142,7 +142,8 @@ long double parse_coordinate(const char* text, const char* label) {
 }
 
 int formula_power(int formula) noexcept {
-    return formula == FRACTAL_FORMULA_MULTIBROT3 ? 3 : 2;
+    (void)formula;
+    return 2;
 }
 
 void iterate_direct_formula(
@@ -175,17 +176,6 @@ void iterate_direct_formula(
         const volatile double imaginary_product = cross + parameter_imag;
         next_real = real_difference + parameter_real;
         next_imag = imaginary_product;
-    } else if (formula == FRACTAL_FORMULA_MULTIBROT3) {
-        const volatile double real_square = zr * zr;
-        const volatile double imag_square = zi * zi;
-        const volatile double real_cube = real_square * zr;
-        const volatile double imag_cube = imag_square * zi;
-        const volatile double mixed_real = 3.0 * zr * imag_square;
-        const volatile double mixed_imag = 3.0 * real_square * zi;
-        const volatile double real_difference = real_cube - mixed_real;
-        const volatile double imaginary_difference = mixed_imag - imag_cube;
-        next_real = real_difference + parameter_real;
-        next_imag = imaginary_difference + parameter_imag;
     } else if (formula == FRACTAL_FORMULA_JULIA) {
         const volatile double real_square = zr * zr;
         const volatile double imag_square = zi * zi;

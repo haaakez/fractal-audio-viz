@@ -6,7 +6,7 @@ let
     librosa
     pillow
     mpmath
-    tkinter
+    pygobject3
   ] ++ pkgs.lib.optional (ps ? demucs) ps.demucs);
 in
 pkgs.mkShell {
@@ -19,7 +19,8 @@ pkgs.mkShell {
     pkgs.pkg-config
     pkgs.gmp
     pkgs.mpfr
-    pkgs.tk
+    pkgs.gtk3
+    pkgs.gobject-introspection
   ]
   ++ pkgs.lib.optional (pkgs ? gh) pkgs.gh
   ++ pkgs.lib.optionals ((pkgs ? opencl-headers) && (pkgs ? ocl-icd)) [

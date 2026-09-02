@@ -80,7 +80,6 @@ from deep_zoom_points import (
     FORMULA_POINT_CATALOGUES,
     FORMULA_POINTS_BY_SLUG,
     JULIA_POINTS,
-    MULTIBROT3_POINTS,
     TRICORN_POINTS,
     DeepZoomPoint,
 )
@@ -106,40 +105,36 @@ DEFAULT_Y_CENTER = (
 # Fields are expensive, so they can be cached; their cache identity must
 # change when native numerical behaviour changes.  This prevents a new
 # renderer from silently reusing an old, under-resolved .npy keyframe.
-KEYFRAME_CACHE_SCHEMA = "raw-field-series-v10-bla38-tiered"
+KEYFRAME_CACHE_SCHEMA = "raw-field-series-v11-safe-alternate"
 AUDIO_CACHE_SCHEMA = "audio-controls-v10-onset-sync"
-ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v10-bla38-aligned-tiered"
+ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v11-safe-alternate"
 
 FORMULA_CHOICES = (
     "mandelbrot",
     "julia",
     "burning-ship",
     "tricorn",
-    "multibrot3",
 )
 FORMULA_IDS = {
     "mandelbrot": 0,
     "julia": 1,
     "burning-ship": 2,
     "tricorn": 3,
-    "multibrot3": 4,
 }
 FORMULA_DESCRIPTIONS = {
     "mandelbrot": "classic z²+c parameter plane; the e150+ optimized path",
     "julia": "fixed-c Julia set; use --julia-c to change the constant",
     "burning-ship": "absolute-value z²+c, with the characteristic ship symmetry",
     "tricorn": "conjugate z²+c (the Mandelbar)",
-    "multibrot3": "cubic z³+c parameter plane",
 }
 # Every formula has its own catalogue and default centre.  Julia presets also
-# carry their fixed c value; Mandelbrot's catalogue is the only one screened
-# for the production native e150+ path.
+# carry their fixed c value; the Mandelbrot catalogue is the production native
+# e150+ path while alternate formulas use validated deep boundary targets.
 FORMULA_DEFAULT_CENTERS = {
     "mandelbrot": (DEFAULT_X_CENTER, DEFAULT_Y_CENTER),
     "julia": (JULIA_POINTS[0].x, JULIA_POINTS[0].y),
     "burning-ship": (BURNING_SHIP_POINTS[0].x, BURNING_SHIP_POINTS[0].y),
     "tricorn": (TRICORN_POINTS[0].x, TRICORN_POINTS[0].y),
-    "multibrot3": (MULTIBROT3_POINTS[0].x, MULTIBROT3_POINTS[0].y),
 }
 DEFAULT_JULIA_C = ("-0.8", "0.156")
 
@@ -2656,6 +2651,49 @@ def _validate_center_text(value: str, label: str) -> str:
     return text
 
 
+JULIA_TARGET_PRECISION_DIGITS = 384
+
+
+def _julia_repelling_fixed_point(
+    julia_constant: tuple[str, str],
+) -> tuple[str, str]:
+    """Return a high-precision fixed point on the selected Julia boundary.
+
+    The fixed points solve ``z² - z + c = 0``.  Selecting the root with the
+    larger modulus selects the repelling branch, which is on the Julia set;
+    using a generated decimal target keeps a custom ``--julia-c`` usable at
+    the same depth as the built-in presets.
+    """
+
+    if len(julia_constant) != 2:
+        raise ValueError("Julia constant must contain real and imaginary coordinates")
+    real_text = _validate_center_text(julia_constant[0], "Julia real")
+    imag_text = _validate_center_text(julia_constant[1], "Julia imaginary")
+    with localcontext() as context:
+        context.prec = JULIA_TARGET_PRECISION_DIGITS
+        c_real = Decimal(real_text)
+        c_imag = Decimal(imag_text)
+        discriminant_real = Decimal(1) - Decimal(4) * c_real
+        discriminant_imag = -Decimal(4) * c_imag
+        magnitude = (discriminant_real * discriminant_real
+                     + discriminant_imag * discriminant_imag).sqrt()
+        root_real = ((magnitude + discriminant_real) / Decimal(2)).sqrt()
+        root_imag = ((magnitude - discriminant_real) / Decimal(2)).sqrt()
+        if discriminant_imag < 0:
+            root_imag = -root_imag
+        root_a = ((Decimal(1) + root_real) / Decimal(2), root_imag / Decimal(2))
+        root_b = ((Decimal(1) - root_real) / Decimal(2), -root_imag / Decimal(2))
+        selected = max(
+            (root_a, root_b),
+            key=lambda root: root[0] * root[0] + root[1] * root[1],
+        )
+        real, imag = selected
+        significant = JULIA_TARGET_PRECISION_DIGITS
+        real_output = format(real, f".{significant}g")
+        imag_output = "0.0" if imag == 0 else format(imag, f".{significant}g")
+    return real_output, imag_output
+
+
 def _finite_float_coordinate(value: str, label: str) -> float:
     """Convert a coordinate for a binary renderer without allowing infinity."""
 
@@ -2677,6 +2715,7 @@ def _resolve_render_point(
     random_seed: Optional[int],
     max_log_zoom: float,
     formula: str = "mandelbrot",
+    julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
 ) -> tuple[str, str, Optional[DeepZoomPoint]]:
     """Resolve a formula-specific preset, random point, pair, or x/y input."""
 
@@ -2698,6 +2737,8 @@ def _resolve_render_point(
     spec = "random" if random_point else (point_spec.strip() if point_spec is not None else None)
     if spec is None:
         if x_center is None:
+            if formula == "julia":
+                return (*_julia_repelling_fixed_point(julia_constant), None)
             default_x, default_y = FORMULA_DEFAULT_CENTERS[formula]
             return default_x, default_y, None
         return (
@@ -2718,11 +2759,15 @@ def _resolve_render_point(
                 )
             ]
         else:
-            # Alternate formula entries are creative starter views rather
-            # than claims of Mandelbrot's native e150 safety.  Let random
-            # selection choose among that formula's own views; the main
-            # alternate renderer still enforces its e300 exploratory limit.
-            candidates = list(catalogue)
+            # Never choose a shallow gallery framing point for a deep render.
+            # Alternate formulas now expose only targets with an explicit
+            # recommended depth, so random selection remains meaningful at
+            # e150 instead of silently ending in an interior tile.
+            candidates = [
+                point
+                for point in catalogue
+                if float(point.source_log10_zoom) + 1.0e-9 >= float(max_log_zoom)
+            ]
         if not candidates:
             deepest = max(
                 (_deep_point_max_log10_zoom(point) for point in catalogue),
@@ -2734,6 +2779,13 @@ def _resolve_render_point(
             )
         chooser = random.SystemRandom() if random_seed is None else random.Random(random_seed)
         selected = chooser.choice(candidates)
+        if formula == "julia" and selected.julia_c is not None:
+            target_constant = (
+                selected.julia_c
+                if julia_constant == DEFAULT_JULIA_C
+                else julia_constant
+            )
+            return (*_julia_repelling_fixed_point(target_constant), selected)
         return selected.x, selected.y, selected
 
     preset = points_by_slug.get(spec.casefold())
@@ -2744,6 +2796,19 @@ def _resolve_render_point(
                 f"point '{preset.slug}' is stored safely through about 10^{supported:.0f}, "
                 f"below requested 10^{float(max_log_zoom):.3f}"
             )
+        if formula != "mandelbrot" and float(preset.source_log10_zoom) + 1.0e-9 < float(max_log_zoom):
+            raise ValueError(
+                f"point '{preset.slug}' is recommended through about "
+                f"10^{float(preset.source_log10_zoom):.1f}, below requested "
+                f"10^{float(max_log_zoom):.3f}; choose an e150-safe preset or lower --max-zoom"
+            )
+        if formula == "julia" and preset.julia_c is not None:
+            target_constant = (
+                preset.julia_c
+                if julia_constant == DEFAULT_JULIA_C
+                else julia_constant
+            )
+            return (*_julia_repelling_fixed_point(target_constant), preset)
         return preset.x, preset.y, preset
 
     if len(spec) <= 2 * MAX_COORDINATE_TEXT_LENGTH + 1:
@@ -2822,8 +2887,6 @@ def _formula_name(value: str) -> str:
         "burningship": "burning-ship",
         "burning_ship": "burning-ship",
         "mandelbar": "tricorn",
-        "multibrot": "multibrot3",
-        "multibrot-3": "multibrot3",
     }
     name = aliases.get(name, name)
     if name not in FORMULA_CHOICES:
@@ -2855,7 +2918,8 @@ def _parse_coordinate_pair(value: str, label: str) -> tuple[str, str]:
 
 
 def _formula_power(formula: str) -> int:
-    return 3 if _formula_name(formula) == "multibrot3" else 2
+    _formula_name(formula)
+    return 2
 
 
 def _zoom_log(value: Any) -> float:
@@ -2916,14 +2980,42 @@ def _reference_orbit(
     log10_zoom: float,
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
-) -> tuple[Any, Any]:
-    """Return a high-precision reference orbit for an alternate formula."""
+    *,
+    include_margins: bool = False,
+) -> tuple[Any, Any] | tuple[Any, Any, Any]:
+    """Return a high-precision reference orbit for an alternate formula.
+
+    ``real`` and ``imag`` are float projections used by the vectorised
+    perturbation recurrence.  When requested, ``margins`` retains the
+    high-precision value ``|z|² - 4`` for every reference sample.  Comparing
+    the projected float orbit directly with ``4`` loses sub-ulp escape bands
+    at deep zooms (notably the Tricorn and Burning Ship tips), so the margin
+    lets the alternate renderer make the escape decision without rounding
+    away the very quantity it is trying to detect.
+    """
 
     np = _require_numpy()
     formula = _formula_name(formula)
     precision = _decimal_precision(x_center, y_center, log10_zoom)
     real = np.empty(max_iter + 1, dtype=np.float64)
     imag = np.empty(max_iter + 1, dtype=np.float64)
+    margins = np.empty(max_iter + 1, dtype=np.float64) if include_margins else None
+
+    def store_reference(index: int, zr: Any, zi: Any) -> None:
+        real[index] = float(zr)
+        imag[index] = float(zi)
+        if margins is not None:
+            try:
+                margin = float(zr * zr + zi * zi - 4)
+            except (OverflowError, ValueError):
+                margin = math.inf
+            margins[index] = margin
+
+    def store_escaped_tail(index: int) -> None:
+        real[index:] = math.inf
+        imag[index:] = math.inf
+        if margins is not None:
+            margins[index:] = math.inf
 
     try:
         import mpmath as mp
@@ -2940,30 +3032,60 @@ def _reference_orbit(
                 zr = mp.mpf("0")
                 zi = mp.mpf("0")
                 parameter_real, parameter_imag = cx, cy
+            fixed_point = None
+            if formula == "julia":
+                # Julia presets are repelling fixed points.  Their decimal
+                # exports intentionally carry far more digits than the
+                # requested viewport, but even a 384-digit approximation
+                # eventually leaves the fixed point when iterated for the
+                # renderer's much larger iteration budget.  Recover the
+                # algebraic root from c and hold this reference exactly at
+                # the selected target; pixel perturbations still determine
+                # which side of the Julia boundary each pixel occupies.
+                discriminant = mp.sqrt(1 - 4 * mp.mpc(julia_cx, julia_cy))
+                roots = (
+                    (1 + discriminant) / 2,
+                    (1 - discriminant) / 2,
+                )
+                candidate = mp.mpc(cx, cy)
+                selected_root = min(roots, key=lambda root: abs(root - candidate))
+                required_digits = max(
+                    32,
+                    int(math.ceil(max(0.0, log10_zoom)))
+                    + CENTER_PRECISION_GUARD_DIGITS,
+                )
+                root_tolerance = mp.power(10, -required_digits)
+                if (
+                    abs(2 * selected_root) > 1
+                    and abs(selected_root - candidate) <= root_tolerance
+                ):
+                    fixed_point = (mp.re(selected_root), mp.im(selected_root))
             float_limit = mp.mpf("1e300")
-            for index in range(max_iter + 1):
-                if abs(zr) > float_limit or abs(zi) > float_limit:
-                    # The reference has escaped so far that its float64
-                    # representation would overflow. Remaining pixels are
-                    # handled as escaped by the perturbation loop.
-                    real[index:] = math.inf
-                    imag[index:] = math.inf
-                    break
-                real[index] = float(zr)
-                imag[index] = float(zi)
-                if formula == "burning-ship":
-                    next_real = abs(zr) * abs(zr) - abs(zi) * abs(zi) + parameter_real
-                    next_imag = 2 * abs(zr) * abs(zi) + parameter_imag
-                elif formula == "tricorn":
-                    next_real = zr * zr - zi * zi + parameter_real
-                    next_imag = -2 * zr * zi + parameter_imag
-                elif formula == "multibrot3":
-                    next_real = zr**3 - 3 * zr * zi * zi + parameter_real
-                    next_imag = 3 * zr * zr * zi - zi**3 + parameter_imag
-                else:
-                    next_real = zr * zr - zi * zi + parameter_real
-                    next_imag = 2 * zr * zi + parameter_imag
-                zr, zi = next_real, next_imag
+            if fixed_point is not None:
+                fixed_real, fixed_imag = fixed_point
+                real.fill(float(fixed_real))
+                imag.fill(float(fixed_imag))
+                if margins is not None:
+                    margins.fill(float(fixed_real * fixed_real + fixed_imag * fixed_imag - 4))
+            else:
+                for index in range(max_iter + 1):
+                    if abs(zr) > float_limit or abs(zi) > float_limit:
+                        # The reference has escaped so far that its float64
+                        # representation would overflow. Remaining pixels are
+                        # handled as escaped by the perturbation loop.
+                        store_escaped_tail(index)
+                        break
+                    store_reference(index, zr, zi)
+                    if formula == "burning-ship":
+                        next_real = abs(zr) * abs(zr) - abs(zi) * abs(zi) + parameter_real
+                        next_imag = 2 * abs(zr) * abs(zi) + parameter_imag
+                    elif formula == "tricorn":
+                        next_real = zr * zr - zi * zi + parameter_real
+                        next_imag = -2 * zr * zi + parameter_imag
+                    else:
+                        next_real = zr * zr - zi * zi + parameter_real
+                        next_imag = 2 * zr * zi + parameter_imag
+                    zr, zi = next_real, next_imag
     except ImportError:
         # Decimal is slower but keeps the centre precise without making mpmath
         # a hard dependency for ordinary-depth renders.
@@ -2980,29 +3102,219 @@ def _reference_orbit(
                 zr = Decimal(0)
                 zi = Decimal(0)
                 parameter_real, parameter_imag = cx, cy
+            fixed_point = None
+            if formula == "julia":
+                discriminant_real = Decimal(1) - Decimal(4) * julia_cx
+                discriminant_imag = -Decimal(4) * julia_cy
+                magnitude = (
+                    discriminant_real * discriminant_real
+                    + discriminant_imag * discriminant_imag
+                ).sqrt()
+                root_real = ((magnitude + discriminant_real) / Decimal(2)).sqrt()
+                root_imag = ((magnitude - discriminant_real) / Decimal(2)).sqrt()
+                if discriminant_imag < 0:
+                    root_imag = -root_imag
+                roots = (
+                    (
+                        (Decimal(1) + root_real) / Decimal(2),
+                        root_imag / Decimal(2),
+                    ),
+                    (
+                        (Decimal(1) - root_real) / Decimal(2),
+                        -root_imag / Decimal(2),
+                    ),
+                )
+                selected_root = min(
+                    roots,
+                    key=lambda root: (root[0] - cx) ** 2 + (root[1] - cy) ** 2,
+                )
+                required_digits = max(
+                    32,
+                    int(math.ceil(max(0.0, log10_zoom)))
+                    + CENTER_PRECISION_GUARD_DIGITS,
+                )
+                root_tolerance = Decimal(1).scaleb(-required_digits)
+                distance_squared = (selected_root[0] - cx) ** 2 + (selected_root[1] - cy) ** 2
+                multiplier_squared = 4 * (
+                    selected_root[0] * selected_root[0]
+                    + selected_root[1] * selected_root[1]
+                )
+                if multiplier_squared > 1 and distance_squared.sqrt() <= root_tolerance:
+                    fixed_point = selected_root
             decimal_limit = Decimal("1e300")
-            for index in range(max_iter + 1):
-                if abs(zr) > decimal_limit or abs(zi) > decimal_limit:
-                    real[index:] = math.inf
-                    imag[index:] = math.inf
-                    break
-                real[index] = float(zr)
-                imag[index] = float(zi)
-                if formula == "burning-ship":
-                    next_real = abs(zr) * abs(zr) - abs(zi) * abs(zi) + parameter_real
-                    next_imag = Decimal(2) * abs(zr) * abs(zi) + parameter_imag
-                elif formula == "tricorn":
-                    next_real = zr * zr - zi * zi + parameter_real
-                    next_imag = Decimal(-2) * zr * zi + parameter_imag
-                elif formula == "multibrot3":
-                    next_real = zr**3 - Decimal(3) * zr * zi * zi + parameter_real
-                    next_imag = Decimal(3) * zr * zr * zi - zi**3 + parameter_imag
-                else:
-                    next_real = zr * zr - zi * zi + parameter_real
-                    next_imag = Decimal(2) * zr * zi + parameter_imag
-                zr, zi = next_real, next_imag
+            if fixed_point is not None:
+                fixed_real, fixed_imag = fixed_point
+                real.fill(float(fixed_real))
+                imag.fill(float(fixed_imag))
+                if margins is not None:
+                    margins.fill(fixed_real * fixed_real + fixed_imag * fixed_imag - Decimal(4))
+            else:
+                for index in range(max_iter + 1):
+                    if abs(zr) > decimal_limit or abs(zi) > decimal_limit:
+                        store_escaped_tail(index)
+                        break
+                    store_reference(index, zr, zi)
+                    if formula == "burning-ship":
+                        next_real = abs(zr) * abs(zr) - abs(zi) * abs(zi) + parameter_real
+                        next_imag = Decimal(2) * abs(zr) * abs(zi) + parameter_imag
+                    elif formula == "tricorn":
+                        next_real = zr * zr - zi * zi + parameter_real
+                        next_imag = Decimal(-2) * zr * zi + parameter_imag
+                    else:
+                        next_real = zr * zr - zi * zi + parameter_real
+                        next_imag = Decimal(2) * zr * zi + parameter_imag
+                    zr, zi = next_real, next_imag
 
-    return real, imag
+    if margins is None:
+        return real, imag
+    return real, imag, margins
+
+
+ALTERNATE_CYCLE_MAX_PERIOD = 4096
+ALTERNATE_CYCLE_TOLERANCE = 1.0e-13
+ALTERNATE_CYCLE_CONFIRMATIONS = 3
+
+
+def _detect_float_cycle_period(values: Any) -> Optional[int]:
+    """Find a short, numerically settled period in a bounded orbit."""
+
+    np = _require_numpy()
+    values = np.asarray(values, dtype=np.complex128).ravel()
+    if values.size < 6 or not np.isfinite(values[-1]):
+        return None
+    maximum = min(ALTERNATE_CYCLE_MAX_PERIOD, (values.size - 1) // 3)
+    for period in range(1, maximum + 1):
+        window = min(values.size - period, max(3 * period, 256))
+        if window < 3 * period:
+            continue
+        current = values[-window:]
+        previous = values[-window - period:-period]
+        difference = np.abs(current - previous)
+        scale = np.maximum(1.0, np.maximum(np.abs(current), np.abs(previous)))
+        if np.all(difference <= ALTERNATE_CYCLE_TOLERANCE * scale):
+            return period
+    return None
+
+
+def _alternate_critical_orbit(
+    formula: str,
+    x_center: str,
+    y_center: str,
+    julia_constant: tuple[str, str],
+) -> Any:
+    """Return a small float critical orbit used for interior acceleration."""
+
+    np = _require_numpy()
+    if formula == "julia":
+        parameter_real = _finite_float_coordinate(julia_constant[0], "Julia real")
+        parameter_imag = _finite_float_coordinate(julia_constant[1], "Julia imaginary")
+    else:
+        parameter_real = _finite_float_coordinate(x_center, "real")
+        parameter_imag = _finite_float_coordinate(y_center, "imaginary")
+    zr = 0.0
+    zi = 0.0
+    values: list[complex] = []
+    for _ in range(ALTERNATE_CYCLE_MAX_PERIOD * 3):
+        zr, zi = _alternate_float_step(
+            formula, zr, zi, parameter_real, parameter_imag
+        )
+        magnitude_squared = zr * zr + zi * zi
+        if not math.isfinite(magnitude_squared) or magnitude_squared > 4.0:
+            break
+        values.append(complex(zr, zi))
+    return np.asarray(values, dtype=np.complex128)
+
+
+def _alternate_float_step(
+    formula: str,
+    real: float,
+    imag: float,
+    parameter_real: float,
+    parameter_imag: float,
+) -> tuple[float, float]:
+    """Apply one alternate recurrence to a pair of ordinary floats."""
+
+    if formula == "burning-ship":
+        absolute_real = abs(real)
+        absolute_imag = abs(imag)
+        return (
+            absolute_real * absolute_real
+            - absolute_imag * absolute_imag
+            + parameter_real,
+            2.0 * absolute_real * absolute_imag + parameter_imag,
+        )
+    if formula == "tricorn":
+        return (
+            real * real - imag * imag + parameter_real,
+            -2.0 * real * imag + parameter_imag,
+        )
+    return (
+        real * real - imag * imag + parameter_real,
+        2.0 * real * imag + parameter_imag,
+    )
+
+
+def _cycle_is_attracting(
+    formula: str,
+    values: Any,
+    period: int,
+    parameter_real: float,
+    parameter_imag: float,
+) -> bool:
+    """Require a measured contraction before enabling cycle skipping."""
+
+    if period <= 0 or values.size < period:
+        return False
+    base = complex(values[-period])
+    perturbation = 1.0e-8 + 1.0e-8j
+    perturbed = base + perturbation
+    for _ in range(period):
+        base_real, base_imag = _alternate_float_step(
+            formula, base.real, base.imag, parameter_real, parameter_imag
+        )
+        perturbed_real, perturbed_imag = _alternate_float_step(
+            formula,
+            perturbed.real,
+            perturbed.imag,
+            parameter_real,
+            parameter_imag,
+        )
+        base = complex(base_real, base_imag)
+        perturbed = complex(perturbed_real, perturbed_imag)
+    if not (math.isfinite(base.real) and math.isfinite(base.imag)):
+        return False
+    contraction = abs(perturbed - base) / abs(perturbation)
+    return math.isfinite(contraction) and contraction < 0.95
+
+
+def _alternate_cycle_period(
+    formula: str,
+    reference: Any,
+    x_center: str,
+    y_center: str,
+    julia_constant: tuple[str, str],
+) -> Optional[int]:
+    """Choose a conservative period for skipping converged interior pixels."""
+
+    if formula == "julia":
+        # The Julia reference is deliberately stabilized at a repelling fixed
+        # point, so its period is not the attracting cycle that bounds the
+        # filled interior. Probe the critical orbit instead.
+        values = _alternate_critical_orbit(
+            formula, x_center, y_center, julia_constant
+        )
+        parameter_real = _finite_float_coordinate(julia_constant[0], "Julia real")
+        parameter_imag = _finite_float_coordinate(julia_constant[1], "Julia imaginary")
+    else:
+        values = reference
+        parameter_real = _finite_float_coordinate(x_center, "real")
+        parameter_imag = _finite_float_coordinate(y_center, "imaginary")
+    period = _detect_float_cycle_period(values)
+    if period is None or not _cycle_is_attracting(
+        formula, values, period, parameter_real, parameter_imag
+    ):
+        return None
+    return period
 
 
 def _view_offsets(width: int, height: int, log10_zoom: float) -> tuple[Any, Any]:
@@ -3113,17 +3425,6 @@ def _render_direct(
                 + active_parameter_real
             )
             next_imag = -2.0 * active_real * active_imag + active_parameter_imag
-        elif formula == "multibrot3":
-            next_real = (
-                active_real**3
-                - 3.0 * active_real * active_imag * active_imag
-                + active_parameter_real
-            )
-            next_imag = (
-                3.0 * active_real * active_real * active_imag
-                - active_imag**3
-                + active_parameter_imag
-            )
         else:
             next_real = (
                 active_real * active_real
@@ -3258,13 +3559,14 @@ def _render_perturbed_alternate(
         _validate_center_text(julia_constant[1], "Julia imaginary"),
     )
     x_offset, y_offset = _view_offsets(width, height, log10_zoom)
-    reference_real, reference_imag = _reference_orbit(
+    reference_real, reference_imag, reference_margin = _reference_orbit(
         x_center,
         y_center,
         max_iter,
         log10_zoom,
         formula,
         julia_constant,
+        include_margins=True,
     )
     offset = x_offset.ravel() + 1j * y_offset.ravel()
     reference = np.full(reference_real.shape, np.inf + 0j, dtype=np.complex128)
@@ -3272,21 +3574,58 @@ def _render_perturbed_alternate(
     reference[finite_reference] = (
         reference_real[finite_reference] + 1j * reference_imag[finite_reference]
     )
+    # The alternate recurrence is evaluated around the selected centre.  In
+    # the axis-crossing fallback below we must reconstruct the complete map
+    # ``f(z) = |z|^2 + c`` rather than adding only the pixel's tiny offset.
+    # Keeping this as the projected float centre also makes the recomputed
+    # value use the same precision as ``reference`` and ``next_ref``.
+    parameter = complex(
+        _finite_float_coordinate(x_center, "real"),
+        _finite_float_coordinate(y_center, "imaginary"),
+    )
+    cycle_period = _alternate_cycle_period(
+        formula,
+        reference,
+        x_center,
+        y_center,
+        julia_constant,
+    )
+    cycle_start_iteration = max(
+        256,
+        int(math.ceil(max(0.0, log10_zoom) / math.log10(4.0))) + 32,
+    )
+    cycle_checkpoint = (
+        np.empty(width * height, dtype=np.complex128)
+        if cycle_period is not None
+        else None
+    )
+    cycle_checkpoint_valid = (
+        np.zeros(width * height, dtype=bool)
+        if cycle_period is not None
+        else None
+    )
+    cycle_hits = (
+        np.zeros(width * height, dtype=np.uint8)
+        if cycle_period is not None
+        else None
+    )
     delta = offset.copy() if formula == "julia" else np.zeros(width * height, dtype=np.complex128)
     escaped = np.zeros(width * height, dtype=bool)
     smooth = np.full(width * height, float(max_iter), dtype=np.float32)
+    # A stabilized Julia reference is an analytic fixed point.  The exact
+    # centre pixel is therefore known bounded; removing it up front also
+    # prevents the tiny initial perturbations of neighbouring pixels from
+    # looking like a false period before they have separated from the
+    # repelling reference.
+    reference_is_fixed = (
+        formula == "julia"
+        and np.isfinite(reference[0])
+        and np.isfinite(reference[1])
+        and reference[0] == reference[1]
+    )
+    if reference_is_fixed:
+        escaped[offset == 0.0] = True
     power = _formula_power(formula)
-    if formula == "julia":
-        parameter = complex(
-            _finite_float_coordinate(julia_constant[0], "Julia real"),
-            _finite_float_coordinate(julia_constant[1], "Julia imaginary"),
-        )
-    else:
-        parameter = complex(
-            _finite_float_coordinate(x_center, "real"),
-            _finite_float_coordinate(y_center, "imaginary"),
-        )
-
     with np.errstate(over="ignore", invalid="ignore", under="ignore"):
         for iteration in range(max_iter):
             active_indices = np.flatnonzero(~escaped)
@@ -3299,33 +3638,22 @@ def _render_perturbed_alternate(
                 escaped[active_indices] = True
                 break
             active_delta = delta[active_indices]
-            # The reference orbit is calculated with mpmath, then stored as
-            # float64 for the vector loop.  Add the rounding residual between
-            # the float reference step and the stored high-precision step;
-            # otherwise a common ~1e-16 orbit error hides e150-scale pixel
-            # differences long before the perturbation has a chance to grow.
-            if formula == "julia":
-                reference_step = ref * ref + parameter
-            elif formula == "burning-ship":
-                reference_abs = abs(float(ref.real)) + 1j * abs(float(ref.imag))
-                reference_step = reference_abs * reference_abs + parameter
-            elif formula == "tricorn":
-                reference_step = np.conjugate(ref) * np.conjugate(ref) + parameter
-            else:  # multibrot3
-                reference_step = ref * ref * ref + parameter
-            reference_residual = reference_step - next_ref
+            # ``ref`` is the float projection of a higher-precision reference
+            # orbit.  The perturbation is defined relative to that orbit, so
+            # its centre must remain exactly delta=0.  A residual calculated
+            # from the rounded float reference is numerical noise (often
+            # about 1e-16); adding it would swamp a 1e-150 pixel offset and
+            # turn a valid deep view into a flat field.
             if formula == "julia":
                 next_delta = (
                     2.0 * ref * active_delta
                     + active_delta * active_delta
-                    + reference_residual
                 )
             elif formula == "tricorn":
                 conjugate_delta = np.conjugate(active_delta)
                 next_delta = (
                     2.0 * np.conjugate(ref) * conjugate_delta
                     + conjugate_delta * conjugate_delta
-                    + reference_residual
                     + offset[active_indices]
                 )
             elif formula == "burning-ship":
@@ -3339,7 +3667,6 @@ def _render_perturbed_alternate(
                 next_delta = (
                     2.0 * reference_abs * signed_delta
                     + signed_delta * signed_delta
-                    + reference_residual
                     + offset[active_indices]
                 )
                 # The absolute-value map is piecewise analytic. Recompute
@@ -3354,19 +3681,39 @@ def _render_perturbed_alternate(
                 )
                 if np.any(crossing):
                     absolute_actual = np.abs(actual.real[crossing]) + 1j * np.abs(actual.imag[crossing])
-                    exact_next = absolute_actual * absolute_actual + offset[active_indices][crossing]
-                    next_delta[crossing] = exact_next - next_ref
-            else:  # multibrot3
-                next_delta = (
-                    3.0 * ref * ref * active_delta
-                    + 3.0 * ref * active_delta * active_delta
-                    + active_delta * active_delta * active_delta
-                    + reference_residual
-                    + offset[active_indices]
-                )
+                    # Keep the tiny parameter offset out of the O(1) sum
+                    # until after the projected centre has been subtracted;
+                    # forming ``parameter + offset`` first rounds an e150
+                    # pixel back to the centre and loses the crossing path.
+                    next_delta[crossing] = (
+                        absolute_actual * absolute_actual
+                        + (parameter - next_ref)
+                        + offset[active_indices][crossing]
+                    )
+            else:
+                raise RuntimeError(f"unsupported alternate formula: {formula}")
             next_value = next_ref + next_delta
-            magnitude_squared = next_value.real * next_value.real + next_value.imag * next_value.imag
-            newly_escaped = (magnitude_squared > 4.0) | ~np.isfinite(magnitude_squared)
+            # Do the escape test in terms of a high-precision reference
+            # margin.  ``next_value.real**2 + next_value.imag**2`` rounds
+            # values such as ``4 + 1e-300`` back to exactly 4.0, making the
+            # e150+ boundary bands disappear.  Expanding around the exact
+            # reference preserves that tiny margin while retaining a fully
+            # vectorised float path for all pixels.
+            reference_real_next = float(next_ref.real)
+            reference_imag_next = float(next_ref.imag)
+            delta_real_next = next_delta.real
+            delta_imag_next = next_delta.imag
+            margin = (
+                reference_margin[iteration + 1]
+                + 2.0 * (
+                    reference_real_next * delta_real_next
+                    + reference_imag_next * delta_imag_next
+                )
+                + delta_real_next * delta_real_next
+                + delta_imag_next * delta_imag_next
+            )
+            newly_escaped = (margin > 0.0) | ~np.isfinite(margin)
+            magnitude_squared = np.maximum(4.0000001, 4.0 + margin)
             escaped_indices = active_indices[newly_escaped]
             smooth[escaped_indices] = _smooth_escape(
                 iteration + 1,
@@ -3375,6 +3722,61 @@ def _render_perturbed_alternate(
             )
             escaped[escaped_indices] = True
             delta[active_indices] = next_delta
+            if (
+                cycle_period is not None
+                and iteration + 1 >= cycle_start_iteration
+                and (iteration + 1) % cycle_period == 0
+            ):
+                surviving = ~newly_escaped
+                surviving_indices = active_indices[surviving]
+                surviving_values = next_value[surviving]
+                assert cycle_checkpoint is not None
+                assert cycle_checkpoint_valid is not None
+                assert cycle_hits is not None
+                if surviving_indices.size:
+                    uninitialized = ~cycle_checkpoint_valid[surviving_indices]
+                    if np.any(uninitialized):
+                        first_checkpoint = surviving_indices[uninitialized]
+                        cycle_checkpoint[first_checkpoint] = surviving_values[uninitialized]
+                        cycle_checkpoint_valid[first_checkpoint] = True
+                        cycle_hits[first_checkpoint] = 0
+
+                    checked_indices = surviving_indices[~uninitialized]
+                    if checked_indices.size:
+                        checked_values = surviving_values[~uninitialized]
+                        previous_values = cycle_checkpoint[checked_indices]
+                        difference = np.abs(checked_values - previous_values)
+                        scale = np.maximum(
+                            1.0,
+                            np.maximum(
+                                np.abs(checked_values), np.abs(previous_values)
+                            ),
+                        )
+                        close = difference <= ALTERNATE_CYCLE_TOLERANCE * scale
+                        if reference_is_fixed:
+                            # A repelling fixed reference makes all pixels
+                            # look period-matched while their perturbation is
+                            # still microscopic. Only consider an attracting
+                            # Julia cycle after the orbit has visibly left
+                            # that reference neighbourhood.
+                            close &= np.abs(checked_values - next_ref) > 1.0e-8
+                        cycle_hits[checked_indices[~close]] = 0
+                        close_indices = checked_indices[close]
+                        cycle_hits[close_indices] = np.minimum(
+                            255, cycle_hits[close_indices].astype(np.uint16) + 1
+                        ).astype(np.uint8)
+                        stable = close & (
+                            cycle_hits[checked_indices] >= ALTERNATE_CYCLE_CONFIRMATIONS
+                        )
+                        stable_indices = checked_indices[stable]
+                        if stable_indices.size:
+                            smooth[stable_indices] = float(max_iter)
+                            escaped[stable_indices] = True
+                        update_mask = ~stable
+                        if np.any(update_mask):
+                            cycle_checkpoint[checked_indices[update_mask]] = checked_values[
+                                update_mask
+                            ]
 
     return smooth.reshape((height, width))
 
@@ -7053,8 +7455,6 @@ def render_video(
     cpu_count = max(2, os.cpu_count() or 2)
     if native_threads == 0:
         native_threads = min(MAX_THREAD_COUNT, max(1, (cpu_count * 2) // 3))
-    if encoder_threads == 0:
-        encoder_threads = min(MAX_THREAD_COUNT, max(1, cpu_count // 3))
     render_width, render_height = _scaled_dimensions(
         width,
         height,
@@ -7264,7 +7664,7 @@ def render_video(
         f"field renderer: {active_renderer}; "
         f"native backend: {native_backend if native_library is not None else 'python'}; "
         f"native threads: {native_threads}; encoder: {selected_codec}; "
-        f"encoder threads: {encoder_threads}",
+        f"encoder threads: {encoder_threads if encoder_threads > 0 else 'auto'}",
         flush=True,
     )
 
@@ -7302,7 +7702,7 @@ def render_video(
             "-c:v",
             selected_codec,
             *preset_arguments,
-            *([] if using_vaapi else ["-threads", str(encoder_threads)]),
+            *(["-threads", str(encoder_threads)] if not using_vaapi and encoder_threads > 0 else []),
             *rate_control,
             *([] if using_vaapi else ["-pix_fmt", "yuv420p"]),
             "-c:a",
@@ -8153,6 +8553,7 @@ def _main_impl() -> None:
             random_seed=args.random_seed,
             max_log_zoom=max_log,
             formula=args.formula,
+            julia_constant=julia_constant,
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error

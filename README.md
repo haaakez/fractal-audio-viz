@@ -1,11 +1,14 @@
 # Fractal Audio Viz
 
+[![Render preview](images/preview.GIF)](images/preview.GIF)
+[![GTK GUI](images/gui.png)](images/gui.png)
+
 Fractal Audio Viz renders audio-reactive zooms through the Mandelbrot family:
-Mandelbrot, Julia, Burning Ship, Tricorn, and Multibrot³. It reads one local
+Mandelbrot, Julia, Burning Ship, and Tricorn. It reads one local
 song, turns the audio into animation controls, renders reusable scalar
 keyframes, and sends the final RGB frames to FFmpeg. The Mandelbrot path is
 the production path for e150+ deep zooms; the other formulas are first-class
-shallow and exploratory high-precision modes.
+high-precision modes with formula-specific deep boundary targets.
 
 ## How it works
 
@@ -35,9 +38,9 @@ The render is split into five stages.
    reference orbit and renders pixel offsets with perturbation arithmetic.
    Scaled mantissa/exponent values preserve tiny offsets, while BLA maps, an
    adaptive image-wide series, OpenMP, and depth-specific reference tiers
-   reduce the per-pixel cost. Julia, Burning Ship, Tricorn, and Multibrot³ use
+   reduce the per-pixel cost. Julia, Burning Ship, and Tricorn use
    formula-aware direct iteration and a high-precision Python perturbation
-   fallback for exploratory deep views.
+   fallback for deep boundary targets.
 
 5. **Colour and encoding.** Keyframes store scalar iteration data. The native
    colour path or Pillow turns that data into RGB after cropping. Built-in or
@@ -59,7 +62,8 @@ source fields and still produces a 4K video.
 | `renderer.cpp` / `renderer.h` | Native C ABI, MPFR deep rendering, BLA, OpenMP, and colour paths. |
 | `deep_zoom_points.py` | Formula-specific point catalogues and exact decimal centres. |
 | `profiles.py` | Shared render presets used by the CLI and GUI. |
-| `gui.py` | Optional Tkinter launcher; the CLI remains the reproducible interface. |
+| `gui.py` | Optional GTK3/PyGObject launcher; the CLI remains the reproducible interface. |
+| `images/` | README preview and GUI screenshots/placeholders. |
 | `make_preview.py` | Converts the newest 4K/e150 render to a GIF or short MP4. |
 | `point_sheet.py` | Creates a labelled catalogue contact sheet. |
 | `benchmark.py` | Field, compositor, and atlas benchmarks without audio or video encoding. |
@@ -69,7 +73,7 @@ source fields and still produces a 4K video.
 ## Installation and build
 
 The supplied Nix shell provides Python, NumPy, librosa, Pillow, mpmath,
-FFmpeg, GCC, GMP, MPFR, and Tk. OpenCL support is enabled when the host has
+FFmpeg, GCC, GMP, MPFR, GTK3, and PyGObject. OpenCL support is enabled when the host has
 the headers and ICD available. A regular Python environment can use
 `pip install -r requirements.txt`, followed by `make` if GMP/MPFR and a C++
 compiler are installed.
@@ -82,9 +86,8 @@ make test
 
 `make` creates `mandelbrot.so`. GMP and MPFR are required for native deep
 zooms. The Python renderer is useful for shallow previews and tests, but it is
-not a replacement for the native Mandelbrot e150+ path. On Linux, Tkinter may
-need to be installed separately by the distribution; Windows Python normally
-ships it.
+not a replacement for the native Mandelbrot e150+ path. The GTK launcher is an
+optional desktop dependency; headless CLI renders do not need PyGObject or GTK.
 
 ## Running a render
 
@@ -116,9 +119,11 @@ python3 gui.py
 The GUI only starts the same CLI in a child process, so it stays responsive
 and every render can still be copied from the log and reproduced in a shell.
 Profiles, formulas, palettes, catalogue points, and the audio/effects values
-are available at the top; scroll down for the complete technical options,
-including precision, iteration, native backend, encoder, cache, and manifest
-settings.
+are available at the top. The complete technical options—including precision,
+iteration, native backend, encoder, cache, and manifest controls—are collapsed
+behind the `Technical options` expander by default; expand it when needed. It
+uses GTK's native dark theme and a real scrolled container, so collapsing the
+advanced section cannot leave the form at an empty scroll offset.
 
 ## Constructing a command
 
@@ -190,16 +195,16 @@ python3 visualizer.py --list-points --formula burning-ship
 python3 visualizer.py --list-points --formula julia
 ```
 
-Each formula has its own point list. Mandelbrot contains 24 entries from named
-KFR files in the [MDZ gallery](https://mathr.co.uk/mdz/gallery/) and deep test
-views in [FractalShark](https://github.com/mattsaccount364/FractalShark),
-including labelled conjugate mirrors. Burning Ship, Tricorn, and Multibrot³
-use their own parameter-plane locations. Julia presets also include their
+Each formula has its own point list. Mandelbrot contains screened e150+ entries
+from named KFR files in the [MDZ gallery](https://mathr.co.uk/mdz/gallery/) and
+deep test views in [FractalShark](https://github.com/mattsaccount364/FractalShark),
+including labelled conjugate mirrors. Burning Ship and Tricorn use their own
+formula-specific boundary targets. Julia presets also include their
 fixed `c` value, so choosing `julia-douady-rabbit`, for example, changes both
 the preset and the Julia constant. `random` and `--random-point` select from
-the catalogue for the currently selected formula. Only Mandelbrot entries are
-screened for the production native e150+ path; alternate entries are
-exploratory recommendations.
+the catalogue for the currently selected formula. Mandelbrot entries are
+screened for the production native e150+ path; alternate entries are screened
+as Python high-precision boundary targets at the same depth.
 
 To use your own centre, pass a comma-separated pair to `--point`. This works
 for every formula and replaces that formula's preset:
@@ -246,16 +251,15 @@ python3 visualizer.py music/track.mp3 --formula burning-ship \
   --max-zoom 1e8 --beat-strength 1.0 \
   --palette-file examples/palette-neon.txt --output renders/ship.mp4
 
-# The remaining built-ins are tricorn (Mandelbar) and multibrot3.
+# The remaining built-in is tricorn (Mandelbar).
 python3 visualizer.py music/track.mp3 --formula tricorn --max-zoom 1e7
-python3 visualizer.py music/track.mp3 --formula multibrot3 --max-zoom 1e7
 ```
 
 Use `python3 visualizer.py --list-formulas` for the complete list. The
 validated MPFR/BLA e150+ accelerator is currently specific to the Mandelbrot
-parameter plane. Alternate formulas remain useful for ordinary renders and
-Python exploratory zooms up to about e300; they are not silently routed through
-an incompatible Mandelbrot reference.
+parameter plane. Alternate formulas use their own Python high-precision
+perturbation path for deep targets up to about e300; they are not silently
+routed through an incompatible Mandelbrot reference.
 
 ### 4K/e150 speed profile
 
@@ -339,7 +343,7 @@ Unless noted otherwise, the values in parentheses are the defaults.
 | `--random-seed N` | Seed random point selection so the same command chooses the same entry. Without it, system randomness is used. |
 | `--list-points` | Print every catalogue slug and its stored safe depth, then exit. An audio file is not needed. |
 | `--list-formulas` | Print the supported Mandelbrot-family formulas and exit. |
-| `--formula NAME` (`mandelbrot`) | Select `mandelbrot`, `julia`, `burning-ship`, `tricorn`, or `multibrot3`. |
+| `--formula NAME` (`mandelbrot`) | Select `mandelbrot`, `julia`, `burning-ship`, or `tricorn`. |
 | `--julia-c REAL,IMAG` (`-0.8,0.156`) | Fixed Julia constant used when `--formula julia` is selected. |
 | `--x-center VALUE` | Exact real coordinate. Must be paired with `--y-center`. |
 | `--y-center VALUE` | Exact imaginary coordinate. Must be paired with `--x-center`. |
@@ -437,7 +441,7 @@ frames or scalar fields when checking numerical output across machines.
 | `--renderer python` | Python direct/perturbed renderer | All formulas; exploratory fallback supports up to approximately `10^300`. |
 | `--renderer auto` + shallow zoom | Native direct CPU renderer when available; Python fallback otherwise | All formulas; OpenCL is used only when explicitly selected. |
 | `--renderer auto` + deep Mandelbrot | Native MPFR reference + scaled perturbation/BLA | Production path from approximately `10^12` through the validated catalogue depth. |
-| `--renderer auto` + deep alternate formula | Python high-precision perturbation fallback | Julia, Burning Ship, Tricorn, and Multibrot³ remain exploratory at deep zoom. |
+| `--renderer auto` + deep alternate formula | Python high-precision perturbation fallback | Julia, Burning Ship, and Tricorn use formula-specific boundary targets. |
 | `--native-backend opencl` | Native OpenCL direct renderer | Mandelbrot-only shallow views; unavailable or deep paths fail clearly rather than silently changing numerical mode. |
 | `--codec auto` | First passing hardware probe, otherwise `libx264` | The selected encoder is recorded in the manifest; hardware output is not byte-for-byte portable. |
 
@@ -459,10 +463,9 @@ zoom plan, settings, timings, and whether the render completed. Use
 
 ## GUI and project tools
 
-Tkinter is the lightest reasonable cross-platform GUI choice here: it ships
-with standard Windows Python installations and is available as a small system
-package on Linux. The GUI is intentionally a launcher rather than a second
-renderer, which keeps the command line reproducible:
+GTK3 with PyGObject provides the native dark desktop controls on Linux and
+other platforms with GTK installed. The GUI is intentionally a launcher rather
+than a second renderer, which keeps the command line reproducible:
 
 ```sh
 python3 gui.py
@@ -508,7 +511,7 @@ Benchmark arguments:
 | `--reference-zoom-log` | Reference/BLA setup depth. It must be at least the rendered depth. |
 | `--iterations` (`20000`) | Iteration budget for the field. |
 | `--x-center`, `--y-center` | Decimal benchmark centre; defaults to the bundled centre. |
-| `--formula` (`mandelbrot`) | Formula to benchmark: `mandelbrot`, `julia`, `burning-ship`, `tricorn`, or `multibrot3`. |
+| `--formula` (`mandelbrot`) | Formula to benchmark: `mandelbrot`, `julia`, `burning-ship`, or `tricorn`. |
 | `--julia-c` (`-0.8,0.156`) | Fixed Julia constant when benchmarking the Julia formula. |
 | `--renderer` (`auto`) | `auto`, `native`, or `python`. |
 | `--backend` (`auto`) | `auto`, `scalar`, `avx2`, or `opencl`. OpenCL is shallow only. |
@@ -560,10 +563,10 @@ This project is released under the [MIT License](LICENSE).
   Demucs and keep `--separation auto`/`demucs`.
 - **Hardware encoder error:** leave `--codec auto` enabled so the complete
   hardware path is probed and `libx264` is selected when necessary.
-- **Alternate formula is slow at extreme depth:** this is expected. The
-  Mandelbrot e150+ path uses the validated native BLA implementation; Julia,
-  Burning Ship, Tricorn, and Multibrot³ currently use direct native iteration
-  for shallow views and a correctness-oriented Python perturbation fallback
-  for exploratory deep views.
-- **GUI will not start on Linux:** install the distribution's Tk package (for
-  example `python3-tk` on Debian/Ubuntu) or enter the supplied `nix-shell`.
+- **Alternate formula is slow at extreme depth:** the Mandelbrot e150+ path
+  uses the validated native BLA implementation; Julia, Burning Ship, and
+  Tricorn use a correctness-oriented Python perturbation fallback for deep
+  boundary targets.
+- **GUI will not start:** install GTK3 and PyGObject for the system Python, or
+  enter the supplied `nix-shell`. Headless CLI renders do not need GUI
+  dependencies.

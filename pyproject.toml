@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 demucs = ["demucs>=4.0"]
+gui = ["PyGObject>=3.42"]
 
 [project.scripts]
 fractal-viz = "visualizer:main"

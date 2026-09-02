@@ -54,13 +54,13 @@ class AnimationTests(unittest.TestCase):
             ),
         )
 
-    def test_curated_point_catalogue_has_at_least_twenty_e150_locations(self):
+    def test_curated_point_catalogue_has_screened_e150_locations(self):
         points = visualizer.DEEP_ZOOM_POINTS
-        self.assertGreaterEqual(len(points), 20)
+        self.assertGreaterEqual(len(points), 18)
         self.assertEqual(len({point.slug for point in points}), len(points))
         self.assertGreaterEqual(
             sum(point.conjugate_of is None for point in points),
-            14,
+            9,
         )
         self.assertTrue(
             all(visualizer._deep_point_max_log10_zoom(point) >= 150.0 for point in points)
@@ -102,7 +102,7 @@ class AnimationTests(unittest.TestCase):
 
     def test_formula_point_resolution_uses_the_selected_catalogue(self):
         burning_ship = visualizer._resolve_render_point(
-            point_spec="burning-ship-mast",
+            point_spec="burning-ship-left-tip",
             random_point=False,
             x_center=None,
             y_center=None,
@@ -111,7 +111,7 @@ class AnimationTests(unittest.TestCase):
             formula="burning-ship",
         )
         self.assertEqual(burning_ship[2].formula, "burning-ship")
-        self.assertEqual(burning_ship[0], "-1.77375")
+        self.assertEqual(burning_ship[0], "-2.0")
 
         julia = visualizer._resolve_render_point(
             point_spec="julia-douady-rabbit",
@@ -124,6 +124,11 @@ class AnimationTests(unittest.TestCase):
         )
         self.assertEqual(julia[2].julia_c, ("-0.123", "0.745"))
 
+        self.assertEqual(
+            visualizer.FORMULA_CHOICES,
+            ("mandelbrot", "julia", "burning-ship", "tricorn"),
+        )
+
         with self.assertRaisesRegex(ValueError, "unknown burning-ship point"):
             visualizer._resolve_render_point(
                 point_spec="oldwooddish",
@@ -134,6 +139,111 @@ class AnimationTests(unittest.TestCase):
                 max_log_zoom=1.0,
                 formula="burning-ship",
             )
+
+    def test_alternate_e150_catalogue_targets_are_finite_and_structured(self):
+        for formula, points in visualizer.FORMULA_POINT_CATALOGUES.items():
+            if formula == "mandelbrot":
+                continue
+            for point in points:
+                x_center, y_center, selected = visualizer._resolve_render_point(
+                    point_spec=point.slug,
+                    random_point=False,
+                    x_center=None,
+                    y_center=None,
+                    random_seed=None,
+                    max_log_zoom=150.0,
+                    formula=formula,
+                )
+                constant = (
+                    selected.julia_c
+                    if formula == "julia" and selected is not None
+                    else visualizer.DEFAULT_JULIA_C
+                )
+                field = visualizer.render_fractal(
+                    12,
+                    8,
+                    150.0,
+                    x_center,
+                    y_center,
+                    4000,
+                    "python",
+                    formula=formula,
+                    julia_constant=constant,
+                )
+                self.assertTrue(np.isfinite(field).all(), point.slug)
+                self.assertGreater(float(np.ptp(field)), 0.0, point.slug)
+
+    def test_burning_ship_e150_axis_crossing_does_not_false_escape(self):
+        point = visualizer.FORMULA_POINT_CATALOGUES["burning-ship"][0]
+        field = visualizer.render_fractal(
+            5,
+            4,
+            150.0,
+            point.x,
+            point.y,
+            1000,
+            "python",
+            formula="burning-ship",
+        )
+        # An independent high-precision orbit stays bounded for this whole
+        # tiny viewport.  Before the axis-crossing fix, the first pixel was
+        # incorrectly reported as escaped around iteration 835.
+        np.testing.assert_array_equal(field, np.full((4, 5), 1000.0, dtype=np.float32))
+
+    def test_left_tip_periodicity_does_not_hide_boundary_escape(self):
+        for formula in ("burning-ship", "tricorn"):
+            point = next(
+                point
+                for point in visualizer.FORMULA_POINT_CATALOGUES[formula]
+                if point.slug.endswith("left-tip")
+            )
+            field = visualizer.render_fractal(
+                3,
+                3,
+                150.0,
+                point.x,
+                point.y,
+                1000,
+                "python",
+                formula=formula,
+            )
+            # The upper-right pixel is just outside the exact -2 tip and
+            # escapes around iteration 251. It must not be marked bounded by
+            # the period-one interior shortcut before that happens.
+            self.assertLess(float(field[0, 2]), 1000.0, formula)
+
+    def test_tricorn_e150_boundary_margin_is_preserved(self):
+        point = visualizer.FORMULA_POINT_CATALOGUES["tricorn"][0]
+        field = visualizer.render_fractal(
+            5,
+            4,
+            150.0,
+            point.x,
+            point.y,
+            1000,
+            "python",
+            formula="tricorn",
+        )
+        self.assertAlmostEqual(float(field[0, 0]), 1.5287664, places=4)
+        self.assertGreater(float(field[1, -1]), 250.0)
+
+    def test_julia_e150_fixed_point_reference_is_stabilized(self):
+        for point in visualizer.JULIA_POINTS:
+            field = visualizer.render_fractal(
+                3,
+                3,
+                150.0,
+                point.x,
+                point.y,
+                1000,
+                "python",
+                formula="julia",
+                julia_constant=point.julia_c,
+            )
+            # The centre is the analytically recovered repelling fixed point,
+            # not a finite-decimal orbit that eventually drifts away after
+            # its last supplied digit.
+            self.assertEqual(float(field[1, 1]), 1000.0, point.slug)
 
     def test_point_accepts_exact_custom_pair_and_rejects_conflicts(self):
         x, y, preset = visualizer._resolve_render_point(
@@ -408,7 +518,7 @@ class AnimationTests(unittest.TestCase):
     def test_native_formula_modes_produce_fields(self):
         if visualizer._get_native_library() is None:
             raise unittest.SkipTest("native renderer is unavailable")
-        for formula in ("julia", "burning-ship", "tricorn", "multibrot3"):
+        for formula in ("julia", "burning-ship", "tricorn"):
             field = visualizer.render_fractal(
                 40,
                 30,

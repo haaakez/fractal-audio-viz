@@ -2,5 +2,7 @@ numpy>=1.24
 librosa>=0.10
 Pillow>=10.0
 mpmath>=1.3
+# Optional GUI: requires a system GTK 3 runtime (not needed for CLI renders).
+# PyGObject>=3.42
 # Optional, for neural vocal/instrumental separation:
 # demucs>=4.0

@@ -10,13 +10,11 @@ extern "C" {
 #define FRACTAL_ABI_VERSION 10
 #define FRACTAL_RENDER_OPTIONS_VERSION 1
 
-/* Formula ids used by render_fractal_ex.  The original Mandelbrot entry
- * points remain available for ABI compatibility. */
+/* Formula ids used by render_fractal_ex. */
 #define FRACTAL_FORMULA_MANDELBROT 0
 #define FRACTAL_FORMULA_JULIA 1
 #define FRACTAL_FORMULA_BURNING_SHIP 2
 #define FRACTAL_FORMULA_TRICORN 3
-#define FRACTAL_FORMULA_MULTIBROT3 4
 
 /*
  * Per-call controls for the native renderer.  Callers should initialize this

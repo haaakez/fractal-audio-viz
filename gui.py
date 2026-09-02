@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Small Tkinter launcher for the command-line renderer.
+"""GTK3 launcher for the reproducible command-line renderer.
 
-Tkinter is part of Python's standard library and is available on Windows and
-Linux. The renderer still runs in a child process, so the window stays
-responsive and the CLI remains the source of truth for reproducible renders.
+The GUI is deliberately a thin launcher: it owns the controls, process
+lifecycle, and progress log, while ``visualizer.py`` remains the single source
+of rendering behaviour. GTK's native scrolled container and expander keep the
+compact default view stable even when the technical controls are opened.
 """
 
 from __future__ import annotations
 
-import queue
 import os
+import queue
 import shlex
 import signal
 import subprocess
@@ -18,11 +19,16 @@ import threading
 from pathlib import Path
 
 try:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
-except ImportError:  # pragma: no cover - depends on the Python distribution
-    tk = None  # type: ignore[assignment]
-    filedialog = messagebox = ttk = None  # type: ignore[assignment]
+    import gi
+
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gdk, GLib, Gtk
+except (ImportError, ValueError) as error:  # pragma: no cover - environment dependent
+    Gdk = GLib = Gtk = None  # type: ignore[assignment]
+    GTK_IMPORT_ERROR: Exception | None = error
+else:
+    GTK_IMPORT_ERROR = None
 
 from deep_zoom_points import FORMULA_POINT_CATALOGUES, FORMULA_POINTS_BY_SLUG
 from profiles import PROFILE_CHOICES, PROFILE_DEFAULTS
@@ -53,718 +59,931 @@ def _read_bounded_line(stream: object, limit: int) -> str | None:
     return str(chunk)
 
 
-class RenderApp:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("Fractal Audio Viz")
-        self.root.minsize(720, 560)
-        self.process: subprocess.Popen[str] | None = None
-        self.output_queue: queue.Queue[str] = queue.Queue(maxsize=OUTPUT_QUEUE_LIMIT)
+if Gtk is not None:
 
-        self.audio = tk.StringVar(value=str(ROOT / "song.mp3"))
-        self.output = tk.StringVar(value=str(ROOT / "fractal_viz.mp4"))
-        self.profile = tk.StringVar(value="preview")
-        self.formula = tk.StringVar(value="mandelbrot")
-        self.point = tk.StringVar(value="")
-        self.random_point = tk.BooleanVar(value=False)
-        self.random_seed = tk.StringVar(value="")
-        self.julia_c = tk.StringVar(value="-0.8,0.156")
-        self.x_center = tk.StringVar(value="")
-        self.y_center = tk.StringVar(value="")
-        self.base_zoom = tk.StringVar(value="1.0")
-        self.max_zoom = tk.StringVar(value="1e24")
-        self.width = tk.StringVar(value="960")
-        self.height = tk.StringVar(value="540")
-        self.fps = tk.StringVar(value="24")
-        self.sample_rate = tk.StringVar(value="44100")
-        self.separation = tk.StringVar(value="auto")
-        self.render_scale = tk.StringVar(value="1.0")
-        self.fractal_scale = tk.StringVar(value="0.5")
-        self.quality = tk.StringVar(value="draft")
-        self.keyframe_factor = tk.StringVar(value="4.0")
-        self.keyframe_mode = tk.StringVar(value="atlas")
-        self.allow_underspecified_center = tk.BooleanVar(value=False)
-        self.iteration_base = tk.StringVar(value="384")
-        self.iterations_per_decade = tk.StringVar(value="500")
-        self.iteration_cap = tk.StringVar(value="100000")
-        self.zoom_punch = tk.StringVar(value="3.0")
-        self.zoom_speed = tk.StringVar(value="-0.04")
-        self.attack = tk.StringVar(value="0.025")
-        self.release = tk.StringVar(value="0.12")
-        self.series_order = tk.StringVar(value="3")
-        self.series_block = tk.StringVar(value="256")
-        self.renderer = tk.StringVar(value="auto")
-        self.native_threads = tk.StringVar(value="0")
-        self.native_backend = tk.StringVar(value="auto")
-        self.video_preset = tk.StringVar(value="ultrafast")
-        self.codec = tk.StringVar(value="auto")
-        self.crf = tk.StringVar(value="18")
-        self.resample = tk.StringVar(value="bilinear")
-        self.encoder_threads = tk.StringVar(value="0")
-        self.cache = tk.StringVar(value=str(ROOT / "cache"))
-        self.cache_limit_mb = tk.StringVar(value="0")
-        self.durable_cache = tk.BooleanVar(value=False)
-        self.manifest = tk.StringVar(value="")
-        self.no_manifest = tk.BooleanVar(value=False)
-        self.palette = tk.StringVar(value="aurora")
-        self.palette_file = tk.StringVar(value="")
-        self.beat_strength = tk.DoubleVar(value=0.0)
-        self.glow = tk.DoubleVar(value=0.0)
-        self.motion_blur = tk.DoubleVar(value=0.0)
-        self.beat_strength_value = tk.StringVar(value="0.00")
-        self.glow_value = tk.StringVar(value="0.00")
-        self.motion_blur_value = tk.StringVar(value="0.00")
+    class RenderApp:
+        """Own the GTK window and launch the shared CLI in a child process."""
 
-        self._build_widgets()
-        self.profile.trace_add("write", self._profile_changed)
-        self.formula.trace_add("write", self._formula_changed)
-        self.point.trace_add("write", self._point_changed)
-        self._profile_changed()
-        self._formula_changed()
-        self.root.after(100, self._drain_output)
-        self.root.protocol("WM_DELETE_WINDOW", self._close)
+        def __init__(self, application: Gtk.Application) -> None:
+            self.application = application
+            self.window = Gtk.ApplicationWindow(application=application)
+            self.window.set_title("Fractal Audio Viz")
+            self.window.set_default_size(980, 760)
+            self.window.set_size_request(760, 560)
+            self.window.connect("delete-event", self._on_delete_event)
+            self.process: subprocess.Popen[str] | None = None
+            self.output_queue: queue.Queue[str] = queue.Queue(maxsize=OUTPUT_QUEUE_LIMIT)
 
-    def _build_widgets(self) -> None:
-        self.root.minsize(780, 640)
-        shell = ttk.Frame(self.root)
-        shell.pack(fill="both", expand=True)
-        shell.rowconfigure(0, weight=1)
-        shell.columnconfigure(0, weight=1)
+            self._configure_dark_theme()
+            self._build_widgets()
+            self.profile.connect("changed", self._profile_changed)
+            self.formula.connect("changed", self._formula_changed)
+            self.point_combo.connect("changed", self._point_changed)
+            self._profile_changed()
+            self._formula_changed()
+            GLib.timeout_add(100, self._drain_output)
+            self.window.show_all()
+            self.technical_expander.set_expanded(False)
+            self._set_technical_child_visible(False)
 
-        canvas = tk.Canvas(shell, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        @staticmethod
+        def _configure_dark_theme() -> None:
+            """Use a coherent dark palette for GTK and native popovers."""
 
-        root_frame = ttk.Frame(canvas, padding=12)
-        root_frame.columnconfigure(0, weight=1)
-        window_id = canvas.create_window((0, 0), window=root_frame, anchor="nw")
+            settings = Gtk.Settings.get_default()
+            if settings is not None:
+                settings.set_property("gtk-application-prefer-dark-theme", True)
+                settings.set_property("gtk-enable-animations", True)
 
-        def update_scroll_region(_event: object = None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def resize_content(event: tk.Event) -> None:
-            canvas.itemconfigure(window_id, width=max(event.width, root_frame.winfo_reqwidth()))
-
-        root_frame.bind("<Configure>", update_scroll_region)
-        canvas.bind("<Configure>", resize_content)
-
-        def scroll(event: tk.Event) -> None:
-            if getattr(event, "num", None) == 4:
-                canvas.yview_scroll(-1, "units")
-            elif getattr(event, "num", None) == 5:
-                canvas.yview_scroll(1, "units")
-            else:
-                canvas.yview_scroll(int(-event.delta / 120), "units")
-
-        canvas.bind_all("<MouseWheel>", scroll)
-        canvas.bind_all("<Button-4>", scroll)
-        canvas.bind_all("<Button-5>", scroll)
-
-        render_frame = ttk.LabelFrame(root_frame, text="Render")
-        render_frame.grid(row=0, column=0, sticky="ew")
-        render_frame.columnconfigure(1, weight=1)
-        row = 0
-        row = self._path_row(render_frame, row, "Audio", self.audio, [
-            ("Audio files", "*.mp3 *.wav *.flac *.ogg"),
-            ("All files", "*"),
-        ])
-        row = self._path_row(render_frame, row, "Output", self.output, [
-            ("MP4", "*.mp4"),
-            ("All files", "*"),
-        ], save=True)
-        row = self._combo_row(render_frame, row, "Profile", self.profile, PROFILE_CHOICES)
-        row = self._combo_row(
-            render_frame,
-            row,
-            "Formula",
-            self.formula,
-            tuple(FORMULA_POINT_CATALOGUES),
-        )
-
-        ttk.Label(render_frame, text="Point").grid(row=row, column=0, sticky="w", pady=4)
-        point_frame = ttk.Frame(render_frame)
-        point_frame.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
-        point_frame.columnconfigure(0, weight=1)
-        self.point_combo = ttk.Combobox(
-            point_frame,
-            textvariable=self.point,
-            values=("", "random"),
-        )
-        self.point_combo.grid(row=0, column=0, sticky="ew")
-        self.point_combo.bind("<<ComboboxSelected>>", self._point_changed)
-        ttk.Checkbutton(
-            point_frame,
-            text="Random catalogue point",
-            variable=self.random_point,
-        ).grid(row=0, column=1, padx=(8, 0))
-        row += 1
-        row = self._entry_row(render_frame, row, "Julia c", self.julia_c, "REAL,IMAG")
-        row = self._entry_row(render_frame, row, "Max zoom", self.max_zoom, "for example 1e150")
-
-        dimensions = ttk.Frame(render_frame)
-        dimensions.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
-        for index in range(6):
-            dimensions.columnconfigure(index, weight=1 if index in {1, 3, 5} else 0)
-        ttk.Label(render_frame, text="Video").grid(row=row, column=0, sticky="w", pady=4)
-        for index, (label, variable) in enumerate(
-            (("W", self.width), ("H", self.height), ("FPS", self.fps))
-        ):
-            ttk.Label(dimensions, text=label).grid(row=0, column=index * 2, padx=(0, 3))
-            ttk.Entry(dimensions, textvariable=variable, width=8).grid(
-                row=0, column=index * 2 + 1, sticky="ew", padx=(0, 12)
-            )
-        row += 1
-        row = self._combo_row(
-            render_frame,
-            row,
-            "Palette",
-            self.palette,
-            ("aurora", "fire", "ocean", "neon", "sunset", "mono"),
-        )
-        row = self._path_row(
-            render_frame,
-            row,
-            "Palette file",
-            self.palette_file,
-            [("Palette text", "*.txt"), ("All files", "*")],
-        )
-
-        effects = ttk.LabelFrame(root_frame, text="Audio and effects")
-        effects.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        effects.columnconfigure(1, weight=1)
-        row = 0
-        row = self._slider_row(
-            effects, row, "Beat strength", self.beat_strength, self.beat_strength_value,
-            3.0, "onset contribution; 0 disables it",
-        )
-        row = self._slider_row(
-            effects, row, "Glow", self.glow, self.glow_value,
-            1.0, "bloom amount; adds compositor work",
-        )
-        self._slider_row(
-            effects, row, "Motion blur", self.motion_blur, self.motion_blur_value,
-            0.99, "blend with the previous frame",
-        )
-
-        technical = ttk.LabelFrame(root_frame, text="Technical options")
-        technical.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        technical.columnconfigure(1, weight=1)
-        row = 0
-        row = self._technical_row(technical, row, "Sample rate", self.sample_rate, "Hz")
-        row = self._technical_row(
-            technical, row, "Separation", self.separation, "audio stem strategy",
-            ("auto", "demucs", "spectral", "none"),
-        )
-        row = self._technical_row(technical, row, "Render scale", self.render_scale, "keyframe resolution multiplier")
-        row = self._technical_row(technical, row, "Fractal scale", self.fractal_scale, "minimum source resolution multiplier")
-        row = self._technical_row(
-            technical, row, "Quality", self.quality, "draft / balanced / quality / extreme",
-            ("draft", "balanced", "quality", "extreme"),
-        )
-        row = self._technical_row(technical, row, "Keyframe factor", self.keyframe_factor, "maximum zoom jump between keyframes")
-        row = self._technical_row(
-            technical, row, "Keyframe mode", self.keyframe_mode, "atlas reuses nested tiles",
-            ("atlas", "legacy"),
-        )
-        row = self._technical_row(technical, row, "Random seed", self.random_seed, "reproducible catalogue selection")
-        row = self._technical_row(technical, row, "X centre", self.x_center, "paired with Y centre; conflicts with Point")
-        row = self._technical_row(technical, row, "Y centre", self.y_center, "paired with X centre; conflicts with Point")
-        row = self._technical_row(technical, row, "Base zoom", self.base_zoom, "starting zoom")
-        row = self._check_row(
-            technical, row, "Allow underspecified centre", self.allow_underspecified_center,
-            "exploratory deep render only",
-        )
-        row = self._technical_row(technical, row, "Iteration base", self.iteration_base, "minimum shallow iteration budget")
-        row = self._technical_row(technical, row, "Iterations / decade", self.iterations_per_decade, "added per decimal zoom")
-        row = self._technical_row(technical, row, "Iteration cap", self.iteration_cap, "maximum iteration budget")
-        row = self._technical_row(technical, row, "Zoom punch", self.zoom_punch, "loudness contrast")
-        row = self._technical_row(technical, row, "Zoom speed", self.zoom_speed, "quiet-time log zoom velocity")
-        row = self._technical_row(technical, row, "Attack", self.attack, "audio envelope seconds")
-        row = self._technical_row(technical, row, "Release", self.release, "audio envelope seconds")
-        row = self._technical_row(technical, row, "Series order", self.series_order, "native BLA polynomial degree")
-        row = self._technical_row(technical, row, "Series block", self.series_block, "native BLA block length")
-        row = self._technical_row(
-            technical, row, "Renderer", self.renderer, "auto / native / python",
-            ("auto", "native", "python"),
-        )
-        row = self._technical_row(technical, row, "Native threads", self.native_threads, "0 uses the runtime default")
-        row = self._technical_row(
-            technical, row, "Native backend", self.native_backend, "hardware field backend",
-            ("auto", "scalar", "avx2", "opencl"),
-        )
-        row = self._technical_row(
-            technical, row, "Video preset", self.video_preset, "FFmpeg speed / size trade-off",
-            ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"),
-        )
-        row = self._technical_row(technical, row, "Codec", self.codec, "FFmpeg encoder name or auto")
-        row = self._technical_row(technical, row, "CRF", self.crf, "encoder quality, 0 to 51")
-        row = self._technical_row(
-            technical, row, "Resample", self.resample, "crop filter",
-            ("bilinear", "lanczos"),
-        )
-        row = self._technical_row(technical, row, "Encoder threads", self.encoder_threads, "0 lets FFmpeg choose")
-        row = self._technical_row(technical, row, "Cache limit MB", self.cache_limit_mb, "0 means unlimited")
-        row = self._check_row(
-            technical, row, "Durable cache", self.durable_cache,
-            "fsync each tile; safer but slower",
-        )
-        row = self._path_row(
-            technical, row, "Manifest", self.manifest,
-            [("JSON", "*.json"), ("All files", "*")], save=True,
-        )
-        self._check_row(
-            technical, row, "Disable manifest", self.no_manifest,
-            "do not write the automatic JSON sidecar",
-        )
-
-        buttons = ttk.Frame(root_frame)
-        buttons.grid(row=3, column=0, sticky="ew", pady=(10, 6))
-        self.start_button = ttk.Button(buttons, text="Render", command=self._start)
-        self.start_button.pack(side="left")
-        self.estimate_button = ttk.Button(buttons, text="Estimate", command=self._estimate)
-        self.estimate_button.pack(side="left", padx=6)
-        self.stop_button = ttk.Button(buttons, text="Stop", command=self._stop, state="disabled")
-        self.stop_button.pack(side="left")
-
-        ttk.Label(root_frame, text="Renderer output").grid(row=4, column=0, sticky="w", pady=(4, 0))
-        self.log = tk.Text(
-            root_frame,
-            height=16,
-            wrap="word",
-            state="disabled",
-            background="#101218",
-            foreground="#e8eaf0",
-        )
-        self.log.grid(row=5, column=0, sticky="nsew", pady=(4, 0))
-
-    def _combo_row(
-        self,
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        variable: tk.StringVar,
-        values: tuple[str, ...],
-    ) -> int:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Combobox(
-            parent, textvariable=variable, values=values, state="readonly"
-        ).grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
-        return row + 1
-
-    def _slider_row(
-        self,
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        variable: tk.DoubleVar,
-        display: tk.StringVar,
-        maximum: float,
-        hint: str,
-    ) -> int:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=5)
-        ttk.Scale(
-            parent,
-            from_=0.0,
-            to=maximum,
-            variable=variable,
-            command=lambda value: display.set(f"{float(value):.2f}"),
-        ).grid(row=row, column=1, sticky="ew", padx=(4, 8), pady=5)
-        ttk.Label(parent, textvariable=display, width=6, anchor="e").grid(
-            row=row, column=2, sticky="e", padx=(0, 8), pady=5
-        )
-        ttk.Label(parent, text=hint).grid(row=row, column=3, sticky="w", padx=(0, 8), pady=5)
-        return row + 1
-
-    def _technical_row(
-        self,
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        variable: tk.StringVar,
-        hint: str,
-        values: tuple[str, ...] | None = None,
-    ) -> int:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=3)
-        if values is None:
-            widget: tk.Widget = ttk.Entry(parent, textvariable=variable)
-        else:
-            widget = ttk.Combobox(parent, textvariable=variable, values=values, state="readonly")
-        widget.grid(row=row, column=1, sticky="ew", padx=4, pady=3)
-        ttk.Label(parent, text=hint).grid(row=row, column=2, sticky="w", padx=(8, 8), pady=3)
-        return row + 1
-
-    def _check_row(
-        self,
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        variable: tk.BooleanVar,
-        hint: str,
-    ) -> int:
-        ttk.Checkbutton(parent, text=label, variable=variable).grid(
-            row=row, column=0, columnspan=2, sticky="w", padx=8, pady=3
-        )
-        ttk.Label(parent, text=hint).grid(row=row, column=2, sticky="w", padx=(8, 8), pady=3)
-        return row + 1
-
-    def _entry_row(self, parent: ttk.Frame, row: int, label: str, variable: tk.StringVar, hint: str) -> int:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        entry = ttk.Entry(parent, textvariable=variable)
-        entry.grid(row=row, column=1, sticky="ew", pady=4)
-        entry.insert(0, "") if not variable.get() else None
-        entry.configure(width=max(20, len(hint)))
-        return row + 1
-
-    def _path_row(
-        self,
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        variable: tk.StringVar,
-        filetypes: list[tuple[str, str]],
-        save: bool = False,
-        directory: bool = False,
-    ) -> int:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Entry(parent, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=4)
-        def browse() -> None:
-            if directory:
-                chosen = filedialog.askdirectory()
-            elif save:
-                chosen = filedialog.asksaveasfilename(filetypes=filetypes)
-            else:
-                chosen = filedialog.askopenfilename(filetypes=filetypes)
-            if chosen:
-                variable.set(chosen)
-        ttk.Button(parent, text="Browse", command=browse).grid(row=row, column=2, padx=(6, 0), pady=4)
-        return row + 1
-
-    def _formula_changed(self, *_: object) -> None:
-        formula = self.formula.get()
-        points = FORMULA_POINT_CATALOGUES.get(formula, ())
-        values = ("", "random", *(point.slug for point in points))
-        self.point_combo.configure(values=values)
-
-        current = self.point.get().strip()
-        known_values = {value.casefold() for value in values if value}
-        if current and "," not in current and current.casefold() not in known_values:
-            # A slug belongs to one formula.  Exact coordinate pairs remain
-            # editable when the user changes formula.
-            self.point.set("")
-        self._point_changed()
-
-    def _point_changed(self, *_: object) -> None:
-        preset = FORMULA_POINTS_BY_SLUG.get(self.formula.get(), {}).get(
-            self.point.get().strip().casefold()
-        )
-        if preset is not None and preset.julia_c is not None:
-            self.julia_c.set(",".join(preset.julia_c))
-
-    def _profile_changed(self, *_: object) -> None:
-        values = PROFILE_DEFAULTS.get(self.profile.get(), {})
-        for key, variable in (
-            ("width", self.width),
-            ("height", self.height),
-            ("fps", self.fps),
-            ("max_zoom", self.max_zoom),
-            ("separation", self.separation),
-            ("fractal_scale", self.fractal_scale),
-            ("quality", self.quality),
-            ("keyframe_factor", self.keyframe_factor),
-            ("video_preset", self.video_preset),
-        ):
-            if key in values:
-                variable.set(str(values[key]))
-        self.beat_strength.set(float(values.get("beat_strength", 0.0)))
-        self.beat_strength_value.set(f"{self.beat_strength.get():.2f}")
-        self.glow_value.set(f"{self.glow.get():.2f}")
-        self.motion_blur_value.set(f"{self.motion_blur.get():.2f}")
-
-    def _command(self, estimate: bool = False) -> list[str]:
-        point_spec = self.point.get().strip()
-        has_point = self.random_point.get() or bool(point_spec)
-        has_x = bool(self.x_center.get().strip())
-        has_y = bool(self.y_center.get().strip())
-        if has_point and (has_x or has_y):
-            raise ValueError("Point/random point cannot be combined with X/Y centre")
-        if has_x != has_y:
-            raise ValueError("X and Y centre must be supplied together")
-        audio_path = Path(self.audio.get()).expanduser().resolve()
-        # Preserve the final component so the CLI can reject an output
-        # symlink safely instead of resolving it into the target file.
-        output_path = Path(self.output.get()).expanduser().absolute()
-        command = [sys.executable, "-u", str(VISUALIZER), str(audio_path)]
-        command.extend(["--output", str(output_path), "--profile", self.profile.get()])
-        formula = self.formula.get()
-        julia_preset = FORMULA_POINTS_BY_SLUG.get(formula, {}).get(point_spec.casefold())
-        command.extend([
-            "--formula", formula,
-            "--max-zoom", self.max_zoom.get(),
-            "--width", self.width.get(), "--height", self.height.get(), "--fps", self.fps.get(),
-            "--sample-rate", self.sample_rate.get(),
-            "--separation", self.separation.get(),
-            "--render-scale", self.render_scale.get(),
-            "--fractal-scale", self.fractal_scale.get(),
-            "--quality", self.quality.get(),
-            "--keyframe-factor", self.keyframe_factor.get(),
-            "--keyframe-mode", self.keyframe_mode.get(),
-            "--base-zoom", self.base_zoom.get(),
-            "--iteration-base", self.iteration_base.get(),
-            "--iterations-per-decade", self.iterations_per_decade.get(),
-            "--iteration-cap", self.iteration_cap.get(),
-            "--zoom-punch", self.zoom_punch.get(),
-            "--zoom-speed", self.zoom_speed.get(),
-            "--palette", self.palette.get(),
-            "--beat-strength", str(self.beat_strength.get()),
-            "--attack", self.attack.get(),
-            "--release", self.release.get(),
-            "--series-order", self.series_order.get(),
-            "--series-block", self.series_block.get(),
-            "--renderer", self.renderer.get(),
-            "--native-threads", self.native_threads.get(),
-            "--native-backend", self.native_backend.get(),
-            "--video-preset", self.video_preset.get(),
-            "--codec", self.codec.get(),
-            "--crf", self.crf.get(),
-            "--resample", self.resample.get(),
-            "--glow", str(self.glow.get()), "--motion-blur", str(self.motion_blur.get()),
-            "--encoder-threads", self.encoder_threads.get(),
-            "--cache-limit-mb", self.cache_limit_mb.get(),
-        ])
-        if formula == "julia":
-            # Resolve the preset at command-build time too.  This covers a
-            # slug typed into the editable combobox, even when Tk has not
-            # emitted a ComboboxSelected event.  Random selection must not
-            # inherit a stale preset constant from the editable combobox.
-            if not self.random_point.get() and point_spec.casefold() != "random" and (
-                julia_preset is not None and julia_preset.julia_c is not None
-            ):
-                command.append("--julia-c=" + ",".join(julia_preset.julia_c))
-            elif not self.random_point.get() and point_spec.casefold() != "random":
-                # A value such as -0.8,0.156 is interpreted as an option by
-                # argparse when it is passed as a separate argv item.
-                command.append("--julia-c=" + self.julia_c.get().strip())
-        if self.random_point.get():
-            command.append("--random-point")
-        elif point_spec:
-            # The same applies to negative custom Mandelbrot coordinates.
-            command.append("--point=" + point_spec)
-        if self.random_seed.get().strip():
-            command.extend(["--random-seed", self.random_seed.get().strip()])
-        if self.x_center.get().strip():
-            command.append("--x-center=" + self.x_center.get().strip())
-        if self.y_center.get().strip():
-            command.append("--y-center=" + self.y_center.get().strip())
-        if self.allow_underspecified_center.get():
-            command.append("--allow-underspecified-center")
-        if self.cache.get().strip():
-            command.extend([
-                "--cache-dir",
-                str(Path(self.cache.get().strip()).expanduser().resolve()),
-            ])
-        if self.durable_cache.get():
-            command.append("--durable-cache")
-        if self.manifest.get().strip():
-            command.extend([
-                "--manifest",
-                str(Path(self.manifest.get().strip()).expanduser().absolute()),
-            ])
-        if self.no_manifest.get():
-            command.append("--no-manifest")
-        if self.palette_file.get().strip():
-            command.extend([
-                "--palette-file",
-                str(Path(self.palette_file.get().strip()).expanduser().resolve()),
-            ])
-        if estimate:
-            command.append("--estimate")
-        return command
-
-    @staticmethod
-    def _process_options() -> dict[str, object]:
-        if os.name == "nt":
-            return {
-                "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            css = b"""
+            * {
+                color: #e8eaf0;
             }
-        return {"start_new_session": True}
+            window, .fractal-root, scrolledwindow, viewport {
+                background-color: #111318;
+            }
+            headerbar {
+                background-image: none;
+                background-color: #171b22;
+                border-bottom: 1px solid #343b49;
+                box-shadow: none;
+            }
+            frame {
+                border: 1px solid #343b49;
+                border-radius: 8px;
+                background-color: #191d25;
+            }
+            frame > label {
+                color: #f4f6fb;
+                background-color: #191d25;
+                padding: 0 6px;
+            }
+            label {
+                color: #e8eaf0;
+            }
+            entry, combobox box, spinbutton {
+                color: #f1f3f8;
+                background-image: none;
+                background-color: #242a35;
+                border: 1px solid #3b4555;
+                border-radius: 5px;
+                padding: 5px 7px;
+                caret-color: #ffffff;
+            }
+            entry:focus, combobox:focus, spinbutton:focus {
+                border-color: #5b9cff;
+                box-shadow: 0 0 0 1px #315b9a;
+            }
+            entry:disabled, combobox:disabled, spinbutton:disabled {
+                color: #697383;
+                background-color: #171b22;
+            }
+            button {
+                color: #f1f3f8;
+                background-image: none;
+                background-color: #252c38;
+                border: 1px solid #3b4555;
+                border-radius: 5px;
+                padding: 6px 12px;
+            }
+            button:hover {
+                background-color: #3d72bd;
+                border-color: #5b9cff;
+            }
+            button:active, button:checked {
+                background-color: #315b9a;
+            }
+            button:disabled {
+                color: #626b78;
+                background-color: #191d25;
+                border-color: #2a303b;
+            }
+            checkbutton, radiobutton {
+                color: #e8eaf0;
+            }
+            checkbutton check, radiobutton radio {
+                background-color: #242a35;
+                border: 1px solid #526073;
+            }
+            checkbutton:checked check, radiobutton:checked radio {
+                background-color: #315b9a;
+                border-color: #5b9cff;
+            }
+            scale trough {
+                background-color: #2a313e;
+                border: 1px solid #3b4555;
+                border-radius: 4px;
+                min-height: 6px;
+            }
+            scale highlight {
+                background-color: #3d72bd;
+                border-radius: 4px;
+            }
+            scale slider {
+                background-image: none;
+                background-color: #d9e6ff;
+                border: 1px solid #5b9cff;
+                min-width: 14px;
+                min-height: 14px;
+            }
+            expander title {
+                color: #f1f3f8;
+                padding: 3px 0;
+            }
+            expander arrow {
+                color: #8db9ff;
+            }
+            scrollbar trough {
+                background-color: #0b0e13;
+            }
+            scrollbar slider {
+                background-color: #3b4555;
+                border: 1px solid #526073;
+                border-radius: 6px;
+                min-width: 10px;
+                min-height: 10px;
+            }
+            scrollbar slider:hover {
+                background-color: #5b6d89;
+            }
+            textview, textview text {
+                color: #e8eaf0;
+                background-color: #0b0e13;
+            }
+            tooltip {
+                color: #f1f3f8;
+                background-color: #242a35;
+                border: 1px solid #526073;
+            }
+            """
+            provider = Gtk.CssProvider()
+            provider.load_from_data(css)
+            screen = Gdk.Screen.get_default()
+            if screen is not None:
+                Gtk.StyleContext.add_provider_for_screen(
+                    screen,
+                    provider,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+                )
 
-    @staticmethod
-    def _terminate_process(process: subprocess.Popen[str]) -> None:
-        """Terminate the renderer and its FFmpeg descendants as one unit."""
+        @staticmethod
+        def _entry(text: str = "") -> Gtk.Entry:
+            entry = Gtk.Entry()
+            entry.set_text(text)
+            entry.set_hexpand(True)
+            return entry
 
-        if process.poll() is not None:
-            return
-        if os.name == "nt":
-            try:
-                process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
-            except (OSError, ValueError):
+        @staticmethod
+        def _combo(values: tuple[str, ...], selected: str) -> Gtk.ComboBoxText:
+            combo = Gtk.ComboBoxText()
+            for value in values:
+                combo.append(value, value)
+            combo.set_active_id(selected)
+            combo.set_hexpand(True)
+            return combo
+
+        @staticmethod
+        def _grid() -> Gtk.Grid:
+            grid = Gtk.Grid()
+            grid.set_column_spacing(12)
+            grid.set_row_spacing(8)
+            grid.set_border_width(12)
+            grid.set_hexpand(True)
+            return grid
+
+        @staticmethod
+        def _label(text: str) -> Gtk.Label:
+            label = Gtk.Label(label=text)
+            label.set_halign(Gtk.Align.START)
+            return label
+
+        def _add_widget_row(
+            self,
+            grid: Gtk.Grid,
+            row: int,
+            label: str,
+            widget: Gtk.Widget,
+            hint: str = "",
+        ) -> int:
+            grid.attach(self._label(label), 0, row, 1, 1)
+            widget.set_hexpand(True)
+            grid.attach(widget, 1, row, 1, 1)
+            if hint:
+                hint_label = self._label(hint)
+                hint_label.get_style_context().add_class("dim-label")
+                grid.attach(hint_label, 2, row, 1, 1)
+            return row + 1
+
+        def _add_path_row(
+            self,
+            grid: Gtk.Grid,
+            row: int,
+            label: str,
+            entry: Gtk.Entry,
+            *,
+            action: Gtk.FileChooserAction,
+            patterns: tuple[str, ...],
+            save: bool = False,
+        ) -> int:
+            grid.attach(self._label(label), 0, row, 1, 1)
+            grid.attach(entry, 1, row, 1, 1)
+            button = Gtk.Button(label="Browse")
+            button.connect(
+                "clicked",
+                self._choose_path,
+                entry,
+                action,
+                patterns,
+                save,
+            )
+            grid.attach(button, 2, row, 1, 1)
+            return row + 1
+
+        @staticmethod
+        def _frame(title: str, child: Gtk.Widget) -> Gtk.Frame:
+            frame = Gtk.Frame(label=title)
+            frame.add(child)
+            frame.set_hexpand(True)
+            return frame
+
+        def _build_widgets(self) -> None:
+            header = Gtk.HeaderBar()
+            header.set_show_close_button(True)
+            header.set_title("Fractal Audio Viz")
+            header.set_subtitle("Audio-reactive deep-zoom renderer")
+            self.window.set_titlebar(header)
+
+            self.audio = self._entry(str(ROOT / "song.mp3"))
+            self.output = self._entry(str(ROOT / "fractal_viz.mp4"))
+            self.profile = self._combo(PROFILE_CHOICES, "preview")
+            self.formula = self._combo(tuple(FORMULA_POINT_CATALOGUES), "mandelbrot")
+            self.point_combo = Gtk.ComboBoxText.new_with_entry()
+            self.point_entry = self.point_combo.get_child()
+            assert isinstance(self.point_entry, Gtk.Entry)
+            self.point_entry.set_placeholder_text("catalogue slug or REAL,IMAG")
+            self.point_combo.set_hexpand(True)
+            self.random_point = Gtk.CheckButton(label="Random catalogue point")
+            self.julia_c = self._entry("-0.8,0.156")
+            self.max_zoom = self._entry("1e24")
+            self.width = self._entry("960")
+            self.height = self._entry("540")
+            self.fps = self._entry("24")
+            self.palette = self._combo(
+                ("aurora", "fire", "ocean", "neon", "sunset", "mono"),
+                "aurora",
+            )
+            self.palette_file = self._entry()
+
+            render_grid = self._grid()
+            row = 0
+            row = self._add_path_row(
+                render_grid,
+                row,
+                "Audio",
+                self.audio,
+                action=Gtk.FileChooserAction.OPEN,
+                patterns=("*.mp3", "*.wav", "*.flac", "*.ogg"),
+            )
+            row = self._add_path_row(
+                render_grid,
+                row,
+                "Output",
+                self.output,
+                action=Gtk.FileChooserAction.SAVE,
+                patterns=("*.mp4", "*.mkv", "*.webm"),
+                save=True,
+            )
+            row = self._add_widget_row(render_grid, row, "Profile", self.profile)
+            row = self._add_widget_row(render_grid, row, "Formula", self.formula)
+            point_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            point_box.set_hexpand(True)
+            point_box.pack_start(self.point_combo, True, True, 0)
+            point_box.pack_start(self.random_point, False, False, 0)
+            row = self._add_widget_row(render_grid, row, "Point", point_box)
+            row = self._add_widget_row(render_grid, row, "Julia c", self.julia_c, "REAL,IMAG")
+            row = self._add_widget_row(render_grid, row, "Max zoom", self.max_zoom, "for example 1e150")
+
+            dimensions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            for label, entry in (
+                ("W", self.width),
+                ("H", self.height),
+                ("FPS", self.fps),
+            ):
+                dimensions.pack_start(self._label(label), False, False, 0)
+                entry.set_width_chars(7)
+                dimensions.pack_start(entry, True, True, 0)
+            row = self._add_widget_row(render_grid, row, "Video", dimensions)
+            row = self._add_widget_row(render_grid, row, "Palette", self.palette)
+            self._add_path_row(
+                render_grid,
+                row,
+                "Palette file",
+                self.palette_file,
+                action=Gtk.FileChooserAction.OPEN,
+                patterns=("*.txt",),
+            )
+
+            self.beat_strength, beat_value = self._scale_row(0.0, 3.0)
+            self.glow, glow_value = self._scale_row(0.0, 1.0)
+            self.motion_blur, blur_value = self._scale_row(0.0, 0.99)
+            effects_grid = self._grid()
+            effects_grid.set_row_spacing(6)
+            effects_grid.attach(self._label("Beat strength"), 0, 0, 1, 1)
+            effects_grid.attach(self.beat_strength, 1, 0, 1, 1)
+            effects_grid.attach(beat_value, 2, 0, 1, 1)
+            effects_grid.attach(self._label("onset contribution; 0 disables it"), 3, 0, 1, 1)
+            effects_grid.attach(self._label("Glow"), 0, 1, 1, 1)
+            effects_grid.attach(self.glow, 1, 1, 1, 1)
+            effects_grid.attach(glow_value, 2, 1, 1, 1)
+            effects_grid.attach(self._label("bloom amount; adds compositor work"), 3, 1, 1, 1)
+            effects_grid.attach(self._label("Motion blur"), 0, 2, 1, 1)
+            effects_grid.attach(self.motion_blur, 1, 2, 1, 1)
+            effects_grid.attach(blur_value, 2, 2, 1, 1)
+            effects_grid.attach(self._label("blend with the previous frame"), 3, 2, 1, 1)
+
+            self.sample_rate = self._entry("44100")
+            self.separation = self._combo(("auto", "demucs", "spectral", "none"), "auto")
+            self.render_scale = self._entry("1.0")
+            self.fractal_scale = self._entry("0.5")
+            self.quality = self._combo(("draft", "balanced", "quality", "extreme"), "draft")
+            self.keyframe_factor = self._entry("4.0")
+            self.keyframe_mode = self._combo(("atlas", "legacy"), "atlas")
+            self.random_seed = self._entry()
+            self.x_center = self._entry()
+            self.y_center = self._entry()
+            self.base_zoom = self._entry("1.0")
+            self.allow_underspecified_center = Gtk.CheckButton(label="Allow underspecified centre")
+            self.iteration_base = self._entry("384")
+            self.iterations_per_decade = self._entry("500")
+            self.iteration_cap = self._entry("100000")
+            self.zoom_punch = self._entry("3.0")
+            self.zoom_speed = self._entry("-0.04")
+            self.attack = self._entry("0.025")
+            self.release = self._entry("0.12")
+            self.series_order = self._entry("3")
+            self.series_block = self._entry("256")
+            self.renderer = self._combo(("auto", "native", "python"), "auto")
+            self.native_threads = self._entry("0")
+            self.native_backend = self._combo(("auto", "scalar", "avx2", "opencl"), "auto")
+            self.video_preset = self._combo(
+                ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"),
+                "ultrafast",
+            )
+            self.codec = self._entry("auto")
+            self.crf = self._entry("18")
+            self.resample = self._combo(("bilinear", "lanczos"), "bilinear")
+            self.encoder_threads = self._entry("0")
+            self.cache = self._entry(str(ROOT / "cache"))
+            self.cache_limit_mb = self._entry("0")
+            self.durable_cache = Gtk.CheckButton(label="Durable cache")
+            self.manifest = self._entry()
+            self.no_manifest = Gtk.CheckButton(label="Disable manifest")
+
+            technical_grid = self._grid()
+            technical_grid.set_row_spacing(6)
+            technical_row = 0
+            for label, widget, hint in (
+                ("Sample rate", self.sample_rate, "Hz"),
+                ("Separation", self.separation, "audio stem strategy"),
+                ("Render scale", self.render_scale, "keyframe resolution multiplier"),
+                ("Fractal scale", self.fractal_scale, "minimum source resolution multiplier"),
+                ("Quality", self.quality, "draft / balanced / quality / extreme"),
+                ("Keyframe factor", self.keyframe_factor, "maximum zoom jump between keyframes"),
+                ("Keyframe mode", self.keyframe_mode, "atlas reuses nested tiles"),
+                ("Random seed", self.random_seed, "reproducible catalogue selection"),
+                ("X centre", self.x_center, "paired with Y centre; conflicts with Point"),
+                ("Y centre", self.y_center, "paired with X centre; conflicts with Point"),
+                ("Base zoom", self.base_zoom, "starting zoom"),
+            ):
+                technical_row = self._add_widget_row(technical_grid, technical_row, label, widget, hint)
+            technical_grid.attach(self.allow_underspecified_center, 0, technical_row, 2, 1)
+            technical_grid.attach(self._label("exploratory deep render only"), 2, technical_row, 1, 1)
+            technical_row += 1
+            for label, widget, hint in (
+                ("Iteration base", self.iteration_base, "minimum shallow iteration budget"),
+                ("Iterations / decade", self.iterations_per_decade, "added per decimal zoom"),
+                ("Iteration cap", self.iteration_cap, "maximum iteration budget"),
+                ("Zoom punch", self.zoom_punch, "loudness contrast"),
+                ("Zoom speed", self.zoom_speed, "quiet-time log zoom velocity"),
+                ("Attack", self.attack, "audio envelope seconds"),
+                ("Release", self.release, "audio envelope seconds"),
+                ("Series order", self.series_order, "native BLA polynomial degree"),
+                ("Series block", self.series_block, "native BLA block length"),
+                ("Renderer", self.renderer, "auto / native / python"),
+                ("Native threads", self.native_threads, "0 uses the runtime default"),
+                ("Native backend", self.native_backend, "hardware field backend"),
+                ("Video preset", self.video_preset, "FFmpeg speed / size trade-off"),
+                ("Codec", self.codec, "FFmpeg encoder name or auto"),
+                ("CRF", self.crf, "encoder quality, 0 to 51"),
+                ("Resample", self.resample, "crop filter"),
+                ("Encoder threads", self.encoder_threads, "0 lets FFmpeg choose"),
+                ("Cache limit MB", self.cache_limit_mb, "0 means unlimited"),
+            ):
+                technical_row = self._add_widget_row(technical_grid, technical_row, label, widget, hint)
+            technical_grid.attach(self.durable_cache, 0, technical_row, 2, 1)
+            technical_grid.attach(self._label("fsync each tile; safer but slower"), 2, technical_row, 1, 1)
+            technical_row += 1
+            technical_row = self._add_path_row(
+                technical_grid,
+                technical_row,
+                "Manifest",
+                self.manifest,
+                action=Gtk.FileChooserAction.SAVE,
+                patterns=("*.json",),
+                save=True,
+            )
+            technical_grid.attach(self.no_manifest, 0, technical_row, 2, 1)
+            technical_grid.attach(self._label("do not write the automatic JSON sidecar"), 2, technical_row, 1, 1)
+
+            self.technical_expander = Gtk.Expander(label="Technical options")
+            self.technical_expander.set_hexpand(True)
+            self.technical_frame = self._frame("Technical options", technical_grid)
+            self.technical_expander.connect("notify::expanded", self._technical_expanded_changed)
+
+            self.start_button = Gtk.Button(label="Render")
+            self.start_button.connect("clicked", self._start)
+            self.estimate_button = Gtk.Button(label="Estimate")
+            self.estimate_button.connect("clicked", self._estimate)
+            self.stop_button = Gtk.Button(label="Stop")
+            self.stop_button.connect("clicked", self._stop)
+            self.stop_button.set_sensitive(False)
+            buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            buttons.pack_start(self.start_button, False, False, 0)
+            buttons.pack_start(self.estimate_button, False, False, 0)
+            buttons.pack_start(self.stop_button, False, False, 0)
+
+            self.log_buffer = Gtk.TextBuffer()
+            self.log = Gtk.TextView(buffer=self.log_buffer)
+            self.log.set_editable(False)
+            self.log.set_cursor_visible(False)
+            self.log.set_monospace(True)
+            self.log.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            self.log.set_vexpand(True)
+            self.log.set_size_request(-1, 240)
+            log_scroll = Gtk.ScrolledWindow()
+            log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            log_scroll.set_min_content_height(240)
+            log_scroll.set_vexpand(True)
+            log_scroll.add(self.log)
+
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            content.get_style_context().add_class("fractal-root")
+            content.set_border_width(16)
+            content.set_hexpand(True)
+            content.pack_start(self._frame("Render", render_grid), False, False, 0)
+            content.pack_start(self._frame("Audio and effects", effects_grid), False, False, 0)
+            content.pack_start(self.technical_expander, False, False, 0)
+            content.pack_start(buttons, False, False, 0)
+            content.pack_start(self._label("Renderer output"), False, False, 0)
+            content.pack_start(log_scroll, True, True, 0)
+
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scrolled.set_overlay_scrolling(False)
+            scrolled.set_hexpand(True)
+            scrolled.set_vexpand(True)
+            scrolled.add(content)
+            self.scroll_adjustment = scrolled.get_vadjustment()
+            self.window.add(scrolled)
+
+        @staticmethod
+        def _scale_row(value: float, maximum: float) -> tuple[Gtk.Scale, Gtk.Label]:
+            scale = Gtk.Scale.new_with_range(
+                Gtk.Orientation.HORIZONTAL,
+                0.0,
+                maximum,
+                maximum / 100.0,
+            )
+            scale.set_value(value)
+            scale.set_digits(2)
+            scale.set_hexpand(True)
+            display = Gtk.Label(label=f"{value:.2f}")
+            display.set_width_chars(6)
+            display.set_xalign(1.0)
+            scale.connect(
+                "value-changed",
+                lambda control: display.set_text(f"{control.get_value():.2f}"),
+            )
+            return scale, display
+
+        def _technical_expanded_changed(self, expander: Gtk.Expander, _param: object) -> None:
+            self._set_technical_child_visible(expander.get_expanded())
+            if not expander.get_expanded():
+                # GTK recalculates the adjustment after the expander's child
+                # is removed from the allocation. Reset on idle so a collapse
+                # from the bottom can never expose an empty top.
+                GLib.idle_add(self._reset_scroll_position)
+
+        def _set_technical_child_visible(self, visible: bool) -> None:
+            if visible:
+                if self.technical_frame.get_parent() is None:
+                    self.technical_expander.add(self.technical_frame)
+                self.technical_frame.show_all()
+            else:
+                if self.technical_frame.get_parent() is self.technical_expander:
+                    self.technical_expander.remove(self.technical_frame)
+                self.technical_frame.hide()
+
+        def _reset_scroll_position(self) -> bool:
+            self.scroll_adjustment.set_value(self.scroll_adjustment.get_lower())
+            return False
+
+        def _choose_path(
+            self,
+            _button: Gtk.Button,
+            entry: Gtk.Entry,
+            action: Gtk.FileChooserAction,
+            patterns: tuple[str, ...],
+            save: bool,
+        ) -> None:
+            title = "Choose output file" if save else "Choose file"
+            dialog = Gtk.FileChooserDialog(
+                title=title,
+                transient_for=self.window,
+                action=action,
+            )
+            dialog.add_buttons(
+                "Cancel",
+                Gtk.ResponseType.CANCEL,
+                "Select",
+                Gtk.ResponseType.ACCEPT,
+            )
+            if save:
+                dialog.set_do_overwrite_confirmation(True)
+            file_filter = Gtk.FileFilter()
+            file_filter.set_name("Supported files")
+            for pattern in patterns:
+                file_filter.add_pattern(pattern)
+            dialog.add_filter(file_filter)
+            existing = entry.get_text().strip()
+            if existing:
                 try:
-                    process.terminate()
-                except OSError:
-                    return
-        else:
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            except (OSError, ProcessLookupError):
-                try:
-                    process.terminate()
-                except OSError:
-                    return
-        try:
-            process.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
+                    dialog.set_filename(existing)
+                except Exception:
+                    pass
+            response = dialog.run()
+            if response == Gtk.ResponseType.ACCEPT:
+                filename = dialog.get_filename()
+                if filename:
+                    entry.set_text(filename)
+            dialog.destroy()
+
+        @staticmethod
+        def _combo_text(combo: Gtk.ComboBoxText) -> str:
+            return combo.get_active_id() or combo.get_active_text() or ""
+
+        def _point_text(self) -> str:
+            return self.point_entry.get_text().strip()
+
+        @staticmethod
+        def _set_combo(combo: Gtk.ComboBoxText, value: object) -> None:
+            combo.set_active_id(str(value))
+
+        def _formula_changed(self, *_args: object) -> None:
+            formula = self._combo_text(self.formula)
+            current = self._point_text()
+            self.point_combo.remove_all()
+            self.point_combo.append("", "")
+            self.point_combo.append("random", "random")
+            points = FORMULA_POINT_CATALOGUES.get(formula, ())
+            for point in points:
+                self.point_combo.append(point.slug, point.slug)
+            known_values = {
+                value.casefold()
+                for value in ("random", *(point.slug for point in points))
+            }
+            if current and "," not in current and current.casefold() not in known_values:
+                current = ""
+            self.point_entry.set_text(current)
+            self._point_changed()
+
+        def _point_changed(self, *_args: object) -> None:
+            point = self._point_text().casefold()
+            preset = FORMULA_POINTS_BY_SLUG.get(self._combo_text(self.formula), {}).get(point)
+            if preset is not None and preset.julia_c is not None:
+                self.julia_c.set_text(",".join(preset.julia_c))
+
+        def _profile_changed(self, *_args: object) -> None:
+            values = PROFILE_DEFAULTS.get(self._combo_text(self.profile), {})
+            for key, widget in (
+                ("width", self.width),
+                ("height", self.height),
+                ("fps", self.fps),
+                ("max_zoom", self.max_zoom),
+                ("separation", self.separation),
+                ("fractal_scale", self.fractal_scale),
+                ("quality", self.quality),
+                ("keyframe_factor", self.keyframe_factor),
+                ("video_preset", self.video_preset),
+            ):
+                if key not in values:
+                    continue
+                value = values[key]
+                if isinstance(widget, Gtk.ComboBoxText):
+                    self._set_combo(widget, value)
+                else:
+                    widget.set_text(str(value))
+
+        def _command(self, estimate: bool = False) -> list[str]:
+            point_spec = self._point_text()
+            has_point = self.random_point.get_active() or bool(point_spec)
+            has_x = bool(self.x_center.get_text().strip())
+            has_y = bool(self.y_center.get_text().strip())
+            if has_point and (has_x or has_y):
+                raise ValueError("Point/random point cannot be combined with X/Y centre")
+            if has_x != has_y:
+                raise ValueError("X and Y centre must be supplied together")
+            audio_path = Path(self.audio.get_text()).expanduser().resolve()
+            # Preserve the final component so the CLI can reject an output
+            # symlink safely instead of resolving it into the target file.
+            output_path = Path(self.output.get_text()).expanduser().absolute()
+            formula = self._combo_text(self.formula)
+            julia_preset = FORMULA_POINTS_BY_SLUG.get(formula, {}).get(point_spec.casefold())
+            command = [sys.executable, "-u", str(VISUALIZER), str(audio_path)]
+            command.extend(["--output", str(output_path), "--profile", self._combo_text(self.profile)])
+            command.extend([
+                "--formula", formula,
+                "--max-zoom", self.max_zoom.get_text(),
+                "--width", self.width.get_text(), "--height", self.height.get_text(),
+                "--fps", self.fps.get_text(),
+                "--sample-rate", self.sample_rate.get_text(),
+                "--separation", self._combo_text(self.separation),
+                "--render-scale", self.render_scale.get_text(),
+                "--fractal-scale", self.fractal_scale.get_text(),
+                "--quality", self._combo_text(self.quality),
+                "--keyframe-factor", self.keyframe_factor.get_text(),
+                "--keyframe-mode", self._combo_text(self.keyframe_mode),
+                "--base-zoom", self.base_zoom.get_text(),
+                "--iteration-base", self.iteration_base.get_text(),
+                "--iterations-per-decade", self.iterations_per_decade.get_text(),
+                "--iteration-cap", self.iteration_cap.get_text(),
+                "--zoom-punch", self.zoom_punch.get_text(),
+                "--zoom-speed", self.zoom_speed.get_text(),
+                "--palette", self._combo_text(self.palette),
+                "--beat-strength", f"{self.beat_strength.get_value():g}",
+                "--attack", self.attack.get_text(),
+                "--release", self.release.get_text(),
+                "--series-order", self.series_order.get_text(),
+                "--series-block", self.series_block.get_text(),
+                "--renderer", self._combo_text(self.renderer),
+                "--native-threads", self.native_threads.get_text(),
+                "--native-backend", self._combo_text(self.native_backend),
+                "--video-preset", self._combo_text(self.video_preset),
+                "--codec", self.codec.get_text(),
+                "--crf", self.crf.get_text(),
+                "--resample", self._combo_text(self.resample),
+                "--glow", f"{self.glow.get_value():g}",
+                "--motion-blur", f"{self.motion_blur.get_value():g}",
+                "--encoder-threads", self.encoder_threads.get_text(),
+                "--cache-limit-mb", self.cache_limit_mb.get_text(),
+            ])
+            if formula == "julia":
+                # Values beginning with '-' must be attached to the option;
+                # argparse otherwise treats a negative custom c as a flag.
+                if (
+                    not self.random_point.get_active()
+                    and point_spec.casefold() != "random"
+                    and julia_preset is not None
+                    and julia_preset.julia_c is not None
+                ):
+                    command.append("--julia-c=" + ",".join(julia_preset.julia_c))
+                elif not self.random_point.get_active() and point_spec.casefold() != "random":
+                    command.append("--julia-c=" + self.julia_c.get_text().strip())
+            if self.random_point.get_active():
+                command.append("--random-point")
+            elif point_spec:
+                command.append("--point=" + point_spec)
+            if self.random_seed.get_text().strip():
+                command.extend(["--random-seed", self.random_seed.get_text().strip()])
+            if self.x_center.get_text().strip():
+                command.append("--x-center=" + self.x_center.get_text().strip())
+            if self.y_center.get_text().strip():
+                command.append("--y-center=" + self.y_center.get_text().strip())
+            if self.allow_underspecified_center.get_active():
+                command.append("--allow-underspecified-center")
+            if self.cache.get_text().strip():
+                command.extend(["--cache-dir", str(Path(self.cache.get_text().strip()).expanduser().resolve())])
+            if self.durable_cache.get_active():
+                command.append("--durable-cache")
+            if self.manifest.get_text().strip():
+                command.extend(["--manifest", str(Path(self.manifest.get_text().strip()).expanduser().absolute())])
+            if self.no_manifest.get_active():
+                command.append("--no-manifest")
+            if self.palette_file.get_text().strip():
+                command.extend(["--palette-file", str(Path(self.palette_file.get_text().strip()).expanduser().resolve())])
+            if estimate:
+                command.append("--estimate")
+            return command
+
+        @staticmethod
+        def _process_options() -> dict[str, object]:
+            if os.name == "nt":
+                return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+            return {"start_new_session": True}
+
+        @staticmethod
+        def _terminate_process(process: subprocess.Popen[str]) -> None:
+            """Terminate the renderer and its FFmpeg descendants as one unit."""
+
+            if process.poll() is not None:
+                return
             if os.name == "nt":
                 try:
-                    process.kill()
-                except OSError:
-                    return
+                    process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
+                except (OSError, ValueError):
+                    try:
+                        process.terminate()
+                    except OSError:
+                        return
             else:
                 try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
                 except (OSError, ProcessLookupError):
                     try:
-                        process.kill()
+                        process.terminate()
                     except OSError:
                         return
             try:
                 process.wait(timeout=2.0)
             except subprocess.TimeoutExpired:
-                return
-
-    def _start(self) -> None:
-        if self.process is not None:
-            return
-        if not Path(self.audio.get()).expanduser().resolve().is_file():
-            messagebox.showerror("Audio file", "Choose an existing audio file first.")
-            return
-        try:
-            command = self._command()
-            self.process = subprocess.Popen(
-                command,
-                cwd=ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                **self._process_options(),
-            )
-        except (OSError, ValueError) as error:
-            messagebox.showerror("Could not start renderer", str(error))
-            return
-        self._set_running(True)
-        self._append("Command: " + shlex.join(command) + "\n")
-        threading.Thread(target=self._read_process, daemon=True).start()
-
-    def _estimate(self) -> None:
-        if self.process is not None:
-            return
-        if not Path(self.audio.get()).expanduser().resolve().is_file():
-            messagebox.showerror("Audio file", "Choose an existing audio file first.")
-            return
-        try:
-            command = self._command(estimate=True)
-            self.process = subprocess.Popen(
-                command,
-                cwd=ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                **self._process_options(),
-            )
-        except (OSError, ValueError) as error:
-            messagebox.showerror("Could not start renderer", str(error))
-            return
-        self._set_running(True)
-        self._append("Estimate command: " + shlex.join(command) + "\n")
-        threading.Thread(target=self._read_process, daemon=True).start()
-
-    def _read_process(self) -> None:
-        process = self.process
-        assert process is not None and process.stdout is not None
-        while True:
-            line = _read_bounded_line(process.stdout, MAX_LOG_LINE_CHARS)
-            if line is None:
-                break
-            self._queue_output(line)
-        code = process.wait()
-        self._queue_output(f"\nProcess exited with status {code}.\n")
-        self._queue_output("__FRACTAL_PROCESS_DONE__")
-
-    def _queue_output(self, text: str) -> None:
-        """Keep a stalled GUI from retaining unbounded renderer output."""
-
-        if len(text) > MAX_LOG_LINE_CHARS:
-            text = text[:MAX_LOG_LINE_CHARS] + "… [line truncated]\n"
-        try:
-            self.output_queue.put_nowait(text)
-            return
-        except queue.Full:
-            pass
-        # Dropping the oldest log line is preferable to blocking the reader:
-        # a blocked GUI pipe can also stall FFmpeg and make Stop ineffective.
-        try:
-            self.output_queue.get_nowait()
-        except queue.Empty:
-            return
-        try:
-            self.output_queue.put_nowait(text)
-        except queue.Full:
-            pass
-
-    def _drain_output(self) -> None:
-        try:
-            while True:
-                line = self.output_queue.get_nowait()
-                if line == "__FRACTAL_PROCESS_DONE__":
-                    self.process = None
-                    self._set_running(False)
+                if os.name == "nt":
+                    try:
+                        process.kill()
+                    except OSError:
+                        return
                 else:
-                    self._append(line)
-        except queue.Empty:
-            pass
-        self.root.after(100, self._drain_output)
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        try:
+                            process.kill()
+                        except OSError:
+                            return
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    return
 
-    def _append(self, text: str) -> None:
-        self.log.configure(state="normal")
-        self.log.insert("end", text)
-        line_number = int(self.log.index("end-1c").split(".", 1)[0])
-        if line_number > MAX_LOG_LINES:
-            first_kept_line = line_number - MAX_LOG_LINES + 1
-            self.log.delete("1.0", f"{first_kept_line}.0")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        def _show_error(self, title: str, message: str) -> None:
+            dialog = Gtk.MessageDialog(
+                transient_for=self.window,
+                modal=True,
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text=title,
+            )
+            dialog.format_secondary_text(message)
+            dialog.run()
+            dialog.destroy()
 
-    def _set_running(self, running: bool) -> None:
-        state = "disabled" if running else "normal"
-        self.start_button.configure(state=state)
-        self.estimate_button.configure(state=state)
-        self.stop_button.configure(state="normal" if running else "disabled")
-
-    def _stop(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            self._terminate_process(self.process)
-            self._append("Stopping renderer...\n")
-
-    def _close(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            if not messagebox.askyesno("Stop render?", "A render is still running. Stop it and close?"):
+        def _start_or_estimate(self, estimate: bool) -> None:
+            if self.process is not None:
                 return
-            self._terminate_process(self.process)
-        self.root.destroy()
+            if not Path(self.audio.get_text()).expanduser().resolve().is_file():
+                self._show_error("Audio file", "Choose an existing audio file first.")
+                return
+            try:
+                command = self._command(estimate=estimate)
+                self.process = subprocess.Popen(
+                    command,
+                    cwd=ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    **self._process_options(),
+                )
+            except (OSError, ValueError) as error:
+                self._show_error("Could not start renderer", str(error))
+                return
+            self._set_running(True)
+            prefix = "Estimate command: " if estimate else "Command: "
+            self._append(prefix + shlex.join(command) + "\n")
+            threading.Thread(target=self._read_process, daemon=True).start()
+
+        def _start(self, _button: Gtk.Button | None = None) -> None:
+            self._start_or_estimate(False)
+
+        def _estimate(self, _button: Gtk.Button | None = None) -> None:
+            self._start_or_estimate(True)
+
+        def _read_process(self) -> None:
+            process = self.process
+            assert process is not None and process.stdout is not None
+            while True:
+                line = _read_bounded_line(process.stdout, MAX_LOG_LINE_CHARS)
+                if line is None:
+                    break
+                self._queue_output(line)
+            code = process.wait()
+            self._queue_output(f"\nProcess exited with status {code}.\n")
+            self._queue_output("__FRACTAL_PROCESS_DONE__")
+
+        def _queue_output(self, text: str) -> None:
+            """Keep a stalled GUI from retaining unbounded renderer output."""
+
+            if len(text) > MAX_LOG_LINE_CHARS:
+                text = text[:MAX_LOG_LINE_CHARS] + "… [line truncated]\n"
+            try:
+                self.output_queue.put_nowait(text)
+                return
+            except queue.Full:
+                pass
+            try:
+                self.output_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self.output_queue.put_nowait(text)
+            except queue.Full:
+                pass
+
+        def _drain_output(self) -> bool:
+            chunks: list[str] = []
+            completed = False
+            try:
+                while True:
+                    line = self.output_queue.get_nowait()
+                    if line == "__FRACTAL_PROCESS_DONE__":
+                        completed = True
+                    else:
+                        chunks.append(line)
+            except queue.Empty:
+                pass
+            if chunks:
+                self._append("".join(chunks))
+            if completed:
+                self.process = None
+                self._set_running(False)
+            return True
+
+        def _append(self, text: str) -> None:
+            self.log_buffer.insert(self.log_buffer.get_end_iter(), text)
+            line_count = self.log_buffer.get_line_count()
+            if line_count > MAX_LOG_LINES:
+                start = self.log_buffer.get_start_iter()
+                trim_end = self.log_buffer.get_iter_at_line(line_count - MAX_LOG_LINES)
+                self.log_buffer.delete(start, trim_end)
+            end = self.log_buffer.get_end_iter()
+            self.log.scroll_to_iter(end, 0.0, False, 0.0, 1.0)
+
+        def _set_running(self, running: bool) -> None:
+            self.start_button.set_sensitive(not running)
+            self.estimate_button.set_sensitive(not running)
+            self.stop_button.set_sensitive(running)
+
+        def _stop(self, _button: Gtk.Button | None = None) -> None:
+            if self.process is not None and self.process.poll() is None:
+                self._terminate_process(self.process)
+                self._append("Stopping renderer…\n")
+
+        def _on_delete_event(self, _window: Gtk.Window, _event: object) -> bool:
+            if self.process is not None and self.process.poll() is None:
+                dialog = Gtk.MessageDialog(
+                    transient_for=self.window,
+                    modal=True,
+                    message_type=Gtk.MessageType.QUESTION,
+                    buttons=Gtk.ButtonsType.NONE,
+                    text="Stop render and close?",
+                )
+                dialog.add_buttons(
+                    "Cancel",
+                    Gtk.ResponseType.CANCEL,
+                    "Stop and close",
+                    Gtk.ResponseType.ACCEPT,
+                )
+                response = dialog.run()
+                dialog.destroy()
+                if response != Gtk.ResponseType.ACCEPT:
+                    return True
+                self._terminate_process(self.process)
+            return False
 
 
 def main() -> None:
-    if tk is None:
+    if Gtk is None:
+        detail = str(GTK_IMPORT_ERROR) if GTK_IMPORT_ERROR is not None else "GTK3 is unavailable"
         raise SystemExit(
-            "Tkinter is not available in this Python. Install python3-tk on Linux "
-            "or use the Python installer that includes Tcl/Tk on Windows."
+            "GTK3/PyGObject is required for the GUI. Install GTK 3 and PyGObject "
+            f"(the Nix shell provides both). Import error: {detail}"
         )
-    root = tk.Tk()
-    RenderApp(root)
-    root.mainloop()
+    application = Gtk.Application(
+        application_id="com.haakez.FractalAudioViz",
+        flags=0,
+    )
+
+    # Keep the Python wrapper alive and make repeated application activation
+    # (for example, launching the desktop entry twice) focus the existing
+    # window instead of creating a second launcher.
+    window_holder: list[RenderApp] = []
+
+    def activate(app: Gtk.Application) -> None:
+        if not window_holder:
+            window_holder.append(RenderApp(app))
+        window_holder[0].window.present()
+
+    application.connect("activate", activate)
+    raise SystemExit(application.run(sys.argv))
 
 
 if __name__ == "__main__":
