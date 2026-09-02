@@ -846,6 +846,19 @@ class AnimationTests(unittest.TestCase):
             self.assertTrue(np.isfinite(rgb).all())
         self.assertIs(visualizer._custom_palette("fire"), visualizer._custom_palette("fire"))
 
+    def test_non_aurora_palettes_reach_high_contrast_anchors(self):
+        luminance_weights = np.asarray([0.2126, 0.7152, 0.0722])
+        for name in visualizer.PALETTE_CHOICES:
+            if name == "aurora":
+                continue
+            stops = np.asarray(visualizer.BUILTIN_PALETTE_STOPS[name], dtype=np.float32)
+            luminance = stops @ luminance_weights
+            self.assertLessEqual(float(np.min(luminance)), 35.0, name)
+            self.assertGreaterEqual(float(np.max(luminance)), 245.0, name)
+            palette = visualizer._custom_palette(name, len(stops))
+            np.testing.assert_array_equal(palette[0], stops[0], err_msg=name)
+            np.testing.assert_array_equal(palette[-1], stops[-1], err_msg=name)
+
     def test_pitch_rotates_legacy_two_hue_gradient(self):
         field = np.linspace(0.0, 100.0, 64 * 64, dtype=np.float32).reshape(64, 64)
         baseline = visualizer._colourise(field, 100, 0.0, 0.5, 0.8, 0.5)

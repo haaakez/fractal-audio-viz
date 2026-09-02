@@ -134,6 +134,59 @@ KALLES_DEFAULT_PALETTE_STOPS = (
     (64, 128, 255),
     (0, 0, 255),
 )
+# Keep the non-liquid palettes punchy at their source instead of trying to
+# recover contrast after audio effects and integer quantisation.  The first
+# and last stops deliberately reach near-black and near-white so fractal
+# boundaries remain readable on both bright and dark desktop themes.
+# Kalles' stops are kept verbatim: they are the portable representation of the
+# bundled .kfp file and must continue to match that file's source colours.
+BUILTIN_PALETTE_STOPS = {
+    "fire": (
+        (0, 0, 0),
+        (48, 0, 12),
+        (180, 0, 0),
+        (255, 40, 0),
+        (255, 180, 0),
+        (255, 255, 190),
+        (255, 255, 255),
+    ),
+    "ocean": (
+        (0, 0, 10),
+        (0, 12, 70),
+        (0, 70, 190),
+        (0, 205, 255),
+        (40, 255, 220),
+        (210, 255, 255),
+        (255, 255, 255),
+    ),
+    "neon": (
+        (0, 0, 20),
+        (75, 0, 140),
+        (255, 0, 150),
+        (0, 180, 255),
+        (0, 255, 200),
+        (220, 255, 0),
+        (255, 255, 255),
+    ),
+    "sunset": (
+        (5, 0, 20),
+        (80, 0, 80),
+        (210, 0, 55),
+        (255, 45, 0),
+        (255, 170, 0),
+        (255, 240, 100),
+        (255, 255, 230),
+    ),
+    "mono": (
+        (0, 0, 0),
+        (8, 8, 8),
+        (48, 48, 48),
+        (192, 192, 192),
+        (248, 248, 248),
+        (255, 255, 255),
+    ),
+    "kalles-default": KALLES_DEFAULT_PALETTE_STOPS,
+}
 FORMULA_IDS = {
     "mandelbrot": 0,
     "julia": 1,
@@ -6729,24 +6782,17 @@ def _custom_palette(name: str, size: int = 4096) -> Any:
     """Build a compact RGB palette once; frame controls only index it."""
 
     np = _require_numpy()
-    stops = {
-        "fire": ((4, 0, 12), (90, 5, 8), (220, 45, 5), (255, 220, 80), (255, 255, 255)),
-        "ocean": ((2, 5, 24), (5, 55, 125), (0, 180, 210), (140, 255, 235), (255, 255, 255)),
-        "neon": ((10, 0, 35), (170, 0, 180), (0, 220, 255), (220, 255, 40), (255, 255, 255)),
-        "sunset": ((18, 2, 30), (100, 8, 70), (235, 45, 55), (255, 150, 40), (255, 245, 180)),
-        "mono": ((0, 0, 0), (80, 80, 80), (180, 180, 180), (255, 255, 255)),
-        "kalles-default": KALLES_DEFAULT_PALETTE_STOPS,
-    }
-    if name not in stops:
+    if name not in BUILTIN_PALETTE_STOPS:
         raise ValueError(f"unknown palette: {name}")
-    anchors = np.linspace(0.0, 1.0, len(stops[name]), dtype=np.float32)
+    stops = BUILTIN_PALETTE_STOPS[name]
+    anchors = np.linspace(0.0, 1.0, len(stops), dtype=np.float32)
     positions = np.linspace(0.0, 1.0, size, dtype=np.float32)
     output = np.empty((size, 3), dtype=np.float32)
     for channel in range(3):
         output[:, channel] = np.interp(
             positions,
             anchors,
-            [stop[channel] for stop in stops[name]],
+            [stop[channel] for stop in stops],
         )
     return np.asarray(np.rint(output), dtype=np.uint8)
 
