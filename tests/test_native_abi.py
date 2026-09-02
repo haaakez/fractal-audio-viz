@@ -1171,9 +1171,13 @@ class NativeRendererTests(unittest.TestCase):
                 finally:
                     self.library.fractal_destroy_reference(wide_handle)
                 centre_adjacent = wide_output[128 * 256 + 128]
-                self.assertLess(
-                    centre_adjacent,
-                    max_iter - 0.5,
+                # The shared compact reference is allowed to report a strict
+                # NaN glitch sentinel. Production atlas rendering repairs it
+                # with a probe-centred secondary reference; it must never
+                # silently turn the unresolved pixel into the interior cap.
+                self.assertTrue(
+                    math.isnan(centre_adjacent)
+                    or centre_adjacent < max_iter - 0.5,
                     "the e100 centre-adjacent escape band became false black",
                 )
 
@@ -1205,9 +1209,11 @@ class NativeRendererTests(unittest.TestCase):
                     256,
                 )
                 self.assertEqual(status, 0, self.library.fractal_last_error())
+                values = list(deep_output)
                 self.assertTrue(
-                    any(value < max_iter - 0.5 for value in deep_output),
-                    f"deep tier produced no escaping pixels at {zoom_text!r}",
+                    any(value < max_iter - 0.5 for value in values)
+                    or any(math.isnan(value) for value in values),
+                    f"deep tier produced neither escaping nor flagged pixels at {zoom_text!r}",
                 )
         finally:
             self.library.fractal_destroy_reference(deep_handle)

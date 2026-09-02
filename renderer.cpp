@@ -935,6 +935,494 @@ inline void write_colour_pixel(
     destination[2] = colour[2];
 }
 
+inline std::uint8_t rounded_colour_byte(double value) {
+    return static_cast<std::uint8_t>(std::clamp(
+        static_cast<int>(std::nearbyint(std::clamp(value, 0.0, 255.0))),
+        0,
+        255));
+}
+
+inline std::uint8_t kfp_dithered_colour_byte(
+    double value,
+    int x,
+    int y,
+    int channel
+) {
+    // Kalles uses a tiny deterministic ordered dither when converting the
+    // final sRGB colour to 8-bit. Keep the calculation in uint32_t so the
+    // result remains defined for large, valid image dimensions.
+    if (!std::isfinite(value)) value = 0.0;
+    const std::uint32_t mixed = (
+        static_cast<std::uint32_t>(x)
+        + static_cast<std::uint32_t>(channel * 67)
+        + static_cast<std::uint32_t>(y) * 236U) * 119U;
+    const double mask = static_cast<double>(mixed & 255U) / 256.0;
+    return static_cast<std::uint8_t>(std::clamp(
+        static_cast<int>(std::floor(std::clamp(value, 0.0, 255.0) + mask)),
+        0,
+        255));
+}
+
+inline double kfp_safe_sample(
+    const float* field,
+    int width,
+    int height,
+    int x,
+    int y,
+    int max_iter
+) {
+    x = std::clamp(x, 0, width - 1);
+    y = std::clamp(y, 0, height - 1);
+    const float value = field[static_cast<size_t>(y) * static_cast<size_t>(width)
+        + static_cast<size_t>(x)];
+    // Kalles stores an interior pixel as (nIter=max_iter, offs=0).  Its
+    // reconstructed neighbour value is therefore max_iter + 1, even though
+    // the centre pixel itself is painted with the configured interior colour.
+    // Preserving that extra unit is important: it keeps the distance/slope
+    // signal sharp at the set boundary instead of making a flat square around
+    // every interior tile.
+    if (!std::isfinite(value)) {
+        return static_cast<double>(max_iter) + 1.0;
+    }
+    if (value >= static_cast<float>(max_iter) - 0.5F) {
+        return static_cast<double>(max_iter) + 1.0;
+    }
+    return std::clamp(static_cast<double>(value), 0.0, static_cast<double>(max_iter));
+}
+
+inline double kfp_reflected_sample(
+    const float* field,
+    int width,
+    int height,
+    int x,
+    int y,
+    int offset_x,
+    int offset_y,
+    int max_iter,
+    double centre
+) {
+    const int sample_x = x + offset_x;
+    const int sample_y = y + offset_y;
+    if (sample_x >= 0 && sample_x < width && sample_y >= 0 && sample_y < height) {
+        return kfp_safe_sample(field, width, height, sample_x, sample_y, max_iter);
+    }
+    // Match Kalles' reflected boundary stencil. A one-pixel dimension has no
+    // opposite sample, so use the centre value instead of propagating NaNs.
+    const int opposite_x = x - offset_x;
+    const int opposite_y = y - offset_y;
+    if (opposite_x >= 0 && opposite_x < width
+        && opposite_y >= 0 && opposite_y < height) {
+        return 2.0 * centre - kfp_safe_sample(
+            field, width, height, opposite_x, opposite_y, max_iter);
+    }
+    return centre;
+}
+
+inline double kfp_difference_magnitude(
+    int differences,
+    double centre,
+    double left,
+    double right,
+    double up,
+    double down,
+    double top_left,
+    double top_right,
+    double bottom_left,
+    double bottom_right
+) {
+    constexpr double inverse_sqrt_two = 0.7071067811865475244008443621048490;
+    constexpr double diagonal_distance_squared = 2.0;
+    if (differences == 0) {
+        return std::abs(left - centre) * std::sqrt(2.0)
+            + std::abs(up - centre) * std::sqrt(2.0)
+            + std::abs(top_left - centre)
+            + std::abs(top_right - centre);
+    }
+    if (differences == 1) {
+        const double squared =
+            (left - centre) * (left - centre)
+            + (right - centre) * (right - centre)
+            + (up - centre) * (up - centre)
+            + (down - centre) * (down - centre)
+            + ((top_left - centre) * (top_left - centre)
+                + (bottom_right - centre) * (bottom_right - centre))
+                * inverse_sqrt_two * inverse_sqrt_two
+            + ((bottom_left - centre) * (bottom_left - centre)
+                + (top_right - centre) * (top_right - centre))
+                * inverse_sqrt_two * inverse_sqrt_two;
+        return std::sqrt(std::max(0.0, squared * 0.25)) * 2.8284271247461903;
+    }
+    if (differences == 2) {
+        const double squared =
+            (right - left) * (right - left) * 0.25
+            + (down - up) * (down - up) * 0.25
+            + (bottom_right - top_left) * (bottom_right - top_left) * 0.125
+            + (top_right - bottom_left) * (top_right - bottom_left) * 0.125;
+        return std::sqrt(std::max(0.0, squared * 0.5)) * 2.8284271247461903;
+    }
+    if (differences == 3) {
+        const double squared =
+            (top_left - centre) * (top_left - centre) / diagonal_distance_squared
+            + (left - up) * (left - up) / diagonal_distance_squared;
+        return std::sqrt(std::max(0.0, squared)) * 2.8284271247461903;
+    }
+    if (differences == 4) {
+        const double dx = ((up - top_left) + (centre - left)) * 0.5;
+        const double dy = ((left - top_left) + (centre - up)) * 0.5;
+        return std::hypot(dx, dy) * 2.8284271247461903;
+    }
+    if (differences == 5) {
+        const double dx = (right + top_right + bottom_right
+            - left - top_left - bottom_left) / 6.0;
+        const double dy = (down + bottom_left + bottom_right
+            - up - top_left - top_right) / 6.0;
+        return std::hypot(dx, dy) * 2.8284271247461903;
+    }
+    if (differences == 6) {
+        const double laplacian = top_left + 4.0 * up + top_right
+            + 4.0 * left - 20.0 * centre + 4.0 * right
+            + bottom_left + 4.0 * down + bottom_right;
+        return std::sqrt(std::abs(laplacian / 6.0 * 1.4426950408889634))
+            * 2.8284271247461903;
+    }
+    const double squared =
+        (right - left) * (right - left) * 0.25
+        + (down - up) * (down - up) * 0.25;
+    return std::sqrt(std::max(0.0, squared)) * 2.8284271247461903;
+}
+
+inline void kfp_hsv_to_rgb(
+    double hue,
+    double saturation,
+    double value,
+    double& red,
+    double& green,
+    double& blue
+) {
+    hue = std::fmod(hue, 1.0);
+    if (hue < 0.0) hue += 1.0;
+    saturation = std::clamp(saturation, 0.0, 1.0);
+    value = std::clamp(value, 0.0, 1.0);
+    const double scaled_hue = hue * 6.0;
+    const int sector = std::min(5, static_cast<int>(std::floor(scaled_hue)));
+    double fraction = scaled_hue - std::floor(scaled_hue);
+    fraction = (sector & 1) == 0 ? 1.0 - fraction : fraction;
+    const double minimum = value * (1.0 - saturation);
+    const double transition = value * (1.0 - saturation * fraction);
+    switch (sector) {
+        case 0:
+            red = minimum;
+            green = transition;
+            blue = value;
+            break;
+        case 1:
+            red = minimum;
+            green = value;
+            blue = transition;
+            break;
+        case 2:
+            red = transition;
+            green = value;
+            blue = minimum;
+            break;
+        case 3:
+            red = value;
+            green = transition;
+            blue = minimum;
+            break;
+        case 4:
+            red = value;
+            green = minimum;
+            blue = transition;
+            break;
+        default:
+            red = transition;
+            green = minimum;
+            blue = value;
+            break;
+    }
+}
+
+inline void write_kfp_pixel(
+    const float* field,
+    int width,
+    int height,
+    int x,
+    int y,
+    int max_iter,
+    double vocal,
+    double pitch,
+    const FractalKfpOptions& options,
+    const std::uint8_t* lut,
+    int lut_size,
+    double transfer_minimum,
+    double transfer_maximum,
+    std::uint8_t* destination
+) {
+    const float raw_value = field[static_cast<size_t>(y) * static_cast<size_t>(width)
+        + static_cast<size_t>(x)];
+    const bool inside = !std::isfinite(raw_value)
+        || raw_value >= static_cast<float>(max_iter) - 0.5F;
+    if (inside) {
+        destination[0] = static_cast<std::uint8_t>(options.interior_color[0]);
+        destination[1] = static_cast<std::uint8_t>(options.interior_color[1]);
+        destination[2] = static_cast<std::uint8_t>(options.interior_color[2]);
+        return;
+    }
+
+    const double safe = std::clamp(
+        static_cast<double>(raw_value), 0.0, static_cast<double>(max_iter));
+    const double colour_iter = options.flat ? std::floor(safe) : safe;
+    const double centre = safe;
+    const bool needs_difference = options.color_method >= 5
+        && options.color_method <= 8;
+    const bool needs_slopes = options.slopes
+        && options.slope_power > 0.0
+        && options.slope_ratio > 0.0;
+    double left = centre;
+    double right = centre;
+    double up = centre;
+    double down = centre;
+    double top_left = centre;
+    double top_right = centre;
+    double bottom_left = centre;
+    double bottom_right = centre;
+    if (needs_difference || needs_slopes) {
+        left = kfp_reflected_sample(field, width, height, x, y, -1, 0, max_iter, centre);
+        right = kfp_reflected_sample(field, width, height, x, y, 1, 0, max_iter, centre);
+        up = kfp_reflected_sample(field, width, height, x, y, 0, -1, max_iter, centre);
+        down = kfp_reflected_sample(field, width, height, x, y, 0, 1, max_iter, centre);
+        if (needs_difference) {
+            top_left = kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre);
+            top_right = kfp_reflected_sample(field, width, height, x, y, 1, -1, max_iter, centre);
+            bottom_left = kfp_reflected_sample(field, width, height, x, y, -1, 1, max_iter, centre);
+            bottom_right = kfp_reflected_sample(field, width, height, x, y, 1, 1, max_iter, centre);
+        }
+    }
+
+    const double gradient = needs_difference
+        ? kfp_difference_magnitude(
+            options.differences,
+            centre,
+            left,
+            right,
+            up,
+            down,
+            top_left,
+            top_right,
+            bottom_left,
+            bottom_right)
+        : 0.0;
+    const double distance = std::clamp(
+        std::isfinite(gradient) ? gradient * static_cast<double>(width) / 640.0 : 0.0,
+        0.0,
+        1.0e12);
+
+    double transfer = colour_iter;
+    switch (options.color_method) {
+        case 1:
+            transfer = std::sqrt(std::max(0.0, colour_iter));
+            break;
+        case 2:
+            transfer = std::cbrt(colour_iter);
+            break;
+        case 3:
+            transfer = std::log(std::max(1.0, colour_iter));
+            break;
+        case 4:
+            transfer = 1024.0 * (colour_iter - transfer_minimum)
+                / std::max(transfer_maximum - transfer_minimum, 1.0e-12);
+            break;
+        case 5:
+            transfer = std::min(distance, 1024.0);
+            break;
+        case 6: {
+            const double distance_transfer = std::min(distance, 1024.0);
+            transfer = distance_transfer > options.iter_div
+                ? colour_iter : distance_transfer;
+            break;
+        }
+        case 7:
+            transfer = std::log(std::max(1.0, distance + 1.0));
+            break;
+        case 8:
+            transfer = std::sqrt(std::max(0.0, distance));
+            break;
+        case 9:
+            transfer = std::log1p(std::log1p(std::max(0.0, colour_iter)));
+            break;
+        case 10:
+            transfer = std::atan(colour_iter);
+            break;
+        case 11:
+            transfer = std::pow(std::max(0.0, colour_iter), 0.25);
+            break;
+        default:
+            break;
+    }
+    if (!std::isfinite(transfer)) transfer = 0.0;
+    if (options.color_method == 5 || options.color_method == 7
+        || options.color_method == 8) {
+        transfer = std::clamp(transfer, 0.0, 1024.0);
+    }
+
+    double position = std::fmod(
+        transfer / options.iter_div + options.color_offset,
+        static_cast<double>(lut_size));
+    if (position < 0.0) position += static_cast<double>(lut_size);
+    const double lower_position = std::floor(position);
+    const int lower = std::clamp(static_cast<int>(lower_position), 0, lut_size - 1);
+    double red;
+    double green;
+    double blue;
+    if (options.smooth) {
+        double fraction = position - lower_position;
+        if (options.inverse_transition) fraction = 1.0 - fraction;
+        const int upper = (lower + 1) % lut_size;
+        red = static_cast<double>(lut[lower * 3]) * (1.0 - fraction)
+            + static_cast<double>(lut[upper * 3]) * fraction;
+        green = static_cast<double>(lut[lower * 3 + 1]) * (1.0 - fraction)
+            + static_cast<double>(lut[upper * 3 + 1]) * fraction;
+        blue = static_cast<double>(lut[lower * 3 + 2]) * (1.0 - fraction)
+            + static_cast<double>(lut[upper * 3 + 2]) * fraction;
+    } else {
+        red = static_cast<double>(lut[lower * 3]);
+        green = static_cast<double>(lut[lower * 3 + 1]);
+        blue = static_cast<double>(lut[lower * 3 + 2]);
+    }
+
+    if (options.multi_color && options.multi_color_count > 0) {
+        const double wave_input = options.smooth
+            ? transfer / options.iter_div + options.color_offset
+            : std::floor(transfer / options.iter_div + options.color_offset);
+        double hue_sum = 0.0;
+        double saturation_sum = 0.0;
+        double value_sum = 0.0;
+        int hue_count = 0;
+        int saturation_count = 0;
+        int value_count = 0;
+        for (std::uint32_t index = 0; index < options.multi_color_count; ++index) {
+            const double period = options.multi_color_period[index];
+            const double wave = period < 0.0
+                ? -period / 100.0
+                : 0.5 + 0.5 * std::sin(
+                    3.14159265358979323846 * wave_input / period);
+            switch (options.multi_color_type[index]) {
+                case 0:
+                    hue_sum += wave;
+                    ++hue_count;
+                    break;
+                case 1:
+                    saturation_sum += wave;
+                    ++saturation_count;
+                    break;
+                default:
+                    value_sum += wave;
+                    ++value_count;
+                    break;
+            }
+        }
+        const double hue = hue_count > 0 ? hue_sum / hue_count : 0.0;
+        const double saturation = saturation_count > 0
+            ? saturation_sum / saturation_count : 1.0;
+        const double value = value_count > 0 ? value_sum / value_count : 1.0;
+        double multi_red;
+        double multi_green;
+        double multi_blue;
+        kfp_hsv_to_rgb(
+            hue, saturation, value, multi_red, multi_green, multi_blue);
+        multi_red *= 255.0;
+        multi_green *= 255.0;
+        multi_blue *= 255.0;
+        if (options.blend_multi_color) {
+            red = (red + multi_red) * 0.5;
+            green = (green + multi_green) * 0.5;
+            blue = (blue + multi_blue) * 0.5;
+        } else {
+            red = multi_red;
+            green = multi_green;
+            blue = multi_blue;
+        }
+    }
+
+    if (needs_slopes) {
+        const double angle = options.slope_angle * 3.14159265358979323846 / 180.0;
+        const double projected = (
+            ((x == 0 ? centre - right : left - centre) * std::cos(angle))
+            + ((y == 0 ? centre - down : up - centre) * std::sin(angle)))
+            * options.slope_power * static_cast<double>(width) / 640.0;
+        const double strength = std::clamp(
+            std::atan(std::abs(projected)) / (3.14159265358979323846 / 2.0)
+                * options.slope_ratio / 100.0,
+            0.0,
+            1.0);
+        if (projected >= 0.0) {
+            red *= 1.0 - strength;
+            green *= 1.0 - strength;
+            blue *= 1.0 - strength;
+        } else {
+            red = red * (1.0 - strength) + 255.0 * strength;
+            green = green * (1.0 - strength) + 255.0 * strength;
+            blue = blue * (1.0 - strength) + 255.0 * strength;
+        }
+    }
+
+    const double vocal_mix = std::clamp(vocal, 0.0, 1.0);
+    const double saturation = 1.0 + 0.18 * vocal_mix;
+    const double luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+    red = luminance + (red - luminance) * saturation;
+    green = luminance + (green - luminance) * saturation;
+    blue = luminance + (blue - luminance) * saturation;
+    const double hue_angle = pitch_hue_angle(pitch);
+    if (std::abs(hue_angle) > 1.0e-15) {
+        const auto rotated = rotate_hue_rgb(
+            {{red, green, blue}}, std::cos(hue_angle), std::sin(hue_angle));
+        red = rotated[0];
+        green = rotated[1];
+        blue = rotated[2];
+    }
+    destination[0] = kfp_dithered_colour_byte(red, x, y, 0);
+    destination[1] = kfp_dithered_colour_byte(green, x, y, 1);
+    destination[2] = kfp_dithered_colour_byte(blue, x, y, 2);
+}
+
+bool valid_kfp_options(const FractalKfpOptions* options, int lut_size) noexcept {
+    if (!options || options->struct_size < sizeof(FractalKfpOptions)
+        || options->version != FRACTAL_KFP_OPTIONS_VERSION
+        || lut_size < 2 || lut_size > 65536
+        || !std::isfinite(options->iter_div) || options->iter_div <= 0.0
+        || !std::isfinite(options->color_offset)
+        || !std::isfinite(options->ratio)
+        || options->color_method < 0 || options->color_method > 11
+        || options->smooth_method < 0 || options->smooth_method > 2
+        || options->smooth < 0 || options->smooth > 1
+        || options->flat < 0 || options->flat > 1
+        || options->inverse_transition < 0 || options->inverse_transition > 1
+        || !std::isfinite(options->phase_color_strength)
+        || options->multi_color < 0 || options->multi_color > 1
+        || options->blend_multi_color < 0 || options->blend_multi_color > 1
+        || options->multi_color_count > FRACTAL_KFP_MAX_MULTI_COLORS
+        || !std::isfinite(options->power) || options->power <= 0.0
+        || options->slopes < 0 || options->slopes > 1
+        || !std::isfinite(options->slope_power) || options->slope_power < 0.0
+        || !std::isfinite(options->slope_ratio) || options->slope_ratio < 0.0
+        || !std::isfinite(options->slope_angle)
+        || options->differences < 0 || options->differences > 7) {
+        return false;
+    }
+    for (std::uint32_t index = 0; index < options->multi_color_count; ++index) {
+        if (!std::isfinite(options->multi_color_period[index])
+            || options->multi_color_period[index] == 0.0
+            || options->multi_color_type[index] < 0
+            || options->multi_color_type[index] > 2) {
+            return false;
+        }
+    }
+    return options->interior_color[0] >= 0 && options->interior_color[0] <= 255
+        && options->interior_color[1] >= 0 && options->interior_color[1] <= 255
+        && options->interior_color[2] >= 0 && options->interior_color[2] <= 255;
+}
+
 long double parse_zoom(const char* text) {
     if (!valid_c_string(text)) throw std::runtime_error("native zoom text is too long or null");
     errno = 0;
@@ -3122,9 +3610,36 @@ void render_bla_impl(
                         delta);
                 }
                 have_total = false;
+                // A compact scaled reference keeps only a double mantissa,
+                // so cancellation between the reference and perturbation can
+                // lose the low bits that decide the orbit. Kalles marks this
+                // condition as a perturbation glitch when the reconstructed
+                // orbit is much smaller than the reference state, then asks
+                // for another reference. Do the same here instead of turning
+                // the first bad escape into a rectangular fill.
+                const ScaledComplex& reference_state =
+                    context.orbit->scaled[static_cast<size_t>(reference_index)];
+                const ScaledNorm reference_norm_value = sc_norm_squared(reference_state);
+                const FloatExp reference_norm = FloatExp{
+                    reference_norm_value.mantissa,
+                    reference_norm_value.exponent,
+                };
+                if (reference_norm.mantissa != 0.0
+                    && reference_norm.finite()
+                    && fe_compare(
+                        FloatExp{total_norm.mantissa, total_norm.exponent},
+                        fe_mul(reference_norm, 1.0e-7)) < 0) {
+                    output[index] = std::numeric_limits<float>::quiet_NaN();
+                    unresolved_pixel = true;
+                    if constexpr (CollectStats) {
+                        ++stats->glitch_count;
+                        ++stats->unresolved_pixels;
+                    }
+                    break;
+                }
                 if (sc_outside_escape(total_norm)
                     || sc_outside_escape_with_delta(
-                        context.orbit->scaled[static_cast<size_t>(reference_index)],
+                        reference_state,
                         delta)) {
                     output[index] = smooth_escape_scaled(iteration, total_norm);
                     escaped = true;
@@ -3756,6 +4271,162 @@ int fractal_colourise(
         return 1;
     } catch (...) {
         set_error("native colouriser failed with an unknown exception");
+        return 1;
+    }
+}
+
+int fractal_apply_aurora_accents(
+    std::uint8_t* output,
+    int width,
+    int height,
+    const std::uint8_t* accents,
+    double pitch,
+    int threads
+) {
+    try {
+        if (!output || !accents || !valid_pixel_dimensions(width, height)
+            || !valid_thread_count(threads) || !std::isfinite(pitch)) {
+            throw std::runtime_error("invalid Aurora accent dimensions or controls");
+        }
+        const double hue_angle = pitch_hue_angle(pitch);
+        const bool rotate = std::abs(hue_angle) > 1.0e-15;
+        const double hue_cos = rotate ? std::cos(hue_angle) : 1.0;
+        const double hue_sin = rotate ? std::sin(hue_angle) : 0.0;
+        const int pixel_count = width * height;
+#ifdef _OPENMP
+        if (threads > 0) omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#endif
+        for (int pixel = 0; pixel < pixel_count; ++pixel) {
+            std::uint8_t* destination = output + static_cast<size_t>(pixel) * 3U;
+            const double red_weight = std::clamp(
+                static_cast<double>(destination[0]) / 140.0, 0.0, 1.0);
+            const double green_weight = std::clamp(
+                static_cast<double>(destination[1]) / 140.0, 0.0, 1.0);
+            const double blue_weight = std::clamp(
+                static_cast<double>(destination[2]) / 140.0, 0.0, 1.0);
+            double red = (
+                red_weight * static_cast<double>(accents[0])
+                + green_weight * static_cast<double>(accents[3])
+                + blue_weight * static_cast<double>(accents[6])) / 1.8;
+            double green = (
+                red_weight * static_cast<double>(accents[1])
+                + green_weight * static_cast<double>(accents[4])
+                + blue_weight * static_cast<double>(accents[7])) / 1.8;
+            double blue = (
+                red_weight * static_cast<double>(accents[2])
+                + green_weight * static_cast<double>(accents[5])
+                + blue_weight * static_cast<double>(accents[8])) / 1.8;
+            if (rotate) {
+                const auto rotated = rotate_hue_rgb(
+                    {{red, green, blue}}, hue_cos, hue_sin);
+                red = rotated[0];
+                green = rotated[1];
+                blue = rotated[2];
+            }
+            destination[0] = rounded_colour_byte(red);
+            destination[1] = rounded_colour_byte(green);
+            destination[2] = rounded_colour_byte(blue);
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native Aurora accent pass failed with an unknown exception");
+        return 1;
+    }
+}
+
+int fractal_colourise_kfp(
+    const float* field,
+    std::uint8_t* output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    try {
+        if (!field || !output || !valid_pixel_dimensions(width, height)
+            || !valid_iteration_count(max_iter) || !valid_thread_count(threads)
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)
+            || !lut || !valid_kfp_options(options, lut_size)) {
+            throw std::runtime_error("invalid native KFP colour dimensions or controls");
+        }
+        const FractalKfpOptions& transfer_options = *options;
+        double transfer_minimum = 0.0;
+        double transfer_maximum = 1.0;
+        if (transfer_options.color_method == 4) {
+            transfer_minimum = std::numeric_limits<double>::infinity();
+            transfer_maximum = -std::numeric_limits<double>::infinity();
+#ifdef _OPENMP
+#pragma omp parallel for reduction(min:transfer_minimum) reduction(max:transfer_maximum) schedule(static)
+#endif
+            for (int pixel = 0; pixel < width * height; ++pixel) {
+                const float raw_value = field[pixel];
+                if (!std::isfinite(raw_value)
+                    || raw_value >= static_cast<float>(max_iter) - 0.5F) {
+                    continue;
+                }
+                const double safe = std::clamp(
+                    static_cast<double>(raw_value), 0.0, static_cast<double>(max_iter));
+                // CFraktalSFT::GetIterations reports the integer nIter0 range
+                // for ColorMethod_Stretched; the fractional transition is
+                // applied only after that range has been selected.
+                const double value = std::floor(safe);
+                transfer_minimum = std::min(transfer_minimum, value);
+                transfer_maximum = std::max(transfer_maximum, value);
+            }
+            if (!std::isfinite(transfer_minimum)
+                || !std::isfinite(transfer_maximum)) {
+                transfer_minimum = 0.0;
+                transfer_maximum = 1.0;
+            }
+        }
+        if (threads > 0) {
+#ifdef _OPENMP
+            omp_set_num_threads(threads);
+#endif
+        }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                std::uint8_t* destination = output + static_cast<size_t>(
+                    y * width + x) * 3U;
+                write_kfp_pixel(
+                    field,
+                    width,
+                    height,
+                    x,
+                    y,
+                    max_iter,
+                    vocal,
+                    pitch,
+                    transfer_options,
+                    lut,
+                    lut_size,
+                    transfer_minimum,
+                    transfer_maximum,
+                    destination);
+            }
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native KFP colouriser failed with an unknown exception");
         return 1;
     }
 }

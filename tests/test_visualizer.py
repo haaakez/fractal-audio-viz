@@ -509,6 +509,41 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(tuple(lut[0]), (0, 0, 0))
         self.assertLess(int(lut[-1, 0]), 255)
 
+    def test_kfp_difference_matches_kalles_traditional_stencil(self):
+        field = np.arange(9, dtype=np.float32).reshape(3, 3)
+        gradient = visualizer._kfp_difference_magnitude(field, 0, np)
+        expected = 6.0 + 4.0 * math.sqrt(2.0)
+        self.assertAlmostEqual(float(gradient[1, 1]), expected, places=12)
+
+    def test_native_kfp_colouriser_matches_portable_boundary_stencils(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_kfp"):
+            raise unittest.SkipTest("native KFP colouriser is unavailable")
+        rng = np.random.default_rng(714)
+        field = rng.uniform(0.0, 180.0, size=(17, 23)).astype(np.float32)
+        field[0, 0] = 200.0
+        field[8, 11] = 200.0
+        field[-1, -1] = 200.0
+        field[1, 2] = np.nan
+        field[9, 13] = np.inf
+        field[15, 20] = -np.inf
+        portable = visualizer._colourise_kfp(
+            field, 200, 0.0, 0.0, 0.0, 0.5, visualizer.KALLES_DEFAULT_KFP
+        )
+        native = visualizer._colourise_kfp_native(
+            field,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            visualizer.KALLES_DEFAULT_KFP,
+            library,
+            2,
+        )
+        difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 1)
+
     def test_public_limits_reject_aliases_and_unbounded_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -695,6 +730,53 @@ class AnimationTests(unittest.TestCase):
             native_library=library,
         )
         np.testing.assert_allclose(local, single, rtol=0.0, atol=1.0e-3)
+
+    def test_glitch_atlas_repairs_deep_tile_without_black_fill(self):
+        """A compact reference glitch is refined instead of becoming a tile."""
+
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_render_points"):
+            raise unittest.SkipTest("native deep reference renderer is unavailable")
+        point = next(
+            candidate for candidate in visualizer.DEEP_ZOOM_POINTS
+            if candidate.slug == "oldwooddish"
+        )
+        width = height = 17
+        max_iter = 4000
+        library, reference = visualizer._create_native_reference(
+            point.x,
+            point.y,
+            max_iter,
+            60.0,
+            3,
+            60.0,
+        )
+        diagnostics: dict[str, int] = {}
+        try:
+            field = visualizer._atlas_local_reference_field(
+                render_width=width,
+                render_height=height,
+                log10_zoom=60.0,
+                x_center=point.x,
+                y_center=point.y,
+                max_iter=max_iter,
+                series_order=3,
+                series_block=256,
+                renderer="native",
+                native_threads=2,
+                native_library=library,
+                native_backend=0,
+                native_reference=reference,
+                allow_recovery=False,
+                diagnostics=diagnostics,
+            )
+        finally:
+            library.fractal_destroy_reference(reference)
+        self.assertTrue(np.isfinite(field).all())
+        self.assertGreater(diagnostics["initial_unresolved_pixels"], 0)
+        self.assertGreater(diagnostics["secondary_references"], 0)
+        self.assertGreater(float(np.ptp(field)), 10.0)
+        self.assertTrue(np.any(field < max_iter - 0.5))
 
     def test_probe_centred_point_reference_preserves_global_pixel_alignment(self):
         library = visualizer._get_native_library()

@@ -486,6 +486,72 @@ class NativeRenderOptions(ctypes.Structure):
         self.backend = checked_values["backend"]
 
 
+NATIVE_KFP_MAX_MULTI_COLORS = 256
+
+
+class NativeKfpOptions(ctypes.Structure):
+    """ctypes mirror of the native Kalles Fraktaler transfer options."""
+
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("iter_div", ctypes.c_double),
+        ("color_offset", ctypes.c_double),
+        ("ratio", ctypes.c_double),
+        ("color_method", ctypes.c_int32),
+        ("smooth_method", ctypes.c_int32),
+        ("smooth", ctypes.c_int32),
+        ("flat", ctypes.c_int32),
+        ("inverse_transition", ctypes.c_int32),
+        ("phase_color_strength", ctypes.c_double),
+        ("multi_color", ctypes.c_int32),
+        ("blend_multi_color", ctypes.c_int32),
+        ("multi_color_count", ctypes.c_uint32),
+        ("multi_color_period", ctypes.c_double * NATIVE_KFP_MAX_MULTI_COLORS),
+        ("multi_color_start", ctypes.c_int32 * NATIVE_KFP_MAX_MULTI_COLORS),
+        ("multi_color_type", ctypes.c_int32 * NATIVE_KFP_MAX_MULTI_COLORS),
+        ("power", ctypes.c_double),
+        ("slopes", ctypes.c_int32),
+        ("slope_power", ctypes.c_double),
+        ("slope_ratio", ctypes.c_double),
+        ("slope_angle", ctypes.c_double),
+        ("differences", ctypes.c_int32),
+        ("interior_color", ctypes.c_int32 * 3),
+    ]
+
+    @classmethod
+    def from_profile(cls, profile: KfpPalette) -> "NativeKfpOptions":
+        if len(profile.multi_colors) > NATIVE_KFP_MAX_MULTI_COLORS:
+            raise ValueError("KFP profile contains too many multi-colour waves")
+        result = cls()
+        result.struct_size = ctypes.sizeof(cls)
+        result.version = 1
+        result.iter_div = profile.iter_div
+        result.color_offset = profile.color_offset
+        result.ratio = profile.ratio
+        result.color_method = profile.color_method
+        result.smooth_method = profile.smooth_method
+        result.smooth = int(profile.smooth)
+        result.flat = int(profile.flat)
+        result.inverse_transition = int(profile.inverse_transition)
+        result.phase_color_strength = profile.phase_color_strength
+        result.multi_color = int(profile.multi_color)
+        result.blend_multi_color = int(profile.blend_multi_color)
+        result.multi_color_count = len(profile.multi_colors)
+        for index, (period, start, colour_type) in enumerate(profile.multi_colors):
+            result.multi_color_period[index] = period
+            result.multi_color_start[index] = start
+            result.multi_color_type[index] = colour_type
+        result.power = profile.power
+        result.slopes = int(profile.slopes)
+        result.slope_power = profile.slope_power
+        result.slope_ratio = profile.slope_ratio
+        result.slope_angle = profile.slope_angle
+        result.differences = profile.differences
+        result.interior_color[:] = profile.interior_color
+        return result
+
+
 NATIVE_BACKEND_NAMES = {
     "scalar": 0,
     "avx2": 1,
@@ -595,6 +661,33 @@ def _get_native_library() -> Any:
                     ctypes.c_int,
                 ]
                 library.fractal_colourise.restype = ctypes.c_int
+                if hasattr(library, "fractal_apply_aurora_accents"):
+                    library.fractal_apply_aurora_accents.argtypes = [
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_double,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_apply_aurora_accents.restype = ctypes.c_int
+                if hasattr(library, "fractal_colourise_kfp"):
+                    library.fractal_colourise_kfp.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(NativeKfpOptions),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_colourise_kfp.restype = ctypes.c_int
                 if hasattr(library, "fractal_crop_field"):
                     library.fractal_crop_field.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -6205,11 +6298,11 @@ def _atlas_colour_frame(
                 native_library,
                 0.5,
             )
-            return _apply_aurora_accents(
-                base,
-                _aurora_accents_for_selection(palette_name, palette_file),
-                pitch,
+            accents = _aurora_accents_for_selection(palette_name, palette_file)
+            accented = _native_apply_aurora_accents(
+                base, accents, pitch, native_library, native_threads
             )
+            return base if accented is None else accented
     parent_view, parent_inside_full = _crop_and_resize_preserving_interior(
         parent,
         output_width,
@@ -7381,7 +7474,7 @@ def _parse_kfp_profile(palette_text: str, path: Path) -> KfpPalette:
             fields, "SlopeAngle", 45.0, path, minimum=-360.0, maximum=360.0
         ),
         differences=_parse_kfp_int(
-            fields, "Differences", 3, path, minimum=0, maximum=16
+            fields, "Differences", 3, path, minimum=0, maximum=7
         ),
         interior_color=interior_color,
     )
@@ -7454,7 +7547,10 @@ def _kfp_palette_lut(profile: KfpPalette, size: int = 1024) -> Any:
     fraction = position - left.astype(np.float32)
     fraction = 0.5 - 0.5 * np.cos(np.pi * fraction)
     lut = stops[left] * (1.0 - fraction[:, None]) + stops[right] * fraction[:, None]
-    return np.asarray(np.rint(np.clip(lut, 0.0, 255.0)), dtype=np.uint8)
+    # Kalles stores m_cPos as unsigned bytes with a C-style conversion, so
+    # the fractional channel is truncated rather than rounded. This matters
+    # at the many half-way values in a short cyclic KFP gradient.
+    return np.asarray(np.clip(lut, 0.0, 255.0), dtype=np.uint8)
 
 
 @lru_cache(maxsize=16)
@@ -7563,6 +7659,41 @@ def _apply_aurora_accents(
     return np.asarray(np.clip(np.rint(rgb), 0.0, 255.0), dtype=np.uint8)
 
 
+def _native_apply_aurora_accents(
+    rgb: Any,
+    accents: tuple[tuple[int, int, int], ...],
+    pitch: float,
+    native_library: Any,
+    native_threads: int,
+) -> Optional[Any]:
+    """Run the ordinary-palette accent pass in native code when available."""
+
+    function = getattr(native_library, "fractal_apply_aurora_accents", None)
+    if function is None:
+        return None
+    np = _require_numpy()
+    output = np.ascontiguousarray(rgb, dtype=np.uint8)
+    if output.ndim != 3 or output.shape[-1] != 3:
+        raise ValueError("Aurora accent output must have shape (height, width, 3)")
+    if len(accents) != 3 or any(len(colour) != 3 for colour in accents):
+        raise ValueError("Aurora accents must contain three RGB colours")
+    accent_values = (ctypes.c_uint8 * 9)(
+        *(int(channel) for colour in accents for channel in colour)
+    )
+    status = function(
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(output.shape[1]),
+        int(output.shape[0]),
+        accent_values,
+        float(pitch),
+        int(native_threads),
+    )
+    if status != 0:
+        message = native_library.fractal_last_error() or b"unknown native Aurora accent error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
 def _colourise_aurora_accents(
     field: Any,
     max_iter: int,
@@ -7614,33 +7745,70 @@ def _kfp_slope_gradient(field: Any, np: Any) -> tuple[Any, Any]:
 
 
 def _kfp_difference_magnitude(field: Any, differences: int, np: Any) -> Any:
-    """Approximate Kalles' selectable 3x3 difference operators.
+    """Apply Kalles' selectable 3x3 difference operators.
 
     A scalar iteration image cannot provide Kalles' analytic distance
-    derivative, but using the selected finite-difference stencil preserves the
-    same local scale and, importantly, avoids manufacturing a rectangle when
-    the field is reprojected at deep zoom.
+    derivative, but using the selected finite-difference stencil preserves
+    Kalles' local scale.  Kalles reflects missing samples at image boundaries
+    before differencing; edge padding looks harmless but changes the slope and
+    distance transfer exactly where a tile seam is most visible.
     """
 
     values = np.asarray(field, dtype=np.float64)
-    padded = np.pad(values, 1, mode="edge")
-    centre = padded[1:-1, 1:-1]
-    left = padded[1:-1, :-2]
-    right = padded[1:-1, 2:]
-    up = padded[:-2, 1:-1]
-    down = padded[2:, 1:-1]
-    top_left = padded[:-2, :-2]
-    top_right = padded[:-2, 2:]
-    bottom_left = padded[2:, :-2]
-    bottom_right = padded[2:, 2:]
+
+    height, width = values.shape
+    centre = values
+
+    def reflected_shift(offset_x: int, offset_y: int) -> Any:
+        """Return a Kalles-style neighbourhood sample for one offset.
+
+        The CPU renderer reflects a missing sample across the target pixel.
+        For a one-pixel-wide dimension there is no opposite sample, so the
+        stable fallback is the centre value instead of propagating NaNs.
+        """
+
+        x = np.arange(width, dtype=np.intp)
+        y = np.arange(height, dtype=np.intp)
+        source_x = x + offset_x
+        source_y = y + offset_y
+        valid_x = (source_x >= 0) & (source_x < width)
+        valid_y = (source_y >= 0) & (source_y < height)
+        clipped_x = np.clip(source_x, 0, max(width - 1, 0))
+        clipped_y = np.clip(source_y, 0, max(height - 1, 0))
+        result = values[np.ix_(clipped_y, clipped_x)].copy()
+        valid = valid_y[:, None] & valid_x[None, :]
+        if np.any(~valid):
+            opposite_x = x - offset_x
+            opposite_y = y - offset_y
+            opposite_valid_x = (opposite_x >= 0) & (opposite_x < width)
+            opposite_valid_y = (opposite_y >= 0) & (opposite_y < height)
+            clipped_opposite_x = np.clip(opposite_x, 0, max(width - 1, 0))
+            clipped_opposite_y = np.clip(opposite_y, 0, max(height - 1, 0))
+            opposite = values[np.ix_(clipped_opposite_y, clipped_opposite_x)]
+            opposite_valid = opposite_valid_y[:, None] & opposite_valid_x[None, :]
+            result = np.where(
+                valid,
+                result,
+                np.where(opposite_valid, 2.0 * centre - opposite, centre),
+            )
+        return result
+
+    left = reflected_shift(-1, 0)
+    right = reflected_shift(1, 0)
+    up = reflected_shift(0, -1)
+    down = reflected_shift(0, 1)
+    top_left = reflected_shift(-1, -1)
+    top_right = reflected_shift(1, -1)
+    bottom_left = reflected_shift(-1, 1)
+    bottom_right = reflected_shift(1, 1)
     diagonal_distance_squared = 2.0
     inv_sqrt_two = 1.0 / math.sqrt(2.0)
-    if differences == 0:  # Traditional: forward x/y differences.
+    if differences == 0:  # Traditional, as in CFraktalSFT::SetColor.
         return (
             np.abs(left - centre) * math.sqrt(2.0)
             + np.abs(up - centre) * math.sqrt(2.0)
             + np.abs(top_left - centre)
-            + np.abs(bottom_left - centre)
+            + np.abs(top_right - centre)
         )
     if differences == 1:  # Forward 3x3, eight radial differences.
         squared = (
@@ -7721,6 +7889,33 @@ def _hsv_to_rgb(hue: Any, saturation: Any, value: Any, np: Any) -> Any:
     return output
 
 
+def _kfp_dither_rgb(rgb: Any, np: Any) -> Any:
+    """Apply Kalles' deterministic ordered dither before converting to RGB8."""
+
+    values = np.asarray(rgb, dtype=np.float64)
+    if values.ndim != 3 or values.shape[-1] != 3:
+        raise ValueError("KFP dither input must have shape (height, width, 3)")
+    height, width, _ = values.shape
+    x = np.arange(width, dtype=np.uint64)[None, :]
+    y = np.arange(height, dtype=np.uint64)[:, None]
+    output = np.empty(values.shape, dtype=np.uint8)
+    for channel in range(3):
+        mixed = (
+            x
+            + np.uint64(channel * 67)
+            + y * np.uint64(236)
+        ) * np.uint64(119)
+        mask = (mixed & np.uint64(255)).astype(np.float64) / 256.0
+        channel_values = np.nan_to_num(
+            values[..., channel], nan=0.0, posinf=255.0, neginf=0.0
+        )
+        output[..., channel] = np.asarray(
+            np.clip(np.floor(np.clip(channel_values, 0.0, 255.0) + mask), 0.0, 255.0),
+            dtype=np.uint8,
+        )
+    return output
+
+
 def _colourise_kfp(
     field: Any,
     max_iter: int,
@@ -7745,8 +7940,27 @@ def _colourise_kfp(
     safe = np.clip(safe, 0.0, float(max_iter))
     smooth_iter = np.maximum(0.0, safe)
     colour_iter = np.floor(smooth_iter) if profile.flat else smooth_iter
-    slope_dx, slope_dy = _kfp_slope_gradient(smooth_iter, np)
-    gradient = _kfp_difference_magnitude(smooth_iter, profile.differences, np)
+    method = int(profile.color_method)
+    needs_difference = method in {5, 6, 7, 8}
+    needs_slopes = bool(
+        profile.slopes
+        and profile.slope_power > 0.0
+        and profile.slope_ratio > 0.0
+    )
+    # Kalles represents an interior sample as (max_iter, transition=0), which
+    # reconstructs to max_iter + 1 when that sample is used by a neighbour
+    # stencil. Keep the centre colour marker at max_iter, but retain the
+    # reconstructed value for the distance and slope passes so boundaries do
+    # not turn into a flat rectangular fill.
+    stencil_iter = np.where(inside, float(max_iter) + 1.0, smooth_iter)
+    if needs_difference:
+        gradient = _kfp_difference_magnitude(stencil_iter, profile.differences, np)
+    else:
+        gradient = np.zeros_like(smooth_iter, dtype=np.float64)
+    if needs_slopes:
+        slope_dx, slope_dy = _kfp_slope_gradient(stencil_iter, np)
+    else:
+        slope_dx = slope_dy = None
     width = max(1, int(field.shape[1]))
     # A scalar iteration field does not carry Kalles' analytic DE derivatives.
     # Its selected finite-difference magnitude is the closest portable local
@@ -7757,7 +7971,6 @@ def _colourise_kfp(
     # width normalization belongs here.
     distance = gradient * width / 640.0
     distance = np.nan_to_num(distance, nan=0.0, posinf=1.0e12, neginf=0.0)
-    method = int(profile.color_method)
     if method == 1:
         transfer = np.sqrt(colour_iter)
     elif method == 2:
@@ -7765,7 +7978,9 @@ def _colourise_kfp(
     elif method == 3:
         transfer = np.log(np.maximum(1.0, colour_iter))
     elif method == 4:
-        escaped = colour_iter[~inside]
+        # Kalles' GetIterations() range is based on integer nIter0 values,
+        # not the fractional transition used for the final pixel colour.
+        escaped = np.floor(smooth_iter[~inside])
         minimum = float(np.min(escaped)) if escaped.size else 0.0
         maximum = float(np.max(escaped)) if escaped.size else minimum + 1.0
         transfer = 1024.0 * (colour_iter - minimum) / max(maximum - minimum, 1.0e-12)
@@ -7838,7 +8053,8 @@ def _colourise_kfp(
         multi_rgb = _hsv_to_rgb(hue, saturation, value, np) * 255.0
         rgb = (rgb + multi_rgb) * 0.5 if profile.blend_multi_color else multi_rgb
 
-    if profile.slopes and profile.slope_power > 0.0 and profile.slope_ratio > 0.0:
+    if needs_slopes:
+        assert slope_dx is not None and slope_dy is not None
         angle = math.radians(profile.slope_angle)
         projected = slope_dx * math.cos(angle) + slope_dy * math.sin(angle)
         projected *= profile.slope_power * width / 640.0
@@ -7866,9 +8082,62 @@ def _colourise_kfp(
     if abs(float(pitch) - 0.5) > 1.0e-12:
         shape = rgb.shape
         rgb = _rotate_hue_rgb(rgb.reshape(-1, 3), pitch).reshape(shape)
-    rgb = np.asarray(np.clip(np.rint(rgb), 0.0, 255.0), dtype=np.uint8)
+    rgb = _kfp_dither_rgb(rgb, np)
     rgb[inside] = np.asarray(profile.interior_color, dtype=np.uint8)
     return rgb
+
+
+@lru_cache(maxsize=32)
+def _native_kfp_options(profile: KfpPalette) -> NativeKfpOptions:
+    """Build one immutable ctypes transfer block per imported KFP profile."""
+
+    return NativeKfpOptions.from_profile(profile)
+
+
+def _colourise_kfp_native(
+    field: Any,
+    max_iter: int,
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    pitch: float,
+    profile: KfpPalette,
+    native_library: Any,
+    native_threads: int,
+) -> Any:
+    """Apply KFP's transfer in one OpenMP-native pass over the scalar field."""
+
+    function = getattr(native_library, "fractal_colourise_kfp", None)
+    if function is None:
+        return _colourise_kfp(
+            field, max_iter, phase, vocal, instrumental, pitch, profile
+        )
+    np = _require_numpy()
+    scalar = np.ascontiguousarray(field, dtype=np.float32)
+    if scalar.ndim != 2:
+        raise ValueError("KFP colour input must be two-dimensional")
+    output = np.empty(scalar.shape + (3,), dtype=np.uint8)
+    lut = np.ascontiguousarray(_kfp_palette_lut(profile), dtype=np.uint8)
+    options = _native_kfp_options(profile)
+    status = function(
+        scalar.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(scalar.shape[1]),
+        int(scalar.shape[0]),
+        int(max_iter),
+        float(phase),
+        float(vocal),
+        float(instrumental),
+        float(pitch),
+        ctypes.byref(options),
+        lut.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(lut.shape[0]),
+        int(native_threads),
+    )
+    if status != 0:
+        message = native_library.fractal_last_error() or b"unknown native KFP colourizer error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
 
 
 def _colourise_custom(
@@ -8231,7 +8500,20 @@ def _colourise_view(
 ) -> Any:
     """Colour an already-resampled scalar iteration field."""
 
-    if _kfp_profile_for_selection(palette_name, palette_file) is not None:
+    kfp_profile = _kfp_profile_for_selection(palette_name, palette_file)
+    if kfp_profile is not None:
+        if native_library is not None and hasattr(native_library, "fractal_colourise_kfp"):
+            return _colourise_kfp_native(
+                view,
+                max_iter,
+                phase,
+                vocal,
+                instrumental,
+                pitch,
+                kfp_profile,
+                native_library,
+                native_threads,
+            )
         return _colourise_custom(
             view,
             max_iter,
@@ -8264,11 +8546,11 @@ def _colourise_view(
             native_library,
             0.5,
         )
-        return _apply_aurora_accents(
-            base,
-            _aurora_accents_for_selection(palette_name, palette_file),
-            pitch,
+        accents = _aurora_accents_for_selection(palette_name, palette_file)
+        accented = _native_apply_aurora_accents(
+            base, accents, pitch, native_library, native_threads
         )
+        return base if accented is None else accented
     if palette_name != "aurora" or palette_file is not None:
         return _colourise_custom(
             view,
@@ -8336,11 +8618,11 @@ def _colour_frame(
             native_library,
             0.5,
         )
-        return _apply_aurora_accents(
-            base,
-            _aurora_accents_for_selection(palette_name, palette_file),
-            pitch,
+        accents = _aurora_accents_for_selection(palette_name, palette_file)
+        accented = _native_apply_aurora_accents(
+            base, accents, pitch, native_library, native_threads
         )
+        return base if accented is None else accented
     view, _ = _crop_and_resize_preserving_interior(
         field,
         output_width,

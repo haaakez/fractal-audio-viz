@@ -9,6 +9,8 @@ extern "C" {
 
 #define FRACTAL_ABI_VERSION 10
 #define FRACTAL_RENDER_OPTIONS_VERSION 1
+#define FRACTAL_KFP_OPTIONS_VERSION 1
+#define FRACTAL_KFP_MAX_MULTI_COLORS 256
 
 /* Formula ids used by render_fractal_ex. */
 #define FRACTAL_FORMULA_MANDELBROT 0
@@ -19,7 +21,10 @@ extern "C" {
 /*
  * Per-call controls for the native renderer.  Callers should initialize this
  * with fractal_render_options_default() and keep struct_size/version intact.
- * No render decision depends on process-global environment variables.
+ * No render decision depends on process-global environment variables.  In a
+ * strict deep render, a float NaN in the output means that the compact
+ * reference detected a perturbation glitch and the caller must refine that
+ * pixel/region with another reference; it is never an interior colour.
  */
 typedef struct FractalRenderOptions {
     uint32_t struct_size;
@@ -37,6 +42,39 @@ typedef struct FractalRenderOptions {
     int32_t backend;
     int32_t reserved[3];
 } FractalRenderOptions;
+
+/*
+ * Portable Kalles Fraktaler colour-transfer controls.  The scalar field and
+ * LUT stay owned by the caller; the native colouriser only reads them.  The
+ * fixed-size multi-colour arrays keep this extension ABI-safe and avoid
+ * handing C++ containers through ctypes.
+ */
+typedef struct FractalKfpOptions {
+    uint32_t struct_size;
+    uint32_t version;
+    double iter_div;
+    double color_offset;
+    double ratio;
+    int32_t color_method;
+    int32_t smooth_method;
+    int32_t smooth;
+    int32_t flat;
+    int32_t inverse_transition;
+    double phase_color_strength;
+    int32_t multi_color;
+    int32_t blend_multi_color;
+    uint32_t multi_color_count;
+    double multi_color_period[FRACTAL_KFP_MAX_MULTI_COLORS];
+    int32_t multi_color_start[FRACTAL_KFP_MAX_MULTI_COLORS];
+    int32_t multi_color_type[FRACTAL_KFP_MAX_MULTI_COLORS];
+    double power;
+    int32_t slopes;
+    double slope_power;
+    double slope_ratio;
+    double slope_angle;
+    int32_t differences;
+    int32_t interior_color[3];
+} FractalKfpOptions;
 
 int fractal_abi_version(void);
 int fractal_render_options_version(void);
@@ -167,6 +205,29 @@ int fractal_colourise(
     double vocal,
     double instrumental,
     double pitch,
+    int threads
+);
+int fractal_apply_aurora_accents(
+    uint8_t *output,
+    int width,
+    int height,
+    const uint8_t *accents,
+    double pitch,
+    int threads
+);
+int fractal_colourise_kfp(
+    const float *field,
+    uint8_t *output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions *options,
+    const uint8_t *lut,
+    int lut_size,
     int threads
 );
 int fractal_crop_field(
