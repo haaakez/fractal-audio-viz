@@ -487,10 +487,14 @@ python3 gui.py
 ```
 
 the gui also has a **live view** button for a screen-saver-like listening
-preview. It renders one small native source, colourises cheap crops at the
-display rate, and uses a streamed 8 kHz ffmpeg energy envelope instead of the
-full export analysis. This keeps startup and cpu use low. press `esc` to close
-it or `f11` to toggle fullscreen; the song loops until the window is closed.
+preview. It prepares a small absolute-zoom source ladder, colourises smooth
+parent/child crops at the display rate, and uses a streamed 8 kHz ffmpeg
+energy envelope instead of the full export analysis. The ladder follows the
+form's `base zoom` and `max zoom`, reaches the selected preview endpoint, and
+then resets to the base view when the song loops. This keeps startup and cpu
+use low while avoiding a stale shallow crop for a deep selection. press `esc`
+to close it or `f11` to toggle fullscreen; the song loops until the window is
+closed.
 The standalone form is:
 
 ```sh
@@ -499,9 +503,10 @@ python3 live_view.py song.mp3 --formula mandelbrot --palette aurora
 
 the live view is intentionally a preview: it caps the fractal source at
 640×360 with the native backend (320×180 for the python fallback), then
-upscales it smoothly. Final renders still use the export pipeline and its
-deep-zoom precision, atlas, and encoding settings. `ffplay` is used for
-playback when installed; without it the visual preview remains usable.
+upscales it smoothly. It prepares at most eight absolute-zoom fields and caps
+the interactive preview at e300; final renders still use the export pipeline
+and its deep-zoom precision, atlas, and encoding settings. `ffplay` is used
+for playback when installed; without it the visual preview remains usable.
 
 the built-in `preview` profile now keeps a native source at its requested
 960×540 density; the e150 4k profile remains a deliberate 2k-source speed

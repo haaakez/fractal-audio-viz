@@ -810,6 +810,41 @@ void fill_bilinear_axis(
     }
 }
 
+// Fill a bilinear map for a window that extends beyond the logical
+// destination rectangle.  The KFP atlas uses a one/two-pixel halo around the
+// visible child so its 3x3 difference/slope stencil can read real neighbours
+// instead of reflecting the moving child edge.  ``destination_origin`` and
+// ``destination_span`` are expressed in pixels of the logical output child.
+void fill_bilinear_axis_window(
+    BilinearAxis& axis,
+    int source_size,
+    int destination_size,
+    double destination_origin,
+    double destination_span
+) {
+    if (source_size <= 0 || destination_size <= 0
+        || !std::isfinite(destination_origin)
+        || !std::isfinite(destination_span) || destination_span <= 0.0) {
+        throw std::runtime_error("invalid bilinear window dimensions");
+    }
+    axis.index0.resize(static_cast<size_t>(destination_size));
+    axis.index1.resize(static_cast<size_t>(destination_size));
+    axis.weight.resize(static_cast<size_t>(destination_size));
+    for (int destination = 0; destination < destination_size; ++destination) {
+        const double logical_pixel = destination_origin
+            + static_cast<double>(destination) + 0.5;
+        double source = logical_pixel * static_cast<double>(source_size)
+            / destination_span - 0.5;
+        source = std::clamp(source, 0.0, static_cast<double>(source_size - 1));
+        const int index0 = static_cast<int>(std::floor(source));
+        axis.index0[static_cast<size_t>(destination)] = index0;
+        axis.index1[static_cast<size_t>(destination)] =
+            std::min(index0 + 1, source_size - 1);
+        axis.weight[static_cast<size_t>(destination)] =
+            static_cast<float>(source - static_cast<double>(index0));
+    }
+}
+
 // Atlas and crop colourisation are called once per video frame.  Keep the
 // coordinate maps in thread-local storage so changing the zoom reuses their
 // capacity instead of allocating several vectors for every frame.  The maps
@@ -4904,14 +4939,39 @@ int fractal_atlas_colourise_kfp_raw(
             ? std::max(1, static_cast<int>(std::lround(
                 static_cast<double>(output_height) * child_fraction)))
             : 0;
-        const int child_left = use_child
+        const int visible_child_left = use_child
             ? (output_width - visible_child_width) / 2
             : 0;
-        const int child_top = use_child
+        const int visible_child_top = use_child
             ? (output_height - visible_child_height) / 2
             : 0;
+        const int halo = use_child
+            ? std::min(
+                2,
+                std::min(
+                    std::min(visible_child_left, output_width
+                        - visible_child_left - visible_child_width),
+                    std::min(visible_child_top, output_height
+                        - visible_child_top - visible_child_height)))
+            : 0;
+        const int child_left = use_child ? visible_child_left - halo : 0;
+        const int child_top = use_child ? visible_child_top - halo : 0;
+        const int sampled_child_width = use_child
+            ? visible_child_width + 2 * halo
+            : 0;
+        const int sampled_child_height = use_child
+            ? visible_child_height + 2 * halo
+            : 0;
+        const int visible_feather = use_child
+            ? std::min(48, std::min(visible_child_width / 8,
+                visible_child_height / 8))
+            : 0;
         const int feather = use_child
-            ? std::min(48, std::min(visible_child_width / 8, visible_child_height / 8))
+            ? std::min(
+                sampled_child_width,
+                std::min(
+                    sampled_child_height,
+                    std::max(2, visible_feather + halo)))
             : 0;
         BilinearWorkspace& workspace = bilinear_workspace;
         BilinearAxis& parent_x_axis = workspace.parent_x_axis;
@@ -4952,15 +5012,25 @@ int fractal_atlas_colourise_kfp_raw(
         if (use_child) {
             BilinearAxis& child_x_axis = workspace.child_x_axis;
             BilinearAxis& child_y_axis = workspace.child_y_axis;
-            fill_bilinear_axis(child_x_axis, child_width, visible_child_width, 1.0);
-            fill_bilinear_axis(child_y_axis, child_height, visible_child_height, 1.0);
-            child_view.resize(static_cast<size_t>(visible_child_width)
-                * static_cast<size_t>(visible_child_height));
+            fill_bilinear_axis_window(
+                child_x_axis,
+                child_width,
+                sampled_child_width,
+                -static_cast<double>(halo),
+                static_cast<double>(visible_child_width));
+            fill_bilinear_axis_window(
+                child_y_axis,
+                child_height,
+                sampled_child_height,
+                -static_cast<double>(halo),
+                static_cast<double>(visible_child_height));
+            child_view.resize(static_cast<size_t>(sampled_child_width)
+                * static_cast<size_t>(sampled_child_height));
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int y = 0; y < visible_child_height; ++y) {
-                for (int x = 0; x < visible_child_width; ++x) {
+            for (int y = 0; y < sampled_child_height; ++y) {
+                for (int x = 0; x < sampled_child_width; ++x) {
                     bool inside = false;
                     const float smooth = sample_bilinear_mapped_preserving_interior(
                         child,
@@ -4972,7 +5042,7 @@ int fractal_atlas_colourise_kfp_raw(
                         child_max_iter,
                         inside);
                     child_view[static_cast<size_t>(y)
-                        * static_cast<size_t>(visible_child_width)
+                        * static_cast<size_t>(sampled_child_width)
                         + static_cast<size_t>(x)] = inside
                         ? static_cast<float>(max_iter)
                         : smooth;
@@ -4987,8 +5057,8 @@ int fractal_atlas_colourise_kfp_raw(
             output_width,
             output_height,
             use_child ? child_view.data() : nullptr,
-            visible_child_width,
-            visible_child_height,
+            sampled_child_width,
+            sampled_child_height,
             output,
             output_width,
             output_height,

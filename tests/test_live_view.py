@@ -4,11 +4,12 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 try:
-    import numpy  # noqa: F401
+    import numpy as np
 except ImportError as error:  # pragma: no cover - environment dependent
     raise unittest.SkipTest(f"NumPy is unavailable: {error}") from error
 
 import live_view
+import visualizer
 
 
 class LiveViewHelperTests(unittest.TestCase):
@@ -27,23 +28,42 @@ class LiveViewHelperTests(unittest.TestCase):
             live_view.live_dimensions(200, -1)
 
     def test_live_track_is_finite_and_bounded(self):
-        track = live_view.build_live_track([0.0, 0.2, 1.0, 0.4, 0.8], 30)
+        track = live_view.build_live_track(
+            [0.0, 0.2, 1.0, 0.4, 0.8],
+            30,
+            "1e2",
+            "1e24",
+        )
         for values in (track.energy, track.onset, track.phase, track.zoom):
             self.assertTrue(all(float(value) == float(value) for value in values))
         self.assertGreaterEqual(float(track.energy.min()), 0.0)
         self.assertLessEqual(float(track.energy.max()), 1.0)
-        self.assertGreaterEqual(float(track.zoom.min()), 1.0)
-        self.assertLessEqual(
-            float(track.zoom.max()),
-            live_view.LIVE_MAX_ZOOM_FACTOR + 1.0e-5,
-        )
+        self.assertGreaterEqual(float(track.zoom.min()), 2.0)
+        self.assertAlmostEqual(float(track.zoom[-1]), 24.0)
         self.assertAlmostEqual(track.duration, 5.0 / 30.0)
 
     def test_silence_does_not_create_nan_controls(self):
-        track = live_view.build_live_track([0.0, 0.0, 0.0], 24)
+        track = live_view.build_live_track([0.0, 0.0, 0.0], 24, "1.0", "1e4")
         self.assertTrue((track.energy == 0.0).all())
         self.assertTrue((track.onset == 0.0).all())
-        self.assertTrue((track.zoom >= 1.0).all())
+        self.assertTrue((track.zoom >= 0.0).all())
+        self.assertAlmostEqual(float(track.zoom[-1]), 4.0)
+
+    def test_live_zoom_ladder_reaches_selected_endpoint_without_overflow(self):
+        ladder = live_view.live_zoom_ladder("1e0", "1e150")
+        self.assertLessEqual(len(ladder), live_view.LIVE_MAX_SOURCE_KEYFRAMES)
+        self.assertAlmostEqual(float(ladder[0]), 0.0)
+        self.assertAlmostEqual(float(ladder[-1]), 150.0)
+        self.assertTrue(all(float(right) > float(left) for left, right in zip(ladder, ladder[1:])))
+
+        capped = live_view.live_zoom_ladder("1e0", "1e1000")
+        self.assertAlmostEqual(float(capped[-1]), live_view.LIVE_MAX_PREVIEW_LOG_ZOOM)
+
+    def test_live_zoom_ladder_rejects_reverse_range(self):
+        with self.assertRaises(ValueError):
+            live_view.live_zoom_ladder("1e4", "1e3")
+        with self.assertRaises(ValueError):
+            live_view.live_zoom_ladder("1e301", "1e302")
 
     def test_audio_player_command_is_quiet_and_uses_a_list(self):
         with mock.patch("live_view.shutil.which", return_value="/usr/bin/ffplay"):
@@ -61,6 +81,71 @@ class LiveViewHelperTests(unittest.TestCase):
                     formula="mandelbrot",
                     x_center="0.0",
                     y_center="0.0",
+                )
+
+    def test_config_rejects_reverse_zoom_range(self):
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            with self.assertRaises(ValueError):
+                live_view.LiveViewConfig(
+                    audio_path=audio,
+                    formula="mandelbrot",
+                    x_center="0.0",
+                    y_center="0.0",
+                    base_zoom="1e4",
+                    max_zoom="1e3",
+                )
+
+    def test_default_cli_config_resolves_a_native_safe_centre(self):
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            args = live_view.build_parser().parse_args([str(audio)])
+            config = live_view._resolve_cli_config(args)
+            self.assertTrue(config.x_center)
+            self.assertTrue(config.y_center)
+            self.assertIsNone(visualizer._center_precision_error(
+                config.x_center,
+                config.y_center,
+                config.max_log_zoom,
+            ))
+
+    def test_deep_native_coordinate_error_has_a_live_python_fallback(self):
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="mandelbrot",
+                x_center="0.0",
+                y_center="0.0",
+                max_zoom="1e24",
+            )
+            fallback = np.zeros((9, 16), dtype=np.float32)
+            with mock.patch(
+                "live_view.visualizer._create_native_reference",
+                side_effect=RuntimeError("invalid real coordinate"),
+            ), mock.patch(
+                "live_view.visualizer.render_fractal",
+                return_value=fallback,
+            ) as render:
+                result = live_view._render_live_source(config, 16, 9, 12.0, object())
+            np.testing.assert_array_equal(result, fallback)
+            self.assertEqual(render.call_args.kwargs["renderer"], "python")
+
+    def test_live_config_rejects_a_base_beyond_preview_precision(self):
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            with self.assertRaisesRegex(ValueError, "base zoom"):
+                live_view.LiveViewConfig(
+                    audio_path=audio,
+                    formula="mandelbrot",
+                    x_center="0.0",
+                    y_center="0.0",
+                    base_zoom="1e301",
+                    max_zoom="1e302",
                 )
 
 

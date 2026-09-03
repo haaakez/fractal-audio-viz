@@ -354,6 +354,10 @@ ATLAS_LOCAL_REFERENCE_FINAL_BUDGET_MS = 750
 ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS = 30_000
 ATLAS_PROGRESS_INTERVAL_SECONDS = 20.0
 ENCODER_BACKPRESSURE_NOTICE_SECONDS = 10.0
+# A child that is smaller than a few display pixels is not carrying useful
+# detail yet. Compositing it anyway makes a one-pixel KFP stencil flicker at
+# every atlas boundary and reads as camera shake in the encoded video.
+ATLAS_MIN_CHILD_PIXELS = 4
 # Alternate formula perturbation uses a decimal reference once the viewport
 # is narrower than a float64 centre can represent reliably. Keep this single
 # threshold shared by the direct renderer and the video planner so an atlas
@@ -6515,7 +6519,47 @@ def _atlas_colour_frame(
     """
 
     np = _require_numpy()
+    if (
+        child is not None
+        and child_iter is not None
+        and float(child_fraction) > 0.0
+        and min(int(output_width), int(output_height)) * float(child_fraction)
+            < ATLAS_MIN_CHILD_PIXELS
+    ):
+        # Let the already valid parent approximation carry the first few
+        # pixels of an interval. The child becomes useful once its KFP
+        # neighbourhood has room to exist in the output image.
+        child = None
+        child_iter = None
+        child_fraction = 0.0
     kfp_profile = _kfp_profile_for_selection(palette_name, palette_file)
+    if (
+        kfp_profile is not None
+        and child is not None
+        and child_iter is not None
+        and float(child_fraction) >= 0.999999
+        and native_library is not None
+        and hasattr(native_library, "fractal_crop_colourise_kfp")
+        and resample == "bilinear"
+    ):
+        # At the end of an atlas interval the child is the complete viewport.
+        # Going through the atlas seam code here would still feather it against
+        # the old parent at the four output edges, causing a one-frame flash
+        # when the next interval promotes that same child to its parent.
+        return _crop_colourise_kfp_native(
+            child,
+            output_width,
+            output_height,
+            1.0,
+            int(child_iter),
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            kfp_profile,
+            native_library,
+            native_threads,
+        )
     if (
         kfp_profile is not None
         and native_library is not None
@@ -6666,7 +6710,39 @@ def _atlas_colour_frame(
     right = left + child_width
     bottom = top + child_height
     if kfp_profile is not None:
-        feather = _atlas_feather(child_width, child_height)
+        visible_feather = _atlas_feather(child_width, child_height)
+        halo = min(
+            2,
+            left,
+            output_width - left - child_width,
+            top,
+            output_height - top - child_height,
+        )
+        if halo > 0:
+            # Kalles' difference/slope stencil needs neighbours outside the
+            # moving child rectangle. Edge padding is the exact prepared-tile
+            # equivalent of the native raw path's clamped bilinear halo.
+            child_view = np.pad(
+                child_view,
+                ((halo, halo), (halo, halo)),
+                mode="edge",
+            )
+            child_inside = np.pad(
+                np.asarray(child_inside, dtype=bool),
+                ((halo, halo), (halo, halo)),
+                mode="edge",
+            )
+            child_width += 2 * halo
+            child_height += 2 * halo
+            left -= halo
+            top -= halo
+            right = left + child_width
+            bottom = top + child_height
+        feather = min(
+            child_width,
+            child_height,
+            max(2, visible_feather + halo),
+        )
         if (
             native_library is not None
             and hasattr(native_library, "fractal_atlas_colourise_kfp")
@@ -8611,6 +8687,27 @@ def _atlas_colourise_kfp_native(
     if child_array.ndim != 2:
         raise ValueError("native KFP atlas child must be two-dimensional")
     child_height, child_width = child_array.shape
+    halo = min(
+        2,
+        int(child_left),
+        int(output_width) - int(child_left) - child_width,
+        int(child_top),
+        int(output_height) - int(child_top) - child_height,
+    )
+    if halo > 0:
+        child_array = np.pad(
+            child_array,
+            ((halo, halo), (halo, halo)),
+            mode="edge",
+        )
+        child_height, child_width = child_array.shape
+        child_left -= halo
+        child_top -= halo
+        feather = min(
+            child_width,
+            child_height,
+            max(2, int(feather) + halo),
+        )
     output = np.empty((int(output_height), int(output_width), 3), dtype=np.uint8)
     lut = np.ascontiguousarray(_kfp_palette_lut(profile), dtype=np.uint8)
     options = _native_kfp_options(profile)

@@ -3,10 +3,12 @@
 
 The export renderer is intentionally built for quality and reproducibility.
 That makes it the wrong thing to run once per screen-refresh in a
-screensaver-like preview.  This module renders one small native scalar field,
-colourises cheap centred crops of it, and keeps the audio decoder, renderer,
-and GTK main loop separate.  The result starts quickly, remains responsive,
-and is smoothly upscaled by the window when it is fullscreen.
+screensaver-like preview.  This module renders a small ladder of native
+scalar fields, colourises a continuous parent/child atlas between them, and
+keeps the audio decoder, renderer, and GTK main loop separate.  The result
+starts quickly, remains responsive, and is smoothly upscaled by the window
+when it is fullscreen.  The ladder follows the selected base/max zoom range
+and the song resets to the base view when it reaches the selected maximum.
 """
 
 from __future__ import annotations
@@ -33,7 +35,13 @@ LIVE_NATIVE_MAX_WIDTH = 640
 LIVE_NATIVE_MAX_HEIGHT = 360
 LIVE_PYTHON_MAX_WIDTH = 320
 LIVE_PYTHON_MAX_HEIGHT = 180
-LIVE_MAX_ZOOM_FACTOR = 4.0
+LIVE_DEFAULT_MAX_ZOOM = "1e4"
+# The live view is a preview, but it should still follow normal deep-zoom
+# selections (including the GUI's usual e150 range).  Beyond e300 the Python
+# alternate-formula path is deliberately not made a blocking screensaver.
+LIVE_MAX_PREVIEW_LOG_ZOOM = 300.0
+LIVE_MAX_SOURCE_KEYFRAMES = 8
+LIVE_SOURCE_LOG_STEP = 3.0
 LIVE_ITERATIONS = 192
 LIVE_FRAME_READ_BYTES = 256 * 1024
 LIVE_FALLBACK_DURATION = 300.0
@@ -60,6 +68,8 @@ class LiveViewConfig:
     native_threads: int = 0
     loop: bool = True
     fullscreen: bool = True
+    base_zoom: str = "1.0"
+    max_zoom: str = LIVE_DEFAULT_MAX_ZOOM
 
     def __post_init__(self) -> None:
         audio_path = Path(self.audio_path).expanduser()
@@ -70,6 +80,18 @@ class LiveViewConfig:
         object.__setattr__(self, "formula", formula)
         object.__setattr__(self, "x_center", visualizer._validate_center_text(self.x_center, "real"))
         object.__setattr__(self, "y_center", visualizer._validate_center_text(self.y_center, "imaginary"))
+        base_zoom = str(self.base_zoom).strip()
+        max_zoom = str(self.max_zoom).strip()
+        base_log_zoom = visualizer._zoom_log(base_zoom)
+        max_log_zoom = visualizer._zoom_log(max_zoom)
+        if max_log_zoom < base_log_zoom:
+            raise ValueError("live max zoom must be greater than or equal to live base zoom")
+        if base_log_zoom > LIVE_MAX_PREVIEW_LOG_ZOOM:
+            raise ValueError(
+                f"live base zoom cannot exceed 1e{LIVE_MAX_PREVIEW_LOG_ZOOM:.0f}"
+            )
+        object.__setattr__(self, "base_zoom", base_zoom)
+        object.__setattr__(self, "max_zoom", max_zoom)
         if len(self.julia_constant) != 2:
             raise ValueError("Julia constant must contain real and imaginary coordinates")
         julia_constant = (
@@ -110,10 +132,31 @@ class LiveViewConfig:
             )
         object.__setattr__(self, "native_threads", native_threads)
 
+    @property
+    def base_log_zoom(self) -> float:
+        return visualizer._zoom_log(self.base_zoom)
+
+    @property
+    def max_log_zoom(self) -> float:
+        return visualizer._zoom_log(self.max_zoom)
+
+    @property
+    def preview_max_log_zoom(self) -> float:
+        return max(self.base_log_zoom, min(self.max_log_zoom, LIVE_MAX_PREVIEW_LOG_ZOOM))
+
+    @property
+    def preview_zoom_is_capped(self) -> bool:
+        return self.preview_max_log_zoom < self.max_log_zoom - 1.0e-9
+
 
 @dataclass(frozen=True)
 class LiveAudioTrack:
-    """Small frame-aligned control arrays used by the live compositor."""
+    """Small frame-aligned control arrays used by the live compositor.
+
+    ``zoom`` stores base-10 logarithms, rather than an enormous binary zoom
+    factor.  This keeps e150 selections finite and lets the compositor choose
+    the correct absolute-zoom source tile without losing precision.
+    """
 
     energy: Any
     onset: Any
@@ -121,6 +164,15 @@ class LiveAudioTrack:
     zoom: Any
     duration: float
     fps: int
+
+
+@dataclass(frozen=True)
+class LiveZoomSources:
+    """Absolute-zoom scalar fields used by the live parent/child compositor."""
+
+    log_zooms: Any
+    fields: tuple[Any, ...]
+    capped: bool = False
 
 
 def live_dimensions(
@@ -152,6 +204,54 @@ def live_dimensions(
     return result_width, result_height
 
 
+def live_zoom_ladder(base_zoom: Any, max_zoom: Any) -> Any:
+    """Return a bounded absolute-zoom ladder for a live preview.
+
+    The export atlas can contain thousands of levels. A live window needs a
+    small fixed setup cost, so it samples the selected logarithmic range at
+    no more than ``LIVE_MAX_SOURCE_KEYFRAMES`` levels and composes the
+    in-between frames continuously.  The final source is capped at e300,
+    where the native Mandelbrot path and the bounded Python fallback remain
+    practical for an interactive preview.
+    """
+
+    np = visualizer._require_numpy()
+    base_log_zoom = visualizer._zoom_log(base_zoom)
+    max_log_zoom = visualizer._zoom_log(max_zoom)
+    if max_log_zoom < base_log_zoom:
+        raise ValueError("live max zoom must be greater than or equal to live base zoom")
+    if base_log_zoom > LIVE_MAX_PREVIEW_LOG_ZOOM:
+        raise ValueError(
+            f"live base zoom cannot exceed 1e{LIVE_MAX_PREVIEW_LOG_ZOOM:.0f}"
+        )
+    preview_max_log_zoom = max(
+        base_log_zoom,
+        min(max_log_zoom, LIVE_MAX_PREVIEW_LOG_ZOOM),
+    )
+    if preview_max_log_zoom <= base_log_zoom:
+        return np.asarray([base_log_zoom], dtype=np.float64)
+    interval_count = max(
+        1,
+        int(math.ceil((preview_max_log_zoom - base_log_zoom) / LIVE_SOURCE_LOG_STEP)),
+    )
+    point_count = min(
+        LIVE_MAX_SOURCE_KEYFRAMES,
+        max(2, interval_count + 1),
+    )
+    return np.linspace(
+        base_log_zoom,
+        preview_max_log_zoom,
+        point_count,
+        dtype=np.float64,
+    )
+
+
+def _live_zoom_text(log_zoom: float) -> str:
+    """Format one live ladder logarithm without overflowing a float zoom."""
+
+    return visualizer._zoom_text(float(log_zoom)).decode("ascii")
+
+
 def _normalise_live_energy(values: Any) -> Any:
     """Map raw frame RMS values to a stable, beat-visible 0..1 envelope."""
 
@@ -176,8 +276,18 @@ def _normalise_live_energy(values: Any) -> Any:
     return np.asarray(np.power(normalised, 0.72), dtype=np.float32)
 
 
-def build_live_track(raw_energy: Any, fps: int) -> LiveAudioTrack:
-    """Build cheap audio controls without invoking the full export analysis."""
+def build_live_track(
+    raw_energy: Any,
+    fps: int,
+    base_zoom: Any = "1.0",
+    max_zoom: Any = LIVE_DEFAULT_MAX_ZOOM,
+) -> LiveAudioTrack:
+    """Build cheap audio controls without invoking the full export analysis.
+
+    The zoom control is an absolute log10 position.  Keeping it in log space
+    avoids the overflow and quantisation that made deep live previews drift
+    into a different crop.
+    """
 
     np = visualizer._require_numpy()
     fps = int(fps)
@@ -204,14 +314,14 @@ def build_live_track(raw_energy: Any, fps: int) -> LiveAudioTrack:
     phase = np.cumsum(phase_rate / float(fps)).astype(np.float32)
     zoom = visualizer._zoom_plan(
         energy,
-        1.0,
-        LIVE_MAX_ZOOM_FACTOR,
+        base_zoom,
+        max_zoom,
         punch=2.5,
         quiet_speed=-0.02,
         onset=onset,
         beat_strength=0.8,
     )
-    zoom = np.asarray(np.power(10.0, zoom), dtype=np.float32)
+    zoom = np.asarray(zoom, dtype=np.float64)
     duration = max(1.0 / float(fps), float(energy.size) / float(fps))
     return LiveAudioTrack(energy, onset, phase, zoom, duration, fps)
 
@@ -343,7 +453,12 @@ def _decode_audio_energy(
                 visualizer._terminate_subprocess(process)
 
 
-def _fallback_live_track(audio_path: Path, fps: int) -> LiveAudioTrack:
+def _fallback_live_track(
+    audio_path: Path,
+    fps: int,
+    base_zoom: Any = "1.0",
+    max_zoom: Any = LIVE_DEFAULT_MAX_ZOOM,
+) -> LiveAudioTrack:
     """Keep visuals usable when a host lacks an FFmpeg decoder."""
 
     np = visualizer._require_numpy()
@@ -351,7 +466,7 @@ def _fallback_live_track(audio_path: Path, fps: int) -> LiveAudioTrack:
     count = max(1, int(math.ceil(duration * fps)))
     timestamps = np.arange(count, dtype=np.float64) / float(fps)
     pulse = 0.42 + 0.24 * (0.5 + 0.5 * np.sin(timestamps * 2.1))
-    track = build_live_track(pulse, fps)
+    track = build_live_track(pulse, fps, base_zoom, max_zoom)
     # Keep the visual clock aligned with the player even when the fallback
     # duration is not an exact multiple of the frame period.
     return LiveAudioTrack(
@@ -361,6 +476,223 @@ def _fallback_live_track(audio_path: Path, fps: int) -> LiveAudioTrack:
         track.zoom,
         duration,
         track.fps,
+    )
+
+
+def _render_live_source(
+    config: LiveViewConfig,
+    source_width: int,
+    source_height: int,
+    log_zoom: float,
+    native_library: Any,
+) -> Any:
+    """Render one absolute-zoom source with the cheapest valid backend."""
+
+    render_options = None
+    if native_library is not None:
+        try:
+            render_options = visualizer.NativeRenderOptions(
+                backend=visualizer._native_backend_id("auto", native_library)
+            )
+        except (OSError, RuntimeError, ValueError):
+            render_options = visualizer.NativeRenderOptions()
+
+    # The native deep path needs a reference orbit. Build it for each live
+    # source rather than pretending that a float64 centre is still exact at
+    # e12+. The live ladder is small and the resulting fields can be reused
+    # for every display frame in the interval.
+    if config.formula == "mandelbrot" and log_zoom >= 12.0 and native_library is not None:
+        reference_library: Any = None
+        reference: Any = None
+        try:
+            reference_library, reference = visualizer._create_native_reference(
+                config.x_center,
+                config.y_center,
+                LIVE_ITERATIONS,
+                log_zoom,
+                3,
+                log_zoom,
+                image_series_order=16,
+            )
+            return visualizer.render_fractal(
+                source_width,
+                source_height,
+                log_zoom,
+                config.x_center,
+                config.y_center,
+                LIVE_ITERATIONS,
+                renderer="native",
+                native_threads=config.native_threads,
+                native_reference=reference,
+                series_order=3,
+                series_block=128,
+                render_options=render_options,
+                formula=config.formula,
+                julia_constant=config.julia_constant,
+            )
+        except RuntimeError:
+            # A live window must remain usable when a native build rejects a
+            # coordinate spelling (for example a locale-specific value copied
+            # from a GUI field). The validated Python perturbation path still
+            # preserves the decimal centre through e300; final exports keep
+            # their stricter native error instead of hiding it.
+            if log_zoom > 300.0:
+                raise
+            return visualizer.render_fractal(
+                source_width,
+                source_height,
+                log_zoom,
+                config.x_center,
+                config.y_center,
+                LIVE_ITERATIONS,
+                renderer="python",
+                native_threads=config.native_threads,
+                formula=config.formula,
+                julia_constant=config.julia_constant,
+            )
+        finally:
+            if reference_library is not None and reference is not None:
+                reference_library.fractal_destroy_reference(reference)
+
+    renderer = "auto"
+    if config.formula == "mandelbrot" and log_zoom >= 12.0:
+        # This is only reached when the native library is missing.  Explicitly
+        # select the bounded high-precision fallback so the error from the
+        # native reference API does not turn the live window into a blank one.
+        renderer = "python"
+    try:
+        return visualizer.render_fractal(
+            source_width,
+            source_height,
+            log_zoom,
+            config.x_center,
+            config.y_center,
+            LIVE_ITERATIONS,
+            renderer=renderer,
+            native_threads=config.native_threads,
+            render_options=render_options,
+            formula=config.formula,
+            julia_constant=config.julia_constant,
+        )
+    except RuntimeError:
+        # A reference can be rejected when a user supplied centre has fewer
+        # digits than the selected deep target. The live preview should still
+        # be useful; its explicit Python fallback is preferable to a stale or
+        # synthetic black field. Final export validation remains strict.
+        if renderer != "python" and log_zoom <= 300.0:
+            return visualizer.render_fractal(
+                source_width,
+                source_height,
+                log_zoom,
+                config.x_center,
+                config.y_center,
+                LIVE_ITERATIONS,
+                renderer="python",
+                native_threads=config.native_threads,
+                formula=config.formula,
+                julia_constant=config.julia_constant,
+            )
+        raise
+
+
+def build_live_zoom_sources(
+    config: LiveViewConfig,
+    source_width: int,
+    source_height: int,
+    native_library: Any,
+    stop_event: Optional[threading.Event] = None,
+    status: Optional[Callable[[str], None]] = None,
+) -> LiveZoomSources:
+    """Prepare the small absolute-zoom atlas used by the live compositor."""
+
+    np = visualizer._require_numpy()
+    log_zooms = live_zoom_ladder(config.base_zoom, config.max_zoom)
+    fields: list[Any] = []
+    for index, log_zoom in enumerate(log_zooms):
+        if stop_event is not None and stop_event.is_set():
+            raise _LiveCancelled
+        if status is not None:
+            status(
+                f"rendering live zoom source {index + 1}/{len(log_zooms)} "
+                f"({_live_zoom_text(float(log_zoom))})…"
+            )
+        field = _render_live_source(
+            config,
+            source_width,
+            source_height,
+            float(log_zoom),
+            native_library,
+        )
+        fields.append(
+            visualizer._validated_field(
+                field,
+                (source_height, source_width),
+                "live zoom source",
+            )
+        )
+    return LiveZoomSources(
+        np.asarray(log_zooms, dtype=np.float64),
+        tuple(fields),
+        config.preview_zoom_is_capped,
+    )
+
+
+def _live_zoom_factor(log_zoom: float, source_log_zoom: float) -> float:
+    """Convert a local live interval position to a finite crop factor."""
+
+    delta = max(0.0, float(log_zoom) - float(source_log_zoom))
+    return max(1.0, math.pow(10.0, delta))
+
+
+def _live_colour_frame(
+    sources: LiveZoomSources,
+    log_zoom: float,
+    output_width: int,
+    output_height: int,
+    phase: float,
+    energy: float,
+    native_library: Any,
+    config: LiveViewConfig,
+) -> Any:
+    """Compose one continuous frame from the absolute live source ladder."""
+
+    np = visualizer._require_numpy()
+    logs = np.asarray(sources.log_zooms, dtype=np.float64)
+    if logs.size == 0 or not sources.fields:
+        raise RuntimeError("live zoom source ladder is empty")
+    bounded_log_zoom = min(max(float(log_zoom), float(logs[0])), float(logs[-1]))
+    index = int(np.searchsorted(logs, bounded_log_zoom, side="right") - 1)
+    index = max(0, min(index, len(sources.fields) - 1))
+    parent = sources.fields[index]
+    parent_log_zoom = float(logs[index])
+    parent_zoom = _live_zoom_factor(bounded_log_zoom, parent_log_zoom)
+    child = None
+    child_iter: Optional[int] = None
+    child_fraction = 0.0
+    if index + 1 < len(sources.fields):
+        child = sources.fields[index + 1]
+        child_log_zoom = float(logs[index + 1])
+        child_interval_factor = _live_zoom_factor(child_log_zoom, parent_log_zoom)
+        child_fraction = min(1.0, parent_zoom / child_interval_factor)
+        child_iter = LIVE_ITERATIONS
+    return visualizer._atlas_colour_frame(
+        parent,
+        child,
+        output_width,
+        output_height,
+        parent_zoom,
+        child_fraction,
+        LIVE_ITERATIONS,
+        child_iter,
+        phase,
+        energy,
+        energy,
+        native_library,
+        config.native_threads,
+        "bilinear",
+        config.palette,
+        0.5,
+        config.palette_file,
     )
 
 
@@ -640,7 +972,12 @@ if Gtk is not None:
                         self._stop_event,
                         lambda process: self._set_child("_decoder_process", process),
                     )
-                    track = build_live_track(raw_energy, self.config.fps)
+                    track = build_live_track(
+                        raw_energy,
+                        self.config.fps,
+                        self.config.base_zoom,
+                        _live_zoom_text(self.config.preview_max_log_zoom),
+                    )
                     if raw_energy.size == 0:
                         raise RuntimeError("ffmpeg returned no audio samples")
                     # A truncated/odd decoder stream should not make playback
@@ -657,35 +994,47 @@ if Gtk is not None:
                 except _LiveCancelled:
                     return
                 except (OSError, RuntimeError, ValueError, OverflowError):
-                    track = _fallback_live_track(self.config.audio_path, self.config.fps)
+                    track = _fallback_live_track(
+                        self.config.audio_path,
+                        self.config.fps,
+                        self.config.base_zoom,
+                        _live_zoom_text(self.config.preview_max_log_zoom),
+                    )
                     self._post_status("audio analysis unavailable; using a live clock", visible=True)
                 if self._stop_event.is_set():
                     return
 
-                self._post_status("rendering fast live source…")
+                self._post_status("preparing live zoom ladder…")
                 try:
                     native_library = visualizer._get_native_library()
                 except (OSError, RuntimeError):
                     native_library = None
+                native_preview = native_library is not None and (
+                    self.config.formula == "mandelbrot"
+                    or self.config.max_log_zoom < visualizer.ALTERNATE_PERTURBATION_MIN_LOG
+                )
                 source_width, source_height = live_dimensions(
                     self.config.width,
                     self.config.height,
-                    native_available=native_library is not None,
+                    native_available=native_preview,
                 )
-                field = visualizer.render_fractal(
+                sources = build_live_zoom_sources(
+                    self.config,
                     source_width,
                     source_height,
-                    0.0,
-                    self.config.x_center,
-                    self.config.y_center,
-                    LIVE_ITERATIONS,
-                    renderer="auto",
-                    native_threads=self.config.native_threads,
-                    formula=self.config.formula,
-                    julia_constant=self.config.julia_constant,
+                    native_library,
+                    self._stop_event,
+                    lambda message: self._post_status(message, dismiss_on_frame=False),
                 )
                 if self._stop_event.is_set():
                     return
+
+                if sources.capped:
+                    self._post_status(
+                        "live preview capped at 1e300; Esc to exit · F11 toggles fullscreen",
+                        visible=True,
+                        dismiss_on_frame=False,
+                    )
 
                 player = _start_audio_player(self.config.audio_path)
                 self._set_child("_audio_process", player)
@@ -697,7 +1046,7 @@ if Gtk is not None:
                     )
                 else:
                     self._post_status("Esc to exit · F11 toggles fullscreen", visible=True)
-                self._run_frames(field, track, native_library)
+                self._run_frames(sources, track, native_library)
             except _LiveCancelled:
                 pass
             except Exception as error:  # keep a broken preview from killing GTK
@@ -711,8 +1060,23 @@ if Gtk is not None:
                     except (AttributeError, OSError):
                         pass
 
-        def _run_frames(self, field: Any, track: LiveAudioTrack, native_library: Any) -> None:
+        def _run_frames(
+            self,
+            sources: LiveZoomSources,
+            track: LiveAudioTrack,
+            native_library: Any,
+        ) -> None:
             np = visualizer._require_numpy()
+            if not sources.fields:
+                raise RuntimeError("live zoom source ladder is empty")
+            source_shape = np.asarray(sources.fields[0]).shape
+            if len(source_shape) != 2:
+                raise RuntimeError("live zoom source has invalid dimensions")
+            # Keep the expensive KFP/Aurora colour pass at the bounded source
+            # density. The DrawingArea applies one bilinear upscale to the
+            # window; rendering a 1920x1080 RGB frame here would do the same
+            # resize twice and make the GUI the dominant live-view bottleneck.
+            source_height, source_width = int(source_shape[0]), int(source_shape[1])
             frame_interval = 1.0 / float(track.fps)
             started = time.monotonic()
             next_deadline = started
@@ -745,22 +1109,16 @@ if Gtk is not None:
                 )
                 energy = float(track.energy[index])
                 phase = float(track.phase[index]) + cycle * phase_span
-                zoom_factor = float(track.zoom[index])
-                rgb = visualizer._colour_frame(
-                    field,
-                    self.config.width,
-                    self.config.height,
-                    zoom_factor,
-                    LIVE_ITERATIONS,
+                log_zoom = float(track.zoom[index])
+                rgb = _live_colour_frame(
+                    sources,
+                    log_zoom,
+                    source_width,
+                    source_height,
                     phase,
                     energy,
-                    energy,
                     native_library,
-                    self.config.native_threads,
-                    "bilinear",
-                    self.config.palette,
-                    pitch=0.5,
-                    palette_file=self.config.palette_file,
+                    self.config,
                 )
                 self._publish_frame(np.asarray(rgb, dtype=np.uint8))
                 next_deadline += frame_interval
@@ -780,7 +1138,7 @@ else:
 
 def _resolve_cli_config(args: argparse.Namespace) -> LiveViewConfig:
     julia_constant = visualizer._parse_coordinate_pair(args.julia_c, "--julia-c")
-    max_log_zoom = 0.0
+    max_log_zoom = visualizer._zoom_log(args.max_zoom)
     x_center, y_center, _selected = visualizer._resolve_render_point(
         point_spec=args.point,
         random_point=args.random_point,
@@ -806,6 +1164,8 @@ def _resolve_cli_config(args: argparse.Namespace) -> LiveViewConfig:
         native_threads=args.native_threads,
         loop=args.loop,
         fullscreen=args.fullscreen,
+        base_zoom=args.base_zoom,
+        max_zoom=args.max_zoom,
     )
 
 
@@ -824,6 +1184,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--palette", choices=visualizer.PALETTE_CHOICES, default="aurora")
     parser.add_argument("--palette-file", type=Path, default=None)
+    parser.add_argument("--base-zoom", default="1.0")
+    parser.add_argument("--max-zoom", default=LIVE_DEFAULT_MAX_ZOOM)
     parser.add_argument("--width", type=int, default=LIVE_DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=LIVE_DEFAULT_HEIGHT)
     parser.add_argument("--fps", type=int, default=LIVE_DEFAULT_FPS)

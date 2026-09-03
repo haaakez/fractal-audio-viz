@@ -645,6 +645,9 @@ if Gtk is not None:
             from live_view import LiveViewConfig
 
             formula = self._combo_text(self.formula)
+            base_zoom = self.base_zoom.get_text().strip()
+            max_zoom = self.max_zoom.get_text().strip()
+            max_log_zoom = visualizer._zoom_log(max_zoom)
             point_spec = self._point_text() or None
             random_point = self.random_point.get_active()
             has_x = bool(self.x_center.get_text().strip())
@@ -668,7 +671,7 @@ if Gtk is not None:
                 x_center=self.x_center.get_text().strip() or None,
                 y_center=self.y_center.get_text().strip() or None,
                 random_seed=random_seed,
-                max_log_zoom=0.0,
+                max_log_zoom=max_log_zoom,
                 formula=formula,
                 julia_constant=julia_constant,
             )
@@ -690,6 +693,8 @@ if Gtk is not None:
                 native_threads=int(self.native_threads.get_text()),
                 loop=True,
                 fullscreen=True,
+                base_zoom=base_zoom,
+                max_zoom=max_zoom,
             )
 
         def _live_view(self, _button: Gtk.Button | None = None) -> None:
