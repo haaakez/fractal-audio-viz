@@ -928,17 +928,24 @@ inline float sample_bilinear_mapped_preserving_interior(
     for (int index = 0; index < 4; ++index) {
         const float value = values[index];
         const double weight = weights[index];
-        if (!std::isfinite(value)
-            || value >= static_cast<float>(source_max_iter) - 0.5F) {
+        if (std::isfinite(value)
+            && value >= static_cast<float>(source_max_iter)) {
             interior_weight += weight;
-        } else {
+        } else if (std::isfinite(value)) {
             exterior_weight += weight;
             exterior_value += static_cast<double>(value) * weight;
         }
     }
-    if (interior_weight >= 0.5 || exterior_weight <= 1.0e-12) {
+    if (interior_weight >= 0.5) {
         inside = true;
         return static_cast<float>(source_max_iter);
+    }
+    if (exterior_weight <= 1.0e-12) {
+        // Ignore invalid neighbours rather than treating them as interior.
+        // Public callers reject non-finite fields, but this keeps the native
+        // ABI safe for diagnostic/test inputs and prevents black rectangles.
+        inside = false;
+        return 0.0F;
     }
     inside = false;
     return static_cast<float>(exterior_value / exterior_weight);
@@ -953,7 +960,7 @@ inline void write_colour_pixel(
     const int* interior_color = nullptr
 ) {
     if (!std::isfinite(smooth)
-        || smooth >= static_cast<float>(source_max_iter) - 0.5F) {
+        || smooth >= static_cast<float>(source_max_iter)) {
         destination[0] = interior_color ? static_cast<std::uint8_t>(interior_color[0]) : 0;
         destination[1] = interior_color ? static_cast<std::uint8_t>(interior_color[1]) : 0;
         destination[2] = interior_color ? static_cast<std::uint8_t>(interior_color[2]) : 0;
@@ -1020,17 +1027,20 @@ inline double kfp_safe_sample(
     // signal sharp at the set boundary instead of making a flat square around
     // every interior tile.
     if (!std::isfinite(value)) {
-        return static_cast<double>(max_iter) + 1.0;
+        // Invalid scalar samples are not proof of membership.  Treat them as
+        // a finite escaped fallback so one numerical glitch cannot paint a
+        // rectangular black interior through the atlas.
+        return 0.0;
     }
-    if (value >= static_cast<float>(max_iter) - 0.5F) {
+    if (value >= static_cast<float>(max_iter)) {
         return static_cast<double>(max_iter) + 1.0;
     }
     return std::clamp(static_cast<double>(value), 0.0, static_cast<double>(max_iter));
 }
 
 inline bool kfp_inside_value(float value, int max_iter) noexcept {
-    return !std::isfinite(value)
-        || value >= static_cast<float>(max_iter) - 0.5F;
+    return std::isfinite(value)
+        && value >= static_cast<float>(max_iter);
 }
 
 inline double kfp_reflected_sample(
@@ -1078,6 +1088,8 @@ inline double kfp_difference_magnitude(
     if (differences == 0) {
         return std::abs(left - centre) * std::sqrt(2.0)
             + std::abs(up - centre) * std::sqrt(2.0)
+            // Diagonal neighbours are sqrt(2) pixels away, cancelling the
+            // historical sqrt(2) factor used before distance normalization.
             + std::abs(top_left - centre)
             + std::abs(bottom_left - centre);
     }
@@ -1219,8 +1231,11 @@ inline void write_kfp_pixel(
         return;
     }
 
-    const double safe = std::clamp(
-        static_cast<double>(raw_value), 0.0, static_cast<double>(max_iter));
+    const double safe = std::isfinite(raw_value)
+        ? std::clamp(
+            static_cast<double>(raw_value), 0.0, static_cast<double>(max_iter))
+        : 0.0;
+    const double smooth_iter = safe;
     const double colour_iter = options.flat ? std::floor(safe) : safe;
     const double centre = safe;
     const bool needs_difference = options.color_method >= 5
@@ -1293,7 +1308,9 @@ inline void write_kfp_pixel(
             const double distance_transfer = std::min(
                 std::sqrt(std::max(0.0, distance)), 1024.0);
             transfer = distance_transfer > options.iter_div
-                ? colour_iter : distance_transfer;
+                // Kalles restores nIter + 1 - offs here, even if Flat was
+                // selected for the initial colour-method input.
+                ? smooth_iter : distance_transfer;
             break;
         }
         case 7:
@@ -1400,8 +1417,15 @@ inline void write_kfp_pixel(
     }
 
     if (needs_slopes) {
+        // Kalles' default CPU colour path prefers the previous horizontal
+        // neighbour and falls forward only at the left edge. Keep this
+        // orientation in the native path so imported .kfp relief is aligned
+        // with the reference renderer users normally see.
+        const double horizontal = x > 0
+            ? left - centre
+            : centre - right;
         const double projected = (
-            ((x == 0 ? centre - right : left - centre) * slope_direction.cosine)
+            (horizontal * slope_direction.cosine)
             + ((y == 0 ? centre - down : up - centre) * slope_direction.sine))
                 * options.slope_power * static_cast<double>(spatial_width) / 640.0;
         const double strength = std::clamp(
@@ -1444,8 +1468,10 @@ KfpTransferBounds kfp_transfer_bounds(
     for (int pixel = 0; pixel < width * height; ++pixel) {
         const float raw_value = field[pixel];
         if (kfp_inside_value(raw_value, max_iter)) continue;
-        const double safe = std::clamp(
-            static_cast<double>(raw_value), 0.0, static_cast<double>(max_iter));
+        const double safe = std::isfinite(raw_value)
+            ? std::clamp(
+                static_cast<double>(raw_value), 0.0, static_cast<double>(max_iter))
+            : 0.0;
         // CFraktalSFT::GetIterations reports the integer nIter0 range for
         // ColorMethod_Stretched; the fractional transition is applied only
         // after that range has been selected.
@@ -4326,7 +4352,7 @@ int fractal_colourise(
         for (int pixel = 0; pixel < pixel_count; ++pixel) {
             const float smooth = field[pixel];
             std::uint8_t* rgb = output + static_cast<size_t>(pixel) * 3U;
-            if (!std::isfinite(smooth) || smooth >= static_cast<float>(max_iter) - 0.5F) {
+            if (!std::isfinite(smooth) || smooth >= static_cast<float>(max_iter)) {
                 rgb[0] = 0;
                 rgb[1] = 0;
                 rgb[2] = 0;

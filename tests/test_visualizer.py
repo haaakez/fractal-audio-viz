@@ -531,6 +531,28 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(tuple(lut[0]), (0, 0, 0))
         self.assertLess(int(lut[-1, 0]), 255)
 
+    def test_kfp_palette_lut_matches_kalles_sine_interpolation(self):
+        profile = visualizer.KfpPalette(
+            stops=((7, 19, 241), (240, 31, 11), (63, 222, 95)),
+        )
+        size = 37
+        lut = visualizer._kfp_palette_lut(profile, size)
+        expected = []
+        for index in range(size):
+            position = index * len(profile.stops) / size
+            left = int(math.floor(position))
+            right = (left + 1) % len(profile.stops)
+            fraction = position - left
+            fraction = math.sin((fraction - 0.5) * math.pi) / 2.0 + 0.5
+            expected.append(tuple(
+                int(
+                    fraction * profile.stops[right][channel]
+                    + (1.0 - fraction) * profile.stops[left][channel]
+                )
+                for channel in range(3)
+            ))
+        np.testing.assert_array_equal(lut, np.asarray(expected, dtype=np.uint8))
+
     def test_kfp_zero_distance_uses_the_imported_first_colour(self):
         field = np.zeros((5, 7), dtype=np.float32)
         rgb = visualizer._colourise_kfp(
@@ -551,6 +573,9 @@ class AnimationTests(unittest.TestCase):
             dtype=np.float32,
         )
         gradient = visualizer._kfp_difference_magnitude(field, 0, np)
+        # Kalles multiplies each delta by sqrt(2), then divides diagonal
+        # neighbours by their geometric distance sqrt(2). Axis terms retain
+        # sqrt(2), while diagonal terms retain unit weight.
         expected = 20.0 + 4.0 * math.sqrt(2.0)
         self.assertAlmostEqual(float(gradient[1, 1]), expected, places=12)
 
@@ -590,6 +615,29 @@ class AnimationTests(unittest.TestCase):
         # DistanceLinear retains the unrooted distance, so the two colours
         # must differ.
         self.assertGreater(int(linear_rgb[0, 0, 0]), int(sqrt_rgb[0, 0, 0]))
+
+    def test_kfp_de_plus_standard_flat_keeps_smooth_fallback(self):
+        field = np.asarray([[0.25, 100.75, 0.25]], dtype=np.float32)
+        common = dict(
+            stops=((0, 0, 0), (255, 255, 255)),
+            iter_div=0.1,
+            color_method=6,
+            smooth=True,
+            slopes=False,
+            differences=0,
+        )
+        flat = visualizer._colourise_kfp(
+            field, 200, 0.0, 0.0, 0.0, 0.5,
+            visualizer.KfpPalette(flat=True, **common),
+        )
+        fractional = visualizer._colourise_kfp(
+            field, 200, 0.0, 0.0, 0.0, 0.5,
+            visualizer.KfpPalette(flat=False, **common),
+        )
+        # The distance branch falls back to nIter + 1 - offs in Kalles,
+        # independently of Flat. The high-gradient centre therefore keeps
+        # its fractional transfer in both profiles.
+        self.assertEqual(tuple(flat[0, 1]), tuple(fractional[0, 1]))
 
     def test_native_kfp_colouriser_matches_portable_boundary_stencils(self):
         library = visualizer._get_native_library()

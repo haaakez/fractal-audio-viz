@@ -105,9 +105,9 @@ DEFAULT_Y_CENTER = (
 # Fields are expensive, so they can be cached; their cache identity must
 # change when native numerical behaviour changes.  This prevents a new
 # renderer from silently reusing an old, under-resolved .npy keyframe.
-KEYFRAME_CACHE_SCHEMA = "raw-field-series-v11-safe-alternate"
+KEYFRAME_CACHE_SCHEMA = "raw-field-series-v12-kalles-interior"
 AUDIO_CACHE_SCHEMA = "audio-controls-v10-onset-sync"
-ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v12-normalized-interior"
+ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v13-kalles-interior"
 
 FORMULA_CHOICES = (
     "mandelbrot",
@@ -3002,6 +3002,33 @@ def _fractional_decimal_places(value: str) -> int:
     return max(0, -int(exponent))
 
 
+def _coordinate_precision_digits(value: str) -> int:
+    """Return usable fractional precision, preserving exact zero/integer axes.
+
+    A literal ``0.0`` is not an under-specified deep coordinate: zero is
+    exactly representable, and Kalles uses real-axis targets like this for
+    several Julia presets.  Likewise, a coordinate written as an integer (or
+    with a non-negative scientific exponent) has no omitted fractional part.
+    Non-zero decimal fractions still report the least-significant supplied
+    digit, because their omitted tail can change a deep zoom target.
+    """
+
+    try:
+        text = str(value).strip()
+        decimal_value = Decimal(text)
+    except Exception:
+        return 0
+    if not decimal_value.is_finite():
+        return 0
+    if (
+        decimal_value.is_zero()
+        or decimal_value == decimal_value.to_integral_value()
+        or decimal_value.as_tuple().exponent >= 0
+    ):
+        return MAX_COORDINATE_TEXT_LENGTH
+    return _fractional_decimal_places(text)
+
+
 def _center_precision_budget(
     x_center: str,
     y_center: str,
@@ -3016,8 +3043,8 @@ def _center_precision_budget(
     """
 
     available = min(
-        _fractional_decimal_places(x_center),
-        _fractional_decimal_places(y_center),
+        _coordinate_precision_digits(x_center),
+        _coordinate_precision_digits(y_center),
     )
     required = max(0, int(math.ceil(max(0.0, float(log10_zoom))))) + CENTER_PRECISION_GUARD_DIGITS
     return available, required
@@ -3046,8 +3073,8 @@ def _deep_point_max_log10_zoom(point: DeepZoomPoint) -> float:
     """Return the depth supported by both the source and stored digits."""
 
     available = min(
-        _fractional_decimal_places(point.x),
-        _fractional_decimal_places(point.y),
+        _coordinate_precision_digits(point.x),
+        _coordinate_precision_digits(point.y),
     )
     return min(
         float(point.source_log10_zoom),
@@ -3186,7 +3213,7 @@ def _resolve_render_point(
             candidates = [
                 point
                 for point in catalogue
-                if float(point.source_log10_zoom) + 1.0e-9 >= float(max_log_zoom)
+                if _deep_point_max_log10_zoom(point) + 1.0e-9 >= float(max_log_zoom)
             ]
         if not candidates:
             deepest = max(
@@ -3211,16 +3238,10 @@ def _resolve_render_point(
     preset = points_by_slug.get(spec.casefold())
     if preset is not None:
         supported = _deep_point_max_log10_zoom(preset)
-        if formula == "mandelbrot" and supported + 1.0e-9 < float(max_log_zoom):
+        if supported + 1.0e-9 < float(max_log_zoom):
             raise ValueError(
                 f"point '{preset.slug}' is stored safely through about 10^{supported:.0f}, "
                 f"below requested 10^{float(max_log_zoom):.3f}"
-            )
-        if formula != "mandelbrot" and float(preset.source_log10_zoom) + 1.0e-9 < float(max_log_zoom):
-            raise ValueError(
-                f"point '{preset.slug}' is recommended through about "
-                f"10^{float(preset.source_log10_zoom):.1f}, below requested "
-                f"10^{float(max_log_zoom):.3f}; choose an e150-safe preset or lower --max-zoom"
             )
         if formula == "julia" and preset.julia_c is not None:
             target_constant = (
@@ -3261,10 +3282,7 @@ def _print_deep_zoom_points(formula: str = "mandelbrot") -> None:
         supported = _deep_point_max_log10_zoom(point)
         derived = f", conjugate of {point.conjugate_of}" if point.conjugate_of else ""
         julia = f", c={','.join(point.julia_c)}" if point.julia_c else ""
-        if formula == "mandelbrot":
-            depth = f"safe to ~1e{supported:.0f}"
-        else:
-            depth = f"recommended through ~1e{point.source_log10_zoom:.1f}"
+        depth = f"stored-safe to ~1e{supported:.0f}"
         print(
             f"  {point.slug:<31} {depth:<28} {point.name}"
             f" [{point.source_name}{derived}{julia}]"
@@ -5072,9 +5090,13 @@ def _crop_and_resize_preserving_interior(
     if field_array.ndim != 2:
         raise ValueError("interior-aware crop source must be two-dimensional")
     max_iter = _validate_iteration_count(max_iter, "interior iteration cap")
+    # The native renderer reserves the exact cap for bounded/interior pixels.
+    # A smooth escaped pixel can legitimately land within half an iteration of
+    # that cap; using ``cap - .5`` promoted those edge pixels to black
+    # interiors and exposed rectangular atlas fills.
     source_inside = (
-        ~np.isfinite(field_array)
-        | (np.asarray(field_array, dtype=np.float64) >= float(max_iter) - 0.5)
+        np.isfinite(field_array)
+        & (np.asarray(field_array, dtype=np.float64) >= float(max_iter))
     )
     if not np.any(source_inside):
         return (
@@ -5548,7 +5570,7 @@ def _atlas_glitch_reference_field(
         parent_fallback = np.asarray(parent_fallback, dtype=np.float32)
         if fallback_max_iter is not None:
             parent_fallback = np.where(
-                parent_fallback >= float(fallback_max_iter) - 0.5,
+                parent_fallback >= float(fallback_max_iter),
                 float(max_iter),
                 parent_fallback,
             ).astype(np.float32, copy=False)
@@ -6074,7 +6096,7 @@ def _atlas_local_reference_field(
             # Translate that sentinel to the current tile's cap instead of
             # turning parent interiors into a false coloured escape band.
             parent_fallback = np.where(
-                parent_fallback >= float(fallback_max_iter) - 0.5,
+                parent_fallback >= float(fallback_max_iter),
                 float(max_iter),
                 parent_fallback,
             ).astype(np.float32, copy=False)
@@ -7604,7 +7626,7 @@ def _colourise(
 ) -> Any:
     np = _require_numpy()
     field = np.asarray(field, dtype=np.float32)
-    inside = ~np.isfinite(field) | (field >= max_iter - 0.5)
+    inside = ~np.isfinite(field) | (field >= max_iter)
     # This is the original three-wave liquid gradient.  The field is a smooth
     # iteration count, so each channel is exactly
     #   0.5 - 0.5*cos(band_thickness*field - phase_channel).
@@ -7959,19 +7981,26 @@ def _kfp_palette_lut(profile: KfpPalette, size: int = 1024) -> Any:
 
     np = _require_numpy()
     size = max(2, int(size))
-    stops = np.asarray(profile.stops, dtype=np.float32)
+    # Kalles builds m_cPos with double-precision temporaries and truncates
+    # each channel only after the cyclic sine interpolation.  Keeping the
+    # lookup construction in float64 avoids a one-bin drift at deep zooms,
+    # especially for palettes with short, high-contrast key sequences.
+    stops = np.asarray(profile.stops, dtype=np.float64)
     if stops.shape[0] < 2:
         raise ValueError("KFP palette needs at least two colour stops")
     # Kalles treats the key colours as a cycle.  The final table entry blends
     # the last key back into the first; a non-cyclic linspace leaves a visible
     # discontinuity whenever ColorOffset crosses 1024.
     position = (
-        np.arange(size, dtype=np.float32) * float(stops.shape[0]) / float(size)
+        np.arange(size, dtype=np.float64) * float(stops.shape[0]) / float(size)
     )
     left = np.floor(position).astype(np.intp)
     right = (left + 1) % stops.shape[0]
-    fraction = position - left.astype(np.float32)
-    fraction = 0.5 - 0.5 * np.cos(np.pi * fraction)
+    fraction = position - left.astype(np.float64)
+    # Keep Kalles' source expression (rather than only its equivalent cosine
+    # identity) so values that land exactly on a byte boundary follow the same
+    # libm rounding path before the final truncating conversion.
+    fraction = np.sin((fraction - 0.5) * np.pi) / 2.0 + 0.5
     lut = stops[left] * (1.0 - fraction[:, None]) + stops[right] * fraction[:, None]
     # Kalles stores m_cPos as unsigned bytes with a C-style conversion, so
     # the fractional channel is truncated rather than rounded. This matters
@@ -8084,7 +8113,7 @@ def _apply_interior_color(
     scalar = np.asarray(field, dtype=np.float32)
     if output.ndim != 3 or output.shape[-1] != 3 or output.shape[:2] != scalar.shape:
         raise ValueError("interior colour input shapes do not match")
-    inside = ~np.isfinite(scalar) | (scalar >= float(max_iter) - 0.5)
+    inside = ~np.isfinite(scalar) | (scalar >= float(max_iter))
     output[inside] = np.asarray(colour, dtype=np.uint8)
     return output
 
@@ -8162,7 +8191,7 @@ def _colourise_aurora_accents(
 
     np = _require_numpy()
     field = np.asarray(field, dtype=np.float32)
-    inside = ~np.isfinite(field) | (field >= float(max_iter) - 0.5)
+    inside = ~np.isfinite(field) | (field >= float(max_iter))
     safe_field = np.nan_to_num(
         np.asarray(field, dtype=np.float64),
         nan=0.0,
@@ -8189,9 +8218,10 @@ def _kfp_slope_gradient(field: Any, np: Any) -> tuple[Any, Any]:
     dx = np.zeros_like(field, dtype=np.float64)
     dy = np.zeros_like(field, dtype=np.float64)
     if width > 1:
-        # SetColor prefers the previous neighbour and falls forward only at
-        # the left edge.  Keep that sign convention because it chooses the
-        # same light/dark side of a KFP slope.
+        # The normal Kalles renderer starts with its CPU colour path. Its
+        # finite-difference slope prefers the previous neighbour and only
+        # falls forward at the left edge; matching that convention keeps the
+        # default .kfp relief oriented like Kalles' own non-OpenGL output.
         dx[:, 0] = field[:, 0] - field[:, 1]
         dx[:, 1:] = field[:, :-1] - field[:, 1:]
     if height > 1:
@@ -8215,39 +8245,47 @@ def _kfp_difference_magnitude(field: Any, differences: int, np: Any) -> Any:
     height, width = values.shape
     centre = values
 
-    def reflected_shift(offset_x: int, offset_y: int) -> Any:
-        """Return a Kalles-style neighbourhood sample for one offset.
-
-        The CPU renderer reflects a missing sample across the target pixel.
-        For a one-pixel-wide dimension there is no opposite sample, so the
-        stable fallback is the centre value instead of propagating NaNs.
-        """
-
-        x = np.arange(width, dtype=np.intp)
-        y = np.arange(height, dtype=np.intp)
-        source_x = x + offset_x
-        source_y = y + offset_y
+    # Cache the one-dimensional index/mask work for all eight shifts. A
+    # single shared halo cannot represent Kalles' exact corner rule: for
+    # example, the missing top-left neighbour uses the opposite diagonal,
+    # while the missing top neighbour uses the opposite vertical sample.
+    # Precomputing these vectors retains the exact rule and avoids rebuilding
+    # them inside every shift.
+    x = np.arange(width, dtype=np.intp)
+    y = np.arange(height, dtype=np.intp)
+    x_data: dict[int, tuple[Any, Any]] = {}
+    y_data: dict[int, tuple[Any, Any]] = {}
+    for offset in (-1, 0, 1):
+        source_x = x + offset
+        source_y = y + offset
         valid_x = (source_x >= 0) & (source_x < width)
         valid_y = (source_y >= 0) & (source_y < height)
-        clipped_x = np.clip(source_x, 0, max(width - 1, 0))
-        clipped_y = np.clip(source_y, 0, max(height - 1, 0))
-        result = values[np.ix_(clipped_y, clipped_x)].copy()
+        x_data[offset] = (np.clip(source_x, 0, width - 1), valid_x)
+        y_data[offset] = (np.clip(source_y, 0, height - 1), valid_y)
+
+    def reflected_shift(offset_x: int, offset_y: int) -> Any:
+        source_x, valid_x = x_data[offset_x]
+        source_y, valid_y = y_data[offset_y]
+        result = values[np.ix_(source_y, source_x)]
         valid = valid_y[:, None] & valid_x[None, :]
-        if np.any(~valid):
-            opposite_x = x - offset_x
-            opposite_y = y - offset_y
-            opposite_valid_x = (opposite_x >= 0) & (opposite_x < width)
-            opposite_valid_y = (opposite_y >= 0) & (opposite_y < height)
-            clipped_opposite_x = np.clip(opposite_x, 0, max(width - 1, 0))
-            clipped_opposite_y = np.clip(opposite_y, 0, max(height - 1, 0))
-            opposite = values[np.ix_(clipped_opposite_y, clipped_opposite_x)]
-            opposite_valid = opposite_valid_y[:, None] & opposite_valid_x[None, :]
-            result = np.where(
-                valid,
-                result,
-                np.where(opposite_valid, 2.0 * centre - opposite, centre),
+        if np.all(valid):
+            return result
+        opposite_x = x - offset_x
+        opposite_y = y - offset_y
+        opposite_valid_x = (opposite_x >= 0) & (opposite_x < width)
+        opposite_valid_y = (opposite_y >= 0) & (opposite_y < height)
+        opposite = values[
+            np.ix_(
+                np.clip(opposite_y, 0, height - 1),
+                np.clip(opposite_x, 0, width - 1),
             )
-        return result
+        ]
+        opposite_valid = opposite_valid_y[:, None] & opposite_valid_x[None, :]
+        return np.where(
+            valid,
+            result,
+            np.where(opposite_valid, 2.0 * centre - opposite, centre),
+        )
 
     left = reflected_shift(-1, 0)
     right = reflected_shift(1, 0)
@@ -8263,6 +8301,9 @@ def _kfp_difference_magnitude(field: Any, differences: int, np: Any) -> Any:
         return (
             np.abs(left - centre) * math.sqrt(2.0)
             + np.abs(up - centre) * math.sqrt(2.0)
+            # Kalles multiplies every delta by sqrt(2) before dividing by
+            # its geometric neighbour distance. Diagonal neighbours are
+            # already sqrt(2) pixels away, so their net coefficient is one.
             + np.abs(top_left - centre)
             + np.abs(bottom_left - centre)
         )
@@ -8398,11 +8439,14 @@ def _colourise_kfp(
     del phase, vocal, instrumental, pitch
     np = _require_numpy()
     field = np.asarray(field, dtype=np.float32)
-    inside = ~np.isfinite(field) | (field >= float(max_iter) - 0.5)
+    inside = np.isfinite(field) & (field >= float(max_iter))
     safe = np.nan_to_num(
         np.asarray(field, dtype=np.float64),
-        nan=float(max_iter),
-        posinf=float(max_iter),
+        # Non-finite samples are numerical faults, not bounded-set markers.
+        # Keep them on the escaped fallback path so they cannot turn an
+        # entire atlas tile into the interior colour.
+        nan=0.0,
+        posinf=0.0,
         neginf=0.0,
     )
     safe = np.clip(safe, 0.0, float(max_iter))
@@ -8467,7 +8511,10 @@ def _colourise_kfp(
         )
         transfer = np.where(
             distance_transfer > profile.iter_div,
-            colour_iter,
+            # CFraktalSFT restores nIter + 1 - offs here.  That is the
+            # original smooth scalar even when Flat only affected the first
+            # colour-method transform.
+            smooth_iter,
             distance_transfer,
         )
     elif method == 7:
@@ -10759,19 +10806,13 @@ def _main_impl() -> None:
             else "Point"
         )
         depth = (
-            f"catalogue depth ~1e{_deep_point_max_log10_zoom(selected_point):.0f}."
-            if args.formula == "mandelbrot"
-            else f"recommended depth ~1e{selected_point.source_log10_zoom:.1f}."
+            f"stored-safe depth ~1e{_deep_point_max_log10_zoom(selected_point):.0f}."
         )
         print(
             f"{selection_kind}: {selected_point.name} ({selected_point.slug}); {depth}",
             flush=True,
         )
-    center_error = (
-        _center_precision_error(args.x_center, args.y_center, max_log)
-        if args.formula == "mandelbrot"
-        else None
-    )
+    center_error = _center_precision_error(args.x_center, args.y_center, max_log)
     if center_error is not None:
         if not args.allow_underspecified_center:
             raise SystemExit(center_error)

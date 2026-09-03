@@ -43,10 +43,19 @@ LIVE_MAX_PREVIEW_LOG_ZOOM = 300.0
 # A sub-decade interval keeps the deepest live crop small. The previous
 # eight-field ladder spread the GUI's default e24 range over 3.4 decades per
 # interval, which made a perfectly good 640x360 source look blocky while it
-# was being magnified. Forty-eight fields keep e150+ setup bounded.
-LIVE_MAX_SOURCE_KEYFRAMES = 48
+# was being magnified. Ninety-six fields keep e150+ setup bounded while
+# reducing the largest replacement jump to about 1.6 decades (and the normal
+# e24 preview still uses the requested 0.75-decade spacing).
+LIVE_MAX_SOURCE_KEYFRAMES = 96
 LIVE_SOURCE_LOG_STEP = 0.75
+# Keep the old name as the minimum for callers/tests that used the original
+# fixed-budget preview.  Deep alternate formulas need a larger budget: a
+# fixed 192-iteration cap classifies an e150 boundary tile as entirely
+# interior, which is indistinguishable from a black rendering failure.
 LIVE_ITERATIONS = 192
+LIVE_MIN_ITERATIONS = LIVE_ITERATIONS
+LIVE_MAX_ITERATIONS = 4096
+LIVE_ITERATION_QUANTUM = 32
 LIVE_FRAME_READ_BYTES = 256 * 1024
 LIVE_FALLBACK_DURATION = 300.0
 
@@ -94,6 +103,13 @@ class LiveViewConfig:
             raise ValueError(
                 f"live base zoom cannot exceed 1e{LIVE_MAX_PREVIEW_LOG_ZOOM:.0f}"
             )
+        precision_error = visualizer._center_precision_error(
+            self.x_center,
+            self.y_center,
+            min(max_log_zoom, LIVE_MAX_PREVIEW_LOG_ZOOM),
+        )
+        if precision_error is not None:
+            raise ValueError(precision_error)
         object.__setattr__(self, "base_zoom", base_zoom)
         object.__setattr__(self, "max_zoom", max_zoom)
         if len(self.julia_constant) != 2:
@@ -176,6 +192,7 @@ class LiveZoomSources:
 
     log_zooms: Any
     fields: tuple[Any, ...]
+    iteration_caps: tuple[int, ...] = ()
     capped: bool = False
 
 
@@ -254,6 +271,41 @@ def _live_zoom_text(log_zoom: float) -> str:
     """Format one live ladder logarithm without overflowing a float zoom."""
 
     return visualizer._zoom_text(float(log_zoom)).decode("ascii")
+
+
+def live_iteration_cap(formula: str, log_zoom: float) -> int:
+    """Choose a bounded live iteration budget for one absolute-zoom tile.
+
+    Iteration depth is independent of coordinate precision, but a boundary
+    point can require substantially more iterations as the viewport narrows.
+    Kalles uses the exact iteration cap as the interior marker; leaving every
+    live tile at 192 therefore turns valid deep alternate-formula views into
+    a solid black rectangle.  The schedule is deliberately much smaller than
+    export defaults and is quantised so neighbouring tiles have stable cache
+    and colourisation behaviour.
+    """
+
+    formula = visualizer._formula_name(formula)
+    try:
+        log_zoom = float(log_zoom)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("live source zoom must be numeric") from error
+    if not math.isfinite(log_zoom):
+        raise ValueError("live source zoom must be finite")
+    log_zoom = max(0.0, log_zoom)
+    if formula == "mandelbrot":
+        base, per_decade = 192.0, 2.5
+    elif formula == "burning-ship":
+        base, per_decade = 256.0, 3.5
+    else:
+        # Julia and Tricorn boundary orbits are more likely to have a long
+        # preperiod than the Mandelbrot reference path.
+        base, per_decade = 256.0, 5.0
+    requested = max(LIVE_MIN_ITERATIONS, int(math.ceil(base + per_decade * log_zoom)))
+    quantised = int(
+        math.ceil(requested / LIVE_ITERATION_QUANTUM) * LIVE_ITERATION_QUANTUM
+    )
+    return min(LIVE_MAX_ITERATIONS, max(LIVE_MIN_ITERATIONS, quantised))
 
 
 def _normalise_live_energy(values: Any) -> Any:
@@ -489,9 +541,11 @@ def _render_live_source(
     source_height: int,
     log_zoom: float,
     native_library: Any,
+    max_iter: int = LIVE_ITERATIONS,
 ) -> Any:
     """Render one absolute-zoom source with the cheapest valid backend."""
 
+    max_iter = visualizer._validate_iteration_count(max_iter, "live iteration cap")
     render_options = None
     if native_library is not None:
         try:
@@ -512,7 +566,7 @@ def _render_live_source(
             reference_library, reference = visualizer._create_native_reference(
                 config.x_center,
                 config.y_center,
-                LIVE_ITERATIONS,
+                max_iter,
                 log_zoom,
                 3,
                 log_zoom,
@@ -524,7 +578,7 @@ def _render_live_source(
                 log_zoom,
                 config.x_center,
                 config.y_center,
-                LIVE_ITERATIONS,
+                max_iter,
                 renderer="native",
                 native_threads=config.native_threads,
                 native_reference=reference,
@@ -548,7 +602,7 @@ def _render_live_source(
                 log_zoom,
                 config.x_center,
                 config.y_center,
-                LIVE_ITERATIONS,
+                max_iter,
                 renderer="python",
                 native_threads=config.native_threads,
                 formula=config.formula,
@@ -571,7 +625,7 @@ def _render_live_source(
             log_zoom,
             config.x_center,
             config.y_center,
-            LIVE_ITERATIONS,
+            max_iter,
             renderer=renderer,
             native_threads=config.native_threads,
             render_options=render_options,
@@ -590,7 +644,7 @@ def _render_live_source(
                 log_zoom,
                 config.x_center,
                 config.y_center,
-                LIVE_ITERATIONS,
+                max_iter,
                 renderer="python",
                 native_threads=config.native_threads,
                 formula=config.formula,
@@ -610,34 +664,81 @@ def build_live_zoom_sources(
     """Prepare the small absolute-zoom atlas used by the live compositor."""
 
     np = visualizer._require_numpy()
-    log_zooms = live_zoom_ladder(config.base_zoom, config.max_zoom)
+    requested_logs = live_zoom_ladder(config.base_zoom, config.max_zoom)
+    rendered_logs: list[float] = []
     fields: list[Any] = []
-    for index, log_zoom in enumerate(log_zooms):
+    iteration_caps: list[int] = []
+    truncated_for_budget = False
+    for index, log_zoom in enumerate(requested_logs):
         if stop_event is not None and stop_event.is_set():
             raise _LiveCancelled
+        source_log_zoom = float(log_zoom)
+        source_iter = live_iteration_cap(config.formula, source_log_zoom)
         if status is not None:
             status(
-                f"rendering live zoom source {index + 1}/{len(log_zooms)} "
-                f"({_live_zoom_text(float(log_zoom))})…"
+                f"rendering live zoom source {index + 1}/{len(requested_logs)} "
+                f"({_live_zoom_text(source_log_zoom)}, {source_iter} iterations)…"
             )
-        field = _render_live_source(
-            config,
-            source_width,
-            source_height,
-            float(log_zoom),
-            native_library,
-        )
-        fields.append(
-            visualizer._validated_field(
+        # A shallow cap can make a valid deep target look entirely bounded.
+        # Retry only that pathological case, and only as far as the bounded
+        # live budget allows; ordinary sources still pay for one render.
+        field = None
+        final_iter = source_iter
+        while True:
+            field = _render_live_source(
+                config,
+                source_width,
+                source_height,
+                source_log_zoom,
+                native_library,
+                final_iter,
+            )
+            field = visualizer._validated_field(
                 field,
                 (source_height, source_width),
                 "live zoom source",
             )
-        )
+            finite_exterior = np.isfinite(field) & (field < float(final_iter))
+            if np.any(finite_exterior) or final_iter >= LIVE_MAX_ITERATIONS:
+                break
+            if final_iter <= LIVE_MIN_ITERATIONS:
+                break
+            next_iter = min(LIVE_MAX_ITERATIONS, final_iter * 2)
+            if next_iter == final_iter:
+                break
+            final_iter = next_iter
+            if status is not None:
+                status(
+                    f"deep live source {_live_zoom_text(source_log_zoom)} reached "
+                    f"its cap; retrying with {final_iter} iterations…"
+                )
+
+        assert field is not None
+        finite_exterior = np.isfinite(field) & (field < float(final_iter))
+        if not np.any(finite_exterior) and fields and source_log_zoom > rendered_logs[-1] + 1.0e-9:
+            # Do not expose an all-interior source as a black rectangular
+            # viewport. Hold the last source and clamp the live camera there;
+            # this is especially important for connected Julia targets whose
+            # boundary does not escape within a practical screensaver budget.
+            truncated_for_budget = True
+            if status is not None:
+                status(
+                    f"live preview holding at {_live_zoom_text(rendered_logs[-1])}; "
+                    f"{_live_zoom_text(source_log_zoom)} needs more than "
+                    f"{final_iter} iterations"
+                )
+            break
+        rendered_logs.append(source_log_zoom)
+        fields.append(field)
+        iteration_caps.append(final_iter)
+
+    if not fields:
+        raise RuntimeError("live zoom source ladder produced no usable field")
     return LiveZoomSources(
-        np.asarray(log_zooms, dtype=np.float64),
+        np.asarray(rendered_logs, dtype=np.float64),
         tuple(fields),
-        config.preview_zoom_is_capped,
+        tuple(iteration_caps),
+        config.preview_zoom_is_capped or truncated_for_budget,
     )
 
 
@@ -669,6 +770,12 @@ def _live_colour_frame(
     index = max(0, min(index, len(sources.fields) - 1))
     parent = sources.fields[index]
     parent_log_zoom = float(logs[index])
+    caps = sources.iteration_caps
+    if len(caps) != len(sources.fields):
+        # Keep hand-constructed LiveZoomSources values compatible with the
+        # original fixed-budget helper API.
+        caps = (LIVE_ITERATIONS,) * len(sources.fields)
+    parent_iter = int(caps[index])
     parent_zoom = _live_zoom_factor(bounded_log_zoom, parent_log_zoom)
     child = None
     child_iter: Optional[int] = None
@@ -678,7 +785,7 @@ def _live_colour_frame(
         child_log_zoom = float(logs[index + 1])
         child_interval_factor = _live_zoom_factor(child_log_zoom, parent_log_zoom)
         child_fraction = min(1.0, parent_zoom / child_interval_factor)
-        child_iter = LIVE_ITERATIONS
+        child_iter = int(caps[index + 1])
     return visualizer._atlas_colour_frame(
         parent,
         child,
@@ -686,7 +793,7 @@ def _live_colour_frame(
         output_height,
         parent_zoom,
         child_fraction,
-        LIVE_ITERATIONS,
+        parent_iter,
         child_iter,
         phase,
         energy,
@@ -1034,8 +1141,11 @@ if Gtk is not None:
                     return
 
                 if sources.capped:
+                    actual_log_zoom = float(sources.log_zooms[-1])
                     self._post_status(
-                        "live preview capped at 1e300; Esc to exit · F11 toggles fullscreen",
+                        "live preview capped at "
+                        f"{_live_zoom_text(actual_log_zoom)}; Esc to exit · "
+                        "F11 toggles fullscreen",
                         visible=True,
                         dismiss_on_frame=False,
                     )

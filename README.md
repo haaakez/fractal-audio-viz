@@ -55,6 +55,17 @@ the render is split into five stages.
    FFmpeg writes the video with the original audio. `--codec auto` probes
    available hardware encoders and falls back to `libx264`.
 
+the KFP path follows Kalles Fraktaler's normal CPU colour pipeline: it builds
+the 1024-entry cyclic palette with sine interpolation, keeps the exact
+iteration cap as the interior marker, reconstructs interior neighbours as
+`max_iter + 1` for distance/slope stencils, applies the selected transfer and
+glossy slope pass, and uses Kalles' deterministic 8-bit dither. The lookup
+table and immutable profile are cached, and the native implementation performs
+the crop, atlas blend, stencil, and colour conversion without a Python image
+round-trip. KFP features that require extra Kalles buffers—custom GLSL colour
+functions, textures, analytic derivatives, and phase channels—remain outside
+the scalar-field compatibility path.
+
 the output dimensions are controlled by `--width` and `--height`. The fractal
 source can be smaller or larger than the output: `--render-scale` multiplies
 the source size, while `--fractal-scale` sets the requested quality floor.

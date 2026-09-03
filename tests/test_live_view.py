@@ -58,6 +58,7 @@ class LiveViewHelperTests(unittest.TestCase):
 
         capped = live_view.live_zoom_ladder("1e0", "1e1000")
         self.assertAlmostEqual(float(capped[-1]), live_view.LIVE_MAX_PREVIEW_LOG_ZOOM)
+        self.assertLessEqual(float(np.max(np.diff(ladder))), 150.0 / 95.0 + 1.0e-9)
 
         default_range = live_view.live_zoom_ladder("1e0", "1e24")
         self.assertEqual(len(default_range), 33)
@@ -71,6 +72,65 @@ class LiveViewHelperTests(unittest.TestCase):
             live_view.live_zoom_ladder("1e4", "1e3")
         with self.assertRaises(ValueError):
             live_view.live_zoom_ladder("1e301", "1e302")
+
+    def test_deep_formula_live_budgets_are_not_fixed_at_192(self):
+        self.assertEqual(live_view.live_iteration_cap("mandelbrot", 0.0), 192)
+        self.assertGreaterEqual(live_view.live_iteration_cap("burning-ship", 150.0), 700)
+        self.assertGreaterEqual(live_view.live_iteration_cap("tricorn", 150.0), 900)
+        self.assertGreaterEqual(live_view.live_iteration_cap("julia", 300.0), 1500)
+        self.assertLessEqual(
+            live_view.live_iteration_cap("julia", 300.0),
+            live_view.LIVE_MAX_ITERATIONS,
+        )
+
+    def test_live_sources_preserve_the_iteration_cap_for_each_tile(self):
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="tricorn",
+                x_center="-1.00000000000000000000",
+                y_center="0.10000000000000000000",
+                max_zoom="1e4",
+            )
+            calls = []
+
+            def fake_render(_config, width, height, _log_zoom, _library, max_iter):
+                calls.append(max_iter)
+                return np.full((height, width), max_iter - 1.0, dtype=np.float32)
+
+            with mock.patch("live_view._render_live_source", side_effect=fake_render):
+                sources = live_view.build_live_zoom_sources(config, 8, 4, None)
+            self.assertEqual(tuple(calls), sources.iteration_caps)
+            self.assertEqual(len(sources.fields), len(sources.iteration_caps))
+            self.assertTrue(all(cap >= live_view.LIVE_MIN_ITERATIONS for cap in calls))
+
+    def test_live_sources_drop_an_unresolved_deep_tile(self):
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="julia",
+                x_center="1.0",
+                y_center="0.0",
+                max_zoom="1e4",
+            )
+            calls = []
+
+            def fake_render(_config, width, height, log_zoom, _library, max_iter):
+                calls.append((log_zoom, max_iter))
+                if log_zoom > 0.0:
+                    return np.full((height, width), max_iter, dtype=np.float32)
+                return np.zeros((height, width), dtype=np.float32)
+
+            with mock.patch("live_view._render_live_source", side_effect=fake_render):
+                sources = live_view.build_live_zoom_sources(config, 8, 4, None)
+            self.assertEqual(len(sources.fields), 1)
+            self.assertTrue(sources.capped)
+            self.assertEqual(float(sources.log_zooms[-1]), 0.0)
+            self.assertGreater(len(calls), 1)  # the deep tile was retried
 
     def test_audio_player_command_is_quiet_and_uses_a_list(self):
         with mock.patch("live_view.shutil.which", return_value="/usr/bin/ffplay"):
