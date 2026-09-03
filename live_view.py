@@ -40,8 +40,12 @@ LIVE_DEFAULT_MAX_ZOOM = "1e4"
 # selections (including the GUI's usual e150 range).  Beyond e300 the Python
 # alternate-formula path is deliberately not made a blocking screensaver.
 LIVE_MAX_PREVIEW_LOG_ZOOM = 300.0
-LIVE_MAX_SOURCE_KEYFRAMES = 8
-LIVE_SOURCE_LOG_STEP = 3.0
+# A sub-decade interval keeps the deepest live crop small. The previous
+# eight-field ladder spread the GUI's default e24 range over 3.4 decades per
+# interval, which made a perfectly good 640x360 source look blocky while it
+# was being magnified. Forty-eight fields keep e150+ setup bounded.
+LIVE_MAX_SOURCE_KEYFRAMES = 48
+LIVE_SOURCE_LOG_STEP = 0.75
 LIVE_ITERATIONS = 192
 LIVE_FRAME_READ_BYTES = 256 * 1024
 LIVE_FALLBACK_DURATION = 300.0

@@ -59,6 +59,13 @@ class LiveViewHelperTests(unittest.TestCase):
         capped = live_view.live_zoom_ladder("1e0", "1e1000")
         self.assertAlmostEqual(float(capped[-1]), live_view.LIVE_MAX_PREVIEW_LOG_ZOOM)
 
+        default_range = live_view.live_zoom_ladder("1e0", "1e24")
+        self.assertEqual(len(default_range), 33)
+        self.assertLessEqual(
+            float(np.max(np.diff(default_range))),
+            live_view.LIVE_SOURCE_LOG_STEP + 1.0e-9,
+        )
+
     def test_live_zoom_ladder_rejects_reverse_range(self):
         with self.assertRaises(ValueError):
             live_view.live_zoom_ladder("1e4", "1e3")

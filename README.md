@@ -492,7 +492,10 @@ parent/child crops at the display rate, and uses a streamed 8 kHz ffmpeg
 energy envelope instead of the full export analysis. The ladder follows the
 form's `base zoom` and `max zoom`, reaches the selected preview endpoint, and
 then resets to the base view when the song loops. This keeps startup and cpu
-use low while avoiding a stale shallow crop for a deep selection. press `esc`
+use low while avoiding a stale shallow crop for a deep selection. The default
+e24 range uses a source field about every three-quarters of a decade (up to 48
+fields for longer ranges), so the live crop never magnifies a parent by
+thousands of times. press `esc`
 to close it or `f11` to toggle fullscreen; the song loops until the window is
 closed.
 The standalone form is:
@@ -503,7 +506,7 @@ python3 live_view.py song.mp3 --formula mandelbrot --palette aurora
 
 the live view is intentionally a preview: it caps the fractal source at
 640×360 with the native backend (320×180 for the python fallback), then
-upscales it smoothly. It prepares at most eight absolute-zoom fields and caps
+upscales it smoothly. It prepares at most 48 absolute-zoom fields and caps
 the interactive preview at e300; final renders still use the export pipeline
 and its deep-zoom precision, atlas, and encoding settings. `ffplay` is used
 for playback when installed; without it the visual preview remains usable.
