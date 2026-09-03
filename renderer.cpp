@@ -821,6 +821,8 @@ struct BilinearWorkspace {
     BilinearAxis child_y_axis;
     std::vector<float> child_edge_x;
     std::vector<float> child_edge_y;
+    std::vector<float> kfp_parent_field;
+    std::vector<float> kfp_child_field;
 };
 
 thread_local BilinearWorkspace bilinear_workspace;
@@ -912,13 +914,14 @@ inline void write_colour_pixel(
     int source_max_iter,
     const AuroraPalette& palette,
     float palette_index_scale,
-    std::uint8_t* destination
+    std::uint8_t* destination,
+    const int* interior_color = nullptr
 ) {
     if (!std::isfinite(smooth)
         || smooth >= static_cast<float>(source_max_iter) - 0.5F) {
-        destination[0] = 0;
-        destination[1] = 0;
-        destination[2] = 0;
+        destination[0] = interior_color ? static_cast<std::uint8_t>(interior_color[0]) : 0;
+        destination[1] = interior_color ? static_cast<std::uint8_t>(interior_color[1]) : 0;
+        destination[2] = interior_color ? static_cast<std::uint8_t>(interior_color[2]) : 0;
         return;
     }
     const int palette_size = static_cast<int>(palette.rgb.size());
@@ -1159,6 +1162,9 @@ inline void write_kfp_pixel(
     int height,
     int x,
     int y,
+    int dither_x,
+    int dither_y,
+    int spatial_width,
     int max_iter,
     const FractalKfpOptions& options,
     const std::uint8_t* lut,
@@ -1222,7 +1228,7 @@ inline void write_kfp_pixel(
             bottom_right)
         : 0.0;
     const double distance = std::clamp(
-        std::isfinite(gradient) ? gradient * static_cast<double>(width) / 640.0 : 0.0,
+        std::isfinite(gradient) ? gradient * static_cast<double>(spatial_width) / 640.0 : 0.0,
         0.0,
         1.0e12);
 
@@ -1362,7 +1368,7 @@ inline void write_kfp_pixel(
         const double projected = (
             ((x == 0 ? centre - right : left - centre) * slope_direction.cosine)
             + ((y == 0 ? centre - down : up - centre) * slope_direction.sine))
-            * options.slope_power * static_cast<double>(width) / 640.0;
+                * options.slope_power * static_cast<double>(spatial_width) / 640.0;
         const double strength = std::clamp(
             std::atan(std::abs(projected)) / (3.14159265358979323846 / 2.0)
                 * options.slope_ratio / 100.0,
@@ -1379,9 +1385,9 @@ inline void write_kfp_pixel(
         }
     }
 
-    destination[0] = kfp_dithered_colour_byte(red, x, y, 0);
-    destination[1] = kfp_dithered_colour_byte(green, x, y, 1);
-    destination[2] = kfp_dithered_colour_byte(blue, x, y, 2);
+    destination[0] = kfp_dithered_colour_byte(red, dither_x, dither_y, 0);
+    destination[1] = kfp_dithered_colour_byte(green, dither_x, dither_y, 1);
+    destination[2] = kfp_dithered_colour_byte(blue, dither_x, dither_y, 2);
 }
 
 struct KfpTransferBounds {
@@ -4428,6 +4434,9 @@ int fractal_colourise_kfp(
                     height,
                     x,
                     y,
+                    x,
+                    y,
+                    width,
                     max_iter,
                     transfer_options,
                     lut,
@@ -4521,13 +4530,17 @@ int fractal_atlas_colourise_kfp(
             child_edge_y.resize(static_cast<size_t>(child_height));
             for (int x = 0; x < child_width; ++x) {
                 const int edge = std::min(x, child_width - 1 - x);
-                child_edge_x[static_cast<size_t>(x)] = std::min(
+                const float linear = std::min(
                     1.0F, static_cast<float>(edge) / static_cast<float>(feather));
+                child_edge_x[static_cast<size_t>(x)] = linear * linear
+                    * (3.0F - 2.0F * linear);
             }
             for (int y = 0; y < child_height; ++y) {
                 const int edge = std::min(y, child_height - 1 - y);
-                child_edge_y[static_cast<size_t>(y)] = std::min(
+                const float linear = std::min(
                     1.0F, static_cast<float>(edge) / static_cast<float>(feather));
+                child_edge_y[static_cast<size_t>(y)] = linear * linear
+                    * (3.0F - 2.0F * linear);
             }
         }
 
@@ -4548,6 +4561,9 @@ int fractal_atlas_colourise_kfp(
                         parent_height,
                         x,
                         y,
+                        x,
+                        y,
+                        output_width,
                         max_iter,
                         transfer_options,
                         lut,
@@ -4564,17 +4580,27 @@ int fractal_atlas_colourise_kfp(
                 const float child_raw = child[static_cast<size_t>(child_y)
                     * static_cast<size_t>(child_width) + static_cast<size_t>(child_x)];
                 const bool child_inside = kfp_inside_value(child_raw, max_iter);
+                const float alpha = feather >= 2
+                    ? std::min(
+                        child_edge_x[static_cast<size_t>(child_x)],
+                        child_edge_y[static_cast<size_t>(child_y)])
+                    : 1.0F;
 
                 // The deeper tile owns classification. This rule is what
                 // prevents an interior child from becoming a rectangular
-                // parent-coloured fill at the edge of an atlas tile.
-                if (child_inside) {
+                // parent-coloured fill in the fully-owned region. In the
+                // feather band both classifications are deliberately blended
+                // so an interior cannot draw a hard rectangle.
+                if (child_inside && alpha >= 0.999999F) {
                     write_kfp_pixel(
                         child,
                         child_width,
                         child_height,
                         child_x,
                         child_y,
+                        x,
+                        y,
+                        output_width,
                         max_iter,
                         transfer_options,
                         lut,
@@ -4596,6 +4622,9 @@ int fractal_atlas_colourise_kfp(
                             parent_height,
                             x,
                             y,
+                            x,
+                            y,
+                            output_width,
                             max_iter,
                             transfer_options,
                             lut,
@@ -4611,6 +4640,9 @@ int fractal_atlas_colourise_kfp(
                             child_height,
                             child_x,
                             child_y,
+                            x,
+                            y,
+                            output_width,
                             max_iter,
                             transfer_options,
                             lut,
@@ -4623,9 +4655,6 @@ int fractal_atlas_colourise_kfp(
                     continue;
                 }
 
-                const float alpha = std::min(
-                    child_edge_x[static_cast<size_t>(child_x)],
-                    child_edge_y[static_cast<size_t>(child_y)]);
                 if (alpha >= 0.999999F) {
                     write_kfp_pixel(
                         child,
@@ -4633,6 +4662,9 @@ int fractal_atlas_colourise_kfp(
                         child_height,
                         child_x,
                         child_y,
+                        x,
+                        y,
+                        output_width,
                         max_iter,
                         transfer_options,
                         lut,
@@ -4644,26 +4676,6 @@ int fractal_atlas_colourise_kfp(
                     continue;
                 }
 
-                const float parent_raw = parent[static_cast<size_t>(y)
-                    * static_cast<size_t>(parent_width) + static_cast<size_t>(x)];
-                const bool parent_inside = kfp_inside_value(parent_raw, max_iter);
-                if (parent_inside) {
-                    write_kfp_pixel(
-                        child,
-                        child_width,
-                        child_height,
-                        child_x,
-                        child_y,
-                        max_iter,
-                        transfer_options,
-                        lut,
-                        lut_size,
-                        child_bounds.minimum,
-                        child_bounds.maximum,
-                        slope_direction,
-                        destination);
-                    continue;
-                }
 
                 std::uint8_t parent_rgb[3];
                 std::uint8_t child_rgb[3];
@@ -4673,6 +4685,9 @@ int fractal_atlas_colourise_kfp(
                     parent_height,
                     x,
                     y,
+                    x,
+                    y,
+                    output_width,
                     max_iter,
                     transfer_options,
                     lut,
@@ -4687,6 +4702,9 @@ int fractal_atlas_colourise_kfp(
                     child_height,
                     child_x,
                     child_y,
+                    x,
+                    y,
+                    output_width,
                     max_iter,
                     transfer_options,
                     lut,
@@ -4713,6 +4731,284 @@ int fractal_atlas_colourise_kfp(
         return 1;
     } catch (...) {
         set_error("native KFP atlas colouriser failed with an unknown exception");
+        return 1;
+    }
+}
+
+int fractal_crop_colourise_kfp(
+    const float* source,
+    int source_width,
+    int source_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    try {
+        if (!source || !output
+            || !valid_pixel_dimensions(source_width, source_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_iteration_count(max_iter)
+            || !valid_thread_count(threads)
+            || !std::isfinite(zoom_factor) || zoom_factor <= 0.0
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)
+            || !lut || !valid_kfp_options(options, lut_size)) {
+            throw std::runtime_error("invalid native KFP crop dimensions or controls");
+        }
+        zoom_factor = std::max(zoom_factor, 1.0);
+        BilinearWorkspace& workspace = bilinear_workspace;
+        BilinearAxis& x_axis = workspace.parent_x_axis;
+        BilinearAxis& y_axis = workspace.parent_y_axis;
+        fill_bilinear_axis(x_axis, source_width, output_width, zoom_factor);
+        fill_bilinear_axis(y_axis, source_height, output_height, zoom_factor);
+
+        // KFP's neighbourhood stencil must see a lossless interior marker.
+        // Resampling the cap as an ordinary float creates a fake escape band;
+        // first build the interior-aware scalar view, then colourise it in the
+        // same native pass used by direct KFP frames.
+        std::vector<float>& cropped = workspace.kfp_parent_field;
+        cropped.resize(static_cast<size_t>(output_width)
+            * static_cast<size_t>(output_height));
+#ifdef _OPENMP
+        if (threads > 0) {
+            omp_set_dynamic(0);
+            omp_set_num_threads(threads);
+        }
+#pragma omp parallel for schedule(static)
+#endif
+        for (int y = 0; y < output_height; ++y) {
+            for (int x = 0; x < output_width; ++x) {
+                bool inside = false;
+                const float smooth = sample_bilinear_mapped_preserving_interior(
+                    source,
+                    source_width,
+                    x_axis,
+                    y_axis,
+                    x,
+                    y,
+                    max_iter,
+                    inside);
+                cropped[static_cast<size_t>(y) * static_cast<size_t>(output_width)
+                    + static_cast<size_t>(x)] = inside
+                    ? static_cast<float>(max_iter)
+                    : smooth;
+            }
+        }
+
+        const FractalKfpOptions& transfer_options = *options;
+        const KfpSlopeDirection slope_direction = kfp_slope_direction(transfer_options);
+        const KfpTransferBounds bounds = transfer_options.color_method == 4
+            ? kfp_transfer_bounds(cropped.data(), output_width, output_height, max_iter)
+            : KfpTransferBounds{};
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int y = 0; y < output_height; ++y) {
+            for (int x = 0; x < output_width; ++x) {
+                write_kfp_pixel(
+                    cropped.data(),
+                    output_width,
+                    output_height,
+                    x,
+                    y,
+                    x,
+                    y,
+                    output_width,
+                    max_iter,
+                    transfer_options,
+                    lut,
+                    lut_size,
+                    bounds.minimum,
+                    bounds.maximum,
+                    slope_direction,
+                    output + (static_cast<size_t>(y) * static_cast<size_t>(output_width)
+                        + static_cast<size_t>(x)) * 3U);
+            }
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native KFP crop colourizer failed with an unknown exception");
+        return 1;
+    }
+}
+
+int fractal_atlas_colourise_kfp_raw(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    try {
+        if (!parent || !output
+            || !valid_pixel_dimensions(parent_width, parent_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_iteration_count(parent_max_iter)
+            || !valid_iteration_count(max_iter)
+            || !valid_thread_count(threads)
+            || !std::isfinite(parent_zoom) || parent_zoom <= 0.0
+            || !std::isfinite(child_fraction)
+            || child_fraction < 0.0 || child_fraction > 1.0
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)
+            || !lut || !valid_kfp_options(options, lut_size)) {
+            throw std::runtime_error("invalid native raw KFP atlas dimensions or controls");
+        }
+        parent_zoom = std::max(parent_zoom, 1.0);
+        const bool use_child = child != nullptr && child_fraction > 0.0;
+        if (use_child && (!valid_pixel_dimensions(child_width, child_height)
+                          || !valid_iteration_count(child_max_iter))) {
+            throw std::runtime_error("invalid native raw KFP atlas child tile");
+        }
+        if (!use_child && child != nullptr) {
+            throw std::runtime_error("raw KFP atlas child needs a positive visible fraction");
+        }
+        if (!use_child && (child_width != 0 || child_height != 0 || child_max_iter != 0)) {
+            throw std::runtime_error("invalid native raw KFP atlas child absence");
+        }
+
+        const int visible_child_width = use_child
+            ? std::max(1, static_cast<int>(std::lround(
+                static_cast<double>(output_width) * child_fraction)))
+            : 0;
+        const int visible_child_height = use_child
+            ? std::max(1, static_cast<int>(std::lround(
+                static_cast<double>(output_height) * child_fraction)))
+            : 0;
+        const int child_left = use_child
+            ? (output_width - visible_child_width) / 2
+            : 0;
+        const int child_top = use_child
+            ? (output_height - visible_child_height) / 2
+            : 0;
+        const int feather = use_child
+            ? std::min(48, std::min(visible_child_width / 8, visible_child_height / 8))
+            : 0;
+        BilinearWorkspace& workspace = bilinear_workspace;
+        BilinearAxis& parent_x_axis = workspace.parent_x_axis;
+        BilinearAxis& parent_y_axis = workspace.parent_y_axis;
+        fill_bilinear_axis(parent_x_axis, parent_width, output_width, parent_zoom);
+        fill_bilinear_axis(parent_y_axis, parent_height, output_height, parent_zoom);
+        std::vector<float>& parent_view = workspace.kfp_parent_field;
+        parent_view.resize(static_cast<size_t>(output_width)
+            * static_cast<size_t>(output_height));
+
+#ifdef _OPENMP
+        if (threads > 0) {
+            omp_set_dynamic(0);
+            omp_set_num_threads(threads);
+        }
+#pragma omp parallel for schedule(static)
+#endif
+        for (int y = 0; y < output_height; ++y) {
+            for (int x = 0; x < output_width; ++x) {
+                bool inside = false;
+                const float smooth = sample_bilinear_mapped_preserving_interior(
+                    parent,
+                    parent_width,
+                    parent_x_axis,
+                    parent_y_axis,
+                    x,
+                    y,
+                    parent_max_iter,
+                    inside);
+                parent_view[static_cast<size_t>(y) * static_cast<size_t>(output_width)
+                    + static_cast<size_t>(x)] = inside
+                    ? static_cast<float>(max_iter)
+                    : smooth;
+            }
+        }
+
+        std::vector<float>& child_view = workspace.kfp_child_field;
+        if (use_child) {
+            BilinearAxis& child_x_axis = workspace.child_x_axis;
+            BilinearAxis& child_y_axis = workspace.child_y_axis;
+            fill_bilinear_axis(child_x_axis, child_width, visible_child_width, 1.0);
+            fill_bilinear_axis(child_y_axis, child_height, visible_child_height, 1.0);
+            child_view.resize(static_cast<size_t>(visible_child_width)
+                * static_cast<size_t>(visible_child_height));
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int y = 0; y < visible_child_height; ++y) {
+                for (int x = 0; x < visible_child_width; ++x) {
+                    bool inside = false;
+                    const float smooth = sample_bilinear_mapped_preserving_interior(
+                        child,
+                        child_width,
+                        child_x_axis,
+                        child_y_axis,
+                        x,
+                        y,
+                        child_max_iter,
+                        inside);
+                    child_view[static_cast<size_t>(y)
+                        * static_cast<size_t>(visible_child_width)
+                        + static_cast<size_t>(x)] = inside
+                        ? static_cast<float>(max_iter)
+                        : smooth;
+                }
+            }
+        } else {
+            child_view.clear();
+        }
+
+        return fractal_atlas_colourise_kfp(
+            parent_view.data(),
+            output_width,
+            output_height,
+            use_child ? child_view.data() : nullptr,
+            visible_child_width,
+            visible_child_height,
+            output,
+            output_width,
+            output_height,
+            max_iter,
+            child_left,
+            child_top,
+            feather,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            options,
+            lut,
+            lut_size,
+            threads);
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native raw KFP atlas colourizer failed with an unknown exception");
         return 1;
     }
 }
@@ -4780,7 +5076,7 @@ int fractal_crop_field(
     }
 }
 
-int fractal_crop_colourise(
+int crop_colourise_impl(
     const float* source,
     int source_width,
     int source_height,
@@ -4793,14 +5089,19 @@ int fractal_crop_colourise(
     double vocal,
     double instrumental,
     double pitch,
-    int threads
+    int threads,
+    const int* interior_color
 ) {
     try {
         if (!source || !output || !valid_pixel_dimensions(source_width, source_height)
             || !valid_pixel_dimensions(output_width, output_height)
             || !valid_iteration_count(max_iter) || !valid_thread_count(threads)
             || !std::isfinite(zoom_factor) || zoom_factor <= 0.0
-            || !valid_colour_controls(phase, vocal, instrumental, pitch)) {
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)
+            || (interior_color != nullptr
+                && (interior_color[0] < 0 || interior_color[0] > 255
+                    || interior_color[1] < 0 || interior_color[1] > 255
+                    || interior_color[2] < 0 || interior_color[2] > 255))) {
             throw std::runtime_error("invalid native crop/colour dimensions or palette");
         }
         zoom_factor = std::max(zoom_factor, 1.0);
@@ -4834,9 +5135,12 @@ int fractal_crop_colourise(
                 std::uint8_t* rgb = output + static_cast<size_t>(
                     output_y * output_width + output_x) * 3U;
                 if (inside) {
-                    rgb[0] = 0;
-                    rgb[1] = 0;
-                    rgb[2] = 0;
+                    rgb[0] = interior_color
+                        ? static_cast<std::uint8_t>(interior_color[0]) : 0;
+                    rgb[1] = interior_color
+                        ? static_cast<std::uint8_t>(interior_color[1]) : 0;
+                    rgb[2] = interior_color
+                        ? static_cast<std::uint8_t>(interior_color[2]) : 0;
                     continue;
                 }
                 const double scaled_index = static_cast<double>(smooth)
@@ -4863,7 +5167,79 @@ int fractal_crop_colourise(
     }
 }
 
-int fractal_atlas_colourise(
+int fractal_crop_colourise(
+    const float* source,
+    int source_width,
+    int source_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int threads
+) {
+    return crop_colourise_impl(
+        source,
+        source_width,
+        source_height,
+        output,
+        output_width,
+        output_height,
+        zoom_factor,
+        max_iter,
+        phase,
+        vocal,
+        instrumental,
+        pitch,
+        threads,
+        nullptr);
+}
+
+int fractal_crop_colourise_interior(
+    const float* source,
+    int source_width,
+    int source_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int interior_red,
+    int interior_green,
+    int interior_blue,
+    int threads
+) {
+    const int interior_color[3] = {
+        interior_red,
+        interior_green,
+        interior_blue,
+    };
+    return crop_colourise_impl(
+        source,
+        source_width,
+        source_height,
+        output,
+        output_width,
+        output_height,
+        zoom_factor,
+        max_iter,
+        phase,
+        vocal,
+        instrumental,
+        pitch,
+        threads,
+        interior_color);
+}
+
+int atlas_colourise_impl(
     const float* parent,
     int parent_width,
     int parent_height,
@@ -4882,7 +5258,8 @@ int fractal_atlas_colourise(
     double vocal,
     double instrumental,
     double pitch,
-    int threads
+    int threads,
+    const int* interior_color
 ) {
     try {
         if (!parent || !output
@@ -4894,7 +5271,11 @@ int fractal_atlas_colourise(
             || !std::isfinite(child_fraction)
             || child_fraction < 0.0 || child_fraction > 1.0
             || palette_max_iter < 0 || palette_max_iter > MAX_NATIVE_ITERATIONS
-            || !valid_colour_controls(phase, vocal, instrumental, pitch)) {
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)
+            || (interior_color != nullptr
+                && (interior_color[0] < 0 || interior_color[0] > 255
+                    || interior_color[1] < 0 || interior_color[1] > 255
+                    || interior_color[2] < 0 || interior_color[2] > 255))) {
             throw std::runtime_error("invalid native atlas dimensions or controls");
         }
         const bool use_child = child != nullptr && child_fraction > 0.0;
@@ -4921,8 +5302,11 @@ int fractal_atlas_colourise(
             : 0;
         const int child_left = (output_width - visible_child_width) / 2;
         const int child_top = (output_height - visible_child_height) / 2;
+        // A narrow linear strip still reads as a rectangle at 1080p. Keep the
+        // native ordinary compositor in lockstep with the portable/KFP path;
+        // the cap prevents a small live preview from becoming over-soft.
         const int feather = use_child
-            ? std::min(16, std::min(visible_child_width / 8, visible_child_height / 8))
+            ? std::min(48, std::min(visible_child_width / 8, visible_child_height / 8))
             : 0;
         const bool full_child = use_child && child_fraction >= 0.999999;
 
@@ -4953,13 +5337,17 @@ int fractal_atlas_colourise(
             child_edge_y.resize(static_cast<size_t>(visible_child_height));
             for (int x = 0; x < visible_child_width; ++x) {
                 const int edge = std::min(x, visible_child_width - 1 - x);
-                child_edge_x[static_cast<size_t>(x)] =
-                    std::min(1.0F, static_cast<float>(edge) / static_cast<float>(feather));
+                const float linear = std::min(
+                    1.0F, static_cast<float>(edge) / static_cast<float>(feather));
+                child_edge_x[static_cast<size_t>(x)] = linear * linear
+                    * (3.0F - 2.0F * linear);
             }
             for (int y = 0; y < visible_child_height; ++y) {
                 const int edge = std::min(y, visible_child_height - 1 - y);
-                child_edge_y[static_cast<size_t>(y)] =
-                    std::min(1.0F, static_cast<float>(edge) / static_cast<float>(feather));
+                const float linear = std::min(
+                    1.0F, static_cast<float>(edge) / static_cast<float>(feather));
+                child_edge_y[static_cast<size_t>(y)] = linear * linear
+                    * (3.0F - 2.0F * linear);
             }
         }
 
@@ -4984,7 +5372,8 @@ int fractal_atlas_colourise(
                     effective_palette_iter,
                     palette,
                     palette_index_scale,
-                    destination);
+                    destination,
+                    interior_color);
             }
         };
 
@@ -5014,7 +5403,8 @@ int fractal_atlas_colourise(
                         effective_palette_iter,
                         palette,
                         palette_index_scale,
-                        destination);
+                        destination,
+                        interior_color);
                 }
                 continue;
             }
@@ -5058,7 +5448,8 @@ int fractal_atlas_colourise(
                         effective_palette_iter,
                         palette,
                         palette_index_scale,
-                        destination);
+                        destination,
+                        interior_color);
                     continue;
                 }
                 bool parent_inside = false;
@@ -5071,24 +5462,42 @@ int fractal_atlas_colourise(
                     output_y,
                     parent_max_iter,
                     parent_inside);
-                // The deeper child is authoritative inside its visible
-                // rectangle. Falling back to an escaped parent value when
-                // only the child is interior creates a hard rectangular fill.
-                const float blended_smooth = child_inside
-                    ? static_cast<float>(effective_palette_iter)
-                    : parent_inside
-                        ? child_smooth
-                        : parent_smooth * (1.0F - alpha) + child_smooth * alpha;
-                // Blend the scalar iteration field before colourisation. RGB
-                // blending mixed two independently indexed hues and produced
-                // a visible seam whenever adjacent tiles had different
-                // iteration budgets.
+                // The feather band is a real compositing operation, including
+                // when either source classifies its sample as interior. A
+                // hard interior shortcut here makes a valid black fill inherit
+                // the child rectangle's four edges. Blend already-colourised
+                // samples only in this narrow band; outside it the deeper tile
+                // remains authoritative and the hot path still performs one
+                // scalar colour lookup.
+                std::uint8_t parent_rgb[3];
+                std::uint8_t child_rgb[3];
                 write_colour_pixel(
-                    blended_smooth,
+                    parent_inside
+                        ? static_cast<float>(effective_palette_iter)
+                        : parent_smooth,
                     effective_palette_iter,
                     palette,
                     palette_index_scale,
-                    destination);
+                    parent_rgb,
+                    interior_color);
+                write_colour_pixel(
+                    child_inside
+                        ? static_cast<float>(effective_palette_iter)
+                        : child_smooth,
+                    effective_palette_iter,
+                    palette,
+                    palette_index_scale,
+                    child_rgb,
+                    interior_color);
+                destination[0] = rounded_colour_byte(
+                    static_cast<double>(parent_rgb[0]) * (1.0 - alpha)
+                    + static_cast<double>(child_rgb[0]) * alpha);
+                destination[1] = rounded_colour_byte(
+                    static_cast<double>(parent_rgb[1]) * (1.0 - alpha)
+                    + static_cast<double>(child_rgb[1]) * alpha);
+                destination[2] = rounded_colour_byte(
+                    static_cast<double>(parent_rgb[2]) * (1.0 - alpha)
+                    + static_cast<double>(child_rgb[2]) * alpha);
             }
             render_parent_span(output_y, child_right, output_width);
         }
@@ -5101,6 +5510,102 @@ int fractal_atlas_colourise(
         set_error("native atlas colouriser failed with an unknown exception");
         return 1;
     }
+}
+
+int fractal_atlas_colourise(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    int palette_max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int threads
+) {
+    return atlas_colourise_impl(
+        parent,
+        parent_width,
+        parent_height,
+        parent_max_iter,
+        child,
+        child_width,
+        child_height,
+        child_max_iter,
+        output,
+        output_width,
+        output_height,
+        parent_zoom,
+        child_fraction,
+        palette_max_iter,
+        phase,
+        vocal,
+        instrumental,
+        pitch,
+        threads,
+        nullptr);
+}
+
+int fractal_atlas_colourise_interior(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    int palette_max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int interior_red,
+    int interior_green,
+    int interior_blue,
+    int threads
+) {
+    const int interior_color[3] = {
+        interior_red,
+        interior_green,
+        interior_blue,
+    };
+    return atlas_colourise_impl(
+        parent,
+        parent_width,
+        parent_height,
+        parent_max_iter,
+        child,
+        child_width,
+        child_height,
+        child_max_iter,
+        output,
+        output_width,
+        output_height,
+        parent_zoom,
+        child_fraction,
+        palette_max_iter,
+        phase,
+        vocal,
+        instrumental,
+        pitch,
+        threads,
+        interior_color);
 }
 
 void* fractal_create_reference(

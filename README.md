@@ -46,9 +46,12 @@ the render is split into five stages.
    colour path or Pillow turns that data into RGB after cropping. ordinary
    palettes reuse Aurora's detail-preserving waves with their own RGB accents;
    `.kfp` files keep Kalles' cyclic transfer, distance, multi-colour, and slope
-   settings, including the bundled default key colours. atlas handoffs are
-   cross-faded so a freshly resolved child tile does not visibly pop. optional
-   glow and motion blur are applied at this stage, and
+   settings, including the bundled default key colours. KFP crop, atlas, and
+   direct colourisation stay in the native path when it is available. atlas levels are
+   prepared before they become visible and use an interior-aware feathered
+   handoff, so a freshly resolved child tile does not become a rectangle or
+   ghost over the parent. optional glow and motion blur are applied at this
+   stage, and
    FFmpeg writes the video with the original audio. `--codec auto` probes
    available hardware encoders and falls back to `libx264`.
 
@@ -68,6 +71,7 @@ source fields and still produces a 4K video.
 | `palettes/` | Built-in palette files, including the Kalles Fraktaler default `.kfp`. |
 | `profiles.py` | Shared render presets used by the CLI and GUI. |
 | `gui.py` | Optional GTK3/PyGObject launcher; the CLI remains the reproducible interface. |
+| `live_view.py` | Low-latency fullscreen GTK preview for listening/screen-saver use. |
 | `images/` | README preview and GUI screenshots/placeholders. |
 | `make_preview.py` | Converts the newest 4K/e150 render to a GIF or short MP4. |
 | `point_sheet.py` | Creates a labelled catalogue contact sheet. |
@@ -481,6 +485,28 @@ line reproducible:
 ```sh
 python3 gui.py
 ```
+
+the gui also has a **live view** button for a screen-saver-like listening
+preview. It renders one small native source, colourises cheap crops at the
+display rate, and uses a streamed 8 kHz ffmpeg energy envelope instead of the
+full export analysis. This keeps startup and cpu use low. press `esc` to close
+it or `f11` to toggle fullscreen; the song loops until the window is closed.
+The standalone form is:
+
+```sh
+python3 live_view.py song.mp3 --formula mandelbrot --palette aurora
+```
+
+the live view is intentionally a preview: it caps the fractal source at
+640×360 with the native backend (320×180 for the python fallback), then
+upscales it smoothly. Final renders still use the export pipeline and its
+deep-zoom precision, atlas, and encoding settings. `ffplay` is used for
+playback when installed; without it the visual preview remains usable.
+
+the built-in `preview` profile now keeps a native source at its requested
+960×540 density; the e150 4k profile remains a deliberate 2k-source speed
+trade-off. Use `master-e150` when the final 4k image must retain source-pixel
+detail all the way through the export.
 
 the repository also includes `examples/make_test_tone.py` for a dependency-free
 audio smoke test, `point_sheet.py` for catalogue previews, and

@@ -354,6 +354,12 @@ ATLAS_LOCAL_REFERENCE_FINAL_BUDGET_MS = 750
 ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS = 30_000
 ATLAS_PROGRESS_INTERVAL_SECONDS = 20.0
 ENCODER_BACKPRESSURE_NOTICE_SECONDS = 10.0
+# Alternate formula perturbation uses a decimal reference once the viewport
+# is narrower than a float64 centre can represent reliably. Keep this single
+# threshold shared by the direct renderer and the video planner so an atlas
+# cannot label a Python field as native or accidentally hand it a Mandelbrot
+# BLA reference.
+ALTERNATE_PERTURBATION_MIN_LOG = 7.0
 MIN_LOG10_ZOOM = -300.0
 MAX_LOG10_ZOOM = 9800.0
 # A render can multiply the output dimensions by both --render-scale and a
@@ -736,6 +742,26 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_colourise_kfp.restype = ctypes.c_int
+                if hasattr(library, "fractal_crop_colourise_kfp"):
+                    library.fractal_crop_colourise_kfp.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(NativeKfpOptions),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_crop_colourise_kfp.restype = ctypes.c_int
                 if hasattr(library, "fractal_atlas_colourise_kfp"):
                     library.fractal_atlas_colourise_kfp.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -761,6 +787,32 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_atlas_colourise_kfp.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_colourise_kfp_raw"):
+                    library.fractal_atlas_colourise_kfp_raw.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(NativeKfpOptions),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_colourise_kfp_raw.restype = ctypes.c_int
                 if hasattr(library, "fractal_crop_field"):
                     library.fractal_crop_field.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -789,6 +841,26 @@ def _get_native_library() -> Any:
                     ctypes.c_int,
                 ]
                 library.fractal_crop_colourise.restype = ctypes.c_int
+                if hasattr(library, "fractal_crop_colourise_interior"):
+                    library.fractal_crop_colourise_interior.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_crop_colourise_interior.restype = ctypes.c_int
                 if hasattr(library, "fractal_atlas_colourise"):
                     library.fractal_atlas_colourise.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -812,6 +884,32 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_atlas_colourise.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_colourise_interior"):
+                    library.fractal_atlas_colourise_interior.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_colourise_interior.restype = ctypes.c_int
                 library.fractal_create_reference.argtypes = [
                     ctypes.c_char_p,
                     ctypes.c_char_p,
@@ -4680,12 +4778,16 @@ def render_fractal(
     # path for alternate formulas as soon as the pixel spacing needs it.  An
     # explicit native request remains an error rather than silently changing
     # backends.
-    if formula != "mandelbrot" and log10_zoom >= 7.0 and renderer == "native":
+    if (
+        formula != "mandelbrot"
+        and log10_zoom >= ALTERNATE_PERTURBATION_MIN_LOG
+        and renderer == "native"
+    ):
         raise RuntimeError(
             f"native alternate-formula rendering is only precise below 1e7; "
             f"use renderer=auto or python for {formula} at deeper zooms"
         )
-    if formula != "mandelbrot" and log10_zoom >= 7.0:
+    if formula != "mandelbrot" and log10_zoom >= ALTERNATE_PERTURBATION_MIN_LOG:
         return _render_perturbed(
             width,
             height,
@@ -6261,6 +6363,7 @@ def _atlas_colourise_native(
     native_threads: int,
     library: Any,
     pitch: float,
+    interior_color: Optional[tuple[int, int, int]] = None,
 ) -> Any:
     """Fused parent/child atlas sampling and pitch-aware colourisation."""
 
@@ -6277,37 +6380,111 @@ def _atlas_colourise_native(
         child_max_iter = int(child_iter)
         child_pointer = child.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
     palette_max_iter = max(int(parent_iter), int(child_iter or parent_iter))
-    status = library.fractal_atlas_colourise(
-        parent.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        parent_width,
-        parent_height,
-        int(parent_iter),
-        child_pointer,
-        child_width,
-        child_height,
-        child_max_iter,
-        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        output_width,
-        output_height,
-        float(parent_zoom),
-        float(child_fraction),
-        palette_max_iter,
-        float(phase),
-        float(vocal),
-        float(instrumental),
-        float(pitch),
-        native_threads,
-    )
+    parent_pointer = parent.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    output_pointer = output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+    interior_function = getattr(library, "fractal_atlas_colourise_interior", None)
+    if interior_color is not None and interior_function is not None:
+        if len(interior_color) != 3 or not all(0 <= int(value) <= 255 for value in interior_color):
+            raise ValueError("ordinary interior colour must contain three bytes")
+        status = interior_function(
+            parent_pointer,
+            parent_width,
+            parent_height,
+            int(parent_iter),
+            child_pointer,
+            child_width,
+            child_height,
+            child_max_iter,
+            output_pointer,
+            output_width,
+            output_height,
+            float(parent_zoom),
+            float(child_fraction),
+            palette_max_iter,
+            float(phase),
+            float(vocal),
+            float(instrumental),
+            float(pitch),
+            *(int(value) for value in interior_color),
+            native_threads,
+        )
+    else:
+        status = library.fractal_atlas_colourise(
+            parent_pointer,
+            parent_width,
+            parent_height,
+            int(parent_iter),
+            child_pointer,
+            child_width,
+            child_height,
+            child_max_iter,
+            output_pointer,
+            output_width,
+            output_height,
+            float(parent_zoom),
+            float(child_fraction),
+            palette_max_iter,
+            float(phase),
+            float(vocal),
+            float(instrumental),
+            float(pitch),
+            native_threads,
+        )
     if status != 0:
         message = library.fractal_last_error() or b"unknown native atlas colourizer error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
+    if interior_color is not None and interior_function is None:
+        # Compatibility with an older native .so. Reconstruct only the
+        # boolean ownership mask in Python; the expensive crop and Aurora
+        # colour pass above still stays native.
+        _, parent_inside = _crop_and_resize_preserving_interior(
+            parent,
+            output_width,
+            output_height,
+            max(float(parent_zoom), 1.0),
+            parent_iter,
+            "bilinear",
+        )
+        inside = np.asarray(parent_inside, dtype=bool)
+        if child is not None and child_iter is not None and child_fraction > 0.0:
+            fraction = min(float(child_fraction), 1.0)
+            child_view_width = (
+                output_width if fraction >= 0.999999
+                else max(1, int(round(output_width * fraction)))
+            )
+            child_view_height = (
+                output_height if fraction >= 0.999999
+                else max(1, int(round(output_height * fraction)))
+            )
+            _, child_inside_mask = _crop_and_resize_preserving_interior(
+                child,
+                child_view_width,
+                child_view_height,
+                1.0,
+                child_iter,
+                "bilinear",
+            )
+            if fraction >= 0.999999:
+                inside = np.asarray(child_inside_mask, dtype=bool)
+            else:
+                left = (output_width - child_view_width) // 2
+                top = (output_height - child_view_height) // 2
+                inside = inside.copy()
+                inside[top:top + child_view_height, left:left + child_view_width] = (
+                    np.asarray(child_inside_mask, dtype=bool)
+                )
+        output[inside] = np.asarray(interior_color, dtype=np.uint8)
     return output
 
 
 def _atlas_feather(width: int, height: int) -> int:
     """Return the shared scalar/RGB atlas seam width."""
 
-    return min(16, max(0, int(width) // 8), max(0, int(height) // 8))
+    # KFP's finite-difference/slope pass is intentionally glossy and very
+    # sensitive to a one-pixel change in source density. Give the nested tile
+    # a real transition band; a 16px strip is effectively a hard rectangle at
+    # 1080p. The cap keeps this from washing out small live/preview frames.
+    return min(48, max(0, int(width) // 8), max(0, int(height) // 8))
 
 
 def _atlas_colour_frame(
@@ -6338,6 +6515,30 @@ def _atlas_colour_frame(
     """
 
     np = _require_numpy()
+    kfp_profile = _kfp_profile_for_selection(palette_name, palette_file)
+    if (
+        kfp_profile is not None
+        and native_library is not None
+        and hasattr(native_library, "fractal_atlas_colourise_kfp_raw")
+        and resample == "bilinear"
+    ):
+        return _atlas_colourise_kfp_raw_native(
+            parent,
+            child,
+            output_width,
+            output_height,
+            parent_zoom,
+            child_fraction,
+            parent_iter,
+            child_iter,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            kfp_profile,
+            native_library,
+            native_threads,
+        )
     if (
         native_library is not None
         and hasattr(native_library, "fractal_atlas_colourise")
@@ -6361,6 +6562,7 @@ def _atlas_colour_frame(
                 pitch,
             )
         if _kfp_profile_for_selection(palette_name, palette_file) is None:
+            interior_color = _ordinary_interior_color(palette_name, palette_file)
             base = _atlas_colourise_native(
                 parent,
                 child,
@@ -6376,12 +6578,23 @@ def _atlas_colour_frame(
                 native_threads,
                 native_library,
                 0.5,
+                interior_color if interior_color != (0, 0, 0) else None,
             )
+            interior_mask = None
+            if interior_color != (0, 0, 0):
+                # The native base pass paints interiors with the requested
+                # colour. Preserve that exact mask while the accent pass
+                # recolours only the exterior Aurora waves.
+                interior_mask = np.all(base == np.asarray(interior_color, dtype=np.uint8), axis=-1)
             accents = _aurora_accents_for_selection(palette_name, palette_file)
             accented = _native_apply_aurora_accents(
                 base, accents, pitch, native_library, native_threads
             )
-            return base if accented is None else accented
+            if accented is None:
+                return base
+            if interior_mask is not None:
+                accented[interior_mask] = np.asarray(interior_color, dtype=np.uint8)
+            return accented
     parent_view, parent_inside_full = _crop_and_resize_preserving_interior(
         parent,
         output_width,
@@ -6452,7 +6665,6 @@ def _atlas_colour_frame(
     top = (output_height - child_height) // 2
     right = left + child_width
     bottom = top + child_height
-    kfp_profile = _kfp_profile_for_selection(palette_name, palette_file)
     if kfp_profile is not None:
         feather = _atlas_feather(child_width, child_height)
         if (
@@ -6482,29 +6694,27 @@ def _atlas_colour_frame(
         # rectangle at the tile boundary, even when both scalar fields are
         # mathematically aligned. Colourise each tile in its own coordinate
         # system, then feather RGB values at the seam instead.
-        parent_rgb = _colourise_view(
+        parent_rgb = _colourise_kfp(
             parent_view,
             effective_iter,
             phase,
             vocal,
             instrumental,
-            native_library,
-            native_threads,
-            palette_name,
             pitch,
-            palette_file,
+            kfp_profile,
+            spatial_width=output_width,
         )
-        child_rgb = _colourise_view(
+        child_rgb = _colourise_kfp(
             child_view,
             effective_iter,
             phase,
             vocal,
             instrumental,
-            native_library,
-            native_threads,
-            palette_name,
             pitch,
-            palette_file,
+            kfp_profile,
+            spatial_width=output_width,
+            dither_x=left,
+            dither_y=top,
         )
         region_rgb = parent_rgb[top:bottom, left:right]
         parent_inside = parent_inside_region[top:bottom, left:right]
@@ -6521,24 +6731,27 @@ def _atlas_colour_frame(
             np.minimum(xx, yy),
             np.minimum(child_width - 1 - xx, child_height - 1 - yy),
         )
-        alpha = np.clip(edge_distance.astype(np.float32) / float(feather), 0.0, 1.0)
+        alpha = np.clip(
+            edge_distance.astype(np.float32) / float(feather), 0.0, 1.0
+        )
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
         blended_rgb = (
             region_rgb.astype(np.float32) * (1.0 - alpha[..., None])
             + child_rgb.astype(np.float32) * alpha[..., None]
         )
-        blended_rgb = np.where(
-            child_inside[..., None],
-            child_rgb,
-            np.where(parent_inside[..., None], child_rgb, blended_rgb),
-        )
+        # Even an interior sample participates in the feather band. Selecting
+        # either classification unconditionally is what turns a valid black
+        # interior into the four straight edges of a child tile. The deeper
+        # child is still authoritative once alpha reaches one; the band itself
+        # is intentionally a smooth RGB transition.
         region_rgb[...] = np.asarray(
             np.clip(np.rint(blended_rgb), 0.0, 255.0),
             dtype=np.uint8,
         )
         return parent_rgb
-    region = parent_view[top:bottom, left:right]
     feather = _atlas_feather(child_width, child_height)
     if feather < 2:
+        region = parent_view[top:bottom, left:right]
         region[...] = child_view
         return _colourise_view(
             parent_view,
@@ -6558,21 +6771,16 @@ def _atlas_colour_frame(
         np.minimum(xx, yy),
         np.minimum(child_width - 1 - xx, child_height - 1 - yy),
     )
-    alpha = np.clip(edge_distance.astype(np.float32) / float(feather), 0.0, 1.0)
-    parent_inside = parent_inside_region[top:bottom, left:right]
-    blended = (
-        region.astype(np.float32) * (1.0 - alpha)
-        + child_view.astype(np.float32) * alpha
+    alpha = np.clip(
+        edge_distance.astype(np.float32) / float(feather), 0.0, 1.0
     )
-    blended = np.where(parent_inside & ~child_inside, child_view, blended)
-    # The deeper child has the authoritative classification in its visible
-    # region. In particular, an interior child must remain an interior pixel
-    # even when the lower-resolution parent escaped it; choosing ``region``
-    # here turns a valid child interior into the parent-coloured half of a
-    # rectangular tile seam.
-    blended = np.where(child_inside, child_view, blended)
-    region[...] = np.asarray(blended, dtype=np.float32)
-    return _colourise_view(
+    alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+    # Colourize the two source densities independently. KFP needs this for its
+    # spatial stencil, and doing the same in the portable ordinary path keeps
+    # interior ownership consistent when native colourisation is unavailable.
+    # Crucially, the feather band blends RGB even when one source is interior;
+    # a hard scalar/classification choice would expose a rectangular tile.
+    parent_rgb = _colourise_view(
         parent_view,
         effective_iter,
         phase,
@@ -6584,6 +6792,25 @@ def _atlas_colour_frame(
         pitch,
         palette_file,
     )
+    child_rgb = _colourise_view(
+        child_view,
+        effective_iter,
+        phase,
+        vocal,
+        instrumental,
+        native_library,
+        native_threads,
+        palette_name,
+        pitch,
+        palette_file,
+    )
+    region_rgb = parent_rgb[top:bottom, left:right]
+    blended = (
+        region_rgb.astype(np.float32) * (1.0 - alpha[..., None])
+        + child_rgb.astype(np.float32) * alpha[..., None]
+    )
+    region_rgb[...] = np.asarray(np.clip(np.rint(blended), 0.0, 255.0), dtype=np.uint8)
+    return parent_rgb
 
 
 def _valid_field_array(field: Any, shape: tuple[int, int]) -> bool:
@@ -6816,12 +7043,8 @@ def _render_video_atlas(
     frame_seconds = 0.0
     encoder_seconds = 0.0
     previous_rgb = None
-    handoff_source = None
-    handoff_remaining = 0
-    handoff_total = 0
     render_started = time.perf_counter()
     active_level = None
-    render_succeeded = False
     try:
         process, ffmpeg_diagnostics, ffmpeg_reader = _start_ffmpeg_process(command)
         frame_writer = _FFmpegFrameWriter(
@@ -6839,10 +7062,6 @@ def _render_video_atlas(
             frame_log_zoom = float(zooms[frame_index])
             level = _atlas_level_for_zoom(frame_log_zoom, origin, step, level_count)
             if level != active_level:
-                if previous_rgb is not None and active_level is not None:
-                    handoff_source = np.array(previous_rgb, dtype=np.uint8, copy=True)
-                    handoff_total = max(2, min(6, int(round(fps * 0.12))))
-                    handoff_remaining = handoff_total
                 active_level = level
                 print(
                     f"Entering atlas level {level}/{level_count} at "
@@ -6888,14 +7107,6 @@ def _render_video_atlas(
                 pitch,
                 palette_file,
             )
-            if handoff_source is not None and handoff_remaining > 0:
-                alpha = (
-                    handoff_total - handoff_remaining
-                ) / max(1, handoff_total - 1)
-                rgb = _blend_atlas_handoff(handoff_source, rgb, alpha)
-                handoff_remaining -= 1
-                if handoff_remaining == 0:
-                    handoff_source = None
             rgb = _apply_frame_effects(rgb, glow, motion_blur, previous_rgb)
             previous_rgb = rgb
             enqueue_frame(rgb)
@@ -6915,7 +7126,6 @@ def _render_video_atlas(
                 ffmpeg_reader,
             ))
         os.replace(temporary_output, output_path)
-        render_succeeded = True
         elapsed = time.perf_counter() - render_started
         print(
             f"Atlas timing: tiles {tile_seconds:.2f}s, frame/reproject/queue "
@@ -6947,12 +7157,14 @@ def _render_video_atlas(
         if frame_writer is not None:
             frame_writer.abort()
         if prefetch_executor is not None:
-            # A failed render must not wait forever for a speculative field
-            # task that is stuck inside a slow decoder/native call. Successful
-            # renders still join the worker so no background task survives a
-            # completed render and its reference handles can be released.
+            # Native tile workers borrow the prepared reference handles. They
+            # cannot be safely abandoned on an error: the outer cleanup may
+            # destroy those handles while a speculative render is still in
+            # MPFR/BLA code. Always join the one bounded worker before the
+            # references are released; the native time budgets keep this
+            # wait finite even for a pathological tile.
             prefetch_executor.shutdown(
-                wait=render_succeeded,
+                wait=True,
                 cancel_futures=True,
             )
         if ffmpeg_reader is not None:
@@ -7237,6 +7449,28 @@ def _select_video_encoder(
             "provide libx264"
         )
     return "libx264", video_preset, ["-crf", str(crf)]
+
+
+def _video_pixel_format(
+    codec: str,
+    palette: str,
+    palette_file: Optional[Path] = None,
+) -> str:
+    """Choose a pixel format that keeps high-frequency KFP colour detail.
+
+    The normal H.264 default is 4:2:0, which is a good compatibility choice
+    for Aurora-like gradients but smears KFP's one-pixel cyan/green edge
+    detail into visibly blocky chroma squares. libx264 can retain that detail
+    with 4:4:4; hardware H.264 paths keep 4:2:0 because their accepted input
+    formats are device-dependent and VAAPI is explicitly NV12.
+    """
+
+    if (
+        codec == "libx264"
+        and _kfp_profile_for_selection(palette, palette_file) is not None
+    ):
+        return "yuv444p"
+    return "yuv420p"
 
 
 @lru_cache(maxsize=8)
@@ -8035,15 +8269,20 @@ def _hsv_to_rgb(hue: Any, saturation: Any, value: Any, np: Any) -> Any:
     return output
 
 
-def _kfp_dither_rgb(rgb: Any, np: Any) -> Any:
+def _kfp_dither_rgb(
+    rgb: Any,
+    np: Any,
+    x_offset: int = 0,
+    y_offset: int = 0,
+) -> Any:
     """Apply Kalles' deterministic ordered dither before converting to RGB8."""
 
     values = np.asarray(rgb, dtype=np.float64)
     if values.ndim != 3 or values.shape[-1] != 3:
         raise ValueError("KFP dither input must have shape (height, width, 3)")
     height, width, _ = values.shape
-    x = np.arange(width, dtype=np.uint64)[None, :]
-    y = np.arange(height, dtype=np.uint64)[:, None]
+    x = (np.arange(width, dtype=np.uint64) + np.uint64(max(0, int(x_offset))))[None, :]
+    y = (np.arange(height, dtype=np.uint64) + np.uint64(max(0, int(y_offset))))[:, None]
     output = np.empty(values.shape, dtype=np.uint8)
     for channel in range(3):
         mixed = (
@@ -8070,6 +8309,9 @@ def _colourise_kfp(
     instrumental: float,
     pitch: float,
     profile: KfpPalette,
+    spatial_width: Optional[int] = None,
+    dither_x: int = 0,
+    dither_y: int = 0,
 ) -> Any:
     """Apply the portable Kalles transfer, multi-colour, and slope stages."""
 
@@ -8111,7 +8353,11 @@ def _colourise_kfp(
         slope_dx, slope_dy = _kfp_slope_gradient(stencil_iter, np)
     else:
         slope_dx = slope_dy = None
-    width = max(1, int(field.shape[1]))
+    # Atlas children are rendered into a smaller rectangle, but their pixels
+    # represent the same final-screen density as the parent crop. Use the
+    # output width for Kalles' resolution-dependent distance/slope scale so a
+    # child does not suddenly change palette contrast at its rectangular edge.
+    width = max(1, int(spatial_width or field.shape[1]))
     # A scalar iteration field does not carry Kalles' analytic DE derivatives.
     # Its selected finite-difference magnitude is the closest portable local
     # distance proxy and, unlike normalising by max_iter, retains detail at any
@@ -8227,7 +8473,7 @@ def _colourise_kfp(
         )
 
     rgb = np.clip(rgb, 0.0, 255.0)
-    rgb = _kfp_dither_rgb(rgb, np)
+    rgb = _kfp_dither_rgb(rgb, np, dither_x, dither_y)
     rgb[inside] = np.asarray(profile.interior_color, dtype=np.uint8)
     return rgb
 
@@ -8281,6 +8527,56 @@ def _colourise_kfp_native(
     )
     if status != 0:
         message = native_library.fractal_last_error() or b"unknown native KFP colourizer error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
+def _crop_colourise_kfp_native(
+    field: Any,
+    output_width: int,
+    output_height: int,
+    zoom_factor: float,
+    max_iter: int,
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    pitch: float,
+    profile: KfpPalette,
+    native_library: Any,
+    native_threads: int,
+) -> Any:
+    """Crop and colourise a KFP frame without a Python/Pillow round trip."""
+
+    function = getattr(native_library, "fractal_crop_colourise_kfp", None)
+    if function is None:
+        raise RuntimeError("native KFP crop colourizer is unavailable")
+    np = _require_numpy()
+    scalar = np.ascontiguousarray(field, dtype=np.float32)
+    if scalar.ndim != 2:
+        raise ValueError("KFP crop input must be two-dimensional")
+    output = np.empty((int(output_height), int(output_width), 3), dtype=np.uint8)
+    lut = np.ascontiguousarray(_kfp_palette_lut(profile), dtype=np.uint8)
+    options = _native_kfp_options(profile)
+    status = function(
+        scalar.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(scalar.shape[1]),
+        int(scalar.shape[0]),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(output_width),
+        int(output_height),
+        float(zoom_factor),
+        int(max_iter),
+        float(phase),
+        float(vocal),
+        float(instrumental),
+        float(pitch),
+        ctypes.byref(options),
+        lut.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(lut.shape[0]),
+        int(native_threads),
+    )
+    if status != 0:
+        message = native_library.fractal_last_error() or b"unknown native KFP crop colourizer error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
     return output
 
@@ -8343,6 +8639,91 @@ def _atlas_colourise_kfp_native(
     )
     if status != 0:
         message = native_library.fractal_last_error() or b"unknown native KFP atlas colourizer error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
+def _atlas_colourise_kfp_raw_native(
+    parent: Any,
+    child: Any,
+    output_width: int,
+    output_height: int,
+    parent_zoom: float,
+    child_fraction: float,
+    parent_iter: int,
+    child_iter: Optional[int],
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    pitch: float,
+    profile: KfpPalette,
+    native_library: Any,
+    native_threads: int,
+) -> Any:
+    """Reproject raw atlas tiles and colourise them without Python image work."""
+
+    function = getattr(native_library, "fractal_atlas_colourise_kfp_raw", None)
+    if function is None:
+        raise RuntimeError("native raw KFP atlas colourizer is unavailable")
+    np = _require_numpy()
+    parent_array = np.ascontiguousarray(parent, dtype=np.float32)
+    if parent_array.ndim != 2:
+        raise ValueError("native raw KFP atlas parent must be two-dimensional")
+    try:
+        requested_parent_zoom = float(parent_zoom)
+        requested_child_fraction = float(child_fraction)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("native raw KFP atlas zoom controls must be numeric") from error
+    if not math.isfinite(requested_parent_zoom) or requested_parent_zoom <= 0.0:
+        raise ValueError("native raw KFP atlas parent zoom must be finite and positive")
+    if not math.isfinite(requested_child_fraction):
+        raise ValueError("native raw KFP atlas child fraction must be finite")
+    effective_parent_zoom = max(requested_parent_zoom, 1.0)
+    effective_child_fraction = min(max(requested_child_fraction, 0.0), 1.0)
+    use_child = child is not None and child_iter is not None and effective_child_fraction > 0.0
+    if not use_child:
+        effective_child_fraction = 0.0
+    if not use_child:
+        child_array = np.empty((0, 0), dtype=np.float32)
+        child_pointer = ctypes.POINTER(ctypes.c_float)()
+        child_width = child_height = child_max_iter = 0
+    else:
+        child_array = np.ascontiguousarray(child, dtype=np.float32)
+        if child_array.ndim != 2:
+            raise ValueError("native raw KFP atlas child must be two-dimensional")
+        child_height, child_width = child_array.shape
+        child_max_iter = int(child_iter)
+        child_pointer = child_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    output = np.empty((int(output_height), int(output_width), 3), dtype=np.uint8)
+    lut = np.ascontiguousarray(_kfp_palette_lut(profile), dtype=np.uint8)
+    options = _native_kfp_options(profile)
+    effective_iter = max(int(parent_iter), int(child_iter or parent_iter))
+    status = function(
+        parent_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(parent_array.shape[1]),
+        int(parent_array.shape[0]),
+        int(parent_iter),
+        child_pointer,
+        int(child_width),
+        int(child_height),
+        int(child_max_iter),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(output_width),
+        int(output_height),
+        effective_parent_zoom,
+        effective_child_fraction,
+        int(effective_iter),
+        float(phase),
+        float(vocal),
+        float(instrumental),
+        float(pitch),
+        ctypes.byref(options),
+        lut.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(lut.shape[0]),
+        int(native_threads),
+    )
+    if status != 0:
+        message = native_library.fractal_last_error() or b"unknown native raw KFP atlas error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
     return output
 
@@ -8419,6 +8800,7 @@ def _crop_and_colourise_native(
     native_threads: int,
     library: Any,
     pitch: float = 0.5,
+    interior_color: Optional[tuple[int, int, int]] = None,
 ) -> Any:
     """Fused centred bilinear crop and colour through the native C ABI."""
 
@@ -8426,24 +8808,54 @@ def _crop_and_colourise_native(
     field = np.ascontiguousarray(field, dtype=np.float32)
     source_height, source_width = field.shape
     rgb = np.empty((output_height, output_width, 3), dtype=np.uint8)
-    status = library.fractal_crop_colourise(
-        field.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        source_width,
-        source_height,
-        rgb.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        output_width,
-        output_height,
-        zoom_factor,
-        max_iter,
-        phase,
-        vocal,
-        instrumental,
-        pitch,
-        native_threads,
-    )
+    source_pointer = field.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    output_pointer = rgb.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+    interior_function = getattr(library, "fractal_crop_colourise_interior", None)
+    if interior_color is not None and interior_function is not None:
+        if len(interior_color) != 3 or not all(0 <= int(value) <= 255 for value in interior_color):
+            raise ValueError("ordinary interior colour must contain three bytes")
+        status = interior_function(
+            source_pointer,
+            source_width,
+            source_height,
+            output_pointer,
+            output_width,
+            output_height,
+            zoom_factor,
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            *(int(value) for value in interior_color),
+            native_threads,
+        )
+    else:
+        status = library.fractal_crop_colourise(
+            source_pointer,
+            source_width,
+            source_height,
+            output_pointer,
+            output_width,
+            output_height,
+            zoom_factor,
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            native_threads,
+        )
     if status != 0:
         message = library.fractal_last_error() or b"unknown native crop/colourizer error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
+    if interior_color is not None and interior_function is None:
+        # Compatibility with an older native .so: retain its fast crop/color
+        # pass, then apply the exact interior mask through the portable mapper.
+        _, inside = _crop_and_resize_preserving_interior(
+            field, output_width, output_height, zoom_factor, max_iter, "bilinear"
+        )
+        rgb[inside] = np.asarray(interior_color, dtype=np.uint8)
     return rgb
 
 
@@ -8823,12 +9235,33 @@ def _colour_frame(
             native_library,
             pitch,
         )
+    kfp_profile = _kfp_profile_for_selection(palette_name, palette_file)
+    if (
+        kfp_profile is not None
+        and native_library is not None
+        and hasattr(native_library, "fractal_crop_colourise_kfp")
+        and resample == "bilinear"
+    ):
+        return _crop_colourise_kfp_native(
+            field,
+            output_width,
+            output_height,
+            zoom_factor,
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            kfp_profile,
+            native_library,
+            native_threads,
+        )
     if (
         native_library is not None
         and resample == "bilinear"
         and _kfp_profile_for_selection(palette_name, palette_file) is None
-        and _ordinary_interior_color(palette_name, palette_file) == (0, 0, 0)
     ):
+        interior_color = _ordinary_interior_color(palette_name, palette_file)
         base = _crop_and_colourise_native(
             field,
             output_width,
@@ -8841,12 +9274,22 @@ def _colour_frame(
             native_threads,
             native_library,
             0.5,
+            interior_color if interior_color != (0, 0, 0) else None,
         )
+        interior_mask = None
+        if interior_color != (0, 0, 0):
+            interior_mask = np.all(
+                base == np.asarray(interior_color, dtype=np.uint8), axis=-1
+            )
         accents = _aurora_accents_for_selection(palette_name, palette_file)
         accented = _native_apply_aurora_accents(
             base, accents, pitch, native_library, native_threads
         )
-        return base if accented is None else accented
+        if accented is None:
+            return base
+        if interior_mask is not None:
+            accented[interior_mask] = np.asarray(interior_color, dtype=np.uint8)
+        return accented
     view, _ = _crop_and_resize_preserving_interior(
         field,
         output_width,
@@ -8866,32 +9309,6 @@ def _colour_frame(
         palette_name,
         pitch,
         palette_file,
-    )
-
-
-def _blend_atlas_handoff(previous: Any, current: Any, alpha: float) -> Any:
-    """Blend an atlas level handoff in RGB space to hide tile replacement pops."""
-
-    np = _require_numpy()
-    previous_array = np.asarray(previous, dtype=np.uint8)
-    current_array = np.asarray(current, dtype=np.uint8)
-    if previous_array.shape != current_array.shape or previous_array.ndim != 3:
-        raise ValueError("atlas handoff frames must have the same RGB shape")
-    alpha = float(np.clip(alpha, 0.0, 1.0))
-    if alpha <= 0.0:
-        return np.ascontiguousarray(previous_array, dtype=np.uint8)
-    if alpha >= 1.0:
-        return np.ascontiguousarray(current_array, dtype=np.uint8)
-    return np.ascontiguousarray(
-        np.clip(
-            np.rint(
-                previous_array.astype(np.float32) * (1.0 - alpha)
-                + current_array.astype(np.float32) * alpha
-            ),
-            0.0,
-            255.0,
-        ),
-        dtype=np.uint8,
     )
 
 
@@ -9150,17 +9567,19 @@ def render_video(
                 raise RuntimeError(
                     "--native-backend opencl currently supports only direct zooms below 1e6"
                 )
-        if formula != "mandelbrot" and max_log_zoom >= 12.0:
+        if formula != "mandelbrot" and max_log_zoom >= ALTERNATE_PERTURBATION_MIN_LOG:
             # The native reference/BLA context is mathematically specific to
             # z²+c in the Mandelbrot parameter plane. Alternate formulas use
-            # the high-precision Python perturbation fallback instead.
+            # the high-precision Python direct renderer instead. Keep the
+            # native library alive for palette colourisation: this avoids
+            # sending every KFP pixel through Python just because the scalar
+            # field itself cannot use Mandelbrot's reference orbit.
             if renderer == "native":
                 raise RuntimeError(
-                    f"--renderer native does not support e150 {formula} yet; "
+                    f"--renderer native does not support deep {formula} yet; "
                     "use --renderer auto or python"
                 )
             active_renderer = "python"
-            native_library = None
             native_references.clear()
             native_backend_id = 0
         if formula == "mandelbrot" and native_library is not None and float(np.max(zooms)) >= 12.0:
@@ -9314,13 +9733,18 @@ def render_video(
         + (f"-julia-{julia_constant[0]}-{julia_constant[1]}" if formula == "julia" else "")
         + f"-backend-{native_backend_id}"
     )
+    colourizer_backend = (
+        f"native-{('scalar', 'avx2', 'opencl')[native_backend_id]}"
+        if native_library is not None and 0 <= native_backend_id <= 2
+        else "python"
+    )
     print(
         f"Keyframe source: {render_width}x{render_height} ({quality}); "
         f"planned keyframes: "
         f"{_keyframe_count(zooms, keyframe_factor) if keyframe_mode == 'legacy' else _atlas_geometry(zooms, keyframe_factor)[2] + 1}; "
         f"mode: {keyframe_mode}; "
         f"field renderer: {active_renderer}; "
-        f"native backend: {native_backend if native_library is not None else 'python'}; "
+        f"colourizer: {colourizer_backend}; "
         f"native threads: {native_threads}; encoder: {selected_codec}; "
         f"encoder threads: {encoder_threads if encoder_threads > 0 else 'auto'}",
         flush=True,
@@ -9330,6 +9754,11 @@ def render_video(
     try:
         temporary_output = _reserved_temporary_sibling(output_path, "rendering")
         using_vaapi = selected_codec == "h264_vaapi"
+        video_pixel_format = _video_pixel_format(
+            selected_codec,
+            palette,
+            palette_file,
+        )
         preset_arguments = ["-preset", selected_preset] if selected_preset else []
         command = [
             ffmpeg_path,
@@ -9362,7 +9791,7 @@ def render_video(
             *preset_arguments,
             *(["-threads", str(encoder_threads)] if not using_vaapi and encoder_threads > 0 else []),
             *rate_control,
-            *([] if using_vaapi else ["-pix_fmt", "yuv420p"]),
+            *([] if using_vaapi else ["-pix_fmt", video_pixel_format]),
             "-c:a",
             "aac",
             # The decoded sample count is rounded up to a video frame.  Padding

@@ -230,6 +230,25 @@ int fractal_colourise_kfp(
     int lut_size,
     int threads
 );
+/* Interior-aware centred crop followed by the native KFP colour pass. */
+int fractal_crop_colourise_kfp(
+    const float *source,
+    int source_width,
+    int source_height,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions *options,
+    const uint8_t *lut,
+    int lut_size,
+    int threads
+);
 int fractal_atlas_colourise_kfp(
     const float *parent,
     int parent_width,
@@ -244,6 +263,31 @@ int fractal_atlas_colourise_kfp(
     int child_left,
     int child_top,
     int feather,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions *options,
+    const uint8_t *lut,
+    int lut_size,
+    int threads
+);
+/* Crop raw parent/child scalar tiles and colourise the atlas in native code. */
+int fractal_atlas_colourise_kfp_raw(
+    const float *parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float *child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    int max_iter,
     double phase,
     double vocal,
     double instrumental,
@@ -278,6 +322,25 @@ int fractal_crop_colourise(
     double pitch,
     int threads
 );
+/* Same crop/compositor path with an explicit ordinary-palette interior colour. */
+int fractal_crop_colourise_interior(
+    const float *source,
+    int source_width,
+    int source_height,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int interior_red,
+    int interior_green,
+    int interior_blue,
+    int threads
+);
 int fractal_atlas_colourise(
     const float *parent,
     int parent_width,
@@ -297,6 +360,31 @@ int fractal_atlas_colourise(
     double vocal,
     double instrumental,
     double pitch,
+    int threads
+);
+/* Same atlas path with an explicit ordinary-palette interior colour. */
+int fractal_atlas_colourise_interior(
+    const float *parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float *child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    int palette_max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int interior_red,
+    int interior_green,
+    int interior_blue,
     int threads
 );
 

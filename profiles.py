@@ -14,7 +14,10 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
         "height": 540,
         "fps": 24,
         "quality": "draft",
-        "fractal_scale": 0.5,
+        # Keep the quick preview at its requested pixel density.  A half-size
+        # scalar source made even this 960x540 profile visibly blocky after
+        # the final upscale, especially around KFP's one-pixel edge detail.
+        "fractal_scale": 1.0,
         "keyframe_factor": 4.0,
         "max_zoom": "1e24",
         "separation": "none",

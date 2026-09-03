@@ -100,6 +100,7 @@ if Gtk is not None:
             self.window.set_size_request(760, 560)
             self.window.connect("delete-event", self._on_delete_event)
             self.process: subprocess.Popen[str] | None = None
+            self.live_windows: list[object] = []
             self.output_queue: queue.Queue[str] = queue.Queue(maxsize=OUTPUT_QUEUE_LIMIT)
             self._log_follow_tail = True
             self._log_scroll_pending = False
@@ -409,10 +410,16 @@ if Gtk is not None:
             self.stop_button = Gtk.Button(label="Stop")
             self.stop_button.connect("clicked", self._stop)
             self.stop_button.set_sensitive(False)
+            self.live_button = Gtk.Button(label="Live view")
+            self.live_button.set_tooltip_text(
+                "open a low-latency fullscreen preview; Esc closes it and F11 toggles fullscreen"
+            )
+            self.live_button.connect("clicked", self._live_view)
             buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             buttons.pack_start(self.start_button, False, False, 0)
             buttons.pack_start(self.estimate_button, False, False, 0)
             buttons.pack_start(self.stop_button, False, False, 0)
+            buttons.pack_start(self.live_button, False, False, 0)
 
             self.log_buffer = Gtk.TextBuffer()
             self.log = Gtk.TextView(buffer=self.log_buffer)
@@ -631,6 +638,82 @@ if Gtk is not None:
 
         def _palette_changed(self, *_args: object) -> None:
             self.palette_preview.queue_draw()
+
+        def _live_config(self) -> object:
+            """Translate the current form into bounded live-view settings."""
+
+            from live_view import LiveViewConfig
+
+            formula = self._combo_text(self.formula)
+            point_spec = self._point_text() or None
+            random_point = self.random_point.get_active()
+            has_x = bool(self.x_center.get_text().strip())
+            has_y = bool(self.y_center.get_text().strip())
+            if has_x != has_y:
+                raise ValueError("X and Y centre must be supplied together")
+            if random_point and point_spec:
+                raise ValueError("Point/random point cannot be combined with a selected catalogue point")
+
+            julia_constant = visualizer.DEFAULT_JULIA_C
+            if formula == "julia":
+                julia_constant = visualizer._parse_coordinate_pair(
+                    self.julia_c.get_text().strip(),
+                    "Julia c",
+                )
+            random_seed_text = self.random_seed.get_text().strip()
+            random_seed = int(random_seed_text) if random_seed_text else None
+            x_center, y_center, _selected = visualizer._resolve_render_point(
+                point_spec=point_spec,
+                random_point=random_point,
+                x_center=self.x_center.get_text().strip() or None,
+                y_center=self.y_center.get_text().strip() or None,
+                random_seed=random_seed,
+                max_log_zoom=0.0,
+                formula=formula,
+                julia_constant=julia_constant,
+            )
+            palette_file_text = self.palette_file.get_text().strip()
+            palette_file = Path(palette_file_text).expanduser() if palette_file_text else None
+            if palette_file is not None and not palette_file.is_file():
+                raise ValueError(f"palette file not found: {palette_file}")
+            return LiveViewConfig(
+                audio_path=Path(self.audio.get_text()).expanduser(),
+                formula=formula,
+                x_center=x_center,
+                y_center=y_center,
+                julia_constant=julia_constant,
+                palette=self._combo_text(self.palette),
+                palette_file=palette_file,
+                width=int(self.width.get_text()),
+                height=int(self.height.get_text()),
+                fps=min(60, max(1, int(self.fps.get_text()))),
+                native_threads=int(self.native_threads.get_text()),
+                loop=True,
+                fullscreen=True,
+            )
+
+        def _live_view(self, _button: Gtk.Button | None = None) -> None:
+            if not Path(self.audio.get_text()).expanduser().resolve().is_file():
+                self._show_error("Audio file", "Choose an existing audio file first.")
+                return
+            try:
+                from live_view import LiveViewWindow
+
+                config = self._live_config()
+                window = LiveViewWindow(
+                    config,
+                    transient_for=self.window,
+                    on_closed=self._live_closed,
+                )
+            except (OSError, RuntimeError, ValueError, OverflowError) as error:
+                self._show_error("Could not open live view", str(error))
+                return
+            self.live_windows.append(window)
+            window.show_all()
+
+        def _live_closed(self, window: object) -> None:
+            if window in self.live_windows:
+                self.live_windows.remove(window)
 
         def _palette_preview_samples(self) -> tuple[tuple[int, int, int], ...]:
             name = self._combo_text(self.palette)
@@ -1035,6 +1118,12 @@ if Gtk is not None:
                 if response != Gtk.ResponseType.ACCEPT:
                     return True
                 self._terminate_process(self.process)
+            for live_window in list(self.live_windows):
+                try:
+                    live_window.close()  # type: ignore[attr-defined]
+                except (AttributeError, RuntimeError):
+                    pass
+            self.live_windows.clear()
             return False
 
 

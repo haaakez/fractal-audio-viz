@@ -24,7 +24,7 @@ else
   OPENCL_LIBS :=
 endif
 
-.PHONY: all test benchmark gui preview clean
+.PHONY: all test benchmark gui live preview clean
 
 all: mandelbrot.so
 
@@ -39,6 +39,9 @@ benchmark: mandelbrot.so
 
 gui:
 	python3 gui.py
+
+live:
+	python3 live_view.py
 
 preview:
 	python3 make_preview.py

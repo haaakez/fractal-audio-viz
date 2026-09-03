@@ -122,6 +122,26 @@ class NativeRendererTests(unittest.TestCase):
             ctypes.c_int,
         ]
         library.fractal_crop_colourise.restype = ctypes.c_int
+        if hasattr(library, "fractal_crop_colourise_interior"):
+            library.fractal_crop_colourise_interior.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_double,
+                ctypes.c_int,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            library.fractal_crop_colourise_interior.restype = ctypes.c_int
         if hasattr(library, "fractal_crop_field"):
             library.fractal_crop_field.argtypes = [
                 ctypes.POINTER(ctypes.c_float),
@@ -157,6 +177,32 @@ class NativeRendererTests(unittest.TestCase):
                 ctypes.c_int,
             ]
             library.fractal_atlas_colourise.restype = ctypes.c_int
+        if hasattr(library, "fractal_atlas_colourise_interior"):
+            library.fractal_atlas_colourise_interior.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_int,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            library.fractal_atlas_colourise_interior.restype = ctypes.c_int
         library.render_mandelbrot_reference.argtypes = [
             ctypes.POINTER(ctypes.c_float),
             ctypes.c_int,
@@ -674,6 +720,71 @@ class NativeRendererTests(unittest.TestCase):
         centre = (8 * 4 + 4) * 3
         self.assertEqual(tuple(output[centre:centre + 3]), (0, 0, 0))
         self.assertNotEqual(tuple(output[:3]), (0, 0, 0))
+
+    def test_native_crop_colourise_supports_non_black_interior(self):
+        if not hasattr(self.library, "fractal_crop_colourise_interior"):
+            raise unittest.SkipTest("extended crop colour ABI is unavailable")
+        field_type = ctypes.c_float * 64
+        output_type = ctypes.c_uint8 * (8 * 8 * 3)
+        source = field_type(*([100.0] * 64))
+        output = output_type()
+        status = self.library.fractal_crop_colourise_interior(
+            source,
+            8,
+            8,
+            output,
+            8,
+            8,
+            1.0,
+            100,
+            0.0,
+            0.5,
+            0.5,
+            0.5,
+            255,
+            255,
+            255,
+            1,
+        )
+        self.assertEqual(status, 0, self.library.fractal_last_error())
+        self.assertEqual(tuple(output[:3]), (255, 255, 255))
+
+    def test_native_atlas_colourise_supports_non_black_interior(self):
+        if not hasattr(self.library, "fractal_atlas_colourise_interior"):
+            raise unittest.SkipTest("extended atlas colour ABI is unavailable")
+        field_type = ctypes.c_float * 64
+        output_type = ctypes.c_uint8 * (8 * 8 * 3)
+        parent = field_type(*([10.0] * 64))
+        child = field_type(*([200.0] * 64))
+        output = output_type()
+        status = self.library.fractal_atlas_colourise_interior(
+            parent,
+            8,
+            8,
+            100,
+            child,
+            8,
+            8,
+            200,
+            output,
+            8,
+            8,
+            1.0,
+            0.5,
+            200,
+            0.0,
+            0.5,
+            0.5,
+            0.5,
+            255,
+            255,
+            255,
+            1,
+        )
+        self.assertEqual(status, 0, self.library.fractal_last_error())
+        centre = (8 * 4 + 4) * 3
+        self.assertEqual(tuple(output[centre:centre + 3]), (255, 255, 255))
+        self.assertNotEqual(tuple(output[:3]), (255, 255, 255))
 
     def test_optimized_atlas_parent_matches_crop_colour_path(self):
         """The mapped hot loop must preserve the previous crop semantics."""
