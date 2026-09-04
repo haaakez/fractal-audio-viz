@@ -22,6 +22,7 @@ from profiles import (
     PROFILE_ALIASES,
     PROFILE_DEFAULTS,
     SOURCE_MODE_CHOICES,
+    SOURCE_MODE_LABELS,
     UPSCALED_SOURCE_SCALE,
 )
 
@@ -488,7 +489,7 @@ class AnimationTests(unittest.TestCase):
             self.assertEqual(values["crf"], NEAR_LOSSLESS_CRF)
             self.assertFalse(values["lossless"])
             self.assertEqual(values["resample"], "bilinear")
-            self.assertEqual(values["source_mode"], "native")
+            self.assertEqual(values["source_mode"], "lossless-compressed")
             args = visualizer.build_parser(["--profile", name]).parse_args([])
             self.assertEqual((args.width, args.height, args.fps), (width, height, 60))
             self.assertEqual(args.max_zoom, "1e100")
@@ -538,14 +539,28 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual((fast_args.width, fast_args.height), (3840, 2160))
 
     def test_export_source_modes_are_explicit_and_have_expected_density(self):
-        self.assertEqual(SOURCE_MODE_CHOICES, ("native", "upscaled"))
+        self.assertEqual(
+            SOURCE_MODE_CHOICES,
+            ("lossless-compressed", "native", "upscaled"),
+        )
+        self.assertEqual(
+            SOURCE_MODE_LABELS["lossless-compressed"],
+            "lossless compressed",
+        )
         parser = visualizer.build_parser()
-        self.assertEqual(parser.parse_args([]).source_mode, "native")
+        self.assertEqual(parser.parse_args([]).source_mode, "lossless-compressed")
+        native_args = visualizer.build_parser(["--source-mode", "native"]).parse_args(
+            ["--source-mode", "native"]
+        )
+        self.assertEqual(native_args.source_mode, "native")
         self.assertEqual(
             visualizer.build_parser(["--upscaling"])
             .parse_args(["--upscaling"])
             .source_mode,
             "upscaled",
+        )
+        compressed_scale, compressed_transition = visualizer._quality_source_settings(
+            0.25, "balanced", "atlas", 8.0, "lossless-compressed"
         )
         native_scale, native_transition = visualizer._quality_source_settings(
             0.25, "balanced", "atlas", 8.0, "native"
@@ -553,13 +568,19 @@ class AnimationTests(unittest.TestCase):
         upscaled_scale, upscaled_transition = visualizer._quality_source_settings(
             1.0, "quality", "atlas", 4.0, "upscaled"
         )
-        self.assertEqual(native_scale, 0.25)
+        self.assertEqual(compressed_scale, 0.25)
+        self.assertEqual(native_scale, 1.0)
+        self.assertEqual(compressed_transition, 0.0)
         self.assertEqual(upscaled_scale, UPSCALED_SOURCE_SCALE)
         self.assertEqual(native_transition, 0.0)
         self.assertEqual(upscaled_transition, 0.0)
         self.assertEqual(
-            visualizer._scaled_dimensions(7680, 4320, native_scale, "test"),
+            visualizer._scaled_dimensions(7680, 4320, compressed_scale, "test"),
             (1920, 1080),
+        )
+        self.assertEqual(
+            visualizer._scaled_dimensions(7680, 4320, native_scale, "test"),
+            (7680, 4320),
         )
         self.assertEqual(
             visualizer._scaled_dimensions(3840, 2160, upscaled_scale, "test"),

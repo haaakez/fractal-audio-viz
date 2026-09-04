@@ -10367,15 +10367,15 @@ def _quality_source_settings(
     quality: str,
     keyframe_mode: str,
     keyframe_factor: float,
-    source_mode: str = "native",
+    source_mode: str = "lossless-compressed",
 ) -> tuple[float, float]:
     """Return the scalar-field scale and transition for an export.
 
-    ``source_mode`` is deliberately separate from the quality preset.  The
-    normal/native path honors the profile's selected scalar density, so the
-    practical profiles above Full HD can use the proven 1920x1080 native
-    pipeline; ``--quality quality --fractal-scale 1`` requests full output
-    density.
+    ``source_mode`` is deliberately separate from the quality preset.
+    ``lossless-compressed`` honors the profile's selected scalar density, so
+    practical profiles above Full HD can use the proven 1920x1080 native C++
+    pipeline. ``native`` forces at least one scalar sample per output pixel;
+    ``--quality quality --fractal-scale 1`` is also a full-density request.
     The explicit upscaled path caps the field at the old quarter-resolution
     source that made 4K quick renders practical. The final FFmpeg filter is
     responsible for enlarging either undersampled source to the requested
@@ -10403,7 +10403,9 @@ def _quality_source_settings(
     if quality not in quality_settings:
         raise ValueError(f"unknown quality preset: {quality}")
     source_scale, transition_fraction = quality_settings[quality]
-    if source_mode == "upscaled":
+    if source_mode == "native":
+        source_scale = max(source_scale, 1.0)
+    elif source_mode == "upscaled":
         source_scale = min(source_scale, UPSCALED_SOURCE_SCALE)
     return source_scale, transition_fraction
 
@@ -10446,7 +10448,7 @@ def render_video(
     glow: float = 0.0,
     motion_blur: float = 0.0,
     lossless: bool = False,
-    source_mode: str = "native",
+    source_mode: str = "lossless-compressed",
 ) -> dict[str, Any]:
     np = _require_numpy()
     audio_path, output_path, _, cache_dir = _validate_render_paths(
@@ -11384,7 +11386,7 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
         choices=PROFILE_CHOICES,
         default=DEFAULT_PROFILE,
         help=(
-            "start from a named preset; defaults to the native-density "
+            "start from a named preset; defaults to the lossless-compressed "
             f"{DEFAULT_PROFILE} quality profile"
         ),
     )
@@ -11430,10 +11432,10 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--source-mode",
         choices=SOURCE_MODE_CHOICES,
-        default="native",
+        default="lossless-compressed",
         help=(
-            "fractal source density: native honors the profile/quality density; "
-            "upscaled caps it at quarter-size and enlarges it for a faster export"
+            "fractal source density: lossless-compressed uses profile density; "
+            "native forces output density; upscaled caps it at quarter-size"
         ),
     )
     parser.add_argument(

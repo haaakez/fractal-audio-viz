@@ -40,6 +40,7 @@ from profiles import (
     FAST_PROFILE_CHOICES,
     PROFILE_DEFAULTS,
     SOURCE_MODE_CHOICES,
+    SOURCE_MODE_LABELS,
 )
 
 
@@ -136,10 +137,14 @@ if Gtk is not None:
             return entry
 
         @staticmethod
-        def _combo(values: tuple[str, ...], selected: str) -> Gtk.ComboBoxText:
+        def _combo(
+            values: tuple[str, ...],
+            selected: str,
+            labels: dict[str, str] | None = None,
+        ) -> Gtk.ComboBoxText:
             combo = Gtk.ComboBoxText()
             for value in values:
-                combo.append(value, value)
+                combo.append(value, (labels or {}).get(value, value))
             combo.set_active_id(selected)
             combo.set_hexpand(True)
             return combo
@@ -260,16 +265,20 @@ if Gtk is not None:
                 save=True,
             )
             row = self._add_widget_row(render_grid, row, "Profile", self.profile)
-            self.source_mode = self._combo(SOURCE_MODE_CHOICES, "native")
+            self.source_mode = self._combo(
+                SOURCE_MODE_CHOICES,
+                "lossless-compressed",
+                SOURCE_MODE_LABELS,
+            )
             self.source_mode.set_tooltip_text(
-                "native renders at the requested source resolution; upscaled uses the fast quarter-size source"
+                "lossless compressed uses profile density; native uses output density; upscaled uses the fast quarter-size source"
             )
             row = self._add_widget_row(
                 render_grid,
                 row,
                 "Source mode",
                 self.source_mode,
-                "native or upscaled (fast)",
+                "lossless compressed, native, or upscaled",
             )
             row = self._add_widget_row(render_grid, row, "Formula", self.formula)
             point_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)

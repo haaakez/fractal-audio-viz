@@ -17,7 +17,12 @@ from __future__ import annotations
 # available with ``--lossless``.
 DEFAULT_PROFILE = "4k60"
 NEAR_LOSSLESS_CRF = 10
-SOURCE_MODE_CHOICES = ("native", "upscaled")
+SOURCE_MODE_CHOICES = ("lossless-compressed", "native", "upscaled")
+SOURCE_MODE_LABELS = {
+    "lossless-compressed": "lossless compressed",
+    "native": "native",
+    "upscaled": "upscaled",
+}
 # The fast export path renders a quarter-size scalar field and lets FFmpeg
 # enlarge it to the requested output dimensions.  This is the source density
 # used by the old practical 4K speed render, and is intentionally explicit so
@@ -57,11 +62,11 @@ def _native_quality_profile(
         "video_preset": "faster",
         "crf": NEAR_LOSSLESS_CRF,
         # Bilinear keeps the fused native atlas colourizer active for Aurora
-        # accents and KFP profiles. With a native source this does not blur
-        # the output; it only selects the renderer's crop primitive.
+        # accents and KFP profiles; it selects the renderer's crop primitive
+        # without adding a Python image round-trip.
         "resample": "bilinear",
         "lossless": False,
-        "source_mode": "native",
+        "source_mode": "lossless-compressed",
     }
 
 
@@ -121,20 +126,21 @@ PROFILE_DEFAULTS["4k-e150"] = {
 }
 
 PROFILE_DESCRIPTIONS: dict[str, str] = {
-    "sd60": "Native 720x480 60 fps, near-lossless CRF 10, e100.",
-    "hd60": "Native 1280x720 60 fps, near-lossless CRF 10, e100.",
-    "fhd60": "Native 1920x1080 60 fps, near-lossless CRF 10, e100.",
-    "2k60": "2K/60 native C++ pipeline from a 1920x1080 source, CRF 10, e100.",
-    "4k60": "4K/60 native C++ pipeline from a 1920x1080 source, CRF 10, e100.",
-    "8k60": "8K/60 native C++ pipeline from a 1920x1080 source, CRF 10, e100.",
+    "sd60": "Lossless-compressed 720x480 60 fps, CRF 10, e100.",
+    "hd60": "Lossless-compressed 1280x720 60 fps, CRF 10, e100.",
+    "fhd60": "Lossless-compressed 1920x1080 60 fps, CRF 10, e100.",
+    "2k60": "2K/60 lossless-compressed C++ pipeline from 1920x1080, CRF 10, e100.",
+    "4k60": "4K/60 lossless-compressed C++ pipeline from 1920x1080, CRF 10, e100.",
+    "8k60": "8K/60 lossless-compressed C++ pipeline from 1920x1080, CRF 10, e100.",
     "4k-e150": "Fast 4K/60 e150 export from a 960x540 source, enlarged at the end.",
 }
 
 # Keep existing command lines usable while making the resolution presets the
 # canonical choices shown by the GTK selector. These aliases intentionally
-# inherit the new native/e100/near-lossless defaults instead of preserving the
-# old undersampled or 30 fps behaviour under a misleading profile name. The
-# old name that explicitly promised losslessness keeps that one stronger
+# inherit the new lossless-compressed/e100/near-lossless defaults instead of
+# preserving the old undersampled or 30 fps behaviour under a misleading
+# profile name. The old name that explicitly promised losslessness keeps that
+# one stronger
 # guarantee as well.
 PROFILE_ALIASES: dict[str, str] = {
     "preview": "sd60",
@@ -150,7 +156,7 @@ for _alias, _canonical in PROFILE_ALIASES.items():
 
 # Preserve the observable meaning of the old quality-master name while moving
 # its otherwise problematic e150 target to the safe e100 default. This is
-# still a native 4K/60 profile, just exact-lossless instead of CRF 10.
+# still a lossless-compressed 4K/60 profile, just exact-lossless instead of CRF 10.
 PROFILE_DEFAULTS["4k-e150-lossless"].update(crf=0, lossless=True)
 PROFILE_DESCRIPTIONS["4k-e150-lossless"] = (
     "Compatibility alias for --profile 4k60 with exact H.264 lossless output."

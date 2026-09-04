@@ -67,10 +67,11 @@ functions, textures, analytic derivatives, and phase channels—remain outside
 the scalar-field compatibility path.
 
 the output dimensions are controlled by `--width` and `--height`. The default
-`--source-mode native` uses the profile's native C++ field pipeline; profiles
-above Full HD use a 1920×1080 source to retain the old render time, while
-`--quality quality --fractal-scale 1` requests one source sample per output
-pixel. The explicit `--source-mode upscaled` (or `--upscaling`)
+`--source-mode lossless-compressed` uses the profile's native C++ field
+pipeline; profiles above Full HD use a 1920×1080 source to retain the old
+render time. `--source-mode native` forces one source sample per output pixel,
+while `--quality quality --fractal-scale 1` is also a full-density request.
+The explicit `--source-mode upscaled` (or `--upscaling`)
 uses the old fast quarter-resolution source and enlarges it to the output.
 `--render-scale` and `--fractal-scale` remain available for deliberate source
 supersampling or custom quality experiments.
@@ -170,14 +171,14 @@ then choose the parts that matter for the render:
    digits in both coordinates.
 6. Choose a quality/speed trade-off with `--quality`, `--fractal-scale`, and
    `--keyframe-factor`; choose `--source-mode upscaled` when the fastest,
-   lower-detail export is preferable to the native C++ pipeline.
+   lower-detail export is preferable to the lossless-compressed C++ pipeline.
 7. Add `--cache-dir` if the render may be resumed or repeated.
 
 profiles are shortcuts for a coherent set of these values. The canonical
 presets are `sd60`, `hd60`, `fhd60`, `2k60`, `4k60`, and `8k60`. Every one uses
 60 fps, e100, the fused native bilinear crop path, and near-lossless CRF 10
 encoding. The SD–FHD profiles use output-density fields; `2k60`, `4k60`, and
-`8k60` use a 1920×1080 field, matching the proven pre-live native pipeline.
+`8k60` use a 1920×1080 field, matching the proven pre-live C++ pipeline.
 With no profile option, `4k60` is selected; explicit options still override
 the profile.
 
@@ -347,7 +348,7 @@ the same high-quality native fractal and colour pipeline.
 | `4k60` | 3840×2160 / 1920×1080 | e100 | CRF 10 |
 | `8k60` | 7680×4320 / 1920×1080 | e100 | CRF 10 |
 
-`4k60` is the default native C++ pipeline. The separate `4k-e150` profile is
+`4k60` is the default lossless-compressed C++ pipeline. The separate `4k-e150` profile is
 the old tested fast quarter-density path. For a full-density field, add
 `--quality quality --fractal-scale 1`; add `--lossless` for exact H.264 rate
 control. Use `--source-mode upscaled`, the `4k-e150` profile, a larger
@@ -365,10 +366,11 @@ python3 visualizer.py music/track.mp3 \
 ```
 
 the legacy names are accepted. `4k-e150` retains the tested fast upscaled
-profile, while `4k-e150-lossless` remains an exact-lossless native alias for
-the safe e100 quality profile. The other legacy names resolve to their
-corresponding near-lossless native profiles. Source density is also recorded
-explicitly with `--source-mode` in the command and render manifest.
+profile, while `4k-e150-lossless` remains an exact-lossless
+lossless-compressed alias for the safe e100 quality profile. The other legacy
+names resolve to their corresponding near-lossless compressed profiles. Source
+density is also recorded explicitly with `--source-mode` in the command and
+render manifest.
 
 use `--estimate` to analyse the song and print the planned source resolution
 and keyframe count without rendering video:
@@ -451,8 +453,8 @@ unless noted otherwise, the values in parentheses are the defaults.
 | argument | description |
 | --- | --- |
 | `--render-scale N` (`1.0`) | Multiplier applied to keyframe source dimensions. Must be at least `1`. |
-| `--source-mode MODE` (`native`, or `upscaled` in `4k-e150`) | `native` honors the profile/quality source density and uses the pre-live fused native colour pipeline; `upscaled` caps the source at `0.25×` and enlarges it at the end. `--upscaling` is a shorthand for the latter. |
-| `--fractal-scale N` (profile-dependent; `0.25` for `8k60`) | Requested fractal source multiplier. Native mode honors it subject to the quality floor; upscaled mode caps it at the fast `0.25×` source. |
+| `--source-mode MODE` (`lossless-compressed`, or `upscaled` in `4k-e150`) | `lossless-compressed` honors the profile/quality source density and uses the pre-live fused native colour pipeline; `native` forces output-density fields; `upscaled` caps the source at `0.25×` and enlarges it at the end. `--upscaling` is a shorthand for the latter. |
+| `--fractal-scale N` (profile-dependent; `0.25` for `8k60`) | Requested fractal source multiplier. Lossless-compressed mode honors it subject to the quality floor; native mode floors it at `1×`; upscaled mode caps it at the fast `0.25×` source. |
 | `--quality MODE` (`balanced` with the canonical profiles) | `draft` permits labelled recovery; `balanced` is the practical atlas quality; `quality` requests at least output-density fields; `extreme` adds modest supersampling. Source density is selected separately with `--source-mode`. |
 | `--keyframe-factor N` (`2.0`) | Maximum zoom ratio between adjacent atlas levels. Larger values reduce the number of fields but enlarge crops more. |
 | `--keyframe-mode MODE` (`atlas`) | `atlas` uses the fixed nested ladder; `legacy` uses the older audio-dependent full-field chunks. |
