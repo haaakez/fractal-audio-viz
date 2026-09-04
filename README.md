@@ -61,8 +61,10 @@ iteration cap as the interior marker, reconstructs interior neighbours as
 `max_iter + 1` for distance/slope stencils, applies the selected transfer and
 glossy slope pass, and uses Kalles' deterministic 8-bit dither. The lookup
 table and immutable profile are cached, and the native implementation performs
-the crop, atlas blend, stencil, and colour conversion without a Python image
-round-trip. KFP features that require extra Kalles buffers—custom GLSL colour
+the crop, atlas re-projection, shared stencil, and colour conversion without a
+Python image round-trip. atlas parent and child fields meet on one screen-space
+scalar surface, so a new tile cannot reset the glossy gradient into a visible
+rectangle. KFP features that require extra Kalles buffers—custom GLSL colour
 functions, textures, analytic derivatives, and phase channels—remain outside
 the scalar-field compatibility path.
 

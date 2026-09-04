@@ -289,7 +289,9 @@ int fractal_atlas_colourise_kfp(
     int lut_size,
     int threads
 );
-/* Crop raw parent/child scalar tiles and colourise the atlas in native code. */
+/* Crop raw parent/child scalar tiles into one shared surface, then run one
+ * native KFP pass so screen-space differences and slopes remain continuous
+ * across the atlas handoff. */
 int fractal_atlas_colourise_kfp_raw(
     const float *parent,
     int parent_width,

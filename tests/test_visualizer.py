@@ -1051,7 +1051,7 @@ class AnimationTests(unittest.TestCase):
         difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
         self.assertLessEqual(int(np.max(difference)), 1)
 
-    def test_native_raw_kfp_atlas_matches_prepared_tiles(self):
+    def test_native_raw_kfp_atlas_matches_shared_portable_surface(self):
         library = visualizer._get_native_library()
         if library is None or not hasattr(library, "fractal_atlas_colourise_kfp_raw"):
             raise unittest.SkipTest("native raw KFP atlas colourizer is unavailable")
@@ -1061,22 +1061,24 @@ class AnimationTests(unittest.TestCase):
         parent[0, 0] = 200.0
         child[3, 4] = 200.0
         profile = visualizer.KALLES_DEFAULT_KFP
-        prepared = visualizer._atlas_colourise_kfp_native(
+        portable = visualizer._atlas_colour_frame(
             parent,
             child,
             32,
             24,
-            200,
-            8,
-            6,
-            visualizer._atlas_feather(16, 12),
-            0.0,
-            0.0,
-            0.0,
+            1.0,
             0.5,
-            profile,
-            library,
+            200,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            None,
             2,
+            "bilinear",
+            "aurora",
+            0.5,
+            Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp",
         )
         raw = visualizer._atlas_colourise_kfp_raw_native(
             parent,
@@ -1095,7 +1097,7 @@ class AnimationTests(unittest.TestCase):
             library,
             2,
         )
-        difference = np.abs(raw.astype(np.int16) - prepared.astype(np.int16))
+        difference = np.abs(raw.astype(np.int16) - portable.astype(np.int16))
         self.assertLessEqual(int(np.max(difference)), 1)
 
     def test_public_limits_reject_aliases_and_unbounded_inputs(self):

@@ -5958,9 +5958,21 @@ int fractal_atlas_colourise_kfp_raw(
         const int sampled_child_height = use_child
             ? visible_child_height + 2 * halo
             : 0;
+        const int visible_child_min = use_child
+            ? std::min(visible_child_width, visible_child_height)
+            : 0;
+        // A narrow KFP feather still produces a bright one-pixel contour
+        // when the parent and child differ by one interior classification.
+        // Widen the scalar transition once the child has enough pixels to
+        // support it; keep the small-frame behaviour unchanged so previews
+        // do not lose their useful detail.
+        const int proportional_feather = visible_child_min >= 64
+            ? visible_child_min / 3
+            : 0;
         const int visible_feather = use_child
-            ? std::min(48, std::min(visible_child_width / 8,
-                visible_child_height / 8))
+            ? std::min(64, std::max(
+                visible_child_min / 8,
+                proportional_feather))
             : 0;
         const int feather = use_child
             ? std::min(
@@ -6048,20 +6060,72 @@ int fractal_atlas_colourise_kfp_raw(
             child_view.clear();
         }
 
-        return fractal_atlas_colourise_kfp(
+        if (use_child) {
+            // KFP's differences and slope passes are screen-space
+            // operations. Colourising the parent and child independently
+            // gives each tile a different finite-difference scale, so the
+            // child can become a large, perfectly rectangular colour patch
+            // when it is inserted into a zoomed parent. Reproject both
+            // tiles into one scalar surface first and run one KFP pass over
+            // that surface. This keeps the neighbourhood stencil continuous
+            // across the atlas transition and also avoids a second full RGB
+            // colourisation.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int y = child_top;
+                 y < child_top + sampled_child_height;
+                 ++y) {
+                for (int x = child_left;
+                     x < child_left + sampled_child_width;
+                     ++x) {
+                    const int child_x = x - child_left;
+                    const int child_y = y - child_top;
+                    const size_t output_index = static_cast<size_t>(y)
+                        * static_cast<size_t>(output_width)
+                        + static_cast<size_t>(x);
+                    const float child_value = child_view[
+                        static_cast<size_t>(child_y)
+                        * static_cast<size_t>(sampled_child_width)
+                        + static_cast<size_t>(child_x)];
+                    float alpha = 1.0F;
+                    if (feather >= 2) {
+                        const int edge_distance = std::min(
+                            std::min(child_x, sampled_child_width - 1 - child_x),
+                            std::min(child_y, sampled_child_height - 1 - child_y));
+                        const float linear = std::clamp(
+                            static_cast<float>(edge_distance)
+                                / static_cast<float>(feather),
+                            0.0F,
+                            1.0F);
+                        alpha = linear * linear * (3.0F - 2.0F * linear);
+                    }
+                    if (alpha >= 0.999999F) {
+                        parent_view[output_index] = child_value;
+                    } else {
+                        const float parent_value = parent_view[output_index];
+                        // The interior cap is a valid scalar only when it is
+                        // the final owner of a pixel. Blending it in the
+                        // feather is intentional: it keeps the transition
+                        // smooth, while alpha=1 restores an exact interior
+                        // sentinel for the shared colour pass.
+                        parent_view[output_index] = parent_value * (1.0F - alpha)
+                            + child_value * alpha;
+                    }
+                }
+            }
+        }
+
+        // The complete frame now has one coordinate system and one
+        // neighbourhood stencil. In particular, do not call the atlas RGB
+        // compositor here: it would recreate the independent-tile seam this
+        // raw path exists to eliminate.
+        return fractal_colourise_kfp(
             parent_view.data(),
-            output_width,
-            output_height,
-            use_child ? child_view.data() : nullptr,
-            sampled_child_width,
-            sampled_child_height,
             output,
             output_width,
             output_height,
             max_iter,
-            child_left,
-            child_top,
-            feather,
             phase,
             vocal,
             instrumental,
