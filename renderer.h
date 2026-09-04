@@ -341,6 +341,26 @@ int fractal_crop_colourise_interior(
     int interior_blue,
     int threads
 );
+/* Same crop path with three Aurora-compatible RGB accents and an interior. */
+int fractal_crop_colourise_accents(
+    const float *source,
+    int source_width,
+    int source_height,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const uint8_t *accents,
+    int interior_red,
+    int interior_green,
+    int interior_blue,
+    int threads
+);
 int fractal_atlas_colourise(
     const float *parent,
     int parent_width,
@@ -382,6 +402,32 @@ int fractal_atlas_colourise_interior(
     double vocal,
     double instrumental,
     double pitch,
+    int interior_red,
+    int interior_green,
+    int interior_blue,
+    int threads
+);
+/* Same atlas path with three Aurora-compatible RGB accents and an interior. */
+int fractal_atlas_colourise_accents(
+    const float *parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float *child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    int palette_max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const uint8_t *accents,
     int interior_red,
     int interior_green,
     int interior_blue,

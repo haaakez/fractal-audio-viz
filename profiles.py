@@ -49,9 +49,13 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
     "4k-e150": {
         "width": 3840,
         "height": 2160,
-        "fps": 30,
+        "fps": 60,
         "quality": "balanced",
-        "fractal_scale": 0.5,
+        # A 960x540 scalar source is enough for a smooth 4K atlas export and
+        # keeps both native field work and per-frame colourisation inside the
+        # practical e150 speed budget. Full HD and master profiles retain
+        # their native-density sources.
+        "fractal_scale": 0.25,
         "keyframe_factor": 8.0,
         "max_zoom": "1e150",
         "separation": "auto",
@@ -86,7 +90,7 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "preview": "Fast low-resolution check render.",
     "fullhd": "Balanced Full HD (1920x1080) render through 1e80.",
     "1080p": "Alias for the Full HD profile.",
-    "4k-e150": "The practical 4K/e150 speed target: 2K fractal source.",
+    "4k-e150": "The practical 4K/e150 speed target: 960x540 fractal source.",
     "master-e150": "Higher-density 4K/e150 master; expect a longer render.",
     "beat": "1080p render with onset-driven zoom punches enabled.",
 }

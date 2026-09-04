@@ -288,9 +288,9 @@ routed through an incompatible Mandelbrot reference.
 
 ### 4k/e150 speed profile
 
-this profile writes 4K output while keeping the fractal source at 2K. It is a
-reasonable starting point for the ten-minute target on a six-core low-power
-cpu; actual time depends on the song, selected point, and encoder.
+this profile writes 4K output while keeping the fractal source at 960x540. It
+is tuned for the e150 speed target on a six-core low-power cpu; actual time
+depends on the song, selected point, and encoder.
 
 ```sh
 python3 visualizer.py music/track.mp3 \
@@ -301,12 +301,13 @@ python3 visualizer.py music/track.mp3 \
   --cache-dir cache/track-4k-e150
 ```
 
-for a native-density master, use `--fractal-scale 1 --keyframe-factor 2`.
+for a 2K-source render, use `--fractal-scale 0.5 --keyframe-factor 8`; for a
+native-density master, use `--fractal-scale 1 --keyframe-factor 2`.
 that produces about 500 source levels at e150 and is substantially slower.
-the speed profile uses about 168 levels and 1920×1080 source fields. If the
+the speed profile uses about 168 levels and 960×540 source fields. If the
 ten-minute ceiling matters more than the smoothest outer crop, add
-`--keyframe-factor 16`; use `--keyframe-factor 4` when source detail matters
-more than render time.
+`--keyframe-factor 16`; use `--keyframe-factor 4` with a larger source when
+source detail matters more than render time.
 
 use `--estimate` to analyse the song and print the planned source resolution
 and keyframe count without rendering video:
@@ -314,7 +315,7 @@ and keyframe count without rendering video:
 ```sh
 python3 visualizer.py music/track.mp3 \
   --width 3840 --height 2160 --quality balanced \
-  --fractal-scale 0.5 --keyframe-factor 4 \
+  --fractal-scale 0.25 --keyframe-factor 8 \
   --max-zoom 1e150 --estimate
 ```
 
@@ -351,7 +352,7 @@ unless noted otherwise, the values in parentheses are the defaults.
 | --- | --- |
 | `audio` (`song.mp3`) | Positional input audio file. This is how you choose a custom song. |
 | `--output PATH` (`fractal_viz.mp4`) | Output video path. |
-| `--profile NAME` | Start from `preview`, `fullhd` (`1080p` alias), `4k-e150`, `master-e150`, or `beat`; later options override it. |
+| `--profile NAME` | Start from `preview`, `fullhd` (`1080p` alias), `4k-e150` (4K/60 e150), `master-e150`, or `beat`; later options override it. |
 | `--list-profiles` | Print the built-in profiles and exit. |
 | `--width N` (`1920`) | Output width in pixels. |
 | `--height N` (`1080`) | Output height in pixels. |

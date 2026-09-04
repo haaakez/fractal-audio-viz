@@ -23,6 +23,20 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(visualizer._fractional_decimal_places("-1.2300"), 4)
         self.assertEqual(visualizer._fractional_decimal_places("12e3"), 0)
 
+    def test_decimal_to_scaled_preserves_non_power_of_two_magnitude(self):
+        value = Decimal("2.4604481033564476e-68")
+        mantissa, exponent = visualizer._decimal_to_scaled(value)
+        reconstructed = math.ldexp(mantissa, exponent)
+        self.assertTrue(math.isfinite(reconstructed))
+        self.assertAlmostEqual(reconstructed, float(value), places=80)
+
+        negative_mantissa, negative_exponent = visualizer._decimal_to_scaled(-value)
+        self.assertAlmostEqual(
+            math.ldexp(negative_mantissa, negative_exponent),
+            -float(value),
+            places=80,
+        )
+
     def test_deep_center_precision_guard_catches_e150_bundled_center(self):
         available, required = visualizer._center_precision_budget(
             visualizer.DEFAULT_X_CENTER,
@@ -323,7 +337,7 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(visualizer._native_reference_tier_logs(20.0), [12.0])
         self.assertEqual(
             visualizer._native_reference_tier_logs(83.0),
-            [12.0, 40.0, 50.0, 60.0, 70.0, 80.0, 83.0],
+            [12.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 83.0],
         )
         references = [
             (12.0, "shallow"),
@@ -340,9 +354,12 @@ class AnimationTests(unittest.TestCase):
     def test_native_reference_tiers_align_to_atlas_boundaries(self):
         step = math.log10(2.0)
         tiers = visualizer._native_reference_tier_logs(83.0, step)
-        expected_first_deep = math.floor(40.0 / step) * step
+        expected_first_deep = max(
+            12.0,
+            math.floor(20.0 / step) * step - 3.0 * step,
+        )
         self.assertAlmostEqual(tiers[1], expected_first_deep, places=12)
-        self.assertLessEqual(tiers[1], 40.0)
+        self.assertLessEqual(tiers[1], 20.0)
         self.assertEqual(tiers[-1], 83.0)
 
     def test_audio_without_stems_uses_full_mix_for_flow_and_zoom(self):
@@ -439,7 +456,10 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(PROFILE_DEFAULTS["fullhd"]["width"], 1920)
         self.assertEqual(PROFILE_DEFAULTS["fullhd"]["height"], 1080)
         self.assertEqual(PROFILE_DEFAULTS["4k-e150"]["width"], 3840)
+        self.assertEqual(PROFILE_DEFAULTS["4k-e150"]["fps"], 60)
         self.assertGreater(PROFILE_DEFAULTS["4k-e150"]["max_zoom"].count("e"), 0)
+        self.assertEqual(PROFILE_DEFAULTS["4k-e150"]["fractal_scale"], 0.25)
+        self.assertEqual(PROFILE_DEFAULTS["4k-e150"]["keyframe_factor"], 8.0)
         self.assertEqual(PROFILE_DEFAULTS["preview"]["fractal_scale"], 1.0)
 
     def test_palette_file_and_frame_effects(self):
@@ -1062,7 +1082,11 @@ class AnimationTests(unittest.TestCase):
             library.fractal_destroy_reference(reference)
         self.assertTrue(np.isfinite(field).all())
         self.assertGreater(diagnostics["initial_unresolved_pixels"], 0)
-        self.assertGreater(diagnostics["secondary_references"], 0)
+        self.assertGreater(
+            diagnostics["secondary_references"]
+            + diagnostics.get("exact_pixel_recoveries", 0),
+            0,
+        )
         self.assertGreater(float(np.ptp(field)), 10.0)
         self.assertTrue(np.any(field < max_iter - 0.5))
 
@@ -1242,6 +1266,95 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(result.dtype, np.uint8)
         self.assertEqual(int(result[0, 0, 0]), 10)
         self.assertEqual(int(result[16, 16, 0]), 20)
+
+    def test_atlas_compositor_promotes_a_nearly_full_child(self):
+        """A reverse-boundary child must not leave a visible parent frame."""
+
+        parent = np.zeros((8, 8), dtype=np.float32)
+        child = np.ones((8, 8), dtype=np.float32)
+        original = visualizer._colourise_view
+
+        def fake_colour(view, *args):
+            value = 20 if float(np.mean(view)) > 0.5 else 10
+            return np.full((*view.shape, 3), value, dtype=np.uint8)
+
+        visualizer._colourise_view = fake_colour
+        try:
+            result = visualizer._atlas_colour_frame(
+                parent,
+                child,
+                64,
+                64,
+                7.9,
+                0.9875,
+                100,
+                200,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                1,
+                "bilinear",
+                "aurora",
+                0.5,
+            )
+        finally:
+            visualizer._colourise_view = original
+        np.testing.assert_array_equal(
+            result,
+            np.full((64, 64, 3), 20, dtype=np.uint8),
+        )
+
+    def test_atlas_compositor_crops_an_overscanned_full_child(self):
+        """A wider stored child keeps its true scale at takeover."""
+
+        parent = np.zeros((8, 8), dtype=np.float32)
+        child = np.ones((8, 8), dtype=np.float32)
+        original_crop = visualizer._crop_and_resize_preserving_interior
+        original_colour = visualizer._colourise_view
+        observed_zooms = []
+
+        def fake_crop(field, output_width, output_height, zoom, max_iter, resample):
+            observed_zooms.append(float(zoom))
+            return (
+                np.full((output_height, output_width), float(np.mean(field)), dtype=np.float32),
+                np.zeros((output_height, output_width), dtype=bool),
+            )
+
+        def fake_colour(view, *args):
+            value = 20 if float(np.mean(view)) > 0.5 else 10
+            return np.full((*view.shape, 3), value, dtype=np.uint8)
+
+        visualizer._crop_and_resize_preserving_interior = fake_crop
+        visualizer._colourise_view = fake_colour
+        try:
+            result = visualizer._atlas_colour_frame(
+                parent,
+                child,
+                64,
+                64,
+                9.6,
+                1.0,
+                100,
+                200,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                1,
+                "bilinear",
+                "aurora",
+                0.5,
+                child_zoom=1.2,
+            )
+        finally:
+            visualizer._crop_and_resize_preserving_interior = original_crop
+            visualizer._colourise_view = original_colour
+        self.assertEqual(observed_zooms, [9.6, 1.2])
+        np.testing.assert_array_equal(
+            result,
+            np.full((64, 64, 3), 20, dtype=np.uint8),
+        )
 
     def test_atlas_compositor_normalizes_parent_and_child_interior_caps(self):
         """A deeper child cap must not turn the parent interior into a rectangle."""
@@ -1498,6 +1611,21 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(codec, "h264_vaapi")
         self.assertEqual(preset, "")
         self.assertEqual(rate_control, ["-qp", "18"])
+
+    def test_hardware_probe_uses_nvenc_safe_dimensions(self):
+        probe_result = mock.Mock(returncode=0)
+        visualizer._hardware_encoder_usable.cache_clear()
+        try:
+            with mock.patch.object(
+                visualizer.shutil, "which", return_value="/usr/bin/ffmpeg"
+            ), mock.patch.object(
+                visualizer.subprocess, "run", return_value=probe_result
+            ) as run:
+                self.assertTrue(visualizer._hardware_encoder_usable("h264_nvenc"))
+        finally:
+            visualizer._hardware_encoder_usable.cache_clear()
+        command = run.call_args.args[0]
+        self.assertIn("color=black:s=256x256:d=0.05", command)
 
     def test_crop_factor_is_clamped_to_native_source(self):
         field = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)

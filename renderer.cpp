@@ -726,7 +726,8 @@ const AuroraPalette& aurora_palette_for(
     double phase,
     double vocal,
     double instrumental,
-    double pitch
+    double pitch,
+    const std::uint8_t* accents = nullptr
 ) {
     const PaletteBasis& basis = colour_basis_for(max_iter);
     const int palette_size = static_cast<int>(basis.cosine.size());
@@ -761,9 +762,40 @@ const AuroraPalette& aurora_palette_for(
             (0.5 - 0.5 * (cosine * green_cos + sine * green_sin)) * green_gain,
             (0.5 - 0.5 * (cosine * blue_cos + sine * blue_sin)) * blue_gain,
         }};
-        const std::array<double, 3> colour = rotate
-            ? rotate_hue_rgb(original, hue_cos, hue_sin)
-            : original;
+        std::array<double, 3> colour = original;
+        if (accents != nullptr) {
+            // Ordinary palettes are the same three Aurora waves, projected
+            // through three RGB accents.  Do that projection while the
+            // palette is being built so the frame needs one native pass,
+            // rather than an Aurora pass followed by a full-image Python or
+            // native recolour pass.
+            const double red_weight = std::clamp(
+                static_cast<double>(colour_byte(original[0])) / 140.0,
+                0.0,
+                1.0);
+            const double green_weight = std::clamp(
+                static_cast<double>(colour_byte(original[1])) / 140.0,
+                0.0,
+                1.0);
+            const double blue_weight = std::clamp(
+                static_cast<double>(colour_byte(original[2])) / 140.0,
+                0.0,
+                1.0);
+            colour = {{
+                (red_weight * static_cast<double>(accents[0])
+                    + green_weight * static_cast<double>(accents[3])
+                    + blue_weight * static_cast<double>(accents[6])) / 1.8,
+                (red_weight * static_cast<double>(accents[1])
+                    + green_weight * static_cast<double>(accents[4])
+                    + blue_weight * static_cast<double>(accents[7])) / 1.8,
+                (red_weight * static_cast<double>(accents[2])
+                    + green_weight * static_cast<double>(accents[5])
+                    + blue_weight * static_cast<double>(accents[8])) / 1.8,
+            }};
+        }
+        if (rotate) {
+            colour = rotate_hue_rgb(colour, hue_cos, hue_sin);
+        }
         aurora_palette.rgb[static_cast<size_t>(index)] = {{
             colour_byte(colour[0]),
             colour_byte(colour[1]),
@@ -1203,6 +1235,493 @@ struct KfpSlopeDirection {
     double sine = 0.0;
 };
 
+// The bundled Kalles palette is the hot path for video rendering.  Its
+// transfer is fixed (Differences=3, ColorMethod=7, 45-degree slopes, no
+// multi-colour wave), so it can use a small float kernel without changing the
+// semantics of arbitrary imported KFP files.  The generic writer below stays
+// available for every other recipe.
+inline bool kfp_is_default_fast_options(
+    const FractalKfpOptions& options
+) noexcept {
+    return options.iter_div == 0.01
+        && options.color_offset == 0.0
+        && options.ratio == 360.0
+        && options.color_method == 7
+        && options.smooth_method == 0
+        && options.smooth != 0
+        && options.flat == 0
+        && options.inverse_transition == 0
+        && options.phase_color_strength == 0.0
+        && options.multi_color == 0
+        && options.blend_multi_color == 0
+        && options.multi_color_count == 0
+        && options.power == 2.0
+        && options.slopes != 0
+        && options.slope_power == 50.0
+        && options.slope_ratio == 20.0
+        && options.slope_angle == 45.0
+        && options.differences == 3
+        && options.interior_color[0] == 0
+        && options.interior_color[1] == 0
+        && options.interior_color[2] == 0;
+}
+
+inline float kfp_fast_log1p(float value) noexcept {
+    if (!(value > 0.0F)) return 0.0F;
+    const float shifted = 1.0F + value;
+    if (!std::isfinite(shifted)) return static_cast<float>(std::log1p(value));
+    int exponent = 0;
+    float mantissa = std::frexp(shifted, &exponent) * 2.0F;
+    --exponent;
+    const float z = (mantissa - 1.0F) / (mantissa + 1.0F);
+    const float z_squared = z * z;
+    // The atanh series converges rapidly because the reduced mantissa is in
+    // [1, 2). The omitted term is below 2e-6 over the whole range relevant
+    // to a KFP distance transfer, well below one 8-bit LUT step.
+    const float series = 1.0F + z_squared * (
+        1.0F / 3.0F + z_squared * (
+            1.0F / 5.0F + z_squared * (
+                1.0F / 7.0F + z_squared * (
+                    1.0F / 9.0F + z_squared / 11.0F))));
+    return 2.0F * z * series
+        + static_cast<float>(exponent) * 0.6931471805599453F;
+}
+
+inline float kfp_fast_atan_nonnegative(float value) noexcept {
+    if (!std::isfinite(value)) return 1.5707963267948966F;
+    const bool invert = value > 1.0F;
+    const float x = invert ? 1.0F / value : value;
+    const float x_squared = x * x;
+    // Minimax-like odd polynomial on [0, 1]. Its maximum error is small
+    // compared with the slope blend's final 8-bit quantisation, while it is
+    // substantially cheaper and easier for the compiler to vectorise than
+    // a scalar libm atan call.
+    const float result = x * (0.9998660F + x_squared * (
+        -0.3302995F + x_squared * (
+            0.1801410F + x_squared * (
+                -0.0851330F + x_squared * 0.0208351F))));
+    return invert ? 1.5707963267948966F - result : result;
+}
+
+inline float kfp_fast_sample_inner(
+    const float* field,
+    size_t index,
+    int max_iter
+) noexcept {
+    const float value = field[index];
+    if (!std::isfinite(value)) return 0.0F;
+    if (value >= static_cast<float>(max_iter)) {
+        return static_cast<float>(max_iter) + 1.0F;
+    }
+    return std::max(value, 0.0F);
+}
+
+#if defined(__AVX2__)
+inline __m256 kfp_fast_sample_inner_avx(
+    const float* field,
+    size_t index,
+    int max_iter
+) {
+    const __m256 raw = _mm256_loadu_ps(field + index);
+    const __m256 absolute = _mm256_andnot_ps(
+        _mm256_set1_ps(-0.0F), raw);
+    const __m256 finite = _mm256_cmp_ps(
+        absolute,
+        _mm256_set1_ps(std::numeric_limits<float>::infinity()),
+        _CMP_LT_OQ);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 limit = _mm256_set1_ps(static_cast<float>(max_iter));
+    __m256 value = _mm256_max_ps(raw, zero);
+    value = _mm256_min_ps(value, limit);
+    value = _mm256_blendv_ps(zero, value, finite);
+    const __m256 inside = _mm256_and_ps(
+        finite,
+        _mm256_cmp_ps(raw, limit, _CMP_GE_OQ));
+    return _mm256_blendv_ps(
+        value,
+        _mm256_set1_ps(static_cast<float>(max_iter) + 1.0F),
+        inside);
+}
+
+inline __m256 kfp_fast_log1p_avx(__m256 value) {
+    const __m256 shifted = _mm256_add_ps(value, _mm256_set1_ps(1.0F));
+    const __m256i bits = _mm256_castps_si256(shifted);
+    const __m256i exponent_bits = _mm256_and_si256(
+        _mm256_srli_epi32(bits, 23),
+        _mm256_set1_epi32(0xff));
+    const __m256i exponent = _mm256_sub_epi32(
+        exponent_bits,
+        _mm256_set1_epi32(127));
+    const __m256i mantissa_bits = _mm256_or_si256(
+        _mm256_and_si256(bits, _mm256_set1_epi32(0x007fffff)),
+        _mm256_set1_epi32(0x3f800000));
+    const __m256 mantissa = _mm256_castsi256_ps(mantissa_bits);
+    const __m256 z = _mm256_div_ps(
+        _mm256_sub_ps(mantissa, _mm256_set1_ps(1.0F)),
+        _mm256_add_ps(mantissa, _mm256_set1_ps(1.0F)));
+    const __m256 z_squared = _mm256_mul_ps(z, z);
+    __m256 series = _mm256_set1_ps(1.0F / 11.0F);
+    series = _mm256_add_ps(
+        _mm256_set1_ps(1.0F / 9.0F), _mm256_mul_ps(z_squared, series));
+    series = _mm256_add_ps(
+        _mm256_set1_ps(1.0F / 7.0F), _mm256_mul_ps(z_squared, series));
+    series = _mm256_add_ps(
+        _mm256_set1_ps(1.0F / 5.0F), _mm256_mul_ps(z_squared, series));
+    series = _mm256_add_ps(
+        _mm256_set1_ps(1.0F / 3.0F), _mm256_mul_ps(z_squared, series));
+    series = _mm256_add_ps(
+        _mm256_set1_ps(1.0F), _mm256_mul_ps(z_squared, series));
+    return _mm256_add_ps(
+        _mm256_mul_ps(_mm256_set1_ps(2.0F), _mm256_mul_ps(z, series)),
+        _mm256_mul_ps(
+            _mm256_cvtepi32_ps(exponent),
+            _mm256_set1_ps(0.6931471805599453F)));
+}
+
+inline __m256 kfp_fast_atan_nonnegative_avx(__m256 value) {
+    const __m256 one = _mm256_set1_ps(1.0F);
+    const __m256 invert = _mm256_cmp_ps(value, one, _CMP_GT_OQ);
+    const __m256 x = _mm256_blendv_ps(
+        value,
+        _mm256_div_ps(one, value),
+        invert);
+    const __m256 x_squared = _mm256_mul_ps(x, x);
+    __m256 polynomial = _mm256_set1_ps(0.0208351F);
+    polynomial = _mm256_add_ps(
+        _mm256_set1_ps(-0.0851330F), _mm256_mul_ps(x_squared, polynomial));
+    polynomial = _mm256_add_ps(
+        _mm256_set1_ps(0.1801410F), _mm256_mul_ps(x_squared, polynomial));
+    polynomial = _mm256_add_ps(
+        _mm256_set1_ps(-0.3302995F), _mm256_mul_ps(x_squared, polynomial));
+    polynomial = _mm256_add_ps(
+        _mm256_set1_ps(0.9998660F), _mm256_mul_ps(x_squared, polynomial));
+    const __m256 result = _mm256_mul_ps(x, polynomial);
+    return _mm256_blendv_ps(
+        result,
+        _mm256_sub_ps(_mm256_set1_ps(1.5707963267948966F), result),
+        invert);
+}
+
+inline void write_kfp_default_fast_block8(
+    const float* field,
+    int width,
+    int source_x,
+    int source_y,
+    int dither_x,
+    int dither_y,
+    int spatial_width,
+    int max_iter,
+    const std::uint8_t* lut,
+    int lut_size,
+    std::uint8_t* destination
+) {
+    const size_t centre_index = static_cast<size_t>(source_y)
+        * static_cast<size_t>(width) + static_cast<size_t>(source_x);
+    const __m256 raw = _mm256_loadu_ps(field + centre_index);
+    const __m256 absolute = _mm256_andnot_ps(
+        _mm256_set1_ps(-0.0F), raw);
+    const __m256 finite = _mm256_cmp_ps(
+        absolute,
+        _mm256_set1_ps(std::numeric_limits<float>::infinity()),
+        _CMP_LT_OQ);
+    const __m256 limit = _mm256_set1_ps(static_cast<float>(max_iter));
+    const __m256 inside = _mm256_and_ps(
+        finite,
+        _mm256_cmp_ps(raw, limit, _CMP_GE_OQ));
+    const __m256 zero = _mm256_setzero_ps();
+    __m256 centre = _mm256_max_ps(raw, zero);
+    centre = _mm256_min_ps(centre, limit);
+    centre = _mm256_blendv_ps(zero, centre, finite);
+
+    const size_t row_width = static_cast<size_t>(width);
+    const __m256 left = kfp_fast_sample_inner_avx(
+        field, centre_index - 1U, max_iter);
+    const __m256 up = kfp_fast_sample_inner_avx(
+        field, centre_index - row_width, max_iter);
+    const __m256 top_left = kfp_fast_sample_inner_avx(
+        field, centre_index - row_width - 1U, max_iter);
+    const __m256 difference_x = _mm256_sub_ps(top_left, centre);
+    const __m256 difference_y = _mm256_sub_ps(left, up);
+    const __m256 gradient = _mm256_mul_ps(
+        _mm256_sqrt_ps(_mm256_max_ps(
+            zero,
+            _mm256_mul_ps(
+                _mm256_add_ps(
+                    _mm256_mul_ps(difference_x, difference_x),
+                    _mm256_mul_ps(difference_y, difference_y)),
+                _mm256_set1_ps(0.5F)))),
+        _mm256_set1_ps(2.8284271247461903F));
+    const __m256 distance = _mm256_min_ps(
+        _mm256_mul_ps(
+            gradient,
+            _mm256_set1_ps(static_cast<float>(spatial_width) / 640.0F)),
+        _mm256_set1_ps(1.0e12F));
+    const __m256 transfer = kfp_fast_log1p_avx(distance);
+    const __m256 cycle = _mm256_set1_ps(static_cast<float>(lut_size));
+    const __m256 raw_position = _mm256_mul_ps(transfer, _mm256_set1_ps(100.0F));
+    const __m256 position = _mm256_sub_ps(
+        raw_position,
+        _mm256_mul_ps(_mm256_floor_ps(_mm256_div_ps(raw_position, cycle)), cycle));
+    __m256i lower = _mm256_cvttps_epi32(position);
+    lower = _mm256_min_epi32(lower, _mm256_set1_epi32(lut_size - 1));
+    __m256i upper = _mm256_add_epi32(lower, _mm256_set1_epi32(1));
+    const __m256i upper_wrap = _mm256_cmpgt_epi32(
+        upper, _mm256_set1_epi32(lut_size - 1));
+    upper = _mm256_blendv_epi8(upper, _mm256_setzero_si256(), upper_wrap);
+    const __m256 fraction = _mm256_sub_ps(
+        position,
+        _mm256_cvtepi32_ps(lower));
+    const __m256 inverse_fraction = _mm256_sub_ps(
+        _mm256_set1_ps(1.0F), fraction);
+    const __m256i three = _mm256_set1_epi32(3);
+    const __m256i lower_offsets = _mm256_mullo_epi32(lower, three);
+    const __m256i upper_offsets = _mm256_mullo_epi32(upper, three);
+    const __m256i lower_packed = _mm256_i32gather_epi32(
+        reinterpret_cast<const int*>(lut), lower_offsets, 1);
+    const __m256i upper_packed = _mm256_i32gather_epi32(
+        reinterpret_cast<const int*>(lut), upper_offsets, 1);
+    const __m256 lower_red = _mm256_cvtepi32_ps(_mm256_and_si256(
+        lower_packed, _mm256_set1_epi32(0xff)));
+    const __m256 lower_green = _mm256_cvtepi32_ps(_mm256_and_si256(
+        _mm256_srli_epi32(lower_packed, 8), _mm256_set1_epi32(0xff)));
+    const __m256 lower_blue = _mm256_cvtepi32_ps(_mm256_and_si256(
+        _mm256_srli_epi32(lower_packed, 16), _mm256_set1_epi32(0xff)));
+    const __m256 upper_red = _mm256_cvtepi32_ps(_mm256_and_si256(
+        upper_packed, _mm256_set1_epi32(0xff)));
+    const __m256 upper_green = _mm256_cvtepi32_ps(_mm256_and_si256(
+        _mm256_srli_epi32(upper_packed, 8), _mm256_set1_epi32(0xff)));
+    const __m256 upper_blue = _mm256_cvtepi32_ps(_mm256_and_si256(
+        _mm256_srli_epi32(upper_packed, 16), _mm256_set1_epi32(0xff)));
+    __m256 red = _mm256_add_ps(
+        _mm256_mul_ps(lower_red, inverse_fraction),
+        _mm256_mul_ps(upper_red, fraction));
+    __m256 green = _mm256_add_ps(
+        _mm256_mul_ps(lower_green, inverse_fraction),
+        _mm256_mul_ps(upper_green, fraction));
+    __m256 blue = _mm256_add_ps(
+        _mm256_mul_ps(lower_blue, inverse_fraction),
+        _mm256_mul_ps(upper_blue, fraction));
+
+    const __m256 horizontal = _mm256_sub_ps(left, centre);
+    const __m256 vertical = _mm256_sub_ps(up, centre);
+    const __m256 projected = _mm256_mul_ps(
+        _mm256_add_ps(horizontal, vertical),
+        _mm256_set1_ps(
+            0.7071067811865475F * 50.0F
+                * static_cast<float>(spatial_width) / 640.0F));
+    const __m256 absolute_projected = _mm256_andnot_ps(
+        _mm256_set1_ps(-0.0F), projected);
+    const __m256 strength = _mm256_mul_ps(
+        kfp_fast_atan_nonnegative_avx(absolute_projected),
+        _mm256_set1_ps(0.2F / 1.5707963267948966F));
+    const __m256 factor = _mm256_sub_ps(_mm256_set1_ps(1.0F), strength);
+    const __m256 light_red = _mm256_add_ps(
+        _mm256_mul_ps(red, factor), _mm256_mul_ps(_mm256_set1_ps(255.0F), strength));
+    const __m256 light_green = _mm256_add_ps(
+        _mm256_mul_ps(green, factor), _mm256_mul_ps(_mm256_set1_ps(255.0F), strength));
+    const __m256 light_blue = _mm256_add_ps(
+        _mm256_mul_ps(blue, factor), _mm256_mul_ps(_mm256_set1_ps(255.0F), strength));
+    const __m256 dark = _mm256_cmp_ps(projected, zero, _CMP_GE_OQ);
+    red = _mm256_blendv_ps(light_red, _mm256_mul_ps(red, factor), dark);
+    green = _mm256_blendv_ps(light_green, _mm256_mul_ps(green, factor), dark);
+    blue = _mm256_blendv_ps(light_blue, _mm256_mul_ps(blue, factor), dark);
+
+    alignas(32) float red_values[8];
+    alignas(32) float green_values[8];
+    alignas(32) float blue_values[8];
+    _mm256_store_ps(red_values, red);
+    _mm256_store_ps(green_values, green);
+    _mm256_store_ps(blue_values, blue);
+    const int inside_bits = _mm256_movemask_ps(inside);
+    for (int lane = 0; lane < 8; ++lane) {
+        std::uint8_t* pixel = destination
+            + static_cast<size_t>(dither_x + lane) * 3U;
+        if ((inside_bits & (1 << lane)) != 0) {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+        } else {
+            pixel[0] = kfp_dithered_colour_byte(
+                red_values[lane], dither_x + lane, dither_y, 0);
+            pixel[1] = kfp_dithered_colour_byte(
+                green_values[lane], dither_x + lane, dither_y, 1);
+            pixel[2] = kfp_dithered_colour_byte(
+                blue_values[lane], dither_x + lane, dither_y, 2);
+        }
+    }
+}
+#endif
+
+inline void write_kfp_default_fast_pixel(
+    const float* field,
+    int width,
+    int height,
+    int x,
+    int y,
+    int dither_x,
+    int dither_y,
+    int spatial_width,
+    int max_iter,
+    const std::uint8_t* lut,
+    int lut_size,
+    std::uint8_t* destination
+) {
+    const size_t centre_index = static_cast<size_t>(y)
+        * static_cast<size_t>(width) + static_cast<size_t>(x);
+    const float raw_value = field[centre_index];
+    if (std::isfinite(raw_value) && raw_value >= static_cast<float>(max_iter)) {
+        destination[0] = 0;
+        destination[1] = 0;
+        destination[2] = 0;
+        return;
+    }
+    const float centre = std::isfinite(raw_value)
+        ? std::clamp(raw_value, 0.0F, static_cast<float>(max_iter))
+        : 0.0F;
+
+    float left;
+    float up;
+    float top_left;
+    float right = centre;
+    float down = centre;
+    if (x > 0 && y > 0 && x + 1 < width && y + 1 < height) {
+        left = kfp_fast_sample_inner(field, centre_index - 1U, max_iter);
+        up = kfp_fast_sample_inner(field, centre_index - static_cast<size_t>(width), max_iter);
+        top_left = kfp_fast_sample_inner(
+            field, centre_index - static_cast<size_t>(width) - 1U, max_iter);
+    } else {
+        left = static_cast<float>(kfp_reflected_sample(field, width, height, x, y, -1, 0, max_iter, centre));
+        up = static_cast<float>(kfp_reflected_sample(field, width, height, x, y, 0, -1, max_iter, centre));
+        top_left = static_cast<float>(kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre));
+        if (x == 0) {
+            right = static_cast<float>(kfp_reflected_sample(field, width, height, x, y, 1, 0, max_iter, centre));
+        }
+        if (y == 0) {
+            down = static_cast<float>(kfp_reflected_sample(field, width, height, x, y, 0, 1, max_iter, centre));
+        }
+    }
+
+    const float difference_x = top_left - centre;
+    const float difference_y = left - up;
+    const float gradient = std::sqrt(std::max(
+        0.0F,
+        (difference_x * difference_x + difference_y * difference_y) * 0.5F))
+        * 2.8284271247461903F;
+    const float distance = std::clamp(
+        gradient * static_cast<float>(spatial_width) / 640.0F,
+        0.0F,
+        1.0e12F);
+    const float transfer = kfp_fast_log1p(distance);
+    const float raw_position = transfer / 0.01F;
+    const float cycle = static_cast<float>(lut_size);
+    const float position = raw_position
+        - std::floor(raw_position / cycle) * cycle;
+    const int lower = std::clamp(static_cast<int>(position), 0, lut_size - 1);
+    const float fraction = position - static_cast<float>(lower);
+    const int upper = (lower + 1) % lut_size;
+    const float inverse_fraction = 1.0F - fraction;
+    float red = static_cast<float>(lut[lower * 3]) * inverse_fraction
+        + static_cast<float>(lut[upper * 3]) * fraction;
+    float green = static_cast<float>(lut[lower * 3 + 1]) * inverse_fraction
+        + static_cast<float>(lut[upper * 3 + 1]) * fraction;
+    float blue = static_cast<float>(lut[lower * 3 + 2]) * inverse_fraction
+        + static_cast<float>(lut[upper * 3 + 2]) * fraction;
+
+    const float horizontal = x > 0 ? left - centre : centre - right;
+    const float vertical = y == 0 ? centre - down : up - centre;
+    const float projected = (horizontal + vertical) * 0.7071067811865475F
+        * 50.0F * static_cast<float>(spatial_width) / 640.0F;
+    const float strength = std::clamp(
+        kfp_fast_atan_nonnegative(std::abs(projected))
+            / 1.5707963267948966F * 0.2F,
+        0.0F,
+        1.0F);
+    if (projected >= 0.0F) {
+        red *= 1.0F - strength;
+        green *= 1.0F - strength;
+        blue *= 1.0F - strength;
+    } else {
+        red = red * (1.0F - strength) + 255.0F * strength;
+        green = green * (1.0F - strength) + 255.0F * strength;
+        blue = blue * (1.0F - strength) + 255.0F * strength;
+    }
+    destination[0] = kfp_dithered_colour_byte(red, dither_x, dither_y, 0);
+    destination[1] = kfp_dithered_colour_byte(green, dither_x, dither_y, 1);
+    destination[2] = kfp_dithered_colour_byte(blue, dither_x, dither_y, 2);
+}
+
+inline void colourise_kfp_default_fast_field(
+    const float* field,
+    int width,
+    int height,
+    int max_iter,
+    const std::uint8_t* lut,
+    int lut_size,
+    std::uint8_t* output,
+    int threads
+) {
+#ifdef _OPENMP
+    if (threads > 0) {
+        omp_set_dynamic(0);
+        omp_set_num_threads(threads);
+    }
+#pragma omp parallel for schedule(static)
+#endif
+    for (int y = 0; y < height; ++y) {
+        int x = 0;
+        write_kfp_default_fast_pixel(
+            field,
+            width,
+            height,
+            x,
+            y,
+            x,
+            y,
+            width,
+            max_iter,
+            lut,
+            lut_size,
+            output + static_cast<size_t>(y) * static_cast<size_t>(width) * 3U);
+        x = 1;
+#if defined(__AVX2__)
+        if (y > 0 && y + 1 < height && width >= 10) {
+            const size_t row_offset = static_cast<size_t>(y)
+                * static_cast<size_t>(width) * 3U;
+            for (; x + 7 < width - 1; x += 8) {
+                write_kfp_default_fast_block8(
+                    field,
+                    width,
+                    x,
+                    y,
+                    x,
+                    y,
+                    width,
+                    max_iter,
+                    lut,
+                    lut_size,
+                    output + row_offset);
+            }
+        }
+#endif
+        for (; x < width; ++x) {
+            write_kfp_default_fast_pixel(
+                field,
+                width,
+                height,
+                x,
+                y,
+                x,
+                y,
+                width,
+                max_iter,
+                lut,
+                lut_size,
+                output + (static_cast<size_t>(y) * static_cast<size_t>(width)
+                    + static_cast<size_t>(x)) * 3U);
+        }
+    }
+}
+
 inline void write_kfp_pixel(
     const float* field,
     int width,
@@ -1221,6 +1740,22 @@ inline void write_kfp_pixel(
     const KfpSlopeDirection& slope_direction,
     std::uint8_t* destination
 ) {
+    if (kfp_is_default_fast_options(options)) {
+        write_kfp_default_fast_pixel(
+            field,
+            width,
+            height,
+            x,
+            y,
+            dither_x,
+            dither_y,
+            spatial_width,
+            max_iter,
+            lut,
+            lut_size,
+            destination);
+        return;
+    }
     const float raw_value = field[static_cast<size_t>(y) * static_cast<size_t>(width)
         + static_cast<size_t>(x)];
     const bool inside = kfp_inside_value(raw_value, max_iter);
@@ -1253,14 +1788,51 @@ inline void write_kfp_pixel(
     double bottom_right = centre;
     if (needs_difference || needs_slopes) {
         left = kfp_reflected_sample(field, width, height, x, y, -1, 0, max_iter, centre);
-        right = kfp_reflected_sample(field, width, height, x, y, 1, 0, max_iter, centre);
         up = kfp_reflected_sample(field, width, height, x, y, 0, -1, max_iter, centre);
-        down = kfp_reflected_sample(field, width, height, x, y, 0, 1, max_iter, centre);
         if (needs_difference) {
-            top_left = kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre);
-            top_right = kfp_reflected_sample(field, width, height, x, y, 1, -1, max_iter, centre);
-            bottom_left = kfp_reflected_sample(field, width, height, x, y, -1, 1, max_iter, centre);
-            bottom_right = kfp_reflected_sample(field, width, height, x, y, 1, 1, max_iter, centre);
+            // Keep the stencil narrow for the common Kalles default
+            // (Differences=3). Its operator uses only the upper-left,
+            // left, and upper samples; loading all eight neighbours here
+            // made every pixel pay for values that were immediately ignored.
+            switch (options.differences) {
+                case 0:
+                    top_left = kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre);
+                    bottom_left = kfp_reflected_sample(field, width, height, x, y, -1, 1, max_iter, centre);
+                    break;
+                case 1:
+                case 2:
+                case 5:
+                case 6:
+                    right = kfp_reflected_sample(field, width, height, x, y, 1, 0, max_iter, centre);
+                    down = kfp_reflected_sample(field, width, height, x, y, 0, 1, max_iter, centre);
+                    top_left = kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre);
+                    top_right = kfp_reflected_sample(field, width, height, x, y, 1, -1, max_iter, centre);
+                    bottom_left = kfp_reflected_sample(field, width, height, x, y, -1, 1, max_iter, centre);
+                    bottom_right = kfp_reflected_sample(field, width, height, x, y, 1, 1, max_iter, centre);
+                    break;
+                case 3:
+                    top_left = kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre);
+                    break;
+                case 4:
+                    top_left = kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre);
+                    break;
+                default:
+                    right = kfp_reflected_sample(field, width, height, x, y, 1, 0, max_iter, centre);
+                    down = kfp_reflected_sample(field, width, height, x, y, 0, 1, max_iter, centre);
+                    break;
+            }
+        }
+        // The slope pass is one-sided: it uses the previous sample except at
+        // the left/top edge, where Kalles falls forward.  Keep the narrow
+        // difference stencil above, but load those two forward samples when
+        // an edge slope actually needs them.
+        if (needs_slopes) {
+            if (x == 0) {
+                right = kfp_reflected_sample(field, width, height, x, y, 1, 0, max_iter, centre);
+            }
+            if (y == 0) {
+                down = kfp_reflected_sample(field, width, height, x, y, 0, 1, max_iter, centre);
+            }
         }
     }
 
@@ -3039,8 +3611,9 @@ void build_bla(ReferenceContext& context, bool retain_builder_orbit = false) {
     // Keep the radius near Kalles' double-precision perturbation budget
     // (about 2^-38) instead of the old 1e-8 visual-only bound. The endpoint
     // escape/replay guard below still rejects blocks that approach the
-    // boundary, while the wider radius avoids a severe e40--e60 throughput
-    // cliff when the perturbation enters the ordinary-double range.
+    // boundary, while the validated BLA hierarchy avoids a severe e40--e60
+    // throughput cliff when the perturbation enters the ordinary-double
+    // range.
     const FloatExp tolerance = FloatExp::from_long_double(
         std::ldexp(1.0L, -38));
     for (int start = 1; start <= base_count; ++start) {
@@ -4482,30 +5055,95 @@ int fractal_colourise_kfp(
             transfer_minimum = bounds.minimum;
             transfer_maximum = bounds.maximum;
         }
+        const bool fast_default = kfp_is_default_fast_options(transfer_options);
+        if (fast_default) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                std::uint8_t* destination = output + static_cast<size_t>(
-                    y * width + x) * 3U;
-                write_kfp_pixel(
-                    field,
-                    width,
-                    height,
-                    x,
-                    y,
-                    x,
-                    y,
-                    width,
-                    max_iter,
-                    transfer_options,
-                    lut,
-                    lut_size,
-                    transfer_minimum,
-                    transfer_maximum,
-                    slope_direction,
-                    destination);
+            for (int y = 0; y < height; ++y) {
+                int x = 0;
+                {
+                    std::uint8_t* destination = output + static_cast<size_t>(
+                        y * width) * 3U;
+                    write_kfp_default_fast_pixel(
+                        field,
+                        width,
+                        height,
+                        x,
+                        y,
+                        x,
+                        y,
+                        width,
+                        max_iter,
+                        lut,
+                        lut_size,
+                        destination);
+                }
+                x = 1;
+#if defined(__AVX2__)
+                if (y > 0 && y + 1 < height && width >= 10) {
+                    const size_t row_offset = static_cast<size_t>(y)
+                        * static_cast<size_t>(width) * 3U;
+                    for (; x + 7 < width - 1; x += 8) {
+                        write_kfp_default_fast_block8(
+                        field,
+                        width,
+                        x,
+                        y,
+                        x,
+                        y,
+                        width,
+                            max_iter,
+                            lut,
+                            lut_size,
+                            output + row_offset);
+                    }
+                }
+#endif
+                for (; x < width; ++x) {
+                    std::uint8_t* destination = output + static_cast<size_t>(
+                        y * width + x) * 3U;
+                    write_kfp_default_fast_pixel(
+                        field,
+                        width,
+                        height,
+                        x,
+                        y,
+                        x,
+                        y,
+                        width,
+                        max_iter,
+                        lut,
+                        lut_size,
+                        destination);
+                }
+            }
+        } else {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int y = 0; y < height; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    std::uint8_t* destination = output + static_cast<size_t>(
+                        y * width + x) * 3U;
+                    write_kfp_pixel(
+                        field,
+                        width,
+                        height,
+                        x,
+                        y,
+                        x,
+                        y,
+                        width,
+                        max_iter,
+                        transfer_options,
+                        lut,
+                        lut_size,
+                        transfer_minimum,
+                        transfer_maximum,
+                        slope_direction,
+                        destination);
+                }
             }
         }
         set_error("");
@@ -4577,6 +5215,7 @@ int fractal_atlas_colourise_kfp(
         }
         const FractalKfpOptions& transfer_options = *options;
         const KfpSlopeDirection slope_direction = kfp_slope_direction(transfer_options);
+        const bool fast_default = kfp_is_default_fast_options(transfer_options);
         const KfpTransferBounds parent_bounds = transfer_options.color_method == 4
             ? kfp_transfer_bounds(parent, parent_width, parent_height, max_iter)
             : KfpTransferBounds{};
@@ -4605,11 +5244,188 @@ int fractal_atlas_colourise_kfp(
             }
         }
 
+        if (fast_default) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-        for (int y = 0; y < output_height; ++y) {
-            for (int x = 0; x < output_width; ++x) {
+            for (int y = 0; y < output_height; ++y) {
+                const size_t row_offset = static_cast<size_t>(y)
+                    * static_cast<size_t>(output_width) * 3U;
+                int x = 0;
+                while (x < output_width) {
+                    const bool in_child = use_child
+                        && x >= child_left && x < child_left + child_width
+                        && y >= child_top && y < child_top + child_height;
+                    if (!in_child) {
+                        const int segment_end = use_child && x < child_left
+                            ? child_left : output_width;
+                        if (y > 0 && y + 1 < output_height && x > 0
+                            && x + 7 < segment_end && x + 7 < output_width - 1) {
+                            write_kfp_default_fast_block8(
+                                parent,
+                                parent_width,
+                                x,
+                                y,
+                                x,
+                                y,
+                                output_width,
+                                max_iter,
+                                lut,
+                                lut_size,
+                                output + row_offset);
+                            x += 8;
+                            continue;
+                        }
+                        write_kfp_default_fast_pixel(
+                            parent,
+                            parent_width,
+                            parent_height,
+                            x,
+                            y,
+                            x,
+                            y,
+                            output_width,
+                            max_iter,
+                            lut,
+                            lut_size,
+                            output + (static_cast<size_t>(y) * static_cast<size_t>(output_width)
+                                + static_cast<size_t>(x)) * 3U);
+                        ++x;
+                        continue;
+                    }
+
+                    const int child_x = x - child_left;
+                    const int child_y = y - child_top;
+                    const float alpha = feather >= 2
+                        ? std::min(
+                            child_edge_x[static_cast<size_t>(child_x)],
+                            child_edge_y[static_cast<size_t>(child_y)])
+                        : 1.0F;
+                    if (alpha >= 0.999999F) {
+                        const int full_end = feather >= 2
+                            ? child_left + child_width - feather
+                            : child_left + child_width;
+                        if (y > 0 && y + 1 < output_height && child_x > 0
+                            && child_x + 7 < child_width - 1
+                            && x + 7 < full_end) {
+                            write_kfp_default_fast_block8(
+                                child,
+                                child_width,
+                                child_x,
+                                child_y,
+                                x,
+                                y,
+                                output_width,
+                                max_iter,
+                                lut,
+                                lut_size,
+                                output + row_offset);
+                            x += 8;
+                            continue;
+                        }
+                        write_kfp_default_fast_pixel(
+                            child,
+                            child_width,
+                            child_height,
+                            child_x,
+                            child_y,
+                            x,
+                            y,
+                            output_width,
+                            max_iter,
+                            lut,
+                            lut_size,
+                            output + (static_cast<size_t>(y) * static_cast<size_t>(output_width)
+                                + static_cast<size_t>(x)) * 3U);
+                        ++x;
+                        continue;
+                    }
+
+                    std::uint8_t* destination = output + (
+                        static_cast<size_t>(y) * static_cast<size_t>(output_width)
+                        + static_cast<size_t>(x)) * 3U;
+                    if (feather < 2) {
+                        const float parent_raw = parent[static_cast<size_t>(y)
+                            * static_cast<size_t>(parent_width) + static_cast<size_t>(x)];
+                        if (!kfp_inside_value(parent_raw, max_iter)) {
+                            write_kfp_default_fast_pixel(
+                                parent,
+                                parent_width,
+                                parent_height,
+                                x,
+                                y,
+                                x,
+                                y,
+                                output_width,
+                                max_iter,
+                                lut,
+                                lut_size,
+                                destination);
+                        } else {
+                            write_kfp_default_fast_pixel(
+                                child,
+                                child_width,
+                                child_height,
+                                child_x,
+                                child_y,
+                                x,
+                                y,
+                                output_width,
+                                max_iter,
+                                lut,
+                                lut_size,
+                                destination);
+                        }
+                        ++x;
+                        continue;
+                    }
+
+                    std::uint8_t parent_rgb[3];
+                    std::uint8_t child_rgb[3];
+                    write_kfp_default_fast_pixel(
+                        parent,
+                        parent_width,
+                        parent_height,
+                        x,
+                        y,
+                        x,
+                        y,
+                        output_width,
+                        max_iter,
+                        lut,
+                        lut_size,
+                        parent_rgb);
+                    write_kfp_default_fast_pixel(
+                        child,
+                        child_width,
+                        child_height,
+                        child_x,
+                        child_y,
+                        x,
+                        y,
+                        output_width,
+                        max_iter,
+                        lut,
+                        lut_size,
+                        child_rgb);
+                    destination[0] = rounded_colour_byte(
+                        static_cast<double>(parent_rgb[0]) * (1.0 - alpha)
+                        + static_cast<double>(child_rgb[0]) * alpha);
+                    destination[1] = rounded_colour_byte(
+                        static_cast<double>(parent_rgb[1]) * (1.0 - alpha)
+                        + static_cast<double>(child_rgb[1]) * alpha);
+                    destination[2] = rounded_colour_byte(
+                        static_cast<double>(parent_rgb[2]) * (1.0 - alpha)
+                        + static_cast<double>(child_rgb[2]) * alpha);
+                    ++x;
+                }
+            }
+        } else {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int y = 0; y < output_height; ++y) {
+                for (int x = 0; x < output_width; ++x) {
                 std::uint8_t* destination = output + static_cast<size_t>(
                     y * output_width + x) * 3U;
                 const bool in_child = use_child
@@ -4785,6 +5601,7 @@ int fractal_atlas_colourise_kfp(
                     + static_cast<double>(child_rgb[2]) * alpha);
             }
         }
+        }
         set_error("");
         return 0;
     } catch (const std::exception& error) {
@@ -4870,6 +5687,18 @@ int fractal_crop_colourise_kfp(
         const KfpTransferBounds bounds = transfer_options.color_method == 4
             ? kfp_transfer_bounds(cropped.data(), output_width, output_height, max_iter)
             : KfpTransferBounds{};
+        const bool fast_default = kfp_is_default_fast_options(transfer_options);
+        if (fast_default) {
+            colourise_kfp_default_fast_field(
+                cropped.data(),
+                output_width,
+                output_height,
+                max_iter,
+                lut,
+                lut_size,
+                output,
+                threads);
+        } else {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -4894,6 +5723,7 @@ int fractal_crop_colourise_kfp(
                     output + (static_cast<size_t>(y) * static_cast<size_t>(output_width)
                         + static_cast<size_t>(x)) * 3U);
             }
+        }
         }
         set_error("");
         return 0;
@@ -5186,7 +6016,8 @@ int crop_colourise_impl(
     double instrumental,
     double pitch,
     int threads,
-    const int* interior_color
+    const int* interior_color,
+    const std::uint8_t* accents
 ) {
     try {
         if (!source || !output || !valid_pixel_dimensions(source_width, source_height)
@@ -5202,7 +6033,7 @@ int crop_colourise_impl(
         }
         zoom_factor = std::max(zoom_factor, 1.0);
         const AuroraPalette& palette = aurora_palette_for(
-            max_iter, phase, vocal, instrumental, pitch);
+            max_iter, phase, vocal, instrumental, pitch, accents);
         const int palette_size = static_cast<int>(palette.rgb.size());
         const float index_scale = static_cast<float>(palette_size - 1)
             / static_cast<float>(max_iter);
@@ -5292,6 +6123,7 @@ int fractal_crop_colourise(
         instrumental,
         pitch,
         threads,
+        nullptr,
         nullptr);
 }
 
@@ -5332,7 +6164,50 @@ int fractal_crop_colourise_interior(
         instrumental,
         pitch,
         threads,
-        interior_color);
+        interior_color,
+        nullptr);
+}
+
+int fractal_crop_colourise_accents(
+    const float* source,
+    int source_width,
+    int source_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const std::uint8_t* accents,
+    int interior_red,
+    int interior_green,
+    int interior_blue,
+    int threads
+) {
+    const int interior_color[3] = {
+        interior_red,
+        interior_green,
+        interior_blue,
+    };
+    return crop_colourise_impl(
+        source,
+        source_width,
+        source_height,
+        output,
+        output_width,
+        output_height,
+        zoom_factor,
+        max_iter,
+        phase,
+        vocal,
+        instrumental,
+        pitch,
+        threads,
+        &interior_color[0],
+        accents);
 }
 
 int atlas_colourise_impl(
@@ -5355,7 +6230,8 @@ int atlas_colourise_impl(
     double instrumental,
     double pitch,
     int threads,
-    const int* interior_color
+    const int* interior_color,
+    const std::uint8_t* accents
 ) {
     try {
         if (!parent || !output
@@ -5384,7 +6260,7 @@ int atlas_colourise_impl(
             1,
             std::max(palette_max_iter, std::max(parent_max_iter, effective_child_iter)));
         const AuroraPalette& palette = aurora_palette_for(
-            effective_palette_iter, phase, vocal, instrumental, pitch);
+            effective_palette_iter, phase, vocal, instrumental, pitch, accents);
         const int effective_palette_size = static_cast<int>(palette.rgb.size());
         const float palette_index_scale = static_cast<float>(effective_palette_size - 1)
             / static_cast<float>(effective_palette_iter);
@@ -5649,6 +6525,7 @@ int fractal_atlas_colourise(
         instrumental,
         pitch,
         threads,
+        nullptr,
         nullptr);
 }
 
@@ -5701,7 +6578,66 @@ int fractal_atlas_colourise_interior(
         instrumental,
         pitch,
         threads,
-        interior_color);
+        interior_color,
+        nullptr);
+}
+
+int fractal_atlas_colourise_accents(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    int palette_max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const std::uint8_t* accents,
+    int interior_red,
+    int interior_green,
+    int interior_blue,
+    int threads
+) {
+    if (!accents) {
+        set_error("ordinary palette accents are required");
+        return 1;
+    }
+    const int interior_color[3] = {
+        interior_red,
+        interior_green,
+        interior_blue,
+    };
+    return atlas_colourise_impl(
+        parent,
+        parent_width,
+        parent_height,
+        parent_max_iter,
+        child,
+        child_width,
+        child_height,
+        child_max_iter,
+        output,
+        output_width,
+        output_height,
+        parent_zoom,
+        child_fraction,
+        palette_max_iter,
+        phase,
+        vocal,
+        instrumental,
+        pitch,
+        threads,
+        &interior_color[0],
+        accents);
 }
 
 void* fractal_create_reference(

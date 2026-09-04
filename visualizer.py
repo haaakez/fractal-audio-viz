@@ -107,7 +107,7 @@ DEFAULT_Y_CENTER = (
 # renderer from silently reusing an old, under-resolved .npy keyframe.
 KEYFRAME_CACHE_SCHEMA = "raw-field-series-v12-kalles-interior"
 AUDIO_CACHE_SCHEMA = "audio-controls-v10-onset-sync"
-ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v13-kalles-interior"
+ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v17-overscanned-tiles"
 
 FORMULA_CHOICES = (
     "mandelbrot",
@@ -344,7 +344,11 @@ DEFAULT_JULIA_C = ("-0.8", "0.156")
 # exact/replayed tails. Large deep tiles start with one bounded shared pass and
 # split only connected regions whose pixels remain unresolved. This keeps MPFR
 # setup and memory proportional to the genuinely difficult part of a tile.
-ATLAS_LOCAL_REFERENCE_MIN_LOG = 40.0
+# Radius-specific references begin at e20. Allow the glitch-driven repair path
+# to handle those tiers immediately; keeping the old e40 gate let a strict
+# e30-ish tile fail outright when its newly selected reference exposed a
+# genuine perturbation glitch.
+ATLAS_LOCAL_REFERENCE_MIN_LOG = 20.0
 ATLAS_LOCAL_REFERENCE_MIN_DIMENSION = 96
 ATLAS_LOCAL_REFERENCE_MAX_DIVISIONS = 32
 ATLAS_LOCAL_REFERENCE_MIN_BUDGET_MS = 200
@@ -352,12 +356,30 @@ ATLAS_LOCAL_REFERENCE_MAX_BUDGET_MS = 4000
 ATLAS_LOCAL_REFERENCE_MS_PER_PIXEL = 0.05
 ATLAS_LOCAL_REFERENCE_FINAL_BUDGET_MS = 750
 ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS = 30_000
+# Arbitrary-precision direct recovery is intentionally a small escape hatch.
+# A single deep pixel can take hundreds of milliseconds, so a large mask must
+# continue through the native subdivision path rather than serialising a whole
+# edge into Python big-number iterations.
+ATLAS_LOCAL_REFERENCE_MAX_EXACT_PIXELS = 32
 ATLAS_PROGRESS_INTERVAL_SECONDS = 20.0
 ENCODER_BACKPRESSURE_NOTICE_SECONDS = 10.0
 # A child that is smaller than a few display pixels is not carrying useful
 # detail yet. Compositing it anyway makes a one-pixel KFP stencil flicker at
 # every atlas boundary and reads as camera shake in the encoded video.
 ATLAS_MIN_CHILD_PIXELS = 4
+# On a reverse zoom, the active parent can be selected for one or two frames
+# while its child still covers almost the whole viewport. Leaving the tiny
+# uncovered strip to the parent is mathematically valid but visibly wrong for
+# KFP's spatial shading: it becomes a rectangular border. Once the uncovered
+# margin is below 2%, promote the child to the complete view instead.
+ATLAS_NEAR_FULL_CHILD_FRACTION = 0.98
+# Render each atlas tile a little wider than its nominal viewport. A camera
+# can pull back between two adjacent levels; without this margin the child
+# then covers only (for example) 88% of the frame and KFP's spatial stencil
+# makes the low-resolution parent perimeter visible as a rectangular block.
+# The same fixed overscan is used at every level, so adjacent tile scales and
+# the exact crop geometry remain self-consistent.
+ATLAS_TILE_OVERSCAN_FACTOR = 1.2
 # Alternate formula perturbation uses a decimal reference once the viewport
 # is narrower than a float64 centre can represent reliably. Keep this single
 # threshold shared by the direct renderer and the video planner so an atlas
@@ -865,6 +887,27 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_crop_colourise_interior.restype = ctypes.c_int
+                if hasattr(library, "fractal_crop_colourise_accents"):
+                    library.fractal_crop_colourise_accents.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_crop_colourise_accents.restype = ctypes.c_int
                 if hasattr(library, "fractal_atlas_colourise"):
                     library.fractal_atlas_colourise.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -914,6 +957,33 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_atlas_colourise_interior.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_colourise_accents"):
+                    library.fractal_atlas_colourise_accents.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_colourise_accents.restype = ctypes.c_int
                 library.fractal_create_reference.argtypes = [
                     ctypes.c_char_p,
                     ctypes.c_char_p,
@@ -4509,20 +4579,36 @@ def _native_reference_tier_logs(
     starts = [12.0]
     if maximum <= 32.0:
         return starts
+    # The first reusable e12 table is intentionally conservative.  Leaving a
+    # 28-decade gap before the next tier makes the e20--e40 atlas levels reuse
+    # a shallow-radius BLA table and fall into a very expensive double-tail
+    # path.  Start the regular deep ladder at e20; the extra two clones are
+    # cheap compared with rendering even one 2K tile and remove that cliff.
     decade_starts = [
-        float(value) for value in range(40, int(maximum) + 1, 10)
+        float(value) for value in range(20, int(maximum) + 1, 10)
     ]
     if atlas_step is not None:
         step = float(atlas_step)
         if not math.isfinite(step) or step <= 0.0:
             raise ValueError("atlas_step must be a finite positive value")
         # Atlas origins are integer multiples of the step, so a zero-origin
-        # floor gives the same boundaries for every render path.  Never move
-        # a tier below e12: the native deep path has no validated BLA contract
-        # for a broad shallow-radius map, and an extreme keyframe factor can
-        # otherwise quantise every decade boundary to e0.
+        # floor gives the same boundaries for every render path. Start three
+        # complete atlas intervals before each decade boundary. A tier
+        # placed at or immediately before a tile's lower edge has a
+        # mathematically valid radius but no numerical margin at that edge;
+        # the first tile using it can expose a narrow perturbation glitch. The
+        # three-step lead leaves two whole tiles for the previous tier and keeps
+        # the new radius comfortably wider than the complete viewport. A tier
+        # exactly on a tile boundary can still make the BLA lookup land on a
+        # floating-point radius edge at large source sizes, so the extra
+        # interval is a deliberate numerical safety margin rather than wasted
+        # setup. Never move a tier below e12: the
+        # native deep path has no validated BLA contract for a broad shallow-
+        # radius map, and an extreme keyframe factor can otherwise quantise
+        # every decade boundary to e0.
         decade_starts = [
-            max(12.0, math.floor(value / step) * step) for value in decade_starts
+            max(12.0, math.floor(value / step) * step - 3.0 * step)
+            for value in decade_starts
         ]
     starts.extend(decade_starts)
     starts = sorted(set(starts))
@@ -4537,12 +4623,27 @@ def _native_reference_tier_logs(
 def _select_native_reference(
     references: list[tuple[float, Any]],
     log_zoom: float,
+    minimum_margin_log: float = 0.0,
 ) -> Any:
-    """Select the deepest reference whose BLA bound starts before a tile."""
+    """Select the deepest reference with a margin before a deep tile.
 
+    The original e12 reference is also the compatibility entry point for a
+    direct e12 render, so it remains eligible at its exact boundary. Deeper
+    radius-specific tiers wait until the next atlas interval: using a newly
+    built tier on the exact tile boundary can expose a one-pixel perturbation
+    glitch even though the nominal BLA radius comparison passes.
+    """
+
+    margin = max(0.0, float(minimum_margin_log))
     selected = None
     for start_log, reference in references:
-        if float(log_zoom) + 1.0e-9 < start_log:
+        if start_log <= 12.0 + 1.0e-9:
+            if float(log_zoom) + 1.0e-9 < start_log:
+                break
+        elif margin > 0.0:
+            if float(log_zoom) <= start_log + margin + 1.0e-9:
+                break
+        elif float(log_zoom) + 1.0e-9 < start_log:
             break
         selected = reference
     return selected
@@ -4638,7 +4739,11 @@ def _decimal_to_scaled(value: Decimal) -> tuple[float, int]:
         + math.log2(decimal_mantissa)
         - binary_exponent
     )
-    normalized = decimal_mantissa * (2.0 ** fractional)
+    # ``fractional`` already contains log2(decimal_mantissa). Multiplying by
+    # the decimal mantissa again inflated every non-power-of-two scaled
+    # offset, eventually pushing otherwise valid local-reference cells beyond
+    # their BLA radius at deep zooms.
+    normalized = 2.0 ** fractional
     mantissa, shift = math.frexp(normalized)
     return sign * float(mantissa), int(binary_exponent + shift)
 
@@ -5520,6 +5625,62 @@ def _spatial_recover_field(
     return result, int(missing_before.sum())
 
 
+def _render_exact_mandelbrot_pixel(
+    x_center: str,
+    y_center: str,
+    max_iter: int,
+    log10_zoom: float,
+) -> float:
+    """Render one Mandelbrot pixel with arbitrary-precision arithmetic.
+
+    This is a strict last-resort path for a very small unresolved mask after
+    native perturbation/reference retries.  It evaluates the exact pixel
+    coordinate directly, so it cannot inherit a bad BLA radius or a rounded
+    double-tail state.  The normal image path never calls this function.
+    """
+
+    try:
+        import mpmath as mp
+    except ImportError as error:  # pragma: no cover - dependency is packaged
+        raise RuntimeError(
+            "mpmath is required for exact deep-pixel recovery"
+        ) from error
+
+    precision = max(
+        64,
+        _decimal_precision(x_center, y_center, log10_zoom) + 32,
+    )
+    with mp.workdps(precision):
+        parameter_real = mp.mpf(x_center)
+        parameter_imag = mp.mpf(y_center)
+        value_real = mp.mpf("0")
+        value_imag = mp.mpf("0")
+        for iteration in range(1, int(max_iter) + 1):
+            next_real = (
+                value_real * value_real
+                - value_imag * value_imag
+                + parameter_real
+            )
+            next_imag = (
+                2 * value_real * value_imag
+                + parameter_imag
+            )
+            value_real = next_real
+            value_imag = next_imag
+            magnitude_squared = (
+                value_real * value_real
+                + value_imag * value_imag
+            )
+            if magnitude_squared > 4:
+                magnitude = mp.sqrt(magnitude_squared)
+                smooth = (
+                    iteration
+                    - mp.log(mp.log(magnitude)) / mp.log(2)
+                )
+                return float(smooth)
+    return float(max_iter)
+
+
 def _atlas_glitch_reference_field(
     *,
     render_width: int,
@@ -5539,6 +5700,7 @@ def _atlas_glitch_reference_field(
     fallback_max_iter: Optional[int],
     allow_recovery: bool,
     diagnostics: Optional[dict[str, int]] = None,
+    native_reference_root: Any = None,
 ) -> Any:
     """Render a tile, refining only pixels that the shared reference cannot solve.
 
@@ -5709,6 +5871,53 @@ def _atlas_glitch_reference_field(
         local, _ = _spatial_recover_field(local, fallback)
         field[y0:y1, x0:x1] = local
 
+    def exact_pixel_recovery(
+        mask: Any,
+        x_offset: int = 0,
+        y_offset: int = 0,
+    ) -> int:
+        """Resolve a small global/local NaN mask without approximation."""
+
+        unresolved_pixels = np.argwhere(np.asarray(mask, dtype=bool))
+        if (
+            unresolved_pixels.size == 0
+            or allow_recovery
+            or len(unresolved_pixels) > ATLAS_LOCAL_REFERENCE_MAX_EXACT_PIXELS
+        ):
+            return 0
+        recovered = 0
+        for local_y_index, local_x_index in unresolved_pixels:
+            pixel_x = x_offset + int(local_x_index)
+            pixel_y = y_offset + int(local_y_index)
+            if not (
+                0 <= pixel_x < render_width
+                and 0 <= pixel_y < render_height
+            ):
+                raise ValueError("exact pixel recovery coordinate is outside the tile")
+            pixel_cell = (pixel_x, pixel_x + 1, pixel_y, pixel_y + 1)
+            pixel_geometry = _atlas_local_reference_cell(
+                render_width,
+                render_height,
+                log10_zoom,
+                x_center,
+                y_center,
+                pixel_cell,
+                (pixel_x, pixel_y),
+            )
+            _, _, _, _, pixel_x_center, pixel_y_center, _ = pixel_geometry
+            field[pixel_y, pixel_x] = _render_exact_mandelbrot_pixel(
+                pixel_x_center,
+                pixel_y_center,
+                max_iter,
+                log10_zoom,
+            )
+            recovered += 1
+        if diagnostics is not None:
+            diagnostics["exact_pixel_recoveries"] = (
+                diagnostics.get("exact_pixel_recoveries", 0) + recovered
+            )
+        return recovered
+
     print(
         f"  Using glitch-driven shared reference for deep tile "
         f"({_zoom_label(log10_zoom)}).",
@@ -5747,11 +5956,92 @@ def _atlas_glitch_reference_field(
             "initial_regions": 0,
             "secondary_references": 0,
             "refined_regions": 0,
+            "exact_pixel_recoveries": 0,
             "recovered_pixels": 0,
             "final_unresolved_pixels": 0,
         })
     if not unresolved.any():
         return field
+
+    # A decade-spaced tier can be mathematically valid yet land on an
+    # unfortunate BLA map boundary for this particular tile. Before building
+    # a tree of small secondary references, retarget one clone of the reusable
+    # root just inside the current viewport. This reuses the already-built
+    # MPFR orbit, adds no approximation to the strict output, and is usually
+    # enough to turn a large timeout mask into a handful of exact pixels.
+    clone = getattr(native_library, "fractal_clone_reference", None)
+    if (
+        native_reference_root is not None
+        and clone is not None
+        and log10_zoom >= 12.0
+    ):
+        retarget_log = max(12.0, float(log10_zoom) - 0.1)
+        retargeted_reference = None
+        try:
+            retargeted_reference = _clone_native_reference(
+                native_library,
+                native_reference_root,
+                retarget_log,
+            )
+            retargeted = np.asarray(
+                render_fractal(
+                    render_width,
+                    render_height,
+                    log10_zoom,
+                    x_center,
+                    y_center,
+                    max_iter,
+                    "native",
+                    native_threads,
+                    retargeted_reference,
+                    series_order,
+                    series_block,
+                    NativeRenderOptions(
+                        strict=True,
+                        allow_recovery=False,
+                        time_budget_ms=0,
+                        strict_cycle=True,
+                        backend=native_backend,
+                    ),
+                ),
+                dtype=np.float32,
+            )
+            retargeted_finite = np.isfinite(retargeted)
+            repaired = unresolved & retargeted_finite
+            if repaired.any():
+                field[repaired] = retargeted[repaired]
+                print(
+                    f"  Retargeted BLA tier repaired {int(repaired.sum())} "
+                    "deep pixels before local refinement.",
+                    flush=True,
+                )
+            unresolved = ~np.isfinite(field)
+            if not unresolved.any():
+                return field
+        except (RuntimeError, ValueError):
+            # A retargeted tier is an optimization, not a correctness
+            # dependency. Keep the existing connected-region repair path as
+            # the fallback if clone support or the candidate radius is not
+            # available for a particular build.
+            pass
+        finally:
+            if retargeted_reference is not None:
+                try:
+                    native_library.fractal_destroy_reference(retargeted_reference)
+                except Exception:
+                    pass
+
+    if not allow_recovery:
+        exact_recovered = exact_pixel_recovery(unresolved)
+        unresolved = ~np.isfinite(field)
+        if exact_recovered:
+            print(
+                f"  Exact arbitrary-precision retry repaired {exact_recovered} "
+                "deep pixels.",
+                flush=True,
+            )
+        if not unresolved.any():
+            return field
 
     regions = _unresolved_regions(unresolved)
     if diagnostics is not None:
@@ -5856,7 +6146,20 @@ def _atlas_glitch_reference_field(
             retry_finite = np.isfinite(local_retry)
             local_view[retry_finite] = local_retry[retry_finite]
             if not retry_finite.all():
-                recover(cell, local_retry)
+                unresolved_local = ~np.isfinite(local_view)
+                exact_recovered = exact_pixel_recovery(
+                    unresolved_local,
+                    x_offset=x0,
+                    y_offset=y0,
+                )
+                if exact_recovered:
+                    print(
+                        f"  Exact arbitrary-precision retry repaired {exact_recovered} "
+                        "local deep pixels.",
+                        flush=True,
+                    )
+                if not np.isfinite(local_view).all():
+                    recover(cell, local_view)
         finally:
             local_library.fractal_destroy_reference(local_reference)
 
@@ -5898,6 +6201,7 @@ def _atlas_local_reference_field(
     native_library: Any,
     native_backend: int = 0,
     native_reference: Any = None,
+    native_reference_root: Any = None,
     fallback_field: Optional[Any] = None,
     fallback_zoom_factor: float = 2.0,
     fallback_max_iter: Optional[int] = None,
@@ -5935,6 +6239,7 @@ def _atlas_local_reference_field(
             native_library=native_library,
             native_backend=native_backend,
             native_reference=native_reference,
+            native_reference_root=native_reference_root,
             fallback_field=fallback_field,
             fallback_zoom_factor=fallback_zoom_factor,
             fallback_max_iter=fallback_max_iter,
@@ -6227,6 +6532,7 @@ def _atlas_tile_field(
     cache_evictor: Optional["_CacheEvictor"] = None,
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
+    native_reference_root: Any = None,
 ) -> Any:
     """Load or render one reusable tile in the fixed zoom atlas."""
 
@@ -6316,6 +6622,7 @@ def _atlas_tile_field(
                     native_library=native_library,
                     native_backend=native_backend,
                     native_reference=native_reference,
+                    native_reference_root=native_reference_root,
                     fallback_field=fallback_field,
                     fallback_zoom_factor=fallback_zoom_factor,
                     fallback_max_iter=fallback_max_iter,
@@ -6390,6 +6697,7 @@ def _atlas_colourise_native(
     library: Any,
     pitch: float,
     interior_color: Optional[tuple[int, int, int]] = None,
+    accents: Optional[tuple[tuple[int, int, int], ...]] = None,
 ) -> Any:
     """Fused parent/child atlas sampling and pitch-aware colourisation."""
 
@@ -6408,7 +6716,47 @@ def _atlas_colourise_native(
     palette_max_iter = max(int(parent_iter), int(child_iter or parent_iter))
     parent_pointer = parent.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
     output_pointer = output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+    accent_function = getattr(library, "fractal_atlas_colourise_accents", None)
+    if accents is not None and accent_function is not None:
+        if len(accents) != 3 or any(len(colour) != 3 for colour in accents):
+            raise ValueError("Aurora accents must contain three RGB colours")
+        accent_values = (ctypes.c_uint8 * 9)(
+            *(int(channel) for colour in accents for channel in colour)
+        )
+        selected_interior = interior_color or (0, 0, 0)
+        if len(selected_interior) != 3 or not all(
+            0 <= int(value) <= 255 for value in selected_interior
+        ):
+            raise ValueError("ordinary interior colour must contain three bytes")
+        status = accent_function(
+            parent_pointer,
+            parent_width,
+            parent_height,
+            int(parent_iter),
+            child_pointer,
+            child_width,
+            child_height,
+            int(child_max_iter),
+            output_pointer,
+            output_width,
+            output_height,
+            float(parent_zoom),
+            float(child_fraction),
+            int(palette_max_iter),
+            float(phase),
+            float(vocal),
+            float(instrumental),
+            float(pitch),
+            accent_values,
+            *(int(value) for value in selected_interior),
+            native_threads,
+        )
+        if status != 0:
+            message = library.fractal_last_error() or b"unknown native accent atlas colourizer error"
+            raise RuntimeError(message.decode("utf-8", errors="replace"))
+        return output
     interior_function = getattr(library, "fractal_atlas_colourise_interior", None)
+    base_pitch = 0.5 if accents is not None else pitch
     if interior_color is not None and interior_function is not None:
         if len(interior_color) != 3 or not all(0 <= int(value) <= 255 for value in interior_color):
             raise ValueError("ordinary interior colour must contain three bytes")
@@ -6430,7 +6778,7 @@ def _atlas_colourise_native(
             float(phase),
             float(vocal),
             float(instrumental),
-            float(pitch),
+            float(base_pitch),
             *(int(value) for value in interior_color),
             native_threads,
         )
@@ -6453,12 +6801,30 @@ def _atlas_colourise_native(
             float(phase),
             float(vocal),
             float(instrumental),
-            float(pitch),
+            float(base_pitch),
             native_threads,
         )
     if status != 0:
         message = library.fractal_last_error() or b"unknown native atlas colourizer error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
+    if accents is not None:
+        interior_mask = None
+        if interior_color is not None:
+            interior_mask = np.all(
+                output == np.asarray(interior_color, dtype=np.uint8), axis=-1
+            )
+        accented = _native_apply_aurora_accents(
+            output,
+            accents,
+            pitch,
+            library,
+            native_threads,
+        )
+        if accented is None:
+            return output
+        if interior_mask is not None:
+            accented[interior_mask] = np.asarray(interior_color, dtype=np.uint8)
+        return accented
     if interior_color is not None and interior_function is None:
         # Compatibility with an older native .so. Reconstruct only the
         # boolean ownership mask in Python; the expensive crop and Aurora
@@ -6531,16 +6897,30 @@ def _atlas_colour_frame(
     palette_name: str,
     pitch: float,
     palette_file: Optional[Path] = None,
+    child_zoom: Optional[float] = None,
 ) -> Any:
     """Compose a frame from a parent tile and its central child tile.
 
     ``child_fraction`` is the fraction of the output frame covered by the
-    child. At the beginning of an atlas interval it is 1/factor; at the end
-    it reaches one. The child is therefore rendered only into its visible
-    central rectangle instead of being expanded into a full temporary frame.
+    child. At the beginning of an atlas interval it is roughly 1/factor; at
+    the end it reaches one. The child is therefore rendered only into its
+    visible central rectangle instead of being expanded into a full temporary
+    frame. Overscanned tiles can be slightly wider than the frame when the
+    child takes over; ``child_zoom`` preserves that crop in the full-child
+    path.
     """
 
     np = _require_numpy()
+    if child_zoom is None:
+        child_crop_zoom = 1.0
+    else:
+        try:
+            child_crop_zoom = float(child_zoom)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("atlas child zoom must be numeric") from error
+        if not math.isfinite(child_crop_zoom) or child_crop_zoom <= 0.0:
+            raise ValueError("atlas child zoom must be finite and positive")
+        child_crop_zoom = max(child_crop_zoom, 1.0)
     if (
         child is not None
         and child_iter is not None
@@ -6555,6 +6935,37 @@ def _atlas_colour_frame(
         child_iter = None
         child_fraction = 0.0
     kfp_profile = _kfp_profile_for_selection(palette_name, palette_file)
+    if (
+        child is not None
+        and child_iter is not None
+        and float(child_fraction) >= ATLAS_NEAR_FULL_CHILD_FRACTION
+        and float(child_fraction) < 0.999999
+    ):
+        # A reverse zoom can select the parent immediately after the child
+        # reached the edge of its atlas interval. A narrow parent perimeter is
+        # harmless for scalar Aurora colour, but KFP's neighbour stencil makes
+        # the two independently coloured strips look like a hard rectangle.
+        # The child is already a nearly complete viewport; promote it for this
+        # short interval and avoid exposing the seam altogether.
+        return _atlas_colour_frame(
+            child,
+            None,
+            output_width,
+            output_height,
+            child_crop_zoom,
+            0.0,
+            int(child_iter),
+            None,
+            phase,
+            vocal,
+            instrumental,
+            native_library,
+            native_threads,
+            resample,
+            palette_name,
+            pitch,
+            palette_file,
+        )
     if (
         kfp_profile is not None
         and child is not None
@@ -6572,7 +6983,7 @@ def _atlas_colour_frame(
             child,
             output_width,
             output_height,
-            1.0,
+            child_crop_zoom,
             int(child_iter),
             phase,
             vocal,
@@ -6581,6 +6992,40 @@ def _atlas_colour_frame(
             kfp_profile,
             native_library,
             native_threads,
+        )
+    if (
+        child is not None
+        and child_iter is not None
+        and float(child_fraction) >= 0.999999
+        and kfp_profile is None
+        and native_library is not None
+        and hasattr(native_library, "fractal_crop_colourise")
+        and resample == "bilinear"
+    ):
+        # Overscan makes the full child wider than the nominal viewport. Use
+        # the native crop compositor here instead of treating the whole stored
+        # tile as the frame; otherwise the zoom would jump by the overscan
+        # factor exactly at an atlas boundary.
+        interior_color = _ordinary_interior_color(palette_name, palette_file)
+        accents = (
+            None
+            if palette_name == "aurora" and palette_file is None
+            else _aurora_accents_for_selection(palette_name, palette_file)
+        )
+        return _crop_and_colourise_native(
+            child,
+            output_width,
+            output_height,
+            child_crop_zoom,
+            int(child_iter),
+            phase,
+            vocal,
+            instrumental,
+            native_threads,
+            native_library,
+            pitch,
+            interior_color if interior_color != (0, 0, 0) else None,
+            accents,
         )
     if (
         kfp_profile is not None
@@ -6629,7 +7074,7 @@ def _atlas_colour_frame(
             )
         if _kfp_profile_for_selection(palette_name, palette_file) is None:
             interior_color = _ordinary_interior_color(palette_name, palette_file)
-            base = _atlas_colourise_native(
+            return _atlas_colourise_native(
                 parent,
                 child,
                 output_width,
@@ -6643,24 +7088,10 @@ def _atlas_colour_frame(
                 instrumental,
                 native_threads,
                 native_library,
-                0.5,
+                pitch,
                 interior_color if interior_color != (0, 0, 0) else None,
+                _aurora_accents_for_selection(palette_name, palette_file),
             )
-            interior_mask = None
-            if interior_color != (0, 0, 0):
-                # The native base pass paints interiors with the requested
-                # colour. Preserve that exact mask while the accent pass
-                # recolours only the exterior Aurora waves.
-                interior_mask = np.all(base == np.asarray(interior_color, dtype=np.uint8), axis=-1)
-            accents = _aurora_accents_for_selection(palette_name, palette_file)
-            accented = _native_apply_aurora_accents(
-                base, accents, pitch, native_library, native_threads
-            )
-            if accented is None:
-                return base
-            if interior_mask is not None:
-                accented[interior_mask] = np.asarray(interior_color, dtype=np.uint8)
-            return accented
     parent_view, parent_inside_full = _crop_and_resize_preserving_interior(
         parent,
         output_width,
@@ -6689,7 +7120,7 @@ def _atlas_colour_frame(
             child,
             output_width,
             output_height,
-            1.0,
+            child_crop_zoom,
             child_iter,
             resample,
         )
@@ -6974,6 +7405,7 @@ def _render_video_atlas(
     palette_file: Optional[Path] = None,
     glow: float = 0.0,
     motion_blur: float = 0.0,
+    hardware_encoder: bool = False,
 ) -> dict[str, Any]:
     """Render a song through a fixed nested tile atlas.
 
@@ -6981,12 +7413,23 @@ def _render_video_atlas(
     This path ties them only to absolute logarithmic zoom, so a tile is
     rendered once and can be reused by every camera path through the same
     centre. A bounded three-tile window is retained in memory so both forward
-    and audio-driven reverse zooms remain cheap.
+    and audio-driven reverse zooms remain cheap. Tiles include a small fixed
+    overscan margin so reverse zooms never expose a low-resolution perimeter
+    around a nearly complete child.
     """
 
     np = _require_numpy()
+    # The atlas field already has the requested quality density. Colourising
+    # at the final output size would repeat the crop and palette work at 4K
+    # for profiles whose scalar source is intentionally smaller. Keep the
+    # render surface at source resolution and upscale once in FFmpeg.
+    frame_width = int(render_width)
+    frame_height = int(render_height)
+    if frame_width <= 0 or frame_height <= 0:
+        raise ValueError("atlas frame dimensions must be positive")
     origin, step, level_count = _atlas_geometry(zooms, keyframe_factor)
     factor = 10.0 ** step
+    tile_overscan_log = math.log10(ATLAS_TILE_OVERSCAN_FACTOR)
     maximum_log = float(max(float(value) for value in zooms))
     total_frames = features.frame_count
     print(
@@ -7001,19 +7444,54 @@ def _render_video_atlas(
     tile_seconds = 0.0
     tile_futures: dict[int, Future[Any]] = {}
     future_started: dict[int, float] = {}
+    native_reference_root = None
+    if (
+        native_library is not None
+        and len(native_references) > 1
+        and hasattr(native_library, "fractal_clone_reference")
+    ):
+        # The first entry is created with the reusable builder orbit whenever
+        # clone tiers are available. Keep the root alive for rare per-tile
+        # retargets; the normal decade tiers continue to serve the hot path.
+        native_reference_root = native_references[0][1]
+    # Deep native tiles already saturate a CPU-only export. Running a
+    # speculative tile beside x264 (and beside the next foreground tile when
+    # the queue catches up) creates a second OpenMP team and can nearly double
+    # wall time on small machines. A real hardware encoder leaves those CPU
+    # cores available, so permit one bounded look-ahead worker there and cap
+    # its native team below the foreground team.
+    deep_native_export = native_library is not None and maximum_log >= 12.0
+    deep_hardware_prefetch = deep_native_export and hardware_encoder
     prefetch_executor = (
         ThreadPoolExecutor(max_workers=1, thread_name_prefix="fractal-field")
-        if cache_limit_mb <= 0.0 else None
+        if cache_limit_mb <= 0.0 and (not deep_native_export or deep_hardware_prefetch)
+        else None
+    )
+    prefetch_native_threads = (
+        max(1, min(native_threads, max(1, (os.cpu_count() or 2) // 2)))
+        if deep_hardware_prefetch
+        else native_threads
     )
 
-    def tile_log(level: int) -> float:
+    def tile_display_log(level: int) -> float:
+        """Nominal camera boundary represented by an atlas level."""
+
         return origin + step * float(level)
+
+    def tile_log(level: int) -> float:
+        """Effective field zoom, widened by the fixed atlas overscan."""
+
+        return tile_display_log(level) - tile_overscan_log
 
     def tile_iter(level: int) -> int:
         cached = tile_iterations.get(level)
         if cached is not None:
             return cached
-        current_log = tile_log(level)
+        # Iteration count follows the nominal tile interval, not the slightly
+        # wider stored field. This remains conservative for every pixel in
+        # the central viewport while avoiding a depth change in the public
+        # zoom/quality contract.
+        current_log = tile_display_log(level)
         end_log = min(maximum_log, current_log + step)
         value = max_iterations(
             end_log,
@@ -7028,6 +7506,7 @@ def _render_video_atlas(
         level: int,
         parent_field: Any = None,
         parent_max_iter: Optional[int] = None,
+        tile_native_threads: Optional[int] = None,
     ) -> Any:
         if level < 0 or level > level_count:
             return None
@@ -7051,13 +7530,25 @@ def _render_video_atlas(
             series_order=series_order,
             series_block=series_block,
             renderer=active_renderer,
+            # The tier ladder is already placed several complete atlas
+            # intervals before each decade boundary. Waiting for one more
+            # interval here needlessly sends the first tile after a tier
+            # boundary through a shallow BLA table and can turn a sub-second
+            # tile into a long exact-tail replay. Keep the optional margin in
+            # the helper for callers that need it, but the production atlas
+            # uses the validated tier as soon as its radius starts.
             native_reference=_select_native_reference(
                 native_references,
                 tile_log(level),
             ),
-            native_threads=native_threads,
+            native_threads=(
+                native_threads
+                if tile_native_threads is None
+                else tile_native_threads
+            ),
             native_library=native_library,
             native_backend=native_backend,
+            native_reference_root=native_reference_root,
             fallback_field=parent_field,
             fallback_zoom_factor=factor,
             fallback_max_iter=parent_max_iter,
@@ -7132,6 +7623,7 @@ def _render_video_atlas(
             level,
             parent_field,
             tile_iterations.get(level - 1),
+            prefetch_native_threads,
         )
 
     process = None
@@ -7182,6 +7674,10 @@ def _render_video_atlas(
             child_fraction = min(1.0, parent_zoom / factor) if child is not None else 0.0
             parent_max_iter = tile_iter(level)
             child_max_iter = tile_iter(level + 1) if child is not None else None
+            # With fixed tile overscan, a full child can still be wider than
+            # the nominal camera viewport. Preserve that crop when it takes
+            # over the frame instead of showing the whole stored tile.
+            child_zoom = max(1.0, parent_zoom / factor) if child is not None else 1.0
             phase = float(features.phase[frame_index])
             gradient = float(features.gradient[frame_index])
             instrumental = float(features.instrumental[frame_index])
@@ -7189,8 +7685,8 @@ def _render_video_atlas(
             rgb = _atlas_colour_frame(
                 parent,
                 child,
-                width,
-                height,
+                frame_width,
+                frame_height,
                 parent_zoom,
                 child_fraction,
                 parent_max_iter,
@@ -7204,6 +7700,7 @@ def _render_video_atlas(
                 palette,
                 pitch,
                 palette_file,
+                child_zoom,
             )
             rgb = _apply_frame_effects(rgb, glow, motion_blur, previous_rgb)
             previous_rgb = rgb
@@ -7416,7 +7913,11 @@ def _hardware_encoder_usable(encoder: str) -> bool:
         "-f",
         "lavfi",
         "-i",
-        "color=black:s=128x128:d=0.05",
+        # NVENC rejects 128x128 even though FFmpeg advertises the encoder.
+        # Keep this small enough to be cheap while satisfying the minimum
+        # dimensions of current NVIDIA H.264 hardware and remaining valid for
+        # the other hardware encoders that share this probe.
+        "color=black:s=256x256:d=0.05",
         "-frames:v",
         "1",
     ]
@@ -8945,6 +9446,7 @@ def _crop_and_colourise_native(
     library: Any,
     pitch: float = 0.5,
     interior_color: Optional[tuple[int, int, int]] = None,
+    accents: Optional[tuple[tuple[int, int, int], ...]] = None,
 ) -> Any:
     """Fused centred bilinear crop and colour through the native C ABI."""
 
@@ -8954,7 +9456,41 @@ def _crop_and_colourise_native(
     rgb = np.empty((output_height, output_width, 3), dtype=np.uint8)
     source_pointer = field.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
     output_pointer = rgb.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+    accent_function = getattr(library, "fractal_crop_colourise_accents", None)
+    if accents is not None and accent_function is not None:
+        if len(accents) != 3 or any(len(colour) != 3 for colour in accents):
+            raise ValueError("Aurora accents must contain three RGB colours")
+        accent_values = (ctypes.c_uint8 * 9)(
+            *(int(channel) for colour in accents for channel in colour)
+        )
+        selected_interior = interior_color or (0, 0, 0)
+        if len(selected_interior) != 3 or not all(
+            0 <= int(value) <= 255 for value in selected_interior
+        ):
+            raise ValueError("ordinary interior colour must contain three bytes")
+        status = accent_function(
+            source_pointer,
+            source_width,
+            source_height,
+            output_pointer,
+            output_width,
+            output_height,
+            float(zoom_factor),
+            int(max_iter),
+            float(phase),
+            float(vocal),
+            float(instrumental),
+            float(pitch),
+            accent_values,
+            *(int(value) for value in selected_interior),
+            native_threads,
+        )
+        if status != 0:
+            message = library.fractal_last_error() or b"unknown native accent crop colourizer error"
+            raise RuntimeError(message.decode("utf-8", errors="replace"))
+        return rgb
     interior_function = getattr(library, "fractal_crop_colourise_interior", None)
+    base_pitch = 0.5 if accents is not None else pitch
     if interior_color is not None and interior_function is not None:
         if len(interior_color) != 3 or not all(0 <= int(value) <= 255 for value in interior_color):
             raise ValueError("ordinary interior colour must contain three bytes")
@@ -8970,7 +9506,7 @@ def _crop_and_colourise_native(
             phase,
             vocal,
             instrumental,
-            pitch,
+            base_pitch,
             *(int(value) for value in interior_color),
             native_threads,
         )
@@ -8987,12 +9523,30 @@ def _crop_and_colourise_native(
             phase,
             vocal,
             instrumental,
-            pitch,
+            base_pitch,
             native_threads,
         )
     if status != 0:
         message = library.fractal_last_error() or b"unknown native crop/colourizer error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
+    if accents is not None:
+        interior_mask = None
+        if interior_color is not None:
+            interior_mask = np.all(
+                rgb == np.asarray(interior_color, dtype=np.uint8), axis=-1
+            )
+        accented = _native_apply_aurora_accents(
+            rgb,
+            accents,
+            pitch,
+            library,
+            native_threads,
+        )
+        if accented is None:
+            return rgb
+        if interior_mask is not None:
+            accented[interior_mask] = np.asarray(interior_color, dtype=np.uint8)
+        return accented
     if interior_color is not None and interior_function is None:
         # Compatibility with an older native .so: retain its fast crop/color
         # pass, then apply the exact interior mask through the portable mapper.
@@ -9406,7 +9960,7 @@ def _colour_frame(
         and _kfp_profile_for_selection(palette_name, palette_file) is None
     ):
         interior_color = _ordinary_interior_color(palette_name, palette_file)
-        base = _crop_and_colourise_native(
+        return _crop_and_colourise_native(
             field,
             output_width,
             output_height,
@@ -9417,23 +9971,10 @@ def _colour_frame(
             instrumental,
             native_threads,
             native_library,
-            0.5,
+            pitch,
             interior_color if interior_color != (0, 0, 0) else None,
+            _aurora_accents_for_selection(palette_name, palette_file),
         )
-        interior_mask = None
-        if interior_color != (0, 0, 0):
-            interior_mask = np.all(
-                base == np.asarray(interior_color, dtype=np.uint8), axis=-1
-            )
-        accents = _aurora_accents_for_selection(palette_name, palette_file)
-        accented = _native_apply_aurora_accents(
-            base, accents, pitch, native_library, native_threads
-        )
-        if accented is None:
-            return base
-        if interior_mask is not None:
-            accented[interior_mask] = np.asarray(interior_color, dtype=np.uint8)
-        return accented
     view, _ = _crop_and_resize_preserving_interior(
         field,
         output_width,
@@ -9650,8 +10191,8 @@ def render_video(
         # centre of every interval. Keep quality presets as modest optional
         # supersampling instead of rendering every tile at factor squared.
         quality_settings = {
-            "draft": (max(fractal_scale, 0.5), 0.0),
-            "balanced": (max(fractal_scale, 0.5), 0.0),
+            "draft": (max(fractal_scale, 0.25), 0.0),
+            "balanced": (max(fractal_scale, 0.25), 0.0),
             "quality": (max(fractal_scale, 1.0), 0.0),
             "extreme": (max(fractal_scale, 1.25), 0.0),
         }
@@ -9680,6 +10221,10 @@ def render_video(
         render_scale * float(source_scale),
         "fractal source",
     )
+    frame_width = int(render_width)
+    frame_height = int(render_height)
+    if frame_width <= 0 or frame_height <= 0:
+        raise ValueError("fractal frame dimensions must be positive")
     # The encoder destination is reserved only after validation and native
     # setup below have succeeded. This avoids orphaning a placeholder when a
     # hardware probe or deep-reference build fails before encoding starts.
@@ -9898,12 +10443,24 @@ def render_video(
     try:
         temporary_output = _reserved_temporary_sibling(output_path, "rendering")
         using_vaapi = selected_codec == "h264_vaapi"
+        using_hardware_encoder = selected_codec in {
+            "h264_nvenc",
+            "h264_qsv",
+            "h264_vaapi",
+            "h264_videotoolbox",
+        }
         video_pixel_format = _video_pixel_format(
             selected_codec,
             palette,
             palette_file,
         )
         preset_arguments = ["-preset", selected_preset] if selected_preset else []
+        video_filters: list[str] = []
+        if (frame_width, frame_height) != (int(width), int(height)):
+            video_filters.append(f"scale={int(width)}:{int(height)}:flags=bilinear")
+        if using_vaapi:
+            video_filters.extend(["format=nv12", "hwupload"])
+        filter_arguments = ["-vf", ",".join(video_filters)] if video_filters else []
         command = [
             ffmpeg_path,
             "-y",
@@ -9916,7 +10473,7 @@ def render_video(
             "-vcodec",
             "rawvideo",
             "-s",
-            f"{width}x{height}",
+            f"{frame_width}x{frame_height}",
             "-pix_fmt",
             "rgb24",
             "-r",
@@ -9929,7 +10486,7 @@ def render_video(
             "0:v:0",
             "-map",
             "1:a:0",
-            *(["-vf", "format=nv12,hwupload"] if using_vaapi else []),
+            *filter_arguments,
             "-c:v",
             selected_codec,
             *preset_arguments,
@@ -9998,6 +10555,7 @@ def render_video(
                 palette_file=palette_file,
                 glow=glow,
                 motion_blur=motion_blur,
+                hardware_encoder=using_hardware_encoder,
             )
         finally:
             _destroy_native_references(native_library, native_references)
@@ -10154,8 +10712,8 @@ def render_video(
                 pitch = float(features.pitch[frame_index])
                 rgb = _colour_frame(
                     field,
-                    width,
-                    height,
+                    frame_width,
+                    frame_height,
                     relative_zoom,
                     current_iter,
                     phase,
@@ -10186,8 +10744,8 @@ def render_video(
                     if alpha > 0.0 and next_relative_zoom >= 1.0:
                         next_rgb = _colour_frame(
                             next_field,
-                            width,
-                            height,
+                            frame_width,
+                            frame_height,
                             next_relative_zoom,
                             next_iter,
                             phase,
@@ -10944,8 +11502,8 @@ def _main_impl() -> None:
     if args.estimate:
         if args.keyframe_mode == "atlas":
             estimate_scale = {
-                "draft": max(args.fractal_scale, 0.5),
-                "balanced": max(args.fractal_scale, 0.5),
+                "draft": max(args.fractal_scale, 0.25),
+                "balanced": max(args.fractal_scale, 0.25),
                 "quality": max(args.fractal_scale, 1.0),
                 "extreme": max(args.fractal_scale, 1.25),
             }[args.quality]
