@@ -10343,8 +10343,11 @@ def render_video(
         video_preset,
         crf,
         lossless,
-        probe_width=render_width,
-        probe_height=render_height,
+        # The optional scale filter runs before the encoder, so probe the
+        # dimensions that the codec actually receives, not the scalar-field
+        # dimensions used to calculate the fractal.
+        probe_width=width,
+        probe_height=height,
         probe_fps=fps,
         preserve_chroma=preserve_chroma,
     )
@@ -10365,8 +10368,8 @@ def render_video(
             video_preset,
             crf,
             lossless,
-            probe_width=render_width,
-            probe_height=render_height,
+            probe_width=width,
+            probe_height=height,
             probe_fps=fps,
             preserve_chroma=preserve_chroma,
         )
