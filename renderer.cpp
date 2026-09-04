@@ -11,6 +11,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -1017,6 +1018,45 @@ inline std::uint8_t rounded_colour_byte(double value) {
         static_cast<int>(std::nearbyint(std::clamp(value, 0.0, 255.0))),
         0,
         255));
+}
+
+inline void sample_rgb_bilinear_mapped(
+    const std::uint8_t* source,
+    int source_width,
+    const BilinearAxis& x_axis,
+    const BilinearAxis& y_axis,
+    int x,
+    int y,
+    std::uint8_t* destination
+) {
+    const int x_index = x_axis.index0[static_cast<size_t>(x)];
+    const int x_next = x_axis.index1[static_cast<size_t>(x)];
+    const float x_weight = x_axis.weight[static_cast<size_t>(x)];
+    const int y_index = y_axis.index0[static_cast<size_t>(y)];
+    const int y_next = y_axis.index1[static_cast<size_t>(y)];
+    const float y_weight = y_axis.weight[static_cast<size_t>(y)];
+    const std::uint8_t* top = source + (
+        static_cast<size_t>(y_index) * static_cast<size_t>(source_width)
+        + static_cast<size_t>(x_index)) * 3U;
+    const std::uint8_t* top_next = source + (
+        static_cast<size_t>(y_index) * static_cast<size_t>(source_width)
+        + static_cast<size_t>(x_next)) * 3U;
+    const std::uint8_t* bottom = source + (
+        static_cast<size_t>(y_next) * static_cast<size_t>(source_width)
+        + static_cast<size_t>(x_index)) * 3U;
+    const std::uint8_t* bottom_next = source + (
+        static_cast<size_t>(y_next) * static_cast<size_t>(source_width)
+        + static_cast<size_t>(x_next)) * 3U;
+    const float inverse_x = 1.0F - x_weight;
+    const float inverse_y = 1.0F - y_weight;
+    for (int channel = 0; channel < 3; ++channel) {
+        const float top_value = static_cast<float>(top[channel]) * inverse_x
+            + static_cast<float>(top_next[channel]) * x_weight;
+        const float bottom_value = static_cast<float>(bottom[channel]) * inverse_x
+            + static_cast<float>(bottom_next[channel]) * x_weight;
+        destination[channel] = rounded_colour_byte(
+            static_cast<double>(top_value * inverse_y + bottom_value * y_weight));
+    }
 }
 
 inline std::uint8_t kfp_dithered_colour_byte(
@@ -6035,6 +6075,235 @@ int fractal_atlas_colourise_kfp_raw(
         return 1;
     } catch (...) {
         set_error("native raw KFP atlas colourizer failed with an unknown exception");
+        return 1;
+    }
+}
+
+int fractal_crop_rgb(
+    const std::uint8_t* source,
+    int source_width,
+    int source_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int threads
+) {
+    try {
+        if (!source || !output
+            || !valid_pixel_dimensions(source_width, source_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_thread_count(threads)
+            || !std::isfinite(zoom_factor) || zoom_factor <= 0.0) {
+            throw std::runtime_error("invalid native RGB crop dimensions");
+        }
+        zoom_factor = std::max(zoom_factor, 1.0);
+        if (source_width == output_width
+            && source_height == output_height
+            && zoom_factor == 1.0) {
+            std::memcpy(
+                output,
+                source,
+                static_cast<size_t>(output_width)
+                    * static_cast<size_t>(output_height) * 3U);
+            set_error("");
+            return 0;
+        }
+        BilinearWorkspace& workspace = bilinear_workspace;
+        BilinearAxis& x_axis = workspace.parent_x_axis;
+        BilinearAxis& y_axis = workspace.parent_y_axis;
+        fill_bilinear_axis(x_axis, source_width, output_width, zoom_factor);
+        fill_bilinear_axis(y_axis, source_height, output_height, zoom_factor);
+#ifdef _OPENMP
+        if (threads > 0) {
+            omp_set_dynamic(0);
+            omp_set_num_threads(threads);
+        }
+#pragma omp parallel for schedule(static)
+#endif
+        for (int output_y = 0; output_y < output_height; ++output_y) {
+            for (int output_x = 0; output_x < output_width; ++output_x) {
+                sample_rgb_bilinear_mapped(
+                    source,
+                    source_width,
+                    x_axis,
+                    y_axis,
+                    output_x,
+                    output_y,
+                    output + (
+                        static_cast<size_t>(output_y)
+                        * static_cast<size_t>(output_width)
+                        + static_cast<size_t>(output_x)) * 3U);
+            }
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native RGB crop failed with an unknown exception");
+        return 1;
+    }
+}
+
+int fractal_atlas_composite_rgb(
+    const std::uint8_t* parent,
+    int parent_width,
+    int parent_height,
+    const std::uint8_t* child,
+    int child_width,
+    int child_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    int feather,
+    int threads
+) {
+    try {
+        if (!parent || !output
+            || !valid_pixel_dimensions(parent_width, parent_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_thread_count(threads)
+            || !std::isfinite(parent_zoom) || parent_zoom <= 0.0
+            || !std::isfinite(child_fraction)
+            || child_fraction < 0.0 || child_fraction > 1.0
+            || !std::isfinite(child_zoom) || child_zoom <= 0.0
+            || feather < 0) {
+            throw std::runtime_error("invalid native RGB atlas dimensions or controls");
+        }
+        parent_zoom = std::max(parent_zoom, 1.0);
+        child_zoom = std::max(child_zoom, 1.0);
+        const bool use_child = child != nullptr && child_fraction > 0.0;
+        if (!use_child && child_fraction > 0.0) {
+            throw std::runtime_error("RGB atlas child data is missing for a positive fraction");
+        }
+        if (!use_child && child != nullptr) {
+            throw std::runtime_error("RGB atlas child needs a positive visible fraction");
+        }
+        if (!use_child && (child_width != 0 || child_height != 0)) {
+            throw std::runtime_error("invalid native RGB atlas child absence");
+        }
+        if (use_child
+            && (!valid_pixel_dimensions(child_width, child_height)
+                || feather > std::min(
+                    output_width,
+                    output_height))) {
+            throw std::runtime_error("invalid native RGB atlas child tile");
+        }
+
+        const int visible_child_width = use_child
+            ? std::max(1, static_cast<int>(std::lround(
+                static_cast<double>(output_width) * child_fraction)))
+            : 0;
+        const int visible_child_height = use_child
+            ? std::max(1, static_cast<int>(std::lround(
+                static_cast<double>(output_height) * child_fraction)))
+            : 0;
+        const int child_left = use_child
+            ? (output_width - visible_child_width) / 2
+            : 0;
+        const int child_top = use_child
+            ? (output_height - visible_child_height) / 2
+            : 0;
+        const int effective_feather = use_child
+            ? std::min(
+                feather,
+                std::min(visible_child_width, visible_child_height))
+            : 0;
+
+        BilinearWorkspace& workspace = bilinear_workspace;
+        BilinearAxis& parent_x_axis = workspace.parent_x_axis;
+        BilinearAxis& parent_y_axis = workspace.parent_y_axis;
+        fill_bilinear_axis(parent_x_axis, parent_width, output_width, parent_zoom);
+        fill_bilinear_axis(parent_y_axis, parent_height, output_height, parent_zoom);
+        BilinearAxis& child_x_axis = workspace.child_x_axis;
+        BilinearAxis& child_y_axis = workspace.child_y_axis;
+        if (use_child) {
+            // A child tile is deliberately stored with the same fixed
+            // overscan as its parent. Apply that crop during partial atlas
+            // transitions too; otherwise the child is stretched across a
+            // rectangle that is 1.2x wider than its actual camera viewport.
+            fill_bilinear_axis(
+                child_x_axis,
+                child_width,
+                visible_child_width,
+                child_zoom);
+            fill_bilinear_axis(
+                child_y_axis,
+                child_height,
+                visible_child_height,
+                child_zoom);
+        }
+
+#ifdef _OPENMP
+        if (threads > 0) {
+            omp_set_dynamic(0);
+            omp_set_num_threads(threads);
+        }
+#pragma omp parallel for schedule(static)
+#endif
+        for (int output_y = 0; output_y < output_height; ++output_y) {
+            for (int output_x = 0; output_x < output_width; ++output_x) {
+                std::uint8_t* destination = output + (
+                    static_cast<size_t>(output_y)
+                    * static_cast<size_t>(output_width)
+                    + static_cast<size_t>(output_x)) * 3U;
+                sample_rgb_bilinear_mapped(
+                    parent,
+                    parent_width,
+                    parent_x_axis,
+                    parent_y_axis,
+                    output_x,
+                    output_y,
+                    destination);
+                if (!use_child
+                    || output_x < child_left
+                    || output_x >= child_left + visible_child_width
+                    || output_y < child_top
+                    || output_y >= child_top + visible_child_height) {
+                    continue;
+                }
+                std::uint8_t child_rgb[3];
+                sample_rgb_bilinear_mapped(
+                    child,
+                    child_width,
+                    child_x_axis,
+                    child_y_axis,
+                    output_x - child_left,
+                    output_y - child_top,
+                    child_rgb);
+                double alpha = 1.0;
+                if (effective_feather >= 2) {
+                    const int edge_distance = std::min(
+                        std::min(output_x - child_left,
+                            visible_child_width - 1 - (output_x - child_left)),
+                        std::min(output_y - child_top,
+                            visible_child_height - 1 - (output_y - child_top)));
+                    const double linear = std::clamp(
+                        static_cast<double>(edge_distance)
+                            / static_cast<double>(effective_feather),
+                        0.0,
+                        1.0);
+                    alpha = linear * linear * (3.0 - 2.0 * linear);
+                }
+                for (int channel = 0; channel < 3; ++channel) {
+                    destination[channel] = rounded_colour_byte(
+                        static_cast<double>(destination[channel]) * (1.0 - alpha)
+                        + static_cast<double>(child_rgb[channel]) * alpha);
+                }
+            }
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native RGB atlas compositor failed with an unknown exception");
         return 1;
     }
 }

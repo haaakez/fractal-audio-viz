@@ -401,6 +401,11 @@ ATLAS_NEAR_FULL_CHILD_FRACTION = 0.98
 # The same fixed overscan is used at every level, so adjacent tile scales and
 # the exact crop geometry remain self-consistent.
 ATLAS_TILE_OVERSCAN_FACTOR = 1.2
+# KFP's relief transfer needs enough pixels to preserve its fine gradients,
+# but colouring an 8K atlas tile for every level is needlessly expensive.  A
+# 4K working surface is the useful quality/performance ceiling: 4K exports are
+# fully dense and 8K exports receive one high-quality final upscale.
+KFP_ATLAS_MAX_WORKING_DIMENSION = 3840
 # Alternate formula perturbation uses a decimal reference once the viewport
 # is narrower than a float64 centre can represent reliably. Keep this single
 # threshold shared by the direct renderer and the video planner so an atlas
@@ -882,6 +887,36 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_atlas_colourise_kfp_raw.restype = ctypes.c_int
+                if hasattr(library, "fractal_crop_rgb"):
+                    library.fractal_crop_rgb.argtypes = [
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_crop_rgb.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_composite_rgb"):
+                    library.fractal_atlas_composite_rgb.argtypes = [
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_composite_rgb.restype = ctypes.c_int
                 if hasattr(library, "fractal_crop_field"):
                     library.fractal_crop_field.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -5391,6 +5426,44 @@ def _trim_atlas_memory_cache(tile_cache: dict[int, Any], active_level: int) -> N
             del tile_cache[old_level]
 
 
+def _kfp_working_dimensions(
+    output_width: int,
+    output_height: int,
+    scalar_width: int,
+    scalar_height: int,
+) -> tuple[int, int]:
+    """Choose a dense KFP atlas surface without making 8K tiles four times.
+
+    The scalar field remains at the profile's requested source density. KFP
+    is then evaluated on a denser RGB surface once per tile, which preserves
+    Kalles' relief gradients and avoids enlarging an already quantised 8-bit
+    stencil.  The result is capped at 4K because an 8K RGB atlas would only
+    multiply static tile work; FFmpeg performs the final high-quality 8K
+    upscale.
+    """
+
+    output_width, output_height = _validate_dimensions(
+        output_width,
+        output_height,
+        "KFP output",
+    )
+    scalar_width, scalar_height = _validate_dimensions(
+        scalar_width,
+        scalar_height,
+        "KFP scalar source",
+    )
+    target_scale = min(
+        1.0,
+        float(KFP_ATLAS_MAX_WORKING_DIMENSION)
+        / float(max(output_width, output_height)),
+    )
+    target_width = max(1, int(round(output_width * target_scale)))
+    target_height = max(1, int(round(output_height * target_scale)))
+    # Never discard scalar detail when a caller explicitly requested a source
+    # larger than the capped output working surface.
+    return max(scalar_width, target_width), max(scalar_height, target_height)
+
+
 def _atlas_tile_path(
     cache_dir: Optional[Path],
     cache_identity: str,
@@ -6974,6 +7047,8 @@ def _atlas_colour_frame(
     pitch: float,
     palette_file: Optional[Path] = None,
     child_zoom: Optional[float] = None,
+    kfp_parent_rgb: Any = None,
+    kfp_child_rgb: Any = None,
 ) -> Any:
     """Compose a frame from a parent tile and its central child tile.
 
@@ -7040,8 +7115,60 @@ def _atlas_colour_frame(
             resample,
             palette_name,
             pitch,
-            palette_file,
+            palette_file=palette_file,
+            child_zoom=None,
+            kfp_parent_rgb=kfp_child_rgb,
+            kfp_child_rgb=None,
         )
+    if (
+        kfp_profile is not None
+        and kfp_parent_rgb is not None
+        and native_library is not None
+        and hasattr(native_library, "fractal_crop_rgb")
+        and hasattr(native_library, "fractal_atlas_composite_rgb")
+        and resample == "bilinear"
+    ):
+        # The KFP stencil is expensive and spatial: applying it after each
+        # scalar crop made the same tile change appearance on every frame and
+        # exposed the scalar interior sentinel as a rectangular fill.  The
+        # atlas tiles are static, so colourise each once and only interpolate
+        # RGB values while the camera moves.
+        if child is None or child_iter is None or float(child_fraction) <= 0.0:
+            return _crop_rgb_native(
+                kfp_parent_rgb,
+                output_width,
+                output_height,
+                parent_zoom,
+                native_library,
+                native_threads,
+            )
+        if (
+            float(child_fraction) >= 0.999999
+            and kfp_child_rgb is not None
+        ):
+            return _crop_rgb_native(
+                kfp_child_rgb,
+                output_width,
+                output_height,
+                child_crop_zoom,
+                native_library,
+                native_threads,
+            )
+        if kfp_child_rgb is not None:
+            child_width = max(1, int(round(output_width * float(child_fraction))))
+            child_height = max(1, int(round(output_height * float(child_fraction))))
+            return _atlas_composite_rgb_native(
+                kfp_parent_rgb,
+                kfp_child_rgb,
+                output_width,
+                output_height,
+                parent_zoom,
+                min(float(child_fraction), 1.0),
+                child_crop_zoom,
+                _atlas_feather(child_width, child_height),
+                native_library,
+                native_threads,
+            )
     if (
         kfp_profile is not None
         and child is not None
@@ -7470,6 +7597,8 @@ def _render_video_atlas(
     allow_recovery: bool,
     render_width: int,
     render_height: int,
+    frame_width: int,
+    frame_height: int,
     resample: str,
     palette: str,
     cache_dir: Optional[Path],
@@ -7494,14 +7623,14 @@ def _render_video_atlas(
     """
 
     np = _require_numpy()
-    # The atlas field already has the requested quality density. Colourising
-    # at the final output size would repeat the crop and palette work for
-    # undersampled custom renders. Keep the render surface at source
-    # resolution and upscale once in FFmpeg when a custom scale requests it.
-    frame_width = int(render_width)
-    frame_height = int(render_height)
-    if frame_width <= 0 or frame_height <= 0:
-        raise ValueError("atlas frame dimensions must be positive")
+    # Scalar tiles and the RGB working surface can intentionally have
+    # different densities. KFP uses a dense RGB surface so its Kalles relief
+    # gradients remain clean when a 1080p scalar atlas feeds a 4K export.
+    frame_width, frame_height = _validate_dimensions(
+        frame_width,
+        frame_height,
+        "atlas frame",
+    )
     origin, step, level_count = _atlas_geometry(zooms, keyframe_factor)
     factor = 10.0 ** step
     tile_overscan_log = math.log10(ATLAS_TILE_OVERSCAN_FACTOR)
@@ -7515,8 +7644,19 @@ def _render_video_atlas(
 
     tile_cache: dict[int, Any] = {}
     tile_iterations: dict[int, int] = {}
+    kfp_profile = _kfp_profile_for_selection(palette, palette_file)
+    kfp_rgb_enabled = bool(
+        kfp_profile is not None
+        and native_library is not None
+        and hasattr(native_library, "fractal_crop_rgb")
+        and hasattr(native_library, "fractal_atlas_composite_rgb")
+        and hasattr(native_library, "fractal_crop_colourise_kfp")
+        and resample == "bilinear"
+    )
+    kfp_colour_cache: dict[int, Any] = {}
     cache_evictor = _CacheEvictor(cache_dir, cache_limit_mb)
     tile_seconds = 0.0
+    kfp_colour_seconds = 0.0
     tile_futures: dict[int, Future[Any]] = {}
     future_started: dict[int, float] = {}
     native_reference_root = None
@@ -7680,6 +7820,49 @@ def _render_video_atlas(
         _prune_cache(cache_dir, cache_limit_mb, cache_evictor, protected_paths)
         return tile_cache[level]
 
+    def get_colour_tile(level: int, field: Any) -> Any:
+        """Colour one static KFP tile at the RGB working resolution."""
+
+        nonlocal kfp_colour_seconds
+        if not kfp_rgb_enabled or level < 0 or level > level_count:
+            return None
+        cached = kfp_colour_cache.get(level)
+        if cached is not None:
+            return cached
+        started = time.perf_counter()
+        field_array = np.asarray(field)
+        if field_array.shape == (frame_height, frame_width):
+            rgb = _colourise_kfp_native(
+                field_array,
+                tile_iter(level),
+                0.0,
+                0.0,
+                0.0,
+                0.5,
+                kfp_profile,
+                native_library,
+                native_threads,
+            )
+        else:
+            rgb = _crop_colourise_kfp_native(
+                field_array,
+                frame_width,
+                frame_height,
+                1.0,
+                tile_iter(level),
+                0.0,
+                0.0,
+                0.0,
+                0.5,
+                kfp_profile,
+                native_library,
+                native_threads,
+            )
+        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+        kfp_colour_cache[level] = rgb
+        kfp_colour_seconds += time.perf_counter() - started
+        return rgb
+
     def prefetch_tile(level: int) -> None:
         if prefetch_executor is None or level < 0 or level > level_count:
             return
@@ -7738,10 +7921,17 @@ def _render_video_atlas(
                     get_tile(level + 1)
                 prefetch_tile(level + 2)
                 _trim_atlas_memory_cache(tile_cache, level)
+                _trim_atlas_memory_cache(kfp_colour_cache, level)
 
             parent_log = tile_log(level)
             parent = get_tile(level)
             child = get_tile(level + 1) if level < level_count else None
+            kfp_parent_rgb = get_colour_tile(level, parent)
+            kfp_child_rgb = (
+                get_colour_tile(level + 1, child)
+                if child is not None
+                else None
+            )
             parent_zoom = max(1.0, 10.0 ** (frame_log_zoom - parent_log))
             child_fraction = min(1.0, parent_zoom / factor) if child is not None else 0.0
             parent_max_iter = tile_iter(level)
@@ -7773,6 +7963,8 @@ def _render_video_atlas(
                 pitch,
                 palette_file,
                 child_zoom,
+                kfp_parent_rgb,
+                kfp_child_rgb,
             )
             rgb = _apply_frame_effects(rgb, glow, motion_blur, previous_rgb)
             previous_rgb = rgb
@@ -7806,14 +7998,20 @@ def _render_video_atlas(
             ))
         os.replace(temporary_output, output_path)
         elapsed = time.perf_counter() - render_started
+        colour_timing = (
+            f", KFP tile colour {kfp_colour_seconds:.2f}s"
+            if kfp_rgb_enabled
+            else ""
+        )
         print(
             f"Atlas timing: tiles {tile_seconds:.2f}s, frame/reproject/queue "
             f"{frame_seconds:.2f}s, encoder drain {encoder_seconds:.2f}s, "
-            f"total {elapsed:.2f}s.",
+            f"total {elapsed:.2f}s{colour_timing}.",
             flush=True,
         )
         return {
             "keyframe_seconds": float(tile_seconds),
+            "kfp_colour_seconds": float(kfp_colour_seconds),
             "frame_seconds": float(frame_seconds),
             "encoder_seconds": float(encoder_seconds),
             "total_seconds": float(elapsed),
@@ -8413,6 +8611,31 @@ def _video_pixel_format(
     if codec == "h264_nvenc" and preserve_chroma:
         return "yuv444p"
     return "yuv420p"
+
+
+def _final_video_resample(
+    resample: str,
+    palette: str,
+    palette_file: Optional[Path],
+    source_width: int,
+    source_height: int,
+    output_width: int,
+    output_height: int,
+) -> str:
+    """Select the final RGB scale filter without weakening KFP detail."""
+
+    if (int(source_width), int(source_height)) == (
+        int(output_width),
+        int(output_height),
+    ):
+        return resample
+    if _kfp_profile_for_selection(palette, palette_file) is not None:
+        # KFP is already sampled in RGB at the dense working surface. A
+        # bilinear final scale turns its fine relief into the square/mushy
+        # look seen in old 4K exports; Lanczos keeps the Kalles gradient edges
+        # crisp while retaining a continuous transition between pixels.
+        return "lanczos"
+    return resample
 
 
 @lru_cache(maxsize=8)
@@ -9544,6 +9767,133 @@ def _crop_colourise_kfp_native(
     )
     if status != 0:
         message = native_library.fractal_last_error() or b"unknown native KFP crop colourizer error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
+def _crop_rgb_native(
+    rgb: Any,
+    output_width: int,
+    output_height: int,
+    zoom_factor: float,
+    native_library: Any,
+    native_threads: int,
+) -> Any:
+    """Crop an RGB tile with the native bilinear sampler.
+
+    KFP tiles are colourised once at the working resolution.  Keeping this
+    crop in the renderer avoids a Pillow/NumPy round trip for every video
+    frame and, unlike scalar reprojection, cannot manufacture an interior
+    sentinel or a square tile boundary.
+    """
+
+    function = getattr(native_library, "fractal_crop_rgb", None)
+    if function is None:
+        raise RuntimeError("native RGB crop compositor is unavailable")
+    np = _require_numpy()
+    source = np.ascontiguousarray(rgb, dtype=np.uint8)
+    if source.ndim != 3 or source.shape[-1] != 3:
+        raise ValueError("native RGB crop input must have shape (height, width, 3)")
+    output_width, output_height = _validate_dimensions(
+        output_width,
+        output_height,
+        "native RGB crop",
+    )
+    try:
+        zoom = float(zoom_factor)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("native RGB crop zoom must be numeric") from error
+    if not math.isfinite(zoom) or zoom <= 0.0:
+        raise ValueError("native RGB crop zoom must be finite and positive")
+    output = np.empty((output_height, output_width, 3), dtype=np.uint8)
+    status = function(
+        source.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(source.shape[1]),
+        int(source.shape[0]),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        output_width,
+        output_height,
+        zoom,
+        int(native_threads),
+    )
+    if status != 0:
+        message = native_library.fractal_last_error() or b"unknown native RGB crop error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
+def _atlas_composite_rgb_native(
+    parent: Any,
+    child: Any,
+    output_width: int,
+    output_height: int,
+    parent_zoom: float,
+    child_fraction: float,
+    child_zoom: float,
+    feather: int,
+    native_library: Any,
+    native_threads: int,
+) -> Any:
+    """Composite two already-colourised RGB atlas tiles in native code."""
+
+    function = getattr(native_library, "fractal_atlas_composite_rgb", None)
+    if function is None:
+        raise RuntimeError("native RGB atlas compositor is unavailable")
+    np = _require_numpy()
+    parent_array = np.ascontiguousarray(parent, dtype=np.uint8)
+    if parent_array.ndim != 3 or parent_array.shape[-1] != 3:
+        raise ValueError(
+            "native RGB atlas parent must have shape (height, width, 3)"
+        )
+    output_width, output_height = _validate_dimensions(
+        output_width,
+        output_height,
+        "native RGB atlas",
+    )
+    try:
+        zoom = float(parent_zoom)
+        fraction = float(child_fraction)
+        crop_zoom = float(child_zoom)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("native RGB atlas controls must be numeric") from error
+    if not math.isfinite(zoom) or zoom <= 0.0:
+        raise ValueError("native RGB atlas parent zoom must be finite and positive")
+    if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+        raise ValueError("native RGB atlas child fraction must be between 0 and 1")
+    if not math.isfinite(crop_zoom) or crop_zoom <= 0.0:
+        raise ValueError("native RGB atlas child zoom must be finite and positive")
+    feather_value = _index_value(feather, "native RGB atlas feather")
+    if child is None:
+        child_array = None
+        child_pointer = ctypes.POINTER(ctypes.c_uint8)()
+        child_width = child_height = 0
+    else:
+        child_array = np.ascontiguousarray(child, dtype=np.uint8)
+        if child_array.ndim != 3 or child_array.shape[-1] != 3:
+            raise ValueError(
+                "native RGB atlas child must have shape (height, width, 3)"
+            )
+        child_height, child_width = child_array.shape[:2]
+        child_pointer = child_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+    output = np.empty((output_height, output_width, 3), dtype=np.uint8)
+    status = function(
+        parent_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(parent_array.shape[1]),
+        int(parent_array.shape[0]),
+        child_pointer,
+        int(child_width),
+        int(child_height),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        output_width,
+        output_height,
+        zoom,
+        fraction,
+        crop_zoom,
+        feather_value,
+        int(native_threads),
+    )
+    if status != 0:
+        message = native_library.fractal_last_error() or b"unknown native RGB atlas compositor error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
     return output
 
@@ -10881,6 +11231,30 @@ def render_video(
                 _destroy_native_references(native_library, native_references)
                 raise
 
+    kfp_profile = _kfp_profile_for_selection(palette, palette_file)
+    if (
+        keyframe_mode == "atlas"
+        and quality != "draft"
+        and resample == "bilinear"
+        and kfp_profile is not None
+        and native_library is not None
+        and hasattr(native_library, "fractal_crop_colourise_kfp")
+        and hasattr(native_library, "fractal_crop_rgb")
+        and hasattr(native_library, "fractal_atlas_composite_rgb")
+    ):
+        frame_width, frame_height = _kfp_working_dimensions(
+            width,
+            height,
+            render_width,
+            render_height,
+        )
+        if (frame_width, frame_height) != (render_width, render_height):
+            print(
+                f"KFP atlas working surface: {frame_width}x{frame_height}; "
+                "colouring tiles densely before the camera crop.",
+                flush=True,
+            )
+
     cache_identity = _field_renderer_cache_identity(active_renderer)
     cache_identity = (
         f"{cache_identity}-formula-{formula}"
@@ -10920,7 +11294,18 @@ def render_video(
         preset_arguments = ["-preset", selected_preset] if selected_preset else []
         video_filters: list[str] = []
         if (frame_width, frame_height) != (int(width), int(height)):
-            video_filters.append(f"scale={int(width)}:{int(height)}:flags={resample}")
+            final_resample = _final_video_resample(
+                resample,
+                palette,
+                palette_file,
+                frame_width,
+                frame_height,
+                width,
+                height,
+            )
+            video_filters.append(
+                f"scale={int(width)}:{int(height)}:flags={final_resample}"
+            )
         if using_vaapi:
             video_filters.extend(["format=nv12", "hwupload"])
         filter_arguments = ["-vf", ",".join(video_filters)] if video_filters else []
@@ -11007,6 +11392,8 @@ def render_video(
                 allow_recovery=allow_recovery,
                 render_width=render_width,
                 render_height=render_height,
+                frame_width=frame_width,
+                frame_height=frame_height,
                 resample=resample,
                 palette=palette,
                 cache_dir=cache_dir,

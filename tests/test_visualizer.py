@@ -896,6 +896,111 @@ class AnimationTests(unittest.TestCase):
         self.assertLessEqual(int(np.max(difference)), 1)
         np.testing.assert_array_equal(cropped[3, 9], (0, 0, 0))
 
+    def test_native_rgb_crop_is_exact_at_unit_zoom(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_crop_rgb"):
+            raise unittest.SkipTest("native RGB crop compositor is unavailable")
+        rng = np.random.default_rng(2718)
+        source = rng.integers(0, 256, size=(11, 17, 3), dtype=np.uint8)
+        cropped = visualizer._crop_rgb_native(
+            source,
+            source.shape[1],
+            source.shape[0],
+            1.0,
+            library,
+            2,
+        )
+        np.testing.assert_array_equal(cropped, source)
+
+    def test_native_rgb_atlas_parent_only_is_exact(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_atlas_composite_rgb"):
+            raise unittest.SkipTest("native RGB atlas compositor is unavailable")
+        rng = np.random.default_rng(31415)
+        source = rng.integers(0, 256, size=(10, 16, 3), dtype=np.uint8)
+        composed = visualizer._atlas_composite_rgb_native(
+            source,
+            None,
+            source.shape[1],
+            source.shape[0],
+            1.0,
+            0.0,
+            1.0,
+            0,
+            library,
+            2,
+        )
+        np.testing.assert_array_equal(composed, source)
+
+    def test_native_rgb_atlas_crops_overscan_child_during_transition(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_atlas_composite_rgb"):
+            raise unittest.SkipTest("native RGB atlas compositor is unavailable")
+        parent = np.full((24, 32, 3), (10, 20, 30), dtype=np.uint8)
+        child = np.zeros((48, 64, 3), dtype=np.uint8)
+        child[..., 0] = np.arange(64, dtype=np.uint8)[None, :]
+        child[..., 1] = np.arange(48, dtype=np.uint8)[:, None]
+        uncropped = visualizer._atlas_composite_rgb_native(
+            parent,
+            child,
+            32,
+            24,
+            1.0,
+            0.5,
+            1.0,
+            0,
+            library,
+            2,
+        )
+        cropped = visualizer._atlas_composite_rgb_native(
+            parent,
+            child,
+            32,
+            24,
+            1.0,
+            0.5,
+            2.0,
+            0,
+            library,
+            2,
+        )
+        np.testing.assert_array_equal(uncropped[0, 0], parent[0, 0])
+        self.assertFalse(np.array_equal(uncropped[8, 10], cropped[8, 10]))
+
+    def test_kfp_final_scale_is_sharp_and_working_surface_is_dense(self):
+        self.assertEqual(
+            visualizer._final_video_resample(
+                "bilinear",
+                "kalles-default",
+                None,
+                1920,
+                1080,
+                3840,
+                2160,
+            ),
+            "lanczos",
+        )
+        self.assertEqual(
+            visualizer._final_video_resample(
+                "bilinear",
+                "aurora",
+                None,
+                1920,
+                1080,
+                3840,
+                2160,
+            ),
+            "bilinear",
+        )
+        self.assertEqual(
+            visualizer._kfp_working_dimensions(7680, 4320, 1920, 1080),
+            (3840, 2160),
+        )
+        self.assertEqual(
+            visualizer._kfp_working_dimensions(3840, 2160, 1920, 1080),
+            (3840, 2160),
+        )
+
     def test_native_kfp_atlas_colouriser_matches_portable_compositor(self):
         library = visualizer._get_native_library()
         if library is None or not hasattr(library, "fractal_atlas_colourise_kfp"):

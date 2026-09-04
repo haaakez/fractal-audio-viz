@@ -314,6 +314,35 @@ int fractal_atlas_colourise_kfp_raw(
     int lut_size,
     int threads
 );
+/* Crop and composite already-colourised RGB atlas tiles.  Keeping this
+ * operation separate from the scalar KFP pass lets video frames reuse the
+ * expensive Kalles stencil once per tile instead of once per frame. */
+int fractal_crop_rgb(
+    const uint8_t *source,
+    int source_width,
+    int source_height,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int threads
+);
+int fractal_atlas_composite_rgb(
+    const uint8_t *parent,
+    int parent_width,
+    int parent_height,
+    const uint8_t *child,
+    int child_width,
+    int child_height,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    int feather,
+    int threads
+);
 int fractal_crop_field(
     const float *source,
     int source_width,
