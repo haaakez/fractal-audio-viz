@@ -37,6 +37,7 @@ from deep_zoom_points import FORMULA_POINT_CATALOGUES, FORMULA_POINTS_BY_SLUG
 from profiles import (
     CANONICAL_PROFILE_CHOICES,
     DEFAULT_PROFILE,
+    FAST_PROFILE_CHOICES,
     PROFILE_DEFAULTS,
     SOURCE_MODE_CHOICES,
 )
@@ -210,7 +211,10 @@ if Gtk is not None:
         def _build_widgets(self) -> None:
             self.audio = self._entry(str(ROOT / "song.mp3"))
             self.output = self._entry(str(ROOT / "fractal_viz.mp4"))
-            self.profile = self._combo(CANONICAL_PROFILE_CHOICES, DEFAULT_PROFILE)
+            self.profile = self._combo(
+                CANONICAL_PROFILE_CHOICES + FAST_PROFILE_CHOICES,
+                DEFAULT_PROFILE,
+            )
             self.formula = self._combo(tuple(FORMULA_POINT_CATALOGUES), "mandelbrot")
             self.point_combo = Gtk.ComboBoxText.new_with_entry()
             self.point_entry = self.point_combo.get_child()
@@ -847,6 +851,7 @@ if Gtk is not None:
                 ("max_zoom", self.max_zoom),
                 ("separation", self.separation),
                 ("fractal_scale", self.fractal_scale),
+                ("source_mode", self.source_mode),
                 ("quality", self.quality),
                 ("keyframe_factor", self.keyframe_factor),
                 ("video_preset", self.video_preset),

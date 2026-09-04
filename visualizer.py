@@ -86,6 +86,7 @@ from deep_zoom_points import (
 from profiles import (
     CANONICAL_PROFILE_CHOICES,
     DEFAULT_PROFILE,
+    FAST_PROFILE_CHOICES,
     NEAR_LOSSLESS_CRF,
     PROFILE_ALIASES,
     PROFILE_CHOICES,
@@ -11250,6 +11251,9 @@ def render_video(
 def _print_profiles() -> None:
     print("Built-in profiles:")
     for name in CANONICAL_PROFILE_CHOICES:
+        print(f"  {name:<12} {PROFILE_DESCRIPTIONS[name]}")
+    print("Fast compatibility profiles:")
+    for name in FAST_PROFILE_CHOICES:
         print(f"  {name:<12} {PROFILE_DESCRIPTIONS[name]}")
     print("Compatibility aliases:")
     for alias, canonical in PROFILE_ALIASES.items():

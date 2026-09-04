@@ -22,6 +22,7 @@ SOURCE_MODE_CHOICES = ("native", "upscaled")
 # used by the old practical 4K speed render, and is intentionally explicit so
 # it cannot be selected by accident for a quality export.
 UPSCALED_SOURCE_SCALE = 0.25
+FAST_PROFILE_CHOICES = ("4k-e150",)
 CANONICAL_PROFILE_CHOICES = (
     "sd60",
     "hd60",
@@ -47,8 +48,12 @@ def _native_quality_profile(width: int, height: int) -> dict[str, object]:
         # sensible default for a near-lossless export, especially at 8K.
         "video_preset": "faster",
         "crf": NEAR_LOSSLESS_CRF,
-        "resample": "lanczos",
+        # Bilinear keeps the fused native atlas colourizer active for Aurora
+        # accents and KFP profiles. With a native source this does not blur
+        # the output; it only selects the renderer's crop primitive.
+        "resample": "bilinear",
         "lossless": False,
+        "source_mode": "native",
     }
 
 
@@ -61,6 +66,25 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
     "8k60": _native_quality_profile(7680, 4320),
 }
 
+# This is the exact practical 4K speed profile used before the live-view
+# work: a 960x540 source, the fused native colour path, and a fast encoder.
+# Keep it explicit rather than making a quality profile silently undersample.
+PROFILE_DEFAULTS["4k-e150"] = {
+    "width": 3840,
+    "height": 2160,
+    "fps": 60,
+    "quality": "balanced",
+    "fractal_scale": UPSCALED_SOURCE_SCALE,
+    "keyframe_factor": 8.0,
+    "max_zoom": "1e150",
+    "separation": "auto",
+    "video_preset": "ultrafast",
+    "crf": 18,
+    "resample": "bilinear",
+    "lossless": False,
+    "source_mode": "upscaled",
+}
+
 PROFILE_DESCRIPTIONS: dict[str, str] = {
     "sd60": "Native 720x480 60 fps, near-lossless CRF 10, e100.",
     "hd60": "Native 1280x720 60 fps, near-lossless CRF 10, e100.",
@@ -68,10 +92,11 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "2k60": "Native 2560x1440 60 fps, near-lossless CRF 10, e100.",
     "4k60": "Native 3840x2160 60 fps, near-lossless CRF 10, e100.",
     "8k60": "Native 7680x4320 60 fps, near-lossless CRF 10, e100.",
+    "4k-e150": "Fast 4K/60 e150 export from a 960x540 source, enlarged at the end.",
 }
 
 # Keep existing command lines usable while making the resolution presets the
-# only canonical choices shown by the GTK selector. These aliases intentionally
+# canonical choices shown by the GTK selector. These aliases intentionally
 # inherit the new native/e100/near-lossless defaults instead of preserving the
 # old undersampled or 30 fps behaviour under a misleading profile name. The
 # old name that explicitly promised losslessness keeps that one stronger
@@ -80,7 +105,6 @@ PROFILE_ALIASES: dict[str, str] = {
     "preview": "sd60",
     "fullhd": "fhd60",
     "1080p": "fhd60",
-    "4k-e150": "4k60",
     "4k-e150-lossless": "4k60",
     "master-e150": "4k60",
     "beat": "fhd60",
@@ -97,6 +121,11 @@ PROFILE_DESCRIPTIONS["4k-e150-lossless"] = (
     "Compatibility alias for --profile 4k60 with exact H.264 lossless output."
 )
 
-# CLI accepts aliases for existing scripts; GUI and profile documentation use
-# the canonical six-tier list.
-PROFILE_CHOICES = CANONICAL_PROFILE_CHOICES + tuple(PROFILE_ALIASES)
+# CLI accepts the canonical profiles, the explicit fast compatibility profile,
+# and aliases for existing scripts. The GTK selector chooses from the
+# canonical tiers plus the fast profile; aliases remain CLI-only.
+PROFILE_CHOICES = (
+    CANONICAL_PROFILE_CHOICES
+    + FAST_PROFILE_CHOICES
+    + tuple(PROFILE_ALIASES)
+)

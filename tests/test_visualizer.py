@@ -17,6 +17,7 @@ from deep_zoom_points import FORMULA_POINT_CATALOGUES
 from profiles import (
     CANONICAL_PROFILE_CHOICES,
     DEFAULT_PROFILE,
+    FAST_PROFILE_CHOICES,
     NEAR_LOSSLESS_CRF,
     PROFILE_ALIASES,
     PROFILE_DEFAULTS,
@@ -477,7 +478,8 @@ class AnimationTests(unittest.TestCase):
             self.assertEqual(values["video_preset"], "faster")
             self.assertEqual(values["crf"], NEAR_LOSSLESS_CRF)
             self.assertFalse(values["lossless"])
-            self.assertEqual(values["resample"], "lanczos")
+            self.assertEqual(values["resample"], "bilinear")
+            self.assertEqual(values["source_mode"], "native")
             args = visualizer.build_parser(["--profile", name]).parse_args([])
             self.assertEqual((args.width, args.height, args.fps), (width, height, 60))
             self.assertEqual(args.max_zoom, "1e100")
@@ -506,6 +508,22 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(defaults.width, 3840)
         self.assertEqual(defaults.height, 2160)
         self.assertEqual(PROFILE_DEFAULTS["preview"]["fractal_scale"], 1.0)
+        self.assertEqual(FAST_PROFILE_CHOICES, ("4k-e150",))
+        fast_values = PROFILE_DEFAULTS["4k-e150"]
+        self.assertEqual((fast_values["width"], fast_values["height"]), (3840, 2160))
+        self.assertEqual(fast_values["fps"], 60)
+        self.assertEqual(fast_values["quality"], "balanced")
+        self.assertEqual(fast_values["fractal_scale"], UPSCALED_SOURCE_SCALE)
+        self.assertEqual(fast_values["keyframe_factor"], 8.0)
+        self.assertEqual(fast_values["max_zoom"], "1e150")
+        self.assertEqual(fast_values["video_preset"], "ultrafast")
+        self.assertEqual(fast_values["crf"], 18)
+        self.assertEqual(fast_values["resample"], "bilinear")
+        self.assertFalse(fast_values["lossless"])
+        self.assertEqual(fast_values["source_mode"], "upscaled")
+        fast_args = visualizer.build_parser(["--profile", "4k-e150"]).parse_args([])
+        self.assertEqual(fast_args.source_mode, "upscaled")
+        self.assertEqual((fast_args.width, fast_args.height), (3840, 2160))
 
     def test_export_source_modes_are_explicit_and_have_expected_density(self):
         self.assertEqual(SOURCE_MODE_CHOICES, ("native", "upscaled"))

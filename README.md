@@ -173,7 +173,7 @@ then choose the parts that matter for the render:
 
 profiles are shortcuts for a coherent set of these values. The canonical
 presets are `sd60`, `hd60`, `fhd60`, `2k60`, `4k60`, and `8k60`. Every one uses
-60 fps, native fractal resolution, e100, Lanczos resampling, and near-lossless
+60 fps, native fractal resolution, e100, the fused native bilinear crop path, and near-lossless
 CRF 10 encoding. With no profile option, `4k60` is selected; explicit options
 still override the profile.
 
@@ -188,6 +188,15 @@ the same 4K output can use the old fast quarter-resolution source explicitly:
 python3 visualizer.py music/track.mp3 --profile 4k60 \
   --source-mode upscaled --point random --random-seed 42 \
   --output renders/track-4k60-upscaled.mp4
+```
+
+for the exact pre-live speed preset, use `4k-e150`; it uses the tested
+960×540 source, factor-eight atlas spacing, bilinear fused colour path, and
+fast encoder:
+
+```sh
+python3 visualizer.py music/track.mp3 --profile 4k-e150 \
+  --point random --random-seed 42 --output renders/track-4k-e150.mp4
 ```
 
 inspect the available presets with `python3 visualizer.py --list-profiles`.
@@ -218,10 +227,11 @@ python3 visualizer.py music/track.mp3 \
   --cache-dir cache/track
 ```
 
-The old names `preview`, `fullhd`, `1080p`, `4k-e150`, `master-e150`, and
-`beat` remain accepted as compatibility aliases for the new resolution tiers.
-`4k-e150-lossless` remains accepted too and keeps exact-lossless rate control
-while using the safe e100 target.
+The old names `preview`, `fullhd`, `1080p`, `master-e150`, and `beat` remain
+accepted as compatibility aliases for the new resolution tiers. `4k-e150` is
+the explicit fast upscaled profile described above. `4k-e150-lossless` remains
+accepted too and keeps exact-lossless rate control while using the safe e100
+target.
 
 a reproducible random point:
 
@@ -320,8 +330,8 @@ routed through an incompatible Mandelbrot reference.
 
 the six canonical profiles all render the fractal at the output dimensions;
 none of them enlarges a small scalar field into a larger video. They share a
-60 fps frame rate, e100 maximum zoom, quality-mode atlas rendering, Lanczos
-resampling, and CRF 10 near-lossless compression.
+60 fps frame rate, e100 maximum zoom, quality-mode atlas rendering, the fused
+bilinear native colour path, and CRF 10 near-lossless compression.
 
 | profile | native output/source | max zoom | compression |
 | --- | --- | --- | --- |
@@ -332,9 +342,9 @@ resampling, and CRF 10 near-lossless compression.
 | `4k60` | 3840×2160 | e100 | CRF 10 |
 | `8k60` | 7680×4320 | e100 | CRF 10 |
 
-`4k60` is the default. The presets deliberately favour image quality over
-the old undersampled speed path. Add `--lossless` for exact H.264 rate
-control; use `--source-mode upscaled`, `--quality balanced`, a larger
+`4k60` is the default native renderer. The separate `4k-e150` profile is the
+old tested fast upscaled path. Add `--lossless` for exact H.264 rate control;
+use `--source-mode upscaled`, the `4k-e150` profile, a larger
 `--keyframe-factor`, or a larger CRF explicitly when rendering speed matters
 more.
 
@@ -348,12 +358,11 @@ python3 visualizer.py music/track.mp3 \
   --cache-dir cache/track-8k60
 ```
 
-the legacy e150 names are accepted, but resolve to the corresponding
-near-lossless native profile; the explicit `4k-e150-lossless` name retains
-exact-lossless rate control. This keeps old scripts working while making the
-six resolution tiers the single source of truth. Source density is controlled
-separately with `--source-mode`, so the native/upscaled choice is visible in
-the command and in the render manifest.
+the legacy names are accepted. `4k-e150` retains the tested fast upscaled
+profile, while `4k-e150-lossless` remains an exact-lossless native alias for
+the safe e100 quality profile. The other legacy names resolve to their
+corresponding near-lossless native profiles. Source density is also recorded
+explicitly with `--source-mode` in the command and render manifest.
 
 use `--estimate` to analyse the song and print the planned source resolution
 and keyframe count without rendering video:
@@ -436,7 +445,7 @@ unless noted otherwise, the values in parentheses are the defaults.
 | argument | description |
 | --- | --- |
 | `--render-scale N` (`1.0`) | Multiplier applied to keyframe source dimensions. Must be at least `1`. |
-| `--source-mode MODE` (`native`) | `native` keeps the scalar field at least at output resolution; `upscaled` uses the fast `0.25×` source and enlarges it at the end. `--upscaling` is a shorthand for the latter. |
+| `--source-mode MODE` (`native`, or `upscaled` in `4k-e150`) | `native` keeps the scalar field at least at output resolution and uses the pre-live fused native colour pipeline; `upscaled` uses the fast `0.25×` source and enlarges it at the end. `--upscaling` is a shorthand for the latter. |
 | `--fractal-scale N` (`1.0`) | Requested fractal source multiplier. Native mode floors the effective source at `1×`; upscaled mode caps it at the fast `0.25×` source. |
 | `--quality MODE` (`quality` with a resolution profile) | `draft` permits labelled recovery; `balanced` is the faster atlas quality; `quality` is the native-resolution default; `extreme` adds modest supersampling. Source density is selected separately with `--source-mode`. |
 | `--keyframe-factor N` (`2.0`) | Maximum zoom ratio between adjacent atlas levels. Larger values reduce the number of fields but enlarge crops more. |
@@ -458,7 +467,7 @@ unless noted otherwise, the values in parentheses are the defaults.
 | `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox at the requested output size, then validates the `libx264` fallback before selecting it. |
 | `--crf N` (`10` with a resolution profile) | Quality value from `0` to `51`. CRF 10 is the near-lossless profile target; it is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
 | `--lossless` | Use lossless H.264 rate control where supported (`constqp/qp 0` for NVENC, CRF 0 for x264) and preserve 4:4:4 chroma where the encoder accepts it. |
-| `--resample MODE` (`lanczos` with a resolution profile) | Crop and final upscale filter: `bilinear` is faster; `lanczos` is sharper and slower. |
+| `--resample MODE` (`bilinear` with a resolution profile) | Crop and final upscale filter. Bilinear keeps the fused native colourizer active and is the fast pre-live path; Lanczos is sharper for explicit quality experiments but slower. |
 | `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, `mono`, `midnight`, `ember-night`, `terminal`, or `kalles-default`. The night themes use dark exteriors with white interiors; `kalles-default` matches the bundled Kalles Fraktaler profile in `palettes/kalles-default.kfp`. Its first exterior key is intentionally white and its separate interior colour is black, matching Kalles' defaults. |
 | `--palette-file PATH` | Read at least two `#rrggbb` or `r g b` stops from a text file, or import a Kalles `.kfp` gradient and its colour settings. ordinary text palettes use the fast Aurora wave path; `.kfp` uses the Kalles-style transfer path. |
 | `--glow N` (`0`) | Add a low-resolution bloom pass after colourisation, from `0` to `1`. It is off by default for the 10-minute target. |
