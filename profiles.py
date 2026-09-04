@@ -16,6 +16,12 @@ from __future__ import annotations
 # ``--lossless``.
 DEFAULT_PROFILE = "4k60"
 NEAR_LOSSLESS_CRF = 10
+SOURCE_MODE_CHOICES = ("native", "upscaled")
+# The fast export path renders a quarter-size scalar field and lets FFmpeg
+# enlarge it to the requested output dimensions.  This is the source density
+# used by the old practical 4K speed render, and is intentionally explicit so
+# it cannot be selected by accident for a quality export.
+UPSCALED_SOURCE_SCALE = 0.25
 CANONICAL_PROFILE_CHOICES = (
     "sd60",
     "hd60",

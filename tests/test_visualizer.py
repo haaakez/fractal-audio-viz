@@ -20,6 +20,8 @@ from profiles import (
     NEAR_LOSSLESS_CRF,
     PROFILE_ALIASES,
     PROFILE_DEFAULTS,
+    SOURCE_MODE_CHOICES,
+    UPSCALED_SOURCE_SCALE,
 )
 
 
@@ -504,6 +506,37 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(defaults.width, 3840)
         self.assertEqual(defaults.height, 2160)
         self.assertEqual(PROFILE_DEFAULTS["preview"]["fractal_scale"], 1.0)
+
+    def test_export_source_modes_are_explicit_and_have_expected_density(self):
+        self.assertEqual(SOURCE_MODE_CHOICES, ("native", "upscaled"))
+        parser = visualizer.build_parser()
+        self.assertEqual(parser.parse_args([]).source_mode, "native")
+        self.assertEqual(
+            visualizer.build_parser(["--upscaling"])
+            .parse_args(["--upscaling"])
+            .source_mode,
+            "upscaled",
+        )
+        native_scale, native_transition = visualizer._quality_source_settings(
+            0.25, "balanced", "atlas", 4.0, "native"
+        )
+        upscaled_scale, upscaled_transition = visualizer._quality_source_settings(
+            1.0, "quality", "atlas", 4.0, "upscaled"
+        )
+        self.assertEqual(native_scale, 1.0)
+        self.assertEqual(upscaled_scale, UPSCALED_SOURCE_SCALE)
+        self.assertEqual(native_transition, 0.0)
+        self.assertEqual(upscaled_transition, 0.0)
+        self.assertEqual(
+            visualizer._scaled_dimensions(3840, 2160, native_scale, "test"),
+            (3840, 2160),
+        )
+        self.assertEqual(
+            visualizer._scaled_dimensions(3840, 2160, upscaled_scale, "test"),
+            (960, 540),
+        )
+        with self.assertRaisesRegex(ValueError, "unknown source mode"):
+            visualizer._quality_source_settings(1.0, "quality", "atlas", 4.0, "bad")
 
     def test_palette_file_and_frame_effects(self):
         with tempfile.TemporaryDirectory() as directory:

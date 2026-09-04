@@ -38,6 +38,7 @@ from profiles import (
     CANONICAL_PROFILE_CHOICES,
     DEFAULT_PROFILE,
     PROFILE_DEFAULTS,
+    SOURCE_MODE_CHOICES,
 )
 
 
@@ -255,6 +256,17 @@ if Gtk is not None:
                 save=True,
             )
             row = self._add_widget_row(render_grid, row, "Profile", self.profile)
+            self.source_mode = self._combo(SOURCE_MODE_CHOICES, "native")
+            self.source_mode.set_tooltip_text(
+                "native renders at the requested source resolution; upscaled uses the fast quarter-size source"
+            )
+            row = self._add_widget_row(
+                render_grid,
+                row,
+                "Source mode",
+                self.source_mode,
+                "native or upscaled (fast)",
+            )
             row = self._add_widget_row(render_grid, row, "Formula", self.formula)
             point_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             point_box.set_hexpand(True)
@@ -879,6 +891,7 @@ if Gtk is not None:
                 "--render-scale", self.render_scale.get_text(),
                 "--fractal-scale", self.fractal_scale.get_text(),
                 "--quality", self._combo_text(self.quality),
+                "--source-mode", self._combo_text(self.source_mode),
                 "--keyframe-factor", self.keyframe_factor.get_text(),
                 "--keyframe-mode", self._combo_text(self.keyframe_mode),
                 "--base-zoom", self.base_zoom.get_text(),

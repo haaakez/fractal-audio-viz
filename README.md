@@ -66,11 +66,12 @@ round-trip. KFP features that require extra Kalles buffers—custom GLSL colour
 functions, textures, analytic derivatives, and phase channels—remain outside
 the scalar-field compatibility path.
 
-the output dimensions are controlled by `--width` and `--height`. The fractal
-source can be smaller or larger than the output: `--render-scale` multiplies
-the source size, while `--fractal-scale` sets the requested quality floor.
-for example, a 3840×2160 output with `--fractal-scale 0.5` renders 1920×1080
-source fields and still produces a 4K video.
+the output dimensions are controlled by `--width` and `--height`. The default
+`--source-mode native` keeps the fractal source at least as large as the
+output, while the explicit `--source-mode upscaled` (or `--upscaling`)
+renders the old fast quarter-resolution source and enlarges it to the output.
+`--render-scale` and `--fractal-scale` remain available for deliberate source
+supersampling or custom quality experiments.
 
 ### repository layout
 
@@ -166,7 +167,8 @@ then choose the parts that matter for the render:
 5. Set `--max-zoom` and, for a deep custom point, provide enough decimal
    digits in both coordinates.
 6. Choose a quality/speed trade-off with `--quality`, `--fractal-scale`, and
-   `--keyframe-factor`.
+   `--keyframe-factor`; choose `--source-mode upscaled` when a quick,
+   lower-detail export is preferable to a native-resolution render.
 7. Add `--cache-dir` if the render may be resumed or repeated.
 
 profiles are shortcuts for a coherent set of these values. The canonical
@@ -178,6 +180,14 @@ still override the profile.
 ```sh
 python3 visualizer.py music/track.mp3 --profile 4k60 \
   --point random --random-seed 42 --output renders/track-4k60.mp4
+```
+
+the same 4K output can use the old fast quarter-resolution source explicitly:
+
+```sh
+python3 visualizer.py music/track.mp3 --profile 4k60 \
+  --source-mode upscaled --point random --random-seed 42 \
+  --output renders/track-4k60-upscaled.mp4
 ```
 
 inspect the available presets with `python3 visualizer.py --list-profiles`.
@@ -323,9 +333,10 @@ resampling, and CRF 10 near-lossless compression.
 | `8k60` | 7680×4320 | e100 | CRF 10 |
 
 `4k60` is the default. The presets deliberately favour image quality over
-the old undersampled e150 speed profile. Add `--lossless` for exact H.264
-rate control; use `--quality balanced`, a larger `--keyframe-factor`, or a
-larger CRF explicitly when rendering speed matters more.
+the old undersampled speed path. Add `--lossless` for exact H.264 rate
+control; use `--source-mode upscaled`, `--quality balanced`, a larger
+`--keyframe-factor`, or a larger CRF explicitly when rendering speed matters
+more.
 
 for example, an 8K render is:
 
@@ -340,7 +351,9 @@ python3 visualizer.py music/track.mp3 \
 the legacy e150 names are accepted, but resolve to the corresponding
 near-lossless native profile; the explicit `4k-e150-lossless` name retains
 exact-lossless rate control. This keeps old scripts working while making the
-six resolution tiers the single source of truth.
+six resolution tiers the single source of truth. Source density is controlled
+separately with `--source-mode`, so the native/upscaled choice is visible in
+the command and in the render manifest.
 
 use `--estimate` to analyse the song and print the planned source resolution
 and keyframe count without rendering video:
@@ -423,8 +436,9 @@ unless noted otherwise, the values in parentheses are the defaults.
 | argument | description |
 | --- | --- |
 | `--render-scale N` (`1.0`) | Multiplier applied to keyframe source dimensions. Must be at least `1`. |
-| `--fractal-scale N` (`1.0`) | Requested fractal source multiplier. Quality modes impose floors: atlas `draft`/`balanced` use at least `0.5`, `quality` at least `1`, and `extreme` at least `1.25`. |
-| `--quality MODE` (`quality` with a resolution profile) | `draft` is fastest and permits labelled recovery; `balanced` is a strict output-resolution atlas; `quality` preserves native source resolution; `extreme` adds modest supersampling. |
+| `--source-mode MODE` (`native`) | `native` keeps the scalar field at least at output resolution; `upscaled` uses the fast `0.25×` source and enlarges it at the end. `--upscaling` is a shorthand for the latter. |
+| `--fractal-scale N` (`1.0`) | Requested fractal source multiplier. Native mode floors the effective source at `1×`; upscaled mode caps it at the fast `0.25×` source. |
+| `--quality MODE` (`quality` with a resolution profile) | `draft` permits labelled recovery; `balanced` is the faster atlas quality; `quality` is the native-resolution default; `extreme` adds modest supersampling. Source density is selected separately with `--source-mode`. |
 | `--keyframe-factor N` (`2.0`) | Maximum zoom ratio between adjacent atlas levels. Larger values reduce the number of fields but enlarge crops more. |
 | `--keyframe-mode MODE` (`atlas`) | `atlas` uses the fixed nested ladder; `legacy` uses the older audio-dependent full-field chunks. |
 | `--iteration-base N` (`384`) | Minimum iteration budget for shallow frames. |

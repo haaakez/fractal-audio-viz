@@ -91,6 +91,8 @@ from profiles import (
     PROFILE_CHOICES,
     PROFILE_DEFAULTS,
     PROFILE_DESCRIPTIONS,
+    SOURCE_MODE_CHOICES,
+    UPSCALED_SOURCE_SCALE,
 )
 
 
@@ -10368,6 +10370,50 @@ def _apply_frame_effects(
     return np.ascontiguousarray(output, dtype=np.uint8)
 
 
+def _quality_source_settings(
+    fractal_scale: float,
+    quality: str,
+    keyframe_mode: str,
+    keyframe_factor: float,
+    source_mode: str = "native",
+) -> tuple[float, float]:
+    """Return the scalar-field scale and transition for an export.
+
+    ``source_mode`` is deliberately separate from the quality preset.  The
+    normal/native path keeps at least one scalar-field sample per output
+    pixel, while the explicit upscaled path uses the old quarter-resolution
+    source that made 4K quick renders practical.  The final FFmpeg filter is
+    still responsible for enlarging the latter to the requested video size.
+    """
+
+    if source_mode not in SOURCE_MODE_CHOICES:
+        raise ValueError(f"unknown source mode: {source_mode}")
+    if keyframe_mode == "atlas":
+        quality_settings = {
+            "draft": (max(fractal_scale, UPSCALED_SOURCE_SCALE), 0.0),
+            "balanced": (max(fractal_scale, UPSCALED_SOURCE_SCALE), 0.0),
+            "quality": (max(fractal_scale, 1.0), 0.0),
+            "extreme": (max(fractal_scale, 1.25), 0.0),
+        }
+    elif keyframe_mode == "legacy":
+        quality_settings = {
+            "draft": (max(fractal_scale, UPSCALED_SOURCE_SCALE), 0.0),
+            "balanced": (max(fractal_scale, 1.0), 0.12),
+            "quality": (max(fractal_scale, keyframe_factor), 0.20),
+            "extreme": (max(fractal_scale, keyframe_factor * 2.0), 0.28),
+        }
+    else:
+        raise ValueError(f"unknown keyframe mode: {keyframe_mode}")
+    if quality not in quality_settings:
+        raise ValueError(f"unknown quality preset: {quality}")
+    source_scale, transition_fraction = quality_settings[quality]
+    if source_mode == "native":
+        source_scale = max(source_scale, 1.0)
+    else:
+        source_scale = min(source_scale, UPSCALED_SOURCE_SCALE)
+    return source_scale, transition_fraction
+
+
 def render_video(
     audio_path: Path,
     output_path: Path,
@@ -10406,6 +10452,7 @@ def render_video(
     glow: float = 0.0,
     motion_blur: float = 0.0,
     lossless: bool = False,
+    source_mode: str = "native",
 ) -> dict[str, Any]:
     np = _require_numpy()
     audio_path, output_path, _, cache_dir = _validate_render_paths(
@@ -10473,30 +10520,13 @@ def render_video(
     lossless = bool(lossless)
     if lossless:
         crf = 0
-    if keyframe_mode not in {"atlas", "legacy"}:
-        raise ValueError(f"unknown keyframe mode: {keyframe_mode}")
-    if keyframe_mode == "atlas":
-        # Nested tiles already provide the missing factor-two density at the
-        # centre of every interval. Keep quality presets as modest optional
-        # supersampling instead of rendering every tile at factor squared.
-        quality_settings = {
-            "draft": (max(fractal_scale, 0.25), 0.0),
-            "balanced": (max(fractal_scale, 0.25), 0.0),
-            "quality": (max(fractal_scale, 1.0), 0.0),
-            "extreme": (max(fractal_scale, 1.25), 0.0),
-        }
-    else:
-        # Legacy full-field mode is retained for visual regression and for
-        # comparing the new atlas against the previous renderer.
-        quality_settings = {
-            "draft": (max(fractal_scale, 0.25), 0.0),
-            "balanced": (max(fractal_scale, 1.0), 0.12),
-            "quality": (max(fractal_scale, keyframe_factor), 0.20),
-            "extreme": (max(fractal_scale, keyframe_factor * 2.0), 0.28),
-        }
-    if quality not in quality_settings:
-        raise ValueError(f"unknown quality preset: {quality}")
-    source_scale, transition_fraction = quality_settings[quality]
+    source_scale, transition_fraction = _quality_source_settings(
+        fractal_scale,
+        quality,
+        keyframe_mode,
+        keyframe_factor,
+        source_mode,
+    )
     render_width, render_height = _scaled_dimensions(
         width,
         height,
@@ -10780,7 +10810,7 @@ def render_video(
         else "python"
     )
     print(
-        f"Keyframe source: {render_width}x{render_height} ({quality}); "
+        f"Keyframe source: {render_width}x{render_height} ({quality}, {source_mode}); "
         f"planned keyframes: "
         f"{_keyframe_count(zooms, keyframe_factor) if keyframe_mode == 'legacy' else _atlas_geometry(zooms, keyframe_factor)[2] + 1}; "
         f"mode: {keyframe_mode}; "
@@ -11408,6 +11438,23 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--source-mode",
+        choices=SOURCE_MODE_CHOICES,
+        default="native",
+        help=(
+            "fractal source density: native keeps at least output resolution; "
+            "upscaled renders a quarter-size source and enlarges it for a faster export"
+        ),
+    )
+    parser.add_argument(
+        "--upscaling",
+        dest="source_mode",
+        action="store_const",
+        const="upscaled",
+        default=argparse.SUPPRESS,
+        help="shorthand for --source-mode upscaled",
+    )
+    parser.add_argument(
         "--keyframe-factor",
         type=float,
         default=2.0,
@@ -11881,20 +11928,13 @@ def _main_impl() -> None:
         f"{args.output}"
     )
     if args.estimate:
-        if args.keyframe_mode == "atlas":
-            estimate_scale = {
-                "draft": max(args.fractal_scale, 0.25),
-                "balanced": max(args.fractal_scale, 0.25),
-                "quality": max(args.fractal_scale, 1.0),
-                "extreme": max(args.fractal_scale, 1.25),
-            }[args.quality]
-        else:
-            estimate_scale = {
-                "draft": max(args.fractal_scale, 0.25),
-                "balanced": max(args.fractal_scale, 1.0),
-                "quality": max(args.fractal_scale, args.keyframe_factor),
-                "extreme": max(args.fractal_scale, args.keyframe_factor * 2.0),
-            }[args.quality]
+        estimate_scale, _ = _quality_source_settings(
+            args.fractal_scale,
+            args.quality,
+            args.keyframe_mode,
+            args.keyframe_factor,
+            args.source_mode,
+        )
         try:
             render_width, render_height = _scaled_dimensions(
                 args.width,
@@ -11965,6 +12005,7 @@ def _main_impl() -> None:
             args.glow,
             args.motion_blur,
             args.lossless,
+            args.source_mode,
         )
     except Exception as error:
         if manifest_path is not None:
