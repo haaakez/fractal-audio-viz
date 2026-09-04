@@ -6733,14 +6733,10 @@ def _atlas_tile_field(
         _atomic_save_field(cache_path, field, durable=durable_cache)
         if cache_evictor is not None:
             cache_evictor.observe(cache_path)
-        try:
-            with _safe_cache_load(cache_path) as cached:
-                if cached is None:
-                    raise ValueError("unsafe cached atlas tile")
-                if _valid_field_array(cached, (render_height, render_width)):
-                    return np.array(cached, dtype=np.float32, copy=True)
-        except (OSError, EOFError, ValueError, TypeError):
-            pass
+        # The field has already passed the same shape/type/finite validation
+        # used by cache hits. Reopening and copying a freshly written 4K tile
+        # only doubles its disk traffic and peak memory; the next render will
+        # validate the on-disk entry when it actually consumes it.
     return field
 
 
@@ -7468,7 +7464,6 @@ def _render_video_atlas(
     palette_file: Optional[Path] = None,
     glow: float = 0.0,
     motion_blur: float = 0.0,
-    hardware_encoder: bool = False,
 ) -> dict[str, Any]:
     """Render a song through a fixed nested tile atlas.
 
@@ -7517,24 +7512,20 @@ def _render_video_atlas(
         # clone tiers are available. Keep the root alive for rare per-tile
         # retargets; the normal decade tiers continue to serve the hot path.
         native_reference_root = native_references[0][1]
-    # Deep native tiles already saturate a CPU-only export. Running a
-    # speculative tile beside x264 (and beside the next foreground tile when
-    # the queue catches up) creates a second OpenMP team and can nearly double
-    # wall time on small machines. A real hardware encoder leaves those CPU
-    # cores available, so permit one bounded look-ahead worker there and cap
-    # its native team below the foreground team.
+    # Deep native tiles already saturate the CPU. Running a speculative tile
+    # beside the foreground tile creates a second OpenMP team and can nearly
+    # double wall time on small machines. Hardware encoding does not make the
+    # CPU field renderer cheaper: NVENC still leaves the foreground native
+    # team competing with the speculative worker for the same cores. Keep the
+    # deep path on the old single-team schedule; shallow previews still benefit
+    # from one-tile look-ahead.
     deep_native_export = native_library is not None and maximum_log >= 12.0
-    deep_hardware_prefetch = deep_native_export and hardware_encoder
     prefetch_executor = (
         ThreadPoolExecutor(max_workers=1, thread_name_prefix="fractal-field")
-        if cache_limit_mb <= 0.0 and (not deep_native_export or deep_hardware_prefetch)
+        if cache_limit_mb <= 0.0 and not deep_native_export
         else None
     )
-    prefetch_native_threads = (
-        max(1, min(native_threads, max(1, (os.cpu_count() or 2) // 2)))
-        if deep_hardware_prefetch
-        else native_threads
-    )
+    prefetch_native_threads = native_threads
 
     def tile_display_log(level: int) -> float:
         """Nominal camera boundary represented by an atlas level."""
@@ -10381,10 +10372,13 @@ def _quality_source_settings(
     """Return the scalar-field scale and transition for an export.
 
     ``source_mode`` is deliberately separate from the quality preset.  The
-    normal/native path keeps at least one scalar-field sample per output
-    pixel, while the explicit upscaled path uses the old quarter-resolution
-    source that made 4K quick renders practical.  The final FFmpeg filter is
-    still responsible for enlarging the latter to the requested video size.
+    normal/native path honors the profile's selected scalar density, so the
+    practical 4K/8K profiles can use the proven half-density native pipeline;
+    ``--quality quality --fractal-scale 1`` requests full output density.
+    The explicit upscaled path caps the field at the old quarter-resolution
+    source that made 4K quick renders practical. The final FFmpeg filter is
+    responsible for enlarging either undersampled source to the requested
+    video size.
     """
 
     if source_mode not in SOURCE_MODE_CHOICES:
@@ -10408,9 +10402,7 @@ def _quality_source_settings(
     if quality not in quality_settings:
         raise ValueError(f"unknown quality preset: {quality}")
     source_scale, transition_fraction = quality_settings[quality]
-    if source_mode == "native":
-        source_scale = max(source_scale, 1.0)
-    else:
+    if source_mode == "upscaled":
         source_scale = min(source_scale, UPSCALED_SOURCE_SCALE)
     return source_scale, transition_fraction
 
@@ -10826,12 +10818,6 @@ def render_video(
     try:
         temporary_output = _reserved_temporary_sibling(output_path, "rendering")
         using_vaapi = selected_codec == "h264_vaapi"
-        using_hardware_encoder = selected_codec in {
-            "h264_nvenc",
-            "h264_qsv",
-            "h264_vaapi",
-            "h264_videotoolbox",
-        }
         video_pixel_format = _video_pixel_format(
             selected_codec,
             palette,
@@ -10942,7 +10928,6 @@ def render_video(
                 palette_file=palette_file,
                 glow=glow,
                 motion_blur=motion_blur,
-                hardware_encoder=using_hardware_encoder,
             )
         finally:
             _destroy_native_references(native_library, native_references)
@@ -11446,8 +11431,8 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
         choices=SOURCE_MODE_CHOICES,
         default="native",
         help=(
-            "fractal source density: native keeps at least output resolution; "
-            "upscaled renders a quarter-size source and enlarges it for a faster export"
+            "fractal source density: native honors the profile/quality density; "
+            "upscaled caps it at quarter-size and enlarges it for a faster export"
         ),
     )
     parser.add_argument(

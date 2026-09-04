@@ -473,8 +473,14 @@ class AnimationTests(unittest.TestCase):
             self.assertEqual((values["width"], values["height"]), (width, height))
             self.assertEqual(values["fps"], 60)
             self.assertEqual(values["max_zoom"], "1e100")
-            self.assertEqual(values["quality"], "quality")
-            self.assertEqual(values["fractal_scale"], 1.0)
+            if name in {"4k60", "8k60"}:
+                self.assertEqual(values["quality"], "balanced")
+                self.assertEqual(values["fractal_scale"], 0.5)
+                self.assertEqual(values["keyframe_factor"], 8.0)
+            else:
+                self.assertEqual(values["quality"], "quality")
+                self.assertEqual(values["fractal_scale"], 1.0)
+                self.assertEqual(values["keyframe_factor"], 4.0)
             self.assertEqual(values["video_preset"], "faster")
             self.assertEqual(values["crf"], NEAR_LOSSLESS_CRF)
             self.assertFalse(values["lossless"])
@@ -485,6 +491,9 @@ class AnimationTests(unittest.TestCase):
             self.assertEqual(args.max_zoom, "1e100")
             self.assertEqual(args.crf, NEAR_LOSSLESS_CRF)
             self.assertFalse(args.lossless)
+            self.assertEqual(args.quality, values["quality"])
+            self.assertEqual(args.fractal_scale, values["fractal_scale"])
+            self.assertEqual(args.keyframe_factor, values["keyframe_factor"])
         for alias, canonical in PROFILE_ALIASES.items():
             if alias == "4k-e150-lossless":
                 self.assertEqual(PROFILE_DEFAULTS[alias]["width"], 3840)
@@ -536,18 +545,18 @@ class AnimationTests(unittest.TestCase):
             "upscaled",
         )
         native_scale, native_transition = visualizer._quality_source_settings(
-            0.25, "balanced", "atlas", 4.0, "native"
+            0.5, "balanced", "atlas", 8.0, "native"
         )
         upscaled_scale, upscaled_transition = visualizer._quality_source_settings(
             1.0, "quality", "atlas", 4.0, "upscaled"
         )
-        self.assertEqual(native_scale, 1.0)
+        self.assertEqual(native_scale, 0.5)
         self.assertEqual(upscaled_scale, UPSCALED_SOURCE_SCALE)
         self.assertEqual(native_transition, 0.0)
         self.assertEqual(upscaled_transition, 0.0)
         self.assertEqual(
             visualizer._scaled_dimensions(3840, 2160, native_scale, "test"),
-            (3840, 2160),
+            (1920, 1080),
         )
         self.assertEqual(
             visualizer._scaled_dimensions(3840, 2160, upscaled_scale, "test"),

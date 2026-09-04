@@ -4198,10 +4198,12 @@ void render_bla_impl(
     }
 #ifdef _OPENMP
     // Deep zoom cost is highly non-uniform: a single hard filament can make
-    // one row take orders of magnitude longer than its neighbours.  A row is
-    // therefore too coarse a unit of work.  Use small contiguous pixel
-    // chunks so the expensive pixels are redistributed among all workers.
-#pragma omp parallel for schedule(dynamic, 64)
+    // one row take orders of magnitude longer than its neighbours. A row is
+    // therefore too coarse a unit of work. Use moderately sized contiguous
+    // pixel chunks so hard regions are still redistributed while the OpenMP
+    // scheduler does not perform an atomic work assignment for every few
+    // dozen pixels in a multi-million-pixel 4K tile.
+#pragma omp parallel for schedule(dynamic, 256)
 #endif
     for (int linear_pixel = 0; linear_pixel < width * height; ++linear_pixel) {
         const int py = linear_pixel / width;
