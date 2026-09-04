@@ -1738,6 +1738,29 @@ class AnimationTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("color=black:s=256x256:d=0.05", command)
 
+    def test_hardware_probe_uses_render_dimensions(self):
+        probe_result = mock.Mock(returncode=0)
+        visualizer._hardware_encoder_usable.cache_clear()
+        try:
+            with mock.patch.object(
+                visualizer.shutil, "which", return_value="/usr/bin/ffmpeg"
+            ), mock.patch.object(
+                visualizer.subprocess, "run", return_value=probe_result
+            ) as run:
+                self.assertTrue(
+                    visualizer._hardware_encoder_usable(
+                        "h264_nvenc",
+                        near_lossless=True,
+                        width=7680,
+                        height=4320,
+                    )
+                )
+        finally:
+            visualizer._hardware_encoder_usable.cache_clear()
+        command = run.call_args.args[0]
+        self.assertIn("color=black:s=7680x4320:d=0.05", command)
+        self.assertEqual(command[command.index("-r") + 1], "30")
+
     def test_lossless_hardware_probe_matches_nvenc_output_format(self):
         probe_result = mock.Mock(returncode=0)
         visualizer._hardware_encoder_usable.cache_clear()

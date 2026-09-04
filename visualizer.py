@@ -7905,11 +7905,19 @@ def _ffmpeg_encoder_names() -> set[str]:
 def _vaapi_encoder_usable(
     device: str = "/dev/dri/renderD128",
     lossless: bool = False,
+    width: int = 128,
+    height: int = 128,
+    fps: int = 30,
 ) -> bool:
     """Probe the complete upload/encode path, not just FFmpeg's name list."""
 
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None or not Path(device).exists():
+        return False
+    try:
+        width, height = _validate_dimensions(width, height, "VAAPI probe")
+        fps = _validate_fps(fps)
+    except ValueError:
         return False
     try:
         result = subprocess.run(
@@ -7924,7 +7932,9 @@ def _vaapi_encoder_usable(
                 "-f",
                 "lavfi",
                 "-i",
-                "color=black:s=128x128:d=0.05",
+                f"color=black:s={width}x{height}:d=0.05",
+                "-r",
+                str(fps),
                 "-vf",
                 "format=nv12,hwupload",
                 "-c:v",
@@ -7952,11 +7962,19 @@ def _hardware_encoder_usable(
     encoder: str,
     lossless: bool = False,
     near_lossless: bool = False,
+    width: int = 256,
+    height: int = 256,
+    fps: int = 30,
 ) -> bool:
-    """Run a tiny encode so ``auto`` never selects a merely advertised codec."""
+    """Probe the encoder at the dimensions and quality the render will use."""
 
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
+        return False
+    try:
+        width, height = _validate_dimensions(width, height, "hardware encoder probe")
+        fps = _validate_fps(fps)
+    except ValueError:
         return False
     command = [
         ffmpeg,
@@ -7967,11 +7985,12 @@ def _hardware_encoder_usable(
         "-f",
         "lavfi",
         "-i",
-        # NVENC rejects 128x128 even though FFmpeg advertises the encoder.
-        # Keep this small enough to be cheap while satisfying the minimum
-        # dimensions of current NVIDIA H.264 hardware and remaining valid for
-        # the other hardware encoders that share this probe.
-        "color=black:s=256x256:d=0.05",
+        # Use the real input dimensions. A tiny probe can pass even when the
+        # selected hardware rejects an 8K frame, causing the first real frame
+        # to fail after expensive atlas preparation has already started.
+        f"color=black:s={width}x{height}:d=0.05",
+        "-r",
+        str(fps),
         "-frames:v",
         "1",
     ]
@@ -8059,6 +8078,10 @@ def _select_video_encoder(
     video_preset: str,
     crf: int,
     lossless: bool = False,
+    *,
+    probe_width: int = 256,
+    probe_height: int = 256,
+    probe_fps: int = 30,
 ) -> tuple[str, str, list[str]]:
     """Resolve ``auto`` without making a render depend on unavailable hardware."""
 
@@ -8074,9 +8097,21 @@ def _select_video_encoder(
     near_lossless = not lossless and crf <= NEAR_LOSSLESS_CRF
     if requested in hardware:
         usable = (
-            _vaapi_encoder_usable(lossless=lossless)
+            _vaapi_encoder_usable(
+                lossless=lossless,
+                width=probe_width,
+                height=probe_height,
+                fps=probe_fps,
+            )
             if requested == "h264_vaapi"
-            else _hardware_encoder_usable(requested, lossless, near_lossless)
+            else _hardware_encoder_usable(
+                requested,
+                lossless,
+                near_lossless,
+                probe_width,
+                probe_height,
+                probe_fps,
+            )
         )
         if not usable:
             raise RuntimeError(
@@ -8104,21 +8139,40 @@ def _select_video_encoder(
         if encoder not in available:
             continue
         if encoder == "h264_nvenc":
-            if not _hardware_encoder_usable(encoder, lossless, near_lossless):
+            if not _hardware_encoder_usable(
+                encoder,
+                lossless,
+                near_lossless,
+                probe_width,
+                probe_height,
+                probe_fps,
+            ):
                 continue
             preset, rate_control, _ = _video_encoder_settings(
                 encoder, video_preset, crf, lossless=lossless
             )
             return encoder, preset, rate_control
         if encoder == "h264_vaapi":
-            if not _vaapi_encoder_usable(lossless=lossless):
+            if not _vaapi_encoder_usable(
+                lossless=lossless,
+                width=probe_width,
+                height=probe_height,
+                fps=probe_fps,
+            ):
                 continue
             preset, rate_control, _ = _video_encoder_settings(
                 encoder, video_preset, crf, lossless=lossless
             )
             return encoder, preset, rate_control
         if encoder in {"h264_qsv", "h264_videotoolbox"}:
-            if not _hardware_encoder_usable(encoder, lossless, near_lossless):
+            if not _hardware_encoder_usable(
+                encoder,
+                lossless,
+                near_lossless,
+                probe_width,
+                probe_height,
+                probe_fps,
+            ):
                 continue
         preset, rate_control, _ = _video_encoder_settings(
             encoder, video_preset, crf, lossless=lossless
@@ -10230,55 +10284,6 @@ def render_video(
     lossless = bool(lossless)
     if lossless:
         crf = 0
-    formula = _formula_name(formula)
-    ffmpeg_path = shutil.which("ffmpeg")
-    if ffmpeg_path is None:
-        raise RuntimeError("ffmpeg is required to encode the video, but it was not found on PATH")
-    selected_codec, selected_preset, rate_control = _select_video_encoder(
-        video_codec,
-        video_preset,
-        crf,
-        lossless,
-    )
-    if selected_codec == "h264_vaapi" and (
-        width < 128
-        or height < 128
-        or width > 4096
-        or height > 4096
-        or width % 2
-        or height % 2
-    ):
-        if video_codec != "auto":
-            raise RuntimeError(
-                "h264_vaapi requires even dimensions between 128 and 4096 pixels"
-            )
-        selected_codec, selected_preset, rate_control = _select_video_encoder(
-            "libx264",
-            video_preset,
-            crf,
-            lossless,
-        )
-
-    if formula != "mandelbrot" and native_backend == "auto":
-        native_backend = "scalar"
-    if formula != "mandelbrot" and native_backend in {"avx2", "opencl"}:
-        raise RuntimeError(
-            f"--native-backend {native_backend} is only available for Mandelbrot; "
-            "use --native-backend scalar for alternate formulas"
-        )
-    if palette_file is not None:
-        palette_file = _normalise_path(palette_file)
-        if not palette_file.is_file():
-            raise RuntimeError(f"palette file not found: {palette_file}")
-        if _paths_refer_to_same_target(palette_file, audio_path):
-            raise ValueError("palette file must be different from the input audio file")
-        if _paths_refer_to_same_target(palette_file, output_path):
-            raise ValueError("palette file must be different from the output video")
-    if not math.isfinite(float(glow)) or not 0.0 <= float(glow) <= 1.0:
-        raise ValueError("glow must be between 0 and 1")
-    if not math.isfinite(float(motion_blur)) or not 0.0 <= float(motion_blur) < 1.0:
-        raise ValueError("motion-blur must be between 0 (off) and 1")
-
     if keyframe_mode not in {"atlas", "legacy"}:
         raise ValueError(f"unknown keyframe mode: {keyframe_mode}")
     if keyframe_mode == "atlas":
@@ -10303,6 +10308,67 @@ def render_video(
     if quality not in quality_settings:
         raise ValueError(f"unknown quality preset: {quality}")
     source_scale, transition_fraction = quality_settings[quality]
+    render_width, render_height = _scaled_dimensions(
+        width,
+        height,
+        render_scale * float(source_scale),
+        "fractal source",
+    )
+    formula = _formula_name(formula)
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is required to encode the video, but it was not found on PATH")
+    selected_codec, selected_preset, rate_control = _select_video_encoder(
+        video_codec,
+        video_preset,
+        crf,
+        lossless,
+        probe_width=render_width,
+        probe_height=render_height,
+        probe_fps=fps,
+    )
+    if selected_codec == "h264_vaapi" and (
+        width < 128
+        or height < 128
+        or width > 4096
+        or height > 4096
+        or width % 2
+        or height % 2
+    ):
+        if video_codec != "auto":
+            raise RuntimeError(
+                "h264_vaapi requires even dimensions between 128 and 4096 pixels"
+            )
+        selected_codec, selected_preset, rate_control = _select_video_encoder(
+            "libx264",
+            video_preset,
+            crf,
+            lossless,
+            probe_width=render_width,
+            probe_height=render_height,
+            probe_fps=fps,
+        )
+
+    if formula != "mandelbrot" and native_backend == "auto":
+        native_backend = "scalar"
+    if formula != "mandelbrot" and native_backend in {"avx2", "opencl"}:
+        raise RuntimeError(
+            f"--native-backend {native_backend} is only available for Mandelbrot; "
+            "use --native-backend scalar for alternate formulas"
+        )
+    if palette_file is not None:
+        palette_file = _normalise_path(palette_file)
+        if not palette_file.is_file():
+            raise RuntimeError(f"palette file not found: {palette_file}")
+        if _paths_refer_to_same_target(palette_file, audio_path):
+            raise ValueError("palette file must be different from the input audio file")
+        if _paths_refer_to_same_target(palette_file, output_path):
+            raise ValueError("palette file must be different from the output video")
+    if not math.isfinite(float(glow)) or not 0.0 <= float(glow) <= 1.0:
+        raise ValueError("glow must be between 0 and 1")
+    if not math.isfinite(float(motion_blur)) or not 0.0 <= float(motion_blur) < 1.0:
+        raise ValueError("motion-blur must be between 0 (off) and 1")
+
     # Parent crops and neighbour interpolation are useful for a fast preview
     # but cannot be part of a quality master: they are exactly the source of
     # the rectangular/deep-black artefacts seen in earlier renders.
@@ -10310,12 +10376,6 @@ def render_video(
     cpu_count = max(2, os.cpu_count() or 2)
     if native_threads == 0:
         native_threads = min(MAX_THREAD_COUNT, max(1, (cpu_count * 2) // 3))
-    render_width, render_height = _scaled_dimensions(
-        width,
-        height,
-        render_scale * float(source_scale),
-        "fractal source",
-    )
     frame_width = int(render_width)
     frame_height = int(render_height)
     if frame_width <= 0 or frame_height <= 0:
