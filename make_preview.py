@@ -2,9 +2,8 @@
 """Turn a render into a small GIF or silent social-media preview.
 
 With no input, the newest filename containing a canonical resolution profile
-(``sd60`` through ``8k60``) is chosen. Legacy ``4k/e150`` names are also
-recognised. If no profile-like filename exists, the newest video in the
-selected directory is used and the choice is reported.
+(``sd60`` through ``8k60``) is chosen. If no profile-like filename exists, the
+newest video in the selected directory is used and the choice is reported.
 """
 
 from __future__ import annotations
@@ -36,8 +35,6 @@ PROFILE_FILENAME_MARKERS = (
     "2k60",
     "4k60",
     "8k60",
-    "4k-e150",
-    "4k-e-150",
 )
 
 

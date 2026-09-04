@@ -86,7 +86,6 @@ from deep_zoom_points import (
 from profiles import (
     CANONICAL_PROFILE_CHOICES,
     DEFAULT_PROFILE,
-    FAST_PROFILE_CHOICES,
     NEAR_LOSSLESS_CRF,
     PROFILE_ALIASES,
     PROFILE_CHOICES,
@@ -767,6 +766,24 @@ def _get_native_library() -> Any:
                     ctypes.c_int,
                 ]
                 library.fractal_colourise.restype = ctypes.c_int
+                if hasattr(library, "fractal_colourise_accents"):
+                    library.fractal_colourise_accents.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_colourise_accents.restype = ctypes.c_int
                 if hasattr(library, "fractal_apply_aurora_accents"):
                     library.fractal_apply_aurora_accents.argtypes = [
                         ctypes.POINTER(ctypes.c_uint8),
@@ -9759,6 +9776,61 @@ def _colourise_native(
     return rgb
 
 
+def _colourise_native_accents(
+    field: Any,
+    max_iter: int,
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    native_threads: int,
+    library: Any,
+    accents: tuple[tuple[int, int, int], ...],
+    interior_color: tuple[int, int, int],
+    pitch: float = 0.5,
+) -> Optional[Any]:
+    """Colour an ordinary palette in one fused native Aurora pass.
+
+    Older ABI-compatible shared libraries may not expose this optional entry
+    point; callers retain the two-pass compatibility path in that case.
+    """
+
+    function = getattr(library, "fractal_colourise_accents", None)
+    if function is None:
+        return None
+    np = _require_numpy()
+    scalar = np.ascontiguousarray(field, dtype=np.float32)
+    if scalar.ndim != 2:
+        raise ValueError("ordinary colour input must be two-dimensional")
+    if len(accents) != 3 or any(len(colour) != 3 for colour in accents):
+        raise ValueError("Aurora accents must contain three RGB colours")
+    if len(interior_color) != 3 or not all(
+        0 <= int(value) <= 255 for value in interior_color
+    ):
+        raise ValueError("ordinary interior colour must contain three bytes")
+    output = np.empty(scalar.shape + (3,), dtype=np.uint8)
+    accent_values = (ctypes.c_uint8 * 9)(
+        *(int(channel) for colour in accents for channel in colour)
+    )
+    status = function(
+        scalar.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(scalar.shape[1]),
+        int(scalar.shape[0]),
+        int(max_iter),
+        float(phase),
+        float(vocal),
+        float(instrumental),
+        float(pitch),
+        accent_values,
+        *(int(value) for value in interior_color),
+        int(native_threads),
+    )
+    if status != 0:
+        message = library.fractal_last_error() or b"unknown native accent colourizer error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
 def _crop_and_colourise_native(
     field: Any,
     output_width: int,
@@ -10180,6 +10252,22 @@ def _colourise_view(
             pitch,
         )
     if native_library is not None:
+        accents = _aurora_accents_for_selection(palette_name, palette_file)
+        interior_color = _ordinary_interior_color(palette_name, palette_file)
+        fused = _colourise_native_accents(
+            view,
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            native_threads,
+            native_library,
+            accents,
+            interior_color,
+            pitch,
+        )
+        if fused is not None:
+            return fused
         base = _colourise_native(
             view,
             max_iter,
@@ -10190,7 +10278,6 @@ def _colourise_view(
             native_library,
             0.5,
         )
-        accents = _aurora_accents_for_selection(palette_name, palette_file)
         accented = _native_apply_aurora_accents(
             base, accents, pitch, native_library, native_threads
         )
@@ -10202,13 +10289,13 @@ def _colourise_view(
                 vocal,
                 accents,
                 pitch,
-                _ordinary_interior_color(palette_name, palette_file),
+                interior_color,
             )
         return _apply_interior_color(
             accented,
             view,
             max_iter,
-            _ordinary_interior_color(palette_name, palette_file),
+            interior_color,
         )
     if palette_name != "aurora" or palette_file is not None:
         return _colourise_custom(
@@ -11239,9 +11326,6 @@ def render_video(
 def _print_profiles() -> None:
     print("Built-in profiles:")
     for name in CANONICAL_PROFILE_CHOICES:
-        print(f"  {name:<12} {PROFILE_DESCRIPTIONS[name]}")
-    print("Fast compatibility profiles:")
-    for name in FAST_PROFILE_CHOICES:
         print(f"  {name:<12} {PROFILE_DESCRIPTIONS[name]}")
     print("Compatibility aliases:")
     for alias, canonical in PROFILE_ALIASES.items():

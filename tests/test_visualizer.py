@@ -17,7 +17,6 @@ from deep_zoom_points import FORMULA_POINT_CATALOGUES
 from profiles import (
     CANONICAL_PROFILE_CHOICES,
     DEFAULT_PROFILE,
-    FAST_PROFILE_CHOICES,
     NEAR_LOSSLESS_CRF,
     PROFILE_ALIASES,
     PROFILE_DEFAULTS,
@@ -499,21 +498,7 @@ class AnimationTests(unittest.TestCase):
             self.assertEqual(args.fractal_scale, values["fractal_scale"])
             self.assertEqual(args.keyframe_factor, values["keyframe_factor"])
         for alias, canonical in PROFILE_ALIASES.items():
-            if alias == "4k-e150-lossless":
-                self.assertEqual(PROFILE_DEFAULTS[alias]["width"], 3840)
-                self.assertEqual(PROFILE_DEFAULTS[alias]["height"], 2160)
-                self.assertEqual(PROFILE_DEFAULTS[alias]["fps"], 60)
-                self.assertEqual(PROFILE_DEFAULTS[alias]["max_zoom"], "1e100")
-                self.assertEqual(PROFILE_DEFAULTS[alias]["crf"], 0)
-                self.assertTrue(PROFILE_DEFAULTS[alias]["lossless"])
-            else:
-                self.assertEqual(PROFILE_DEFAULTS[alias], PROFILE_DEFAULTS[canonical])
-        legacy_lossless = visualizer.build_parser(
-            ["--profile", "4k-e150-lossless"]
-        ).parse_args([])
-        self.assertTrue(legacy_lossless.lossless)
-        self.assertEqual(legacy_lossless.crf, 0)
-        self.assertEqual(legacy_lossless.max_zoom, "1e100")
+            self.assertEqual(PROFILE_DEFAULTS[alias], PROFILE_DEFAULTS[canonical])
         defaults = visualizer.build_parser().parse_args([])
         self.assertEqual(defaults.profile, DEFAULT_PROFILE)
         self.assertFalse(defaults.lossless)
@@ -521,22 +506,9 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(defaults.width, 3840)
         self.assertEqual(defaults.height, 2160)
         self.assertEqual(PROFILE_DEFAULTS["preview"]["fractal_scale"], 1.0)
-        self.assertEqual(FAST_PROFILE_CHOICES, ("4k-e150",))
-        fast_values = PROFILE_DEFAULTS["4k-e150"]
-        self.assertEqual((fast_values["width"], fast_values["height"]), (3840, 2160))
-        self.assertEqual(fast_values["fps"], 60)
-        self.assertEqual(fast_values["quality"], "balanced")
-        self.assertEqual(fast_values["fractal_scale"], UPSCALED_SOURCE_SCALE)
-        self.assertEqual(fast_values["keyframe_factor"], 8.0)
-        self.assertEqual(fast_values["max_zoom"], "1e150")
-        self.assertEqual(fast_values["video_preset"], "ultrafast")
-        self.assertEqual(fast_values["crf"], 18)
-        self.assertEqual(fast_values["resample"], "bilinear")
-        self.assertFalse(fast_values["lossless"])
-        self.assertEqual(fast_values["source_mode"], "upscaled")
-        fast_args = visualizer.build_parser(["--profile", "4k-e150"]).parse_args([])
-        self.assertEqual(fast_args.source_mode, "upscaled")
-        self.assertEqual((fast_args.width, fast_args.height), (3840, 2160))
+        self.assertNotIn("4k-e150", visualizer.PROFILE_CHOICES)
+        self.assertNotIn("4k-e150-lossless", visualizer.PROFILE_CHOICES)
+        self.assertNotIn("master-e150", visualizer.PROFILE_CHOICES)
 
     def test_export_source_modes_are_explicit_and_have_expected_density(self):
         self.assertEqual(
@@ -845,6 +817,48 @@ class AnimationTests(unittest.TestCase):
         )
         difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
         self.assertLessEqual(int(np.max(difference)), 1)
+
+    def test_native_ordinary_colouriser_uses_one_fused_accent_pass(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_accents"):
+            raise unittest.SkipTest("native fused ordinary colouriser is unavailable")
+        field = np.asarray(
+            [[0.0, 12.5, 87.25], [199.0, 200.0, np.nan]],
+            dtype=np.float32,
+        )
+        accents = visualizer._aurora_accents_for_selection("midnight", None)
+        interior = visualizer._ordinary_interior_color("midnight", None)
+        with mock.patch.object(
+            visualizer,
+            "_colourise_native_accents",
+            wraps=visualizer._colourise_native_accents,
+        ) as fused:
+            result = visualizer._colourise_view(
+                field,
+                200,
+                0.2,
+                0.7,
+                0.3,
+                library,
+                2,
+                "midnight",
+                0.5,
+            )
+        fused.assert_called_once()
+        self.assertEqual(result.shape, (2, 3, 3))
+        self.assertEqual(result.dtype, np.uint8)
+        np.testing.assert_array_equal(result[1, 1], interior)
+        portable = visualizer._colourise_aurora_accents(
+            field,
+            200,
+            0.2,
+            0.7,
+            accents,
+            0.5,
+            interior,
+        )
+        difference = np.abs(result.astype(np.int16) - portable.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 4)
 
     def test_native_kfp_crop_matches_direct_at_unit_zoom(self):
         library = visualizer._get_native_library()

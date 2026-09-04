@@ -24,11 +24,9 @@ SOURCE_MODE_LABELS = {
     "upscaled": "upscaled",
 }
 # The fast export path renders a quarter-size scalar field and lets FFmpeg
-# enlarge it to the requested output dimensions.  This is the source density
-# used by the old practical 4K speed render, and is intentionally explicit so
-# it cannot be selected by accident for a quality export.
+# enlarge it to the requested output dimensions. It remains an explicit source
+# mode so it cannot be selected by accident for a quality export.
 UPSCALED_SOURCE_SCALE = 0.25
-FAST_PROFILE_CHOICES = ("4k-e150",)
 CANONICAL_PROFILE_CHOICES = (
     "sd60",
     "hd60",
@@ -106,25 +104,6 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
     ),
 }
 
-# This is the exact practical 4K speed profile used before the live-view
-# work: a 960x540 source, the fused native colour path, and a fast encoder.
-# Keep it explicit rather than making a quality profile silently undersample.
-PROFILE_DEFAULTS["4k-e150"] = {
-    "width": 3840,
-    "height": 2160,
-    "fps": 60,
-    "quality": "balanced",
-    "fractal_scale": UPSCALED_SOURCE_SCALE,
-    "keyframe_factor": 8.0,
-    "max_zoom": "1e150",
-    "separation": "auto",
-    "video_preset": "ultrafast",
-    "crf": 18,
-    "resample": "bilinear",
-    "lossless": False,
-    "source_mode": "upscaled",
-}
-
 PROFILE_DESCRIPTIONS: dict[str, str] = {
     "sd60": "Lossless-compressed 720x480 60 fps, CRF 10, e100.",
     "hd60": "Lossless-compressed 1280x720 60 fps, CRF 10, e100.",
@@ -132,7 +111,6 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "2k60": "2K/60 lossless-compressed C++ pipeline from 1920x1080, CRF 10, e100.",
     "4k60": "4K/60 lossless-compressed C++ pipeline from 1920x1080, CRF 10, e100.",
     "8k60": "8K/60 lossless-compressed C++ pipeline from 1920x1080, CRF 10, e100.",
-    "4k-e150": "Fast 4K/60 e150 export from a 960x540 source, enlarged at the end.",
 }
 
 # Keep existing command lines usable while making the resolution presets the
@@ -146,27 +124,13 @@ PROFILE_ALIASES: dict[str, str] = {
     "preview": "sd60",
     "fullhd": "fhd60",
     "1080p": "fhd60",
-    "4k-e150-lossless": "4k60",
-    "master-e150": "4k60",
     "beat": "fhd60",
 }
 for _alias, _canonical in PROFILE_ALIASES.items():
     PROFILE_DEFAULTS[_alias] = dict(PROFILE_DEFAULTS[_canonical])
     PROFILE_DESCRIPTIONS[_alias] = f"Compatibility alias for --profile {_canonical}."
 
-# Preserve the observable meaning of the old quality-master name while moving
-# its otherwise problematic e150 target to the safe e100 default. This is
-# still a lossless-compressed 4K/60 profile, just exact-lossless instead of CRF 10.
-PROFILE_DEFAULTS["4k-e150-lossless"].update(crf=0, lossless=True)
-PROFILE_DESCRIPTIONS["4k-e150-lossless"] = (
-    "Compatibility alias for --profile 4k60 with exact H.264 lossless output."
-)
-
-# CLI accepts the canonical profiles, the explicit fast compatibility profile,
-# and aliases for existing scripts. The GTK selector chooses from the
-# canonical tiers plus the fast profile; aliases remain CLI-only.
-PROFILE_CHOICES = (
-    CANONICAL_PROFILE_CHOICES
-    + FAST_PROFILE_CHOICES
-    + tuple(PROFILE_ALIASES)
-)
+# CLI accepts the canonical profiles and aliases for existing scripts. The GTK
+# selector chooses only from the canonical resolution tiers; aliases remain
+# CLI-only.
+PROFILE_CHOICES = CANONICAL_PROFILE_CHOICES + tuple(PROFILE_ALIASES)

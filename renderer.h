@@ -207,6 +207,23 @@ int fractal_colourise(
     double pitch,
     int threads
 );
+/* One-pass Aurora-wave colourisation through three ordinary-palette accents. */
+int fractal_colourise_accents(
+    const float *field,
+    uint8_t *output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const uint8_t *accents,
+    int interior_red,
+    int interior_green,
+    int interior_blue,
+    int threads
+);
 int fractal_apply_aurora_accents(
     uint8_t *output,
     int width,

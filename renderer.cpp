@@ -1474,24 +1474,62 @@ inline void write_kfp_default_fast_block8(
     const __m256 inverse_fraction = _mm256_sub_ps(
         _mm256_set1_ps(1.0F), fraction);
     const __m256i three = _mm256_set1_epi32(3);
-    const __m256i lower_offsets = _mm256_mullo_epi32(lower, three);
-    const __m256i upper_offsets = _mm256_mullo_epi32(upper, three);
+    // A packed RGB lookup reads four bytes at a time. The last three-byte
+    // entry has no fourth byte inside the caller-owned LUT, so clamp gather
+    // addresses to the preceding entry and patch last-entry lanes below.
+    // Without this guard the AVX2 fast path performed an out-of-bounds read at
+    // a perfectly valid palette cycle boundary, which could surface as noisy
+    // pixels or a sporadic crash.
+    const __m256i last_index = _mm256_set1_epi32(lut_size - 1);
+    const __m256i safe_index = _mm256_set1_epi32(lut_size - 2);
+    const __m256i lower_last = _mm256_cmpeq_epi32(lower, last_index);
+    const __m256i upper_last = _mm256_cmpeq_epi32(upper, last_index);
+    const __m256i lower_offsets = _mm256_mullo_epi32(
+        _mm256_min_epi32(lower, safe_index), three);
+    const __m256i upper_offsets = _mm256_mullo_epi32(
+        _mm256_min_epi32(upper, safe_index), three);
     const __m256i lower_packed = _mm256_i32gather_epi32(
         reinterpret_cast<const int*>(lut), lower_offsets, 1);
     const __m256i upper_packed = _mm256_i32gather_epi32(
         reinterpret_cast<const int*>(lut), upper_offsets, 1);
-    const __m256 lower_red = _mm256_cvtepi32_ps(_mm256_and_si256(
+    __m256 lower_red = _mm256_cvtepi32_ps(_mm256_and_si256(
         lower_packed, _mm256_set1_epi32(0xff)));
-    const __m256 lower_green = _mm256_cvtepi32_ps(_mm256_and_si256(
+    __m256 lower_green = _mm256_cvtepi32_ps(_mm256_and_si256(
         _mm256_srli_epi32(lower_packed, 8), _mm256_set1_epi32(0xff)));
-    const __m256 lower_blue = _mm256_cvtepi32_ps(_mm256_and_si256(
+    __m256 lower_blue = _mm256_cvtepi32_ps(_mm256_and_si256(
         _mm256_srli_epi32(lower_packed, 16), _mm256_set1_epi32(0xff)));
-    const __m256 upper_red = _mm256_cvtepi32_ps(_mm256_and_si256(
+    __m256 upper_red = _mm256_cvtepi32_ps(_mm256_and_si256(
         upper_packed, _mm256_set1_epi32(0xff)));
-    const __m256 upper_green = _mm256_cvtepi32_ps(_mm256_and_si256(
+    __m256 upper_green = _mm256_cvtepi32_ps(_mm256_and_si256(
         _mm256_srli_epi32(upper_packed, 8), _mm256_set1_epi32(0xff)));
-    const __m256 upper_blue = _mm256_cvtepi32_ps(_mm256_and_si256(
+    __m256 upper_blue = _mm256_cvtepi32_ps(_mm256_and_si256(
         _mm256_srli_epi32(upper_packed, 16), _mm256_set1_epi32(0xff)));
+    const __m256 lower_last_float = _mm256_castsi256_ps(lower_last);
+    const __m256 upper_last_float = _mm256_castsi256_ps(upper_last);
+    lower_red = _mm256_blendv_ps(
+        lower_red,
+        _mm256_set1_ps(static_cast<float>(lut[(lut_size - 1) * 3])),
+        lower_last_float);
+    lower_green = _mm256_blendv_ps(
+        lower_green,
+        _mm256_set1_ps(static_cast<float>(lut[(lut_size - 1) * 3 + 1])),
+        lower_last_float);
+    lower_blue = _mm256_blendv_ps(
+        lower_blue,
+        _mm256_set1_ps(static_cast<float>(lut[(lut_size - 1) * 3 + 2])),
+        lower_last_float);
+    upper_red = _mm256_blendv_ps(
+        upper_red,
+        _mm256_set1_ps(static_cast<float>(lut[(lut_size - 1) * 3])),
+        upper_last_float);
+    upper_green = _mm256_blendv_ps(
+        upper_green,
+        _mm256_set1_ps(static_cast<float>(lut[(lut_size - 1) * 3 + 1])),
+        upper_last_float);
+    upper_blue = _mm256_blendv_ps(
+        upper_blue,
+        _mm256_set1_ps(static_cast<float>(lut[(lut_size - 1) * 3 + 2])),
+        upper_last_float);
     __m256 red = _mm256_add_ps(
         _mm256_mul_ps(lower_red, inverse_fraction),
         _mm256_mul_ps(upper_red, fraction));
@@ -4844,6 +4882,63 @@ std::unique_ptr<ReferenceContext> clone_reference_context(
 }
 #endif
 
+int colourise_field_impl(
+    const float* field,
+    std::uint8_t* output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int threads,
+    const int* interior_color,
+    const std::uint8_t* accents
+) {
+    try {
+        if (!field || !output || !valid_pixel_dimensions(width, height)
+            || !valid_iteration_count(max_iter) || !valid_thread_count(threads)
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)
+            || (interior_color != nullptr
+                && (interior_color[0] < 0 || interior_color[0] > 255
+                    || interior_color[1] < 0 || interior_color[1] > 255
+                    || interior_color[2] < 0 || interior_color[2] > 255))) {
+            throw std::runtime_error("invalid native colour dimensions or palette");
+        }
+        const AuroraPalette& palette = aurora_palette_for(
+            max_iter, phase, vocal, instrumental, pitch, accents);
+        const int palette_size = static_cast<int>(palette.rgb.size());
+        // Match the float32 indexing used by the Python fallback. A double
+        // product can occasionally select the adjacent 65k-entry palette bin.
+        const float index_scale = static_cast<float>(palette_size - 1)
+            / static_cast<float>(max_iter);
+        const int pixel_count = width * height;
+
+#ifdef _OPENMP
+        if (threads > 0) omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#endif
+        for (int pixel = 0; pixel < pixel_count; ++pixel) {
+            write_colour_pixel(
+                field[pixel],
+                max_iter,
+                palette,
+                index_scale,
+                output + static_cast<size_t>(pixel) * 3U,
+                interior_color);
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native colouriser failed with an unknown exception");
+        return 1;
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -4904,56 +4999,59 @@ int fractal_colourise(
     double pitch,
     int threads
 ) {
-    try {
-        if (!field || !output || !valid_pixel_dimensions(width, height)
-            || !valid_iteration_count(max_iter) || !valid_thread_count(threads)
-            || !valid_colour_controls(phase, vocal, instrumental, pitch)) {
-            throw std::runtime_error("invalid native colour dimensions or palette");
-        }
-        const AuroraPalette& palette = aurora_palette_for(
-            max_iter, phase, vocal, instrumental, pitch);
-        const int palette_size = static_cast<int>(palette.rgb.size());
-        // Match the float32 indexing used by the Python fallback.  A double
-        // product can occasionally select the adjacent 65k-entry palette
-        // bin, which is visible as a several-level RGB difference.
-        const float index_scale = static_cast<float>(palette_size - 1)
-            / static_cast<float>(max_iter);
-        const int pixel_count = width * height;
+    return colourise_field_impl(
+        field,
+        output,
+        width,
+        height,
+        max_iter,
+        phase,
+        vocal,
+        instrumental,
+        pitch,
+        threads,
+        nullptr,
+        nullptr);
+}
 
-#ifdef _OPENMP
-        if (threads > 0) omp_set_num_threads(threads);
-#pragma omp parallel for schedule(static)
-#endif
-        for (int pixel = 0; pixel < pixel_count; ++pixel) {
-            const float smooth = field[pixel];
-            std::uint8_t* rgb = output + static_cast<size_t>(pixel) * 3U;
-            if (!std::isfinite(smooth) || smooth >= static_cast<float>(max_iter)) {
-                rgb[0] = 0;
-                rgb[1] = 0;
-                rgb[2] = 0;
-                continue;
-            }
-            const double scaled_index = static_cast<double>(smooth)
-                * static_cast<double>(index_scale);
-            const int palette_index = scaled_index >= static_cast<double>(palette_size - 1)
-                ? palette_size - 1
-                : !std::isfinite(scaled_index) || scaled_index <= 0.0
-                    ? 0
-                    : static_cast<int>(scaled_index);
-            const auto& colour = palette.rgb[static_cast<size_t>(palette_index)];
-            rgb[0] = colour[0];
-            rgb[1] = colour[1];
-            rgb[2] = colour[2];
-        }
-        set_error("");
-        return 0;
-    } catch (const std::exception& error) {
-        set_error(error.what());
-        return 1;
-    } catch (...) {
-        set_error("native colouriser failed with an unknown exception");
+int fractal_colourise_accents(
+    const float* field,
+    std::uint8_t* output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const std::uint8_t* accents,
+    int interior_red,
+    int interior_green,
+    int interior_blue,
+    int threads
+) {
+    if (!accents) {
+        set_error("ordinary palette accents are required");
         return 1;
     }
+    const int interior_color[3] = {
+        interior_red,
+        interior_green,
+        interior_blue,
+    };
+    return colourise_field_impl(
+        field,
+        output,
+        width,
+        height,
+        max_iter,
+        phase,
+        vocal,
+        instrumental,
+        pitch,
+        threads,
+        interior_color,
+        accents);
 }
 
 int fractal_apply_aurora_accents(

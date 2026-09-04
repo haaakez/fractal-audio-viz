@@ -37,7 +37,6 @@ from deep_zoom_points import FORMULA_POINT_CATALOGUES, FORMULA_POINTS_BY_SLUG
 from profiles import (
     CANONICAL_PROFILE_CHOICES,
     DEFAULT_PROFILE,
-    FAST_PROFILE_CHOICES,
     PROFILE_DEFAULTS,
     SOURCE_MODE_CHOICES,
     SOURCE_MODE_LABELS,
@@ -217,7 +216,7 @@ if Gtk is not None:
             self.audio = self._entry(str(ROOT / "song.mp3"))
             self.output = self._entry(str(ROOT / "fractal_viz.mp4"))
             self.profile = self._combo(
-                CANONICAL_PROFILE_CHOICES + FAST_PROFILE_CHOICES,
+                CANONICAL_PROFILE_CHOICES,
                 DEFAULT_PROFILE,
             )
             self.formula = self._combo(tuple(FORMULA_POINT_CATALOGUES), "mandelbrot")
