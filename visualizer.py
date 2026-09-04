@@ -125,6 +125,15 @@ FORMULA_CHOICES = (
     "burning-ship",
     "tricorn",
 )
+VIDEO_PRESET_CHOICES = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+)
 PALETTE_CHOICES = (
     "aurora",
     "fire",
@@ -8037,6 +8046,84 @@ def _hardware_encoder_usable(
     return result.returncode == 0
 
 
+@lru_cache(maxsize=16)
+def _software_encoder_usable(
+    encoder: str = "libx264",
+    lossless: bool = False,
+    near_lossless: bool = False,
+    width: int = 256,
+    height: int = 256,
+    fps: int = 30,
+    preserve_chroma: bool = False,
+) -> bool:
+    """Probe the software fallback at the same RGB frame shape as a render."""
+
+    if encoder != "libx264":
+        return False
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return False
+    try:
+        width, height = _validate_dimensions(width, height, "software encoder probe")
+        fps = _validate_fps(fps)
+    except ValueError:
+        return False
+    # Keep this in lockstep with _video_pixel_format for software output. A
+    # yuv420p probe would incorrectly bless odd dimensions that x264 rejects.
+    output_pixel_format = (
+        "yuv444p"
+        if preserve_chroma or width % 2 or height % 2
+        else "yuv420p"
+    )
+    try:
+        preset, rate_control, _ = _video_encoder_settings(
+            encoder,
+            "ultrafast",
+            0 if lossless else (NEAR_LOSSLESS_CRF if near_lossless else 24),
+            lossless=lossless,
+        )
+    except ValueError:
+        return False
+    command = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=black:s={width}x{height}:r={fps}:d=0.05,format=rgb24",
+        "-r",
+        str(fps),
+        "-frames:v",
+        "1",
+        "-c:v",
+        encoder,
+        "-preset",
+        preset,
+        *rate_control,
+        "-pix_fmt",
+        output_pixel_format,
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+            **_subprocess_group_options(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def _video_encoder_settings(
     encoder: str,
     video_preset: str,
@@ -8100,6 +8187,10 @@ def _select_video_encoder(
 
     requested = _validate_ffmpeg_token(requested, "video codec")
     video_preset = _validate_ffmpeg_token(video_preset, "video preset")
+    if video_preset not in VIDEO_PRESET_CHOICES:
+        raise ValueError(
+            f"video preset must be one of: {', '.join(VIDEO_PRESET_CHOICES)}"
+        )
     crf = _index_value(crf, "crf")
     if not 0 <= crf <= 51:
         raise ValueError("crf must be between 0 and 51")
@@ -8132,6 +8223,24 @@ def _select_video_encoder(
             raise RuntimeError(
                 f"{requested} was requested, but its complete FFmpeg encode path "
                 "failed the hardware probe"
+            )
+        preset, rate_control, _ = _video_encoder_settings(
+            requested, video_preset, crf, lossless=lossless
+        )
+        return requested, preset, rate_control
+    if requested == "libx264":
+        if not _software_encoder_usable(
+            requested,
+            lossless,
+            near_lossless,
+            probe_width,
+            probe_height,
+            probe_fps,
+            preserve_chroma,
+        ):
+            raise RuntimeError(
+                "libx264 was requested, but its complete FFmpeg encode path "
+                "failed the software probe"
             )
         preset, rate_control, _ = _video_encoder_settings(
             requested, video_preset, crf, lossless=lossless
@@ -8199,6 +8308,19 @@ def _select_video_encoder(
         raise RuntimeError(
             "no usable hardware encoder was found and this FFmpeg build does not "
             "provide libx264"
+        )
+    if not _software_encoder_usable(
+        "libx264",
+        lossless,
+        near_lossless,
+        probe_width,
+        probe_height,
+        probe_fps,
+        preserve_chroma,
+    ):
+        raise RuntimeError(
+            "no usable hardware encoder was found and the libx264 software "
+            "fallback failed its complete FFmpeg probe"
         )
     return "libx264", video_preset, ["-crf", str(crf)]
 
@@ -11398,7 +11520,7 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--video-preset",
-        choices=("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"),
+        choices=VIDEO_PRESET_CHOICES,
         default="ultrafast",
         help="x264 speed/size tradeoff; ultrafast is the low-power default",
     )

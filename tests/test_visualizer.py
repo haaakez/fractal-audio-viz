@@ -1664,12 +1664,13 @@ class AnimationTests(unittest.TestCase):
             )[1],
             ["-tune", "lossless", "-rc", "constqp", "-qp", "0"],
         )
-        codec, preset, rate_control = visualizer._select_video_encoder(
-            "libx264",
-            "slow",
-            18,
-            lossless=True,
-        )
+        with mock.patch.object(visualizer, "_software_encoder_usable", return_value=True):
+            codec, preset, rate_control = visualizer._select_video_encoder(
+                "libx264",
+                "slow",
+                18,
+                lossless=True,
+            )
         self.assertEqual((codec, preset, rate_control), ("libx264", "slow", ["-crf", "0"]))
 
     def test_pitch_rotates_legacy_two_hue_gradient(self):
@@ -1717,12 +1718,64 @@ class AnimationTests(unittest.TestCase):
         self.assertTrue(mask[probe_y, probe_x])
 
     def test_explicit_video_codec_keeps_x264_rate_control(self):
-        codec, preset, rate_control = visualizer._select_video_encoder(
-            "libx264", "ultrafast", 18
-        )
+        with mock.patch.object(visualizer, "_software_encoder_usable", return_value=True):
+            codec, preset, rate_control = visualizer._select_video_encoder(
+                "libx264", "ultrafast", 18
+            )
         self.assertEqual(codec, "libx264")
         self.assertEqual(preset, "ultrafast")
         self.assertEqual(rate_control, ["-crf", "18"])
+
+    def test_video_encoder_rejects_unknown_preset_before_encoding(self):
+        with self.assertRaisesRegex(ValueError, "video preset must be one of"):
+            visualizer._select_video_encoder("libx264", "not-a-preset", 10)
+
+    def test_software_probe_uses_render_dimensions_and_rgb_input(self):
+        probe_result = mock.Mock(returncode=0)
+        visualizer._software_encoder_usable.cache_clear()
+        try:
+            with mock.patch.object(
+                visualizer.shutil, "which", return_value="/usr/bin/ffmpeg"
+            ), mock.patch.object(
+                visualizer.subprocess, "run", return_value=probe_result
+            ) as run:
+                self.assertTrue(
+                    visualizer._software_encoder_usable(
+                        width=7680,
+                        height=4320,
+                        fps=60,
+                        near_lossless=True,
+                    )
+                )
+        finally:
+            visualizer._software_encoder_usable.cache_clear()
+        command = run.call_args.args[0]
+        self.assertIn(
+            "color=black:s=7680x4320:r=60:d=0.05,format=rgb24",
+            command,
+        )
+        self.assertEqual(command[command.index("-r") + 1], "60")
+        self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv420p")
+
+    def test_software_probe_uses_four_four_four_for_odd_dimensions(self):
+        probe_result = mock.Mock(returncode=0)
+        visualizer._software_encoder_usable.cache_clear()
+        try:
+            with mock.patch.object(
+                visualizer.shutil, "which", return_value="/usr/bin/ffmpeg"
+            ), mock.patch.object(
+                visualizer.subprocess, "run", return_value=probe_result
+            ) as run:
+                self.assertTrue(
+                    visualizer._software_encoder_usable(
+                        width=641,
+                        height=480,
+                    )
+                )
+        finally:
+            visualizer._software_encoder_usable.cache_clear()
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv444p")
 
     def test_auto_codec_uses_probed_vaapi_when_available(self):
         with mock.patch.object(

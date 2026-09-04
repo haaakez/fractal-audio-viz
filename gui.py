@@ -333,7 +333,7 @@ if Gtk is not None:
             self.native_threads = self._entry("0")
             self.native_backend = self._combo(("auto", "scalar", "avx2", "opencl"), "auto")
             self.video_preset = self._combo(
-                ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"),
+                visualizer.VIDEO_PRESET_CHOICES,
                 "ultrafast",
             )
             self.codec = self._entry("auto")
