@@ -144,6 +144,55 @@ class LiveViewHelperTests(unittest.TestCase):
             self.assertEqual(len(complete.fields), len(ladder))
             self.assertTrue(store.finished)
 
+    def test_incomplete_live_sources_allow_continuous_lookahead(self):
+        """The live camera must not freeze, then jump, as sources arrive."""
+
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="mandelbrot",
+                x_center="-0.50000000000000000000",
+                y_center="0.00000000000000000000",
+                max_zoom="1e2",
+            )
+            requested = np.asarray([0.0, 1.0, 2.0], dtype=np.float64)
+            store = live_view.LiveZoomSourceStore(requested)
+            store.append(0.0, np.zeros((4, 8), dtype=np.float32), 192)
+            store.append(1.0, np.ones((4, 8), dtype=np.float32), 192)
+            observed = []
+
+            def fake_colour(*args):
+                observed.append(args)
+                return np.zeros((4, 8, 3), dtype=np.uint8)
+
+            with mock.patch.object(
+                live_view.visualizer,
+                "_atlas_colour_frame",
+                side_effect=fake_colour,
+            ):
+                live_view._live_colour_frame(
+                    store,
+                    1.5,
+                    8,
+                    4,
+                    0.0,
+                    0.0,
+                    None,
+                    config,
+                )
+
+            self.assertAlmostEqual(
+                live_view._live_source_zoom_limit(store),
+                2.0,
+            )
+            # The old clamp used the last completed source (1.0), producing a
+            # parent zoom of exactly 1.0. The look-ahead must keep the crop
+            # moving through the not-yet-rendered interval.
+            self.assertEqual(len(observed), 1)
+            self.assertAlmostEqual(observed[0][4], 10.0 ** 0.5, places=6)
+
     def test_shared_live_reference_is_used_without_rebuilding_each_source(self):
         with TemporaryDirectory() as directory:
             audio = Path(directory) / "song.mp3"

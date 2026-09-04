@@ -65,6 +65,12 @@ LIVE_ITERATION_QUANTUM = 32
 LIVE_FRAME_READ_BYTES = 256 * 1024
 LIVE_FALLBACK_DURATION = 300.0
 LIVE_DEFAULT_NATIVE_THREADS = 4
+# Source fields are prepared in the background. When playback catches the
+# builder, let the latest field carry the camera only to the next requested
+# source boundary, and approach that boundary at a bounded rate. Without
+# this, the camera freezes at the last completed field and then jumps when the
+# worker appends the next one, which looks like an atlas-tile slideshow.
+LIVE_MAX_ZOOM_RATE = 2.5
 
 
 class _LiveCancelled(Exception):
@@ -253,6 +259,29 @@ class LiveZoomSourceStore:
             self._error = error
             self._finished = True
             self._condition.notify_all()
+
+    def display_zoom_limit(self) -> Optional[float]:
+        """Return the furthest zoom the current source set can display.
+
+        While the ladder is still being built, the next requested source is a
+        safe look-ahead boundary: the current last field can be continuously
+        cropped up to that point. Once building finishes (including a
+        deliberate deep-zoom cap), never extrapolate beyond the last valid
+        field.
+        """
+
+        with self._condition:
+            if not self._fields:
+                return None
+            last_log = float(self._log_zooms[-1])
+            if not self._finished and len(self._fields) < len(self.requested_logs):
+                try:
+                    next_log = float(self.requested_logs[len(self._fields)])
+                except (IndexError, TypeError, ValueError, OverflowError):
+                    next_log = last_log
+                if math.isfinite(next_log) and next_log > last_log:
+                    return next_log
+            return last_log
 
     def snapshot(self) -> LiveZoomSources:
         np = visualizer._require_numpy()
@@ -1077,6 +1106,26 @@ def _live_zoom_factor(log_zoom: float, source_log_zoom: float) -> float:
     return max(1.0, math.pow(10.0, delta))
 
 
+def _live_source_zoom_limit(
+    sources: LiveZoomSources | LiveZoomSourceStore,
+) -> Optional[float]:
+    """Return the current live camera ceiling for a source ladder."""
+
+    if isinstance(sources, LiveZoomSourceStore):
+        return sources.display_zoom_limit()
+    try:
+        logs = sources.log_zooms
+    except (AttributeError, TypeError):
+        return None
+    if len(logs) == 0:
+        return None
+    try:
+        value = float(logs[-1])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def _live_colour_frame(
     sources: LiveZoomSources | LiveZoomSourceStore,
     log_zoom: float,
@@ -1090,12 +1139,23 @@ def _live_colour_frame(
     """Compose one continuous frame from the absolute live source ladder."""
 
     np = visualizer._require_numpy()
+    source_store = sources if isinstance(sources, LiveZoomSourceStore) else None
     if isinstance(sources, LiveZoomSourceStore):
         sources = sources.snapshot()
     logs = np.asarray(sources.log_zooms, dtype=np.float64)
     if logs.size == 0 or not sources.fields:
         raise RuntimeError("live zoom source ladder is empty")
-    bounded_log_zoom = min(max(float(log_zoom), float(logs[0])), float(logs[-1]))
+    source_limit = _live_source_zoom_limit(source_store or sources)
+    if source_limit is None:
+        source_limit = float(logs[-1])
+    # An incomplete source store exposes one safe interval beyond its last
+    # completed field. This preserves continuous crop motion while the next
+    # field is rendering; the playback loop rate-limits the approach so an
+    # append can never turn into a one-frame jump.
+    bounded_log_zoom = min(
+        max(float(log_zoom), float(logs[0])),
+        max(float(logs[-1]), source_limit),
+    )
     index = int(np.searchsorted(logs, bounded_log_zoom, side="right") - 1)
     index = max(0, min(index, len(sources.fields) - 1))
     parent = sources.fields[index]
@@ -1628,6 +1688,8 @@ if Gtk is not None:
             next_deadline = started
             previous_cycle = -1
             phase_span = float(track.phase[-1]) if track.phase.size else 0.0
+            display_log_zoom: Optional[float] = None
+            last_zoom_update = started
             while not self._stop_event.is_set():
                 elapsed = time.monotonic() - started
                 if track.duration <= 0.0:
@@ -1643,7 +1705,8 @@ if Gtk is not None:
                         )
                         return
                     local_time = elapsed - cycle * track.duration
-                if cycle != previous_cycle:
+                cycle_changed = cycle != previous_cycle
+                if cycle_changed:
                     if cycle and self.config.loop:
                         self._stop_child("_audio_process")
                         player = _start_audio_player(self.config.audio_path)
@@ -1655,10 +1718,22 @@ if Gtk is not None:
                 )
                 energy = float(track.energy[index])
                 phase = float(track.phase[index]) + cycle * phase_span
-                log_zoom = float(track.zoom[index])
+                requested_log_zoom = float(track.zoom[index])
+                source_limit = _live_source_zoom_limit(sources)
+                if source_limit is not None:
+                    requested_log_zoom = min(requested_log_zoom, source_limit)
+                now = time.monotonic()
+                if display_log_zoom is None or cycle_changed:
+                    display_log_zoom = requested_log_zoom
+                else:
+                    elapsed_zoom = max(0.0, now - last_zoom_update)
+                    max_step = LIVE_MAX_ZOOM_RATE * max(elapsed_zoom, frame_interval)
+                    delta = requested_log_zoom - display_log_zoom
+                    display_log_zoom += max(-max_step, min(max_step, delta))
+                last_zoom_update = now
                 rgb = _live_colour_frame(
                     sources,
-                    log_zoom,
+                    display_log_zoom,
                     source_width,
                     source_height,
                     phase,

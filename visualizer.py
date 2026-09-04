@@ -438,6 +438,10 @@ FFMPEG_ENCODER_QUERY_TIMEOUT_SECONDS = 5.0
 MAX_FFMPEG_ENCODER_QUERY_BYTES = 1 * 1024 * 1024
 FFMPEG_FINALIZE_TIMEOUT_SECONDS = 30.0 * 60.0
 FFMPEG_STDIN_STALL_TIMEOUT_SECONDS = 5.0 * 60.0
+# A frame-count report is useful even when a single high-resolution frame or
+# atlas tile takes longer than the old video-time reporting interval. The GTK
+# launcher consumes these lines for its determinate progress bar.
+RENDER_PROGRESS_INTERVAL_SECONDS = 5.0
 
 # These are the original visualizer's liquid-gradient constants.  Keep the
 # numerical field independent from them: the atlas stores raw iteration data,
@@ -7690,6 +7694,7 @@ def _render_video_atlas(
     encoder_seconds = 0.0
     previous_rgb = None
     render_started = time.perf_counter()
+    last_progress_report = render_started
     active_level = None
     try:
         process, ffmpeg_diagnostics, ffmpeg_reader = _start_ffmpeg_process(command)
@@ -7762,8 +7767,20 @@ def _render_video_atlas(
             previous_rgb = rgb
             enqueue_frame(rgb)
             frame_seconds += time.perf_counter() - frame_started
-            if frame_index % max(1, fps * 5) == 0:
-                print(f"  encoded {100.0 * frame_index / total_frames:5.1f}%")
+            progress_now = time.perf_counter()
+            if (
+                frame_index == 0
+                or frame_index + 1 == total_frames
+                or progress_now - last_progress_report
+                    >= RENDER_PROGRESS_INTERVAL_SECONDS
+            ):
+                print(
+                    f"  frame {frame_index + 1}/{total_frames} "
+                    f"({100.0 * (frame_index + 1) / total_frames:5.1f}%) "
+                    f"· atlas level {level}/{level_count}",
+                    flush=True,
+                )
+                last_progress_report = progress_now
 
         encoder_started = time.perf_counter()
         assert frame_writer is not None
@@ -10921,6 +10938,7 @@ def render_video(
     render_started = time.perf_counter()
     keyframe_seconds = 0.0
     frame_seconds = 0.0
+    last_progress_report = render_started
     cache_evictor = _CacheEvictor(cache_dir, cache_limit_mb)
     previous_rgb = None
 
@@ -11111,8 +11129,19 @@ def render_video(
                 # FFmpeg stops consuming input while its process remains alive.
                 frame_writer.write(rgb)
                 frame_seconds += time.perf_counter() - frame_started
-                if frame_index % max(1, fps * 5) == 0:
-                    print(f"  encoded {100.0 * frame_index / total_frames:5.1f}%")
+                progress_now = time.perf_counter()
+                if (
+                    frame_index == 0
+                    or frame_index + 1 == total_frames
+                    or progress_now - last_progress_report
+                        >= RENDER_PROGRESS_INTERVAL_SECONDS
+                ):
+                    print(
+                        f"  frame {frame_index + 1}/{total_frames} "
+                        f"({100.0 * (frame_index + 1) / total_frames:5.1f}%)",
+                        flush=True,
+                    )
+                    last_progress_report = progress_now
 
             if next_field is None:
                 del field
