@@ -14,7 +14,13 @@ except ImportError as error:  # pragma: no cover - environment dependent
 
 import visualizer
 from deep_zoom_points import FORMULA_POINT_CATALOGUES
-from profiles import DEFAULT_PROFILE, PROFILE_DEFAULTS
+from profiles import (
+    CANONICAL_PROFILE_CHOICES,
+    DEFAULT_PROFILE,
+    NEAR_LOSSLESS_CRF,
+    PROFILE_ALIASES,
+    PROFILE_DEFAULTS,
+)
 
 
 class AnimationTests(unittest.TestCase):
@@ -37,7 +43,7 @@ class AnimationTests(unittest.TestCase):
             places=80,
         )
 
-    def test_default_center_has_precision_for_the_default_e150_profile(self):
+    def test_default_center_has_precision_for_the_default_e100_profile(self):
         available, required = visualizer._center_precision_budget(
             visualizer.DEFAULT_X_CENTER,
             visualizer.DEFAULT_Y_CENTER,
@@ -450,26 +456,50 @@ class AnimationTests(unittest.TestCase):
     def test_formula_defaults_and_profile_defaults_are_available(self):
         self.assertEqual(visualizer._formula_name("burningship"), "burning-ship")
         self.assertEqual(visualizer._parse_coordinate_pair("-0.8,0.156", "julia"), ("-0.8", "0.156"))
-        self.assertEqual(PROFILE_DEFAULTS["fullhd"], PROFILE_DEFAULTS["1080p"])
-        self.assertEqual(PROFILE_DEFAULTS["fullhd"]["width"], 1920)
-        self.assertEqual(PROFILE_DEFAULTS["fullhd"]["height"], 1080)
-        self.assertEqual(PROFILE_DEFAULTS["4k-e150"]["width"], 3840)
-        self.assertEqual(PROFILE_DEFAULTS["4k-e150"]["fps"], 60)
-        self.assertGreater(PROFILE_DEFAULTS["4k-e150"]["max_zoom"].count("e"), 0)
-        self.assertEqual(PROFILE_DEFAULTS["4k-e150"]["fractal_scale"], 0.25)
-        self.assertEqual(PROFILE_DEFAULTS["4k-e150"]["keyframe_factor"], 8.0)
-        self.assertEqual(PROFILE_DEFAULTS["4k-e150-lossless"]["fps"], 60)
-        self.assertEqual(PROFILE_DEFAULTS["4k-e150-lossless"]["fractal_scale"], 1.0)
-        self.assertTrue(PROFILE_DEFAULTS["4k-e150-lossless"]["lossless"])
-        self.assertEqual(PROFILE_DEFAULTS["4k-e150-lossless"]["crf"], 0)
-        self.assertEqual(PROFILE_DEFAULTS["4k-e150-lossless"]["resample"], "lanczos")
-        args = visualizer.build_parser(["--profile", "4k-e150-lossless"]).parse_args([])
-        self.assertTrue(args.lossless)
-        self.assertEqual(args.crf, 0)
-        self.assertEqual(args.fractal_scale, 1.0)
+        expected_dimensions = {
+            "sd60": (720, 480),
+            "hd60": (1280, 720),
+            "fhd60": (1920, 1080),
+            "2k60": (2560, 1440),
+            "4k60": (3840, 2160),
+            "8k60": (7680, 4320),
+        }
+        self.assertEqual(tuple(CANONICAL_PROFILE_CHOICES), tuple(expected_dimensions))
+        for name, (width, height) in expected_dimensions.items():
+            values = PROFILE_DEFAULTS[name]
+            self.assertEqual((values["width"], values["height"]), (width, height))
+            self.assertEqual(values["fps"], 60)
+            self.assertEqual(values["max_zoom"], "1e100")
+            self.assertEqual(values["quality"], "quality")
+            self.assertEqual(values["fractal_scale"], 1.0)
+            self.assertEqual(values["crf"], NEAR_LOSSLESS_CRF)
+            self.assertFalse(values["lossless"])
+            self.assertEqual(values["resample"], "lanczos")
+            args = visualizer.build_parser(["--profile", name]).parse_args([])
+            self.assertEqual((args.width, args.height, args.fps), (width, height, 60))
+            self.assertEqual(args.max_zoom, "1e100")
+            self.assertEqual(args.crf, NEAR_LOSSLESS_CRF)
+            self.assertFalse(args.lossless)
+        for alias, canonical in PROFILE_ALIASES.items():
+            if alias == "4k-e150-lossless":
+                self.assertEqual(PROFILE_DEFAULTS[alias]["width"], 3840)
+                self.assertEqual(PROFILE_DEFAULTS[alias]["height"], 2160)
+                self.assertEqual(PROFILE_DEFAULTS[alias]["fps"], 60)
+                self.assertEqual(PROFILE_DEFAULTS[alias]["max_zoom"], "1e100")
+                self.assertEqual(PROFILE_DEFAULTS[alias]["crf"], 0)
+                self.assertTrue(PROFILE_DEFAULTS[alias]["lossless"])
+            else:
+                self.assertEqual(PROFILE_DEFAULTS[alias], PROFILE_DEFAULTS[canonical])
+        legacy_lossless = visualizer.build_parser(
+            ["--profile", "4k-e150-lossless"]
+        ).parse_args([])
+        self.assertTrue(legacy_lossless.lossless)
+        self.assertEqual(legacy_lossless.crf, 0)
+        self.assertEqual(legacy_lossless.max_zoom, "1e100")
         defaults = visualizer.build_parser().parse_args([])
         self.assertEqual(defaults.profile, DEFAULT_PROFILE)
-        self.assertTrue(defaults.lossless)
+        self.assertFalse(defaults.lossless)
+        self.assertEqual(defaults.crf, NEAR_LOSSLESS_CRF)
         self.assertEqual(defaults.width, 3840)
         self.assertEqual(defaults.height, 2160)
         self.assertEqual(PROFILE_DEFAULTS["preview"]["fractal_scale"], 1.0)
@@ -1588,6 +1618,12 @@ class AnimationTests(unittest.TestCase):
             visualizer._video_pixel_format("libx264", "aurora"),
             "yuv420p",
         )
+        self.assertEqual(
+            visualizer._video_pixel_format(
+                "libx264", "aurora", crf=NEAR_LOSSLESS_CRF
+            ),
+            "yuv444p",
+        )
         # Hardware H.264 inputs remain on their device-compatible format.
         self.assertEqual(
             visualizer._video_pixel_format("h264_nvenc", "kalles-default"),
@@ -1595,6 +1631,12 @@ class AnimationTests(unittest.TestCase):
         )
         self.assertEqual(
             visualizer._video_pixel_format("h264_nvenc", "aurora", lossless=True),
+            "yuv444p",
+        )
+        self.assertEqual(
+            visualizer._video_pixel_format(
+                "h264_nvenc", "aurora", crf=NEAR_LOSSLESS_CRF
+            ),
             "yuv444p",
         )
 
@@ -1714,6 +1756,26 @@ class AnimationTests(unittest.TestCase):
         self.assertGreater(command.index("-pix_fmt"), command.index("-i"))
         output_format_index = len(command) - 1 - command[::-1].index("-f")
         self.assertLess(command.index("-pix_fmt"), output_format_index)
+
+    def test_near_lossless_hardware_probe_matches_nvenc_output_format(self):
+        probe_result = mock.Mock(returncode=0)
+        visualizer._hardware_encoder_usable.cache_clear()
+        try:
+            with mock.patch.object(
+                visualizer.shutil, "which", return_value="/usr/bin/ffmpeg"
+            ), mock.patch.object(
+                visualizer.subprocess, "run", return_value=probe_result
+            ) as run:
+                self.assertTrue(
+                    visualizer._hardware_encoder_usable(
+                        "h264_nvenc", near_lossless=True
+                    )
+                )
+        finally:
+            visualizer._hardware_encoder_usable.cache_clear()
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-cq") + 1], str(NEAR_LOSSLESS_CRF))
+        self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv444p")
 
     def test_lossless_vaapi_probe_uses_qp_zero(self):
         probe_result = mock.Mock(returncode=0)

@@ -84,7 +84,7 @@ source fields and still produces a 4K video.
 | `gui.py` | Optional GTK3/PyGObject launcher; the CLI remains the reproducible interface. |
 | `live_view.py` | Low-latency fullscreen GTK preview for listening/screen-saver use. |
 | `images/` | README preview and GUI screenshots/placeholders. |
-| `make_preview.py` | Converts the newest 4K/e150 render to a GIF or short MP4. |
+| `make_preview.py` | Converts the newest high-resolution render to a GIF or short MP4. |
 | `point_sheet.py` | Creates a labelled catalogue contact sheet. |
 | `benchmark.py` | Field, compositor, and atlas benchmarks without audio or video encoding. |
 | `tests/` | Python and native correctness tests. |
@@ -169,44 +169,48 @@ then choose the parts that matter for the render:
    `--keyframe-factor`.
 7. Add `--cache-dir` if the render may be resumed or repeated.
 
-profiles are shortcuts for a coherent set of these values. With no profile
-option, the default is the native-density `4k-e150-lossless` quality render;
-explicit options override the selected profile. Use the fast preset below when
-you want a quick, intentionally lower-detail result:
+profiles are shortcuts for a coherent set of these values. The canonical
+presets are `sd60`, `hd60`, `fhd60`, `2k60`, `4k60`, and `8k60`. Every one uses
+60 fps, native fractal resolution, e100, Lanczos resampling, and near-lossless
+CRF 10 encoding. With no profile option, `4k60` is selected; explicit options
+still override the profile.
 
 ```sh
-python3 visualizer.py music/track.mp3 --profile 4k-e150 \
-  --point random --random-seed 42 --output renders/track.mp4
+python3 visualizer.py music/track.mp3 --profile 4k60 \
+  --point random --random-seed 42 --output renders/track-4k60.mp4
 ```
 
 inspect the available presets with `python3 visualizer.py --list-profiles`.
 
-for a crisp native-density 4k/60 export with lossless h.264 and 4:4:4 colour,
-use the explicit quality profile:
+for a smaller or larger native-resolution export, change only the profile:
 
 ```sh
-python3 visualizer.py music/track.mp3 \
-  --profile 4k-e150-lossless \
+python3 visualizer.py music/track.mp3 --profile 8k60 \
   --point random --random-seed 42 \
-  --output renders/track-4k-e150-lossless.mp4
+  --output renders/track-8k60.mp4
 ```
 
-this profile is intentionally much slower and produces a much larger file
-than `4k-e150`; the latter remains the practical speed preset.
+CRF 10 is intended to be visually transparent while retaining useful
+compression. Add `--lossless` when exact H.264 losslessness matters more than
+file size, or choose a larger CRF explicitly when speed and storage matter
+more.
 
 ### common examples
 
-a normal Full HD render using a named e150-capable point:
+a normal Full HD render using the canonical preset:
 
 ```sh
 python3 visualizer.py music/track.mp3 \
-  --profile fullhd \
-  --point oldwooddish --max-zoom 1e150 \
+  --profile fhd60 \
+  --point oldwooddish \
   --output renders/track.mp4 \
   --cache-dir cache/track
 ```
 
-`--profile 1080p` remains available as an alias for `--profile fullhd`.
+The old names `preview`, `fullhd`, `1080p`, `4k-e150`, `master-e150`, and
+`beat` remain accepted as compatibility aliases for the new resolution tiers.
+`4k-e150-lossless` remains accepted too and keeps exact-lossless rate control
+while using the safe e100 target.
 
 a reproducible random point:
 
@@ -301,47 +305,54 @@ parameter plane. Alternate formulas use their own Python high-precision
 perturbation path for deep targets up to about e300; they are not silently
 routed through an incompatible Mandelbrot reference.
 
-### 4k/e150 speed profile
+### resolution profiles
 
-this profile writes 4K output while keeping the fractal source at 960x540. It
-is tuned for the e150 speed target on a six-core low-power cpu; actual time
-depends on the song, selected point, and encoder.
+the six canonical profiles all render the fractal at the output dimensions;
+none of them enlarges a small scalar field into a larger video. They share a
+60 fps frame rate, e100 maximum zoom, quality-mode atlas rendering, Lanczos
+resampling, and CRF 10 near-lossless compression.
+
+| profile | native output/source | max zoom | compression |
+| --- | --- | --- | --- |
+| `sd60` | 720×480 | e100 | CRF 10 |
+| `hd60` | 1280×720 | e100 | CRF 10 |
+| `fhd60` | 1920×1080 | e100 | CRF 10 |
+| `2k60` | 2560×1440 | e100 | CRF 10 |
+| `4k60` | 3840×2160 | e100 | CRF 10 |
+| `8k60` | 7680×4320 | e100 | CRF 10 |
+
+`4k60` is the default. The presets deliberately favour image quality over
+the old undersampled e150 speed profile. Add `--lossless` for exact H.264
+rate control; use `--quality balanced`, a larger `--keyframe-factor`, or a
+larger CRF explicitly when rendering speed matters more.
+
+for example, an 8K render is:
 
 ```sh
 python3 visualizer.py music/track.mp3 \
-  --profile 4k-e150 \
-  --output renders/track-4k-e150.mp4 \
-  --point random --random-seed 42 --max-zoom 1e150 \
-  --codec auto \
-  --cache-dir cache/track-4k-e150
+  --profile 8k60 \
+  --point random --random-seed 42 \
+  --output renders/track-8k60.mp4 \
+  --cache-dir cache/track-8k60
 ```
 
-for a 2K-source render, use `--fractal-scale 0.5 --keyframe-factor 8`; for a
-native-density master, use `--fractal-scale 1 --keyframe-factor 2`.
-that produces about 500 source levels at e150 and is substantially slower.
-the speed profile uses about 168 levels and 960×540 source fields. If the
-ten-minute ceiling matters more than the smoothest outer crop, add
-`--keyframe-factor 16`; use `--keyframe-factor 4` with a larger source when
-source detail matters more than render time.
-
-`4k-e150-lossless` uses a native 3840×2160 scalar source, lossless encoder
-rate control, and 4:4:4 output. It is the quality choice when source detail
-matters more than the 100-second speed target.
+the legacy e150 names are accepted, but resolve to the corresponding
+near-lossless native profile; the explicit `4k-e150-lossless` name retains
+exact-lossless rate control. This keeps old scripts working while making the
+six resolution tiers the single source of truth.
 
 use `--estimate` to analyse the song and print the planned source resolution
 and keyframe count without rendering video:
 
 ```sh
 python3 visualizer.py music/track.mp3 \
-  --width 3840 --height 2160 --quality balanced \
-  --fractal-scale 0.25 --keyframe-factor 8 \
-  --max-zoom 1e150 --estimate
+  --profile 4k60 --estimate
 ```
 
 ### previews and point browsing
 
-after a render, the small helper chooses the newest filename containing
-`4k`/`e150` and creates a looping GIF:
+after a render, the small helper chooses the newest filename containing one
+of the resolution profile names and creates a looping GIF:
 
 ```sh
 python3 make_preview.py
@@ -350,7 +361,7 @@ python3 make_preview.py
 choose a source or make a short MP4 explicitly:
 
 ```sh
-python3 make_preview.py renders/track-4k-e150.mp4 \
+python3 make_preview.py renders/track-4k60.mp4 \
   --format mp4 --duration 12 --width 1280 \
   --output renders/track-preview.mp4
 ```
@@ -371,7 +382,7 @@ unless noted otherwise, the values in parentheses are the defaults.
 | --- | --- |
 | `audio` (`song.mp3`) | Positional input audio file. This is how you choose a custom song. |
 | `--output PATH` (`fractal_viz.mp4`) | Output video path. |
-| `--profile NAME` | Start from `preview`, `fullhd` (`1080p` alias), `4k-e150` (fast 4K/60 e150), `4k-e150-lossless` (the default), `master-e150`, or `beat`; later options override it. |
+| `--profile NAME` | Start from `sd60`, `hd60`, `fhd60`, `2k60`, `4k60` (the default), or `8k60`; legacy names remain accepted as aliases. Later options override the profile. |
 | `--list-profiles` | Print the built-in profiles and exit. |
 | `--width N` (`3840` with the default profile) | Output width in pixels. |
 | `--height N` (`2160` with the default profile) | Output height in pixels. |
@@ -412,7 +423,7 @@ unless noted otherwise, the values in parentheses are the defaults.
 | --- | --- |
 | `--render-scale N` (`1.0`) | Multiplier applied to keyframe source dimensions. Must be at least `1`. |
 | `--fractal-scale N` (`1.0`) | Requested fractal source multiplier. Quality modes impose floors: atlas `draft`/`balanced` use at least `0.5`, `quality` at least `1`, and `extreme` at least `1.25`. |
-| `--quality MODE` (`balanced`) | `draft` is fastest and permits labelled recovery; `balanced` is a strict output-resolution atlas; `quality` preserves native source resolution; `extreme` adds modest supersampling. |
+| `--quality MODE` (`quality` with a resolution profile) | `draft` is fastest and permits labelled recovery; `balanced` is a strict output-resolution atlas; `quality` preserves native source resolution; `extreme` adds modest supersampling. |
 | `--keyframe-factor N` (`2.0`) | Maximum zoom ratio between adjacent atlas levels. Larger values reduce the number of fields but enlarge crops more. |
 | `--keyframe-mode MODE` (`atlas`) | `atlas` uses the fixed nested ladder; `legacy` uses the older audio-dependent full-field chunks. |
 | `--iteration-base N` (`384`) | Minimum iteration budget for shallow frames. |
@@ -428,11 +439,11 @@ unless noted otherwise, the values in parentheses are the defaults.
 
 | argument | description |
 | --- | --- |
-| `--video-preset MODE` (`ultrafast`) | x264 speed/size preset. Hardware encoders map this to their own speed levels when supported. |
+| `--video-preset MODE` (`slow` with a resolution profile) | x264 speed/size preset. Hardware encoders map this to their own speed levels when supported. |
 | `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox where applicable, then falls back to `libx264`. |
-| `--crf N` (`18`) | Quality value from `0` to `51`. It is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
+| `--crf N` (`10` with a resolution profile) | Quality value from `0` to `51`. CRF 10 is the near-lossless profile target; it is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
 | `--lossless` | Use lossless H.264 rate control where supported (`constqp/qp 0` for NVENC, CRF 0 for x264) and preserve 4:4:4 chroma where the encoder accepts it. |
-| `--resample MODE` (`bilinear`) | Crop and final upscale filter: `bilinear` is faster; `lanczos` is sharper and slower. |
+| `--resample MODE` (`lanczos` with a resolution profile) | Crop and final upscale filter: `bilinear` is faster; `lanczos` is sharper and slower. |
 | `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, `mono`, `midnight`, `ember-night`, `terminal`, or `kalles-default`. The night themes use dark exteriors with white interiors; `kalles-default` matches the bundled Kalles Fraktaler profile in `palettes/kalles-default.kfp`. Its first exterior key is intentionally white and its separate interior colour is black, matching Kalles' defaults. |
 | `--palette-file PATH` | Read at least two `#rrggbb` or `r g b` stops from a text file, or import a Kalles `.kfp` gradient and its colour settings. ordinary text palettes use the fast Aurora wave path; `.kfp` uses the Kalles-style transfer path. |
 | `--glow N` (`0`) | Add a low-resolution bloom pass after colourisation, from `0` to `1`. It is off by default for the 10-minute target. |
@@ -547,10 +558,9 @@ is prepared in the background. Final renders still use the export pipeline and
 its deep-zoom precision, atlas, and encoding settings. `ffplay` is used
 for playback when installed; without it the visual preview remains usable.
 
-the built-in `preview` profile now keeps a native source at its requested
-960×540 density; the e150 4k profile remains a deliberate 960×540-source
-speed trade-off. Use `master-e150` or `4k-e150-lossless` when the final 4k
-image must retain source-pixel detail all the way through the export.
+the live view is independent of the export profiles. It keeps its own small
+fast source ladder and only enlarges the RGB result in GTK; selecting `8k60`
+for an export never makes the live window allocate an 8K surface.
 
 the repository also includes `examples/make_test_tone.py` for a dependency-free
 audio smoke test, `point_sheet.py` for catalogue previews, and

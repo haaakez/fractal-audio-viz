@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Turn a render into a small GIF or silent social-media preview.
 
-With no input, the newest filename containing ``4k`` and ``e150`` is chosen.
-If no such filename exists, the newest video in the selected directory is
-used and the choice is reported.
+With no input, the newest filename containing a canonical resolution profile
+(``sd60`` through ``8k60``) is chosen. Legacy ``4k/e150`` names are also
+recognised. If no profile-like filename exists, the newest video in the
+selected directory is used and the choice is reported.
 """
 
 from __future__ import annotations
@@ -28,6 +29,16 @@ MAX_PREVIEW_DIMENSION = 16_384
 MAX_PREVIEW_PIXELS = 100_000_000
 MAX_VIDEO_SCAN_ENTRIES = 100_000
 MAX_DIAGNOSTIC_LINE_CHARS = 16_384
+PROFILE_FILENAME_MARKERS = (
+    "sd60",
+    "hd60",
+    "fhd60",
+    "2k60",
+    "4k60",
+    "8k60",
+    "4k-e150",
+    "4k-e-150",
+)
 
 
 def _absolute_path(path: Path) -> Path:
@@ -188,9 +199,9 @@ def _latest_video(directory: Path) -> Path:
                     if newest is None or timestamp > newest[1]:
                         newest = candidate
                     stem = path.stem.casefold()
-                    if "4k" in stem and any(
-                        marker in stem for marker in ("e150", "e-150", "150")
-                    ) and (preferred is None or timestamp > preferred[1]):
+                    if any(marker in stem for marker in PROFILE_FILENAME_MARKERS) and (
+                        preferred is None or timestamp > preferred[1]
+                    ):
                         preferred = candidate
             except OSError:
                 # Files can disappear or become inaccessible while a search
@@ -209,7 +220,7 @@ def _latest_video(directory: Path) -> Path:
             f"Video search reached the {MAX_VIDEO_SCAN_ENTRIES:,}-entry limit; "
             "using the newest matching file seen."
         )
-    print("No filename matching 4k/e150 was found; using the newest video.")
+    print("No filename matching a resolution profile was found; using the newest video.")
     return newest[0]
 
 
@@ -228,7 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
         "input",
         nargs="?",
         type=Path,
-        help="source video; omit it to choose the newest 4K/e150 render",
+        help="source video; omit it to choose the newest resolution-profile render",
     )
     parser.add_argument(
         "--directory",

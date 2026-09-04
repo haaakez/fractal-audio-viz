@@ -84,7 +84,10 @@ from deep_zoom_points import (
     DeepZoomPoint,
 )
 from profiles import (
+    CANONICAL_PROFILE_CHOICES,
     DEFAULT_PROFILE,
+    NEAR_LOSSLESS_CRF,
+    PROFILE_ALIASES,
     PROFILE_CHOICES,
     PROFILE_DEFAULTS,
     PROFILE_DESCRIPTIONS,
@@ -100,7 +103,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "3")
 
 DEFAULT_AUDIO = "song.mp3"
 DEFAULT_OUTPUT = "fractal_viz.mp4"
-# Use a catalogue centre with enough exported digits for the default e150
+# Use a catalogue centre with enough exported digits for the default e100
 # quality profile. The old bundled centre stopped at 129 fractional places,
 # which made a no-argument quality render fail its own precision guard.
 _DEFAULT_MANDELBROT_POINT = next(
@@ -7464,9 +7467,9 @@ def _render_video_atlas(
 
     np = _require_numpy()
     # The atlas field already has the requested quality density. Colourising
-    # at the final output size would repeat the crop and palette work at 4K
-    # for profiles whose scalar source is intentionally smaller. Keep the
-    # render surface at source resolution and upscale once in FFmpeg.
+    # at the final output size would repeat the crop and palette work for
+    # undersampled custom renders. Keep the render surface at source
+    # resolution and upscale once in FFmpeg when a custom scale requests it.
     frame_width = int(render_width)
     frame_height = int(render_height)
     if frame_width <= 0 or frame_height <= 0:
@@ -7945,7 +7948,11 @@ def _vaapi_encoder_usable(
 
 
 @lru_cache(maxsize=16)
-def _hardware_encoder_usable(encoder: str, lossless: bool = False) -> bool:
+def _hardware_encoder_usable(
+    encoder: str,
+    lossless: bool = False,
+    near_lossless: bool = False,
+) -> bool:
     """Run a tiny encode so ``auto`` never selects a merely advertised codec."""
 
     ffmpeg = shutil.which("ffmpeg")
@@ -7972,13 +7979,13 @@ def _hardware_encoder_usable(encoder: str, lossless: bool = False) -> bool:
         _, rate_control, _ = _video_encoder_settings(
             encoder,
             "ultrafast",
-            0 if lossless else 24,
+            0 if lossless else (NEAR_LOSSLESS_CRF if near_lossless else 24),
             lossless=lossless,
         )
     except ValueError:
         return False
     command.extend(["-c:v", encoder, *rate_control, "-f", "null", "-"])
-    if lossless and encoder == "h264_nvenc":
+    if (lossless or near_lossless) and encoder == "h264_nvenc":
         # Probe the same 4:4:4 output format used by the real lossless path;
         # a plain yuv420 probe can succeed on a device that rejects the KFP
         # detail-preserving format at encode time.
@@ -8064,11 +8071,12 @@ def _select_video_encoder(
     lossless = bool(lossless)
     if lossless:
         crf = 0
+    near_lossless = not lossless and crf <= NEAR_LOSSLESS_CRF
     if requested in hardware:
         usable = (
             _vaapi_encoder_usable(lossless=lossless)
             if requested == "h264_vaapi"
-            else _hardware_encoder_usable(requested, lossless)
+            else _hardware_encoder_usable(requested, lossless, near_lossless)
         )
         if not usable:
             raise RuntimeError(
@@ -8096,7 +8104,7 @@ def _select_video_encoder(
         if encoder not in available:
             continue
         if encoder == "h264_nvenc":
-            if not _hardware_encoder_usable(encoder, lossless):
+            if not _hardware_encoder_usable(encoder, lossless, near_lossless):
                 continue
             preset, rate_control, _ = _video_encoder_settings(
                 encoder, video_preset, crf, lossless=lossless
@@ -8110,7 +8118,7 @@ def _select_video_encoder(
             )
             return encoder, preset, rate_control
         if encoder in {"h264_qsv", "h264_videotoolbox"}:
-            if not _hardware_encoder_usable(encoder, lossless):
+            if not _hardware_encoder_usable(encoder, lossless, near_lossless):
                 continue
         preset, rate_control, _ = _video_encoder_settings(
             encoder, video_preset, crf, lossless=lossless
@@ -8129,22 +8137,26 @@ def _video_pixel_format(
     palette: str,
     palette_file: Optional[Path] = None,
     lossless: bool = False,
+    crf: int = 18,
 ) -> str:
     """Choose a pixel format that keeps high-frequency KFP colour detail.
 
     The normal H.264 default is 4:2:0, which is a good compatibility choice
     for Aurora-like gradients but smears KFP's one-pixel cyan/green edge
-    detail into visibly blocky chroma squares. Software x264 and NVENC's
-    explicit lossless mode can retain that detail with 4:4:4; other hardware
-    H.264 paths keep 4:2:0 because their accepted input formats are
-    device-dependent and VAAPI is explicitly NV12.
+    detail into visibly blocky chroma squares. Near-lossless software and
+    NVENC profiles retain that detail with 4:4:4; other hardware H.264 paths
+    keep 4:2:0 because their accepted input formats are device-dependent and
+    VAAPI is explicitly NV12.
     """
 
+    near_lossless = not lossless and int(crf) <= NEAR_LOSSLESS_CRF
     if codec == "libx264" and (
-        lossless or _kfp_profile_for_selection(palette, palette_file) is not None
+        lossless
+        or near_lossless
+        or _kfp_profile_for_selection(palette, palette_file) is not None
     ):
         return "yuv444p"
-    if codec == "h264_nvenc" and lossless:
+    if codec == "h264_nvenc" and (lossless or near_lossless):
         return "yuv444p"
     return "yuv420p"
 
@@ -10537,6 +10549,7 @@ def render_video(
             palette,
             palette_file,
             lossless,
+            crf,
         )
         preset_arguments = ["-preset", selected_preset] if selected_preset else []
         video_filters: list[str] = []
@@ -10935,8 +10948,11 @@ def render_video(
 
 def _print_profiles() -> None:
     print("Built-in profiles:")
-    for name in PROFILE_CHOICES:
+    for name in CANONICAL_PROFILE_CHOICES:
         print(f"  {name:<12} {PROFILE_DESCRIPTIONS[name]}")
+    print("Compatibility aliases:")
+    for alias, canonical in PROFILE_ALIASES.items():
+        print(f"  {alias:<20} {canonical}")
 
 
 def _print_formulas() -> None:

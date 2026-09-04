@@ -34,7 +34,11 @@ else:
     GTK_IMPORT_ERROR = None
 
 from deep_zoom_points import FORMULA_POINT_CATALOGUES, FORMULA_POINTS_BY_SLUG
-from profiles import DEFAULT_PROFILE, PROFILE_CHOICES, PROFILE_DEFAULTS
+from profiles import (
+    CANONICAL_PROFILE_CHOICES,
+    DEFAULT_PROFILE,
+    PROFILE_DEFAULTS,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -205,7 +209,7 @@ if Gtk is not None:
         def _build_widgets(self) -> None:
             self.audio = self._entry(str(ROOT / "song.mp3"))
             self.output = self._entry(str(ROOT / "fractal_viz.mp4"))
-            self.profile = self._combo(PROFILE_CHOICES, DEFAULT_PROFILE)
+            self.profile = self._combo(CANONICAL_PROFILE_CHOICES, DEFAULT_PROFILE)
             self.formula = self._combo(tuple(FORMULA_POINT_CATALOGUES), "mandelbrot")
             self.point_combo = Gtk.ComboBoxText.new_with_entry()
             self.point_entry = self.point_combo.get_child()

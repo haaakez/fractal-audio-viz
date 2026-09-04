@@ -43,10 +43,11 @@ LIVE_DEFAULT_MAX_ZOOM = "1e4"
 # selections (including the GUI's usual e150 range).  Beyond e300 the Python
 # alternate-formula path is deliberately not made a blocking screensaver.
 LIVE_MAX_PREVIEW_LOG_ZOOM = 300.0
-# The old fast 4K profile used a factor-eight atlas (about 0.9 decades per
-# replacement). Keep that ladder density for live view, but render its fields
-# at the smaller screensaver source size above. The first fields are still
-# shown immediately and later fields are built in the background.
+# Keep live view's atlas at about 0.75 decades per replacement: that gives it
+# enough intermediate coverage to hide tile changes without paying for export
+# resolution. Its fields stay at the smaller screensaver source size above.
+# The first fields are still shown immediately and later fields are built in
+# the background.
 LIVE_MAX_SOURCE_KEYFRAMES = 168
 LIVE_SOURCE_LOG_STEP = 0.75
 # Render only the first few sources before opening the window. The remaining
