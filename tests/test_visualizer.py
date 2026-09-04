@@ -14,7 +14,7 @@ except ImportError as error:  # pragma: no cover - environment dependent
 
 import visualizer
 from deep_zoom_points import FORMULA_POINT_CATALOGUES
-from profiles import PROFILE_DEFAULTS
+from profiles import DEFAULT_PROFILE, PROFILE_DEFAULTS
 
 
 class AnimationTests(unittest.TestCase):
@@ -37,14 +37,13 @@ class AnimationTests(unittest.TestCase):
             places=80,
         )
 
-    def test_deep_center_precision_guard_catches_e150_bundled_center(self):
+    def test_default_center_has_precision_for_the_default_e150_profile(self):
         available, required = visualizer._center_precision_budget(
             visualizer.DEFAULT_X_CENTER,
             visualizer.DEFAULT_Y_CENTER,
             100.0,
         )
-        self.assertEqual(available, 129)
-        self.assertEqual(required, 116)
+        self.assertGreaterEqual(available, required)
         self.assertIsNone(
             visualizer._center_precision_error(
                 visualizer.DEFAULT_X_CENTER,
@@ -53,17 +52,16 @@ class AnimationTests(unittest.TestCase):
             )
         )
         available, required = visualizer._center_precision_budget(
-            visualizer.DEFAULT_X_CENTER,
-            visualizer.DEFAULT_Y_CENTER,
+            "-1.234567890123456789",
+            "0.123456789012345678",
             150.0,
         )
-        self.assertEqual(available, 129)
-        self.assertEqual(required, 166)
+        self.assertLess(available, required)
         self.assertIn(
             "full-precision --x-center and --y-center",
             visualizer._center_precision_error(
-                visualizer.DEFAULT_X_CENTER,
-                visualizer.DEFAULT_Y_CENTER,
+                "-1.234567890123456789",
+                "0.123456789012345678",
                 150.0,
             ),
         )
@@ -464,10 +462,16 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(PROFILE_DEFAULTS["4k-e150-lossless"]["fractal_scale"], 1.0)
         self.assertTrue(PROFILE_DEFAULTS["4k-e150-lossless"]["lossless"])
         self.assertEqual(PROFILE_DEFAULTS["4k-e150-lossless"]["crf"], 0)
+        self.assertEqual(PROFILE_DEFAULTS["4k-e150-lossless"]["resample"], "lanczos")
         args = visualizer.build_parser(["--profile", "4k-e150-lossless"]).parse_args([])
         self.assertTrue(args.lossless)
         self.assertEqual(args.crf, 0)
         self.assertEqual(args.fractal_scale, 1.0)
+        defaults = visualizer.build_parser().parse_args([])
+        self.assertEqual(defaults.profile, DEFAULT_PROFILE)
+        self.assertTrue(defaults.lossless)
+        self.assertEqual(defaults.width, 3840)
+        self.assertEqual(defaults.height, 2160)
         self.assertEqual(PROFILE_DEFAULTS["preview"]["fractal_scale"], 1.0)
 
     def test_palette_file_and_frame_effects(self):
@@ -1097,6 +1101,41 @@ class AnimationTests(unittest.TestCase):
         )
         self.assertGreater(float(np.ptp(field)), 10.0)
         self.assertTrue(np.any(field < max_iter - 0.5))
+
+    def test_invalid_fast_deep_tile_retries_strict_glitch_repair(self):
+        repaired = np.arange(16, dtype=np.float32).reshape(4, 4)
+        with mock.patch.object(
+            visualizer,
+            "_atlas_local_reference_field",
+            return_value=None,
+        ), mock.patch.object(
+            visualizer,
+            "render_fractal",
+            return_value=np.full((4, 4), np.nan, dtype=np.float32),
+        ), mock.patch.object(
+            visualizer,
+            "_atlas_glitch_reference_field",
+            return_value=repaired,
+        ) as repair:
+            field = visualizer._atlas_tile_field(
+                cache_dir=None,
+                cache_identity="test",
+                render_width=4,
+                render_height=4,
+                level=0,
+                log_zoom=15.0,
+                x_center="-0.7",
+                y_center="0.1",
+                max_iter=128,
+                series_order=3,
+                series_block=256,
+                renderer="auto",
+                native_reference=object(),
+                native_threads=1,
+                native_library=object(),
+            )
+        np.testing.assert_array_equal(field, repaired)
+        repair.assert_called_once()
 
     def test_probe_centred_point_reference_preserves_global_pixel_alignment(self):
         library = visualizer._get_native_library()

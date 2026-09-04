@@ -31,22 +31,23 @@ LIVE_DEFAULT_WIDTH = 640
 LIVE_DEFAULT_HEIGHT = 360
 LIVE_DEFAULT_FPS = 30
 LIVE_MAX_FPS = 60
-LIVE_NATIVE_MAX_WIDTH = 640
-LIVE_NATIVE_MAX_HEIGHT = 360
-LIVE_PYTHON_MAX_WIDTH = 320
-LIVE_PYTHON_MAX_HEIGHT = 180
+# Live view deliberately uses the old fast-render density, reduced one more
+# step for a screensaver. GTK/Cairo performs the only upscale to the actual
+# window or monitor; no 4K surface is allocated for the live path.
+LIVE_NATIVE_MAX_WIDTH = 480
+LIVE_NATIVE_MAX_HEIGHT = 270
+LIVE_PYTHON_MAX_WIDTH = 240
+LIVE_PYTHON_MAX_HEIGHT = 135
 LIVE_DEFAULT_MAX_ZOOM = "1e4"
 # The live view is a preview, but it should still follow normal deep-zoom
 # selections (including the GUI's usual e150 range).  Beyond e300 the Python
 # alternate-formula path is deliberately not made a blocking screensaver.
 LIVE_MAX_PREVIEW_LOG_ZOOM = 300.0
-# A sub-decade interval keeps the deepest live crop small. The previous
-# eight-field ladder spread the GUI's default e24 range over 3.4 decades per
-# interval, which made a perfectly good 640x360 source look blocky while it
-# was being magnified. Ninety-six fields keep e150+ setup bounded while
-# reducing the largest replacement jump to about 1.6 decades (and the normal
-# e24 preview still uses the requested 0.75-decade spacing).
-LIVE_MAX_SOURCE_KEYFRAMES = 96
+# The old fast 4K profile used a factor-eight atlas (about 0.9 decades per
+# replacement). Keep that ladder density for live view, but render its fields
+# at the smaller screensaver source size above. The first fields are still
+# shown immediately and later fields are built in the background.
+LIVE_MAX_SOURCE_KEYFRAMES = 168
 LIVE_SOURCE_LOG_STEP = 0.75
 # Render only the first few sources before opening the window. The remaining
 # ladder is filled by a worker while audio and display playback are already
@@ -62,6 +63,7 @@ LIVE_MAX_ITERATIONS = 4096
 LIVE_ITERATION_QUANTUM = 32
 LIVE_FRAME_READ_BYTES = 256 * 1024
 LIVE_FALLBACK_DURATION = 300.0
+LIVE_DEFAULT_NATIVE_THREADS = 4
 
 
 class _LiveCancelled(Exception):
@@ -275,9 +277,9 @@ def live_dimensions(
     """Return a bounded 16:9-ish source size that the live view can upscale.
 
     The requested dimensions describe the window/aspect ratio, not a promise
-    to calculate a full 4K field every 1/30 second.  Native colourisation can
-    comfortably use 640x360 on the supported machines; the Python fallback is
-    capped lower so a missing native library cannot make the GUI appear hung.
+    to calculate a full 4K field every 1/30 second. Native colourisation uses
+    a 480x270 ceiling on the supported machines; the Python fallback is capped
+    at 240x135 so a missing native library cannot make the GUI appear hung.
     """
 
     try:
@@ -619,7 +621,11 @@ def _render_live_source(
 
     max_iter = visualizer._validate_iteration_count(max_iter, "live iteration cap")
     if native_threads_override is None:
-        render_threads = config.native_threads
+        render_threads = (
+            config.native_threads
+            if config.native_threads > 0
+            else LIVE_DEFAULT_NATIVE_THREADS
+        )
     else:
         render_threads = visualizer._validate_thread_count(
             native_threads_override,
@@ -629,10 +635,15 @@ def _render_live_source(
     if native_library is not None:
         try:
             render_options = visualizer.NativeRenderOptions(
-                backend=visualizer._native_backend_id("auto", native_library)
+                strict=False,
+                allow_recovery=True,
+                backend=visualizer._native_backend_id("auto", native_library),
             )
         except (OSError, RuntimeError, ValueError):
-            render_options = visualizer.NativeRenderOptions()
+            render_options = visualizer.NativeRenderOptions(
+                strict=False,
+                allow_recovery=True,
+            )
 
     np = visualizer._require_numpy()
 
@@ -1104,6 +1115,11 @@ def _live_colour_frame(
         child_interval_factor = _live_zoom_factor(child_log_zoom, parent_log_zoom)
         child_fraction = min(1.0, parent_zoom / child_interval_factor)
         child_iter = int(caps[index + 1])
+    colour_threads = (
+        config.native_threads
+        if config.native_threads > 0
+        else LIVE_DEFAULT_NATIVE_THREADS
+    )
     return visualizer._atlas_colour_frame(
         parent,
         child,
@@ -1117,7 +1133,7 @@ def _live_colour_frame(
         energy,
         energy,
         native_library,
-        config.native_threads,
+        colour_threads,
         "bilinear",
         config.palette,
         0.5,

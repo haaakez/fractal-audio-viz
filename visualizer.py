@@ -83,7 +83,12 @@ from deep_zoom_points import (
     TRICORN_POINTS,
     DeepZoomPoint,
 )
-from profiles import PROFILE_CHOICES, PROFILE_DEFAULTS, PROFILE_DESCRIPTIONS
+from profiles import (
+    DEFAULT_PROFILE,
+    PROFILE_CHOICES,
+    PROFILE_DEFAULTS,
+    PROFILE_DESCRIPTIONS,
+)
 
 
 # Do this before importing numerical libraries.  It helps BLAS-backed NumPy
@@ -95,12 +100,14 @@ os.environ.setdefault("MKL_NUM_THREADS", "3")
 
 DEFAULT_AUDIO = "song.mp3"
 DEFAULT_OUTPUT = "fractal_viz.mp4"
-DEFAULT_X_CENTER = (
-    "-1.711030826576984823314722728180246694222252112777834549259732560022287905717123892927883662257081287304281205446785464750361251745"
+# Use a catalogue centre with enough exported digits for the default e150
+# quality profile. The old bundled centre stopped at 129 fractional places,
+# which made a no-argument quality render fail its own precision guard.
+_DEFAULT_MANDELBROT_POINT = next(
+    point for point in DEEP_ZOOM_POINTS if point.slug == "oldwooddish"
 )
-DEFAULT_Y_CENTER = (
-    "0.000001509818957972609043170877177447547323633361751210706181530872644435995661269979265353802853564243259051551728584671844401805"
-)
+DEFAULT_X_CENTER = _DEFAULT_MANDELBROT_POINT.x
+DEFAULT_Y_CENTER = _DEFAULT_MANDELBROT_POINT.y
 
 # Fields are expensive, so they can be cached; their cache identity must
 # change when native numerical behaviour changes.  This prevents a new
@@ -6657,6 +6664,43 @@ def _atlas_tile_field(
                 formula,
                 julia_constant,
             )
+            if (
+                not _valid_field_array(field, (render_height, render_width))
+                and native_library is not None
+                and formula == "mandelbrot"
+                and renderer in {"auto", "native"}
+                and native_reference is not None
+                and log_zoom >= 12.0
+            ):
+                # The ordinary e12--e20 path is intentionally a fast direct
+                # reference render. A rare BLA/MPFR tail can still leave NaN
+                # samples there, though; retry only that failed tile through
+                # the strict glitch repair queue instead of rejecting the
+                # complete export or fabricating a rectangular fill.
+                print(
+                    "  Native atlas tile was incomplete; retrying with "
+                    "strict glitch repair.",
+                    flush=True,
+                )
+                field = _atlas_glitch_reference_field(
+                    render_width=render_width,
+                    render_height=render_height,
+                    log10_zoom=log_zoom,
+                    x_center=x_center,
+                    y_center=y_center,
+                    max_iter=max_iter,
+                    series_order=series_order,
+                    series_block=series_block,
+                    native_threads=native_threads,
+                    native_library=native_library,
+                    native_backend=native_backend,
+                    native_reference=native_reference,
+                    native_reference_root=native_reference_root,
+                    fallback_field=fallback_field,
+                    fallback_zoom_factor=fallback_zoom_factor,
+                    fallback_max_iter=fallback_max_iter,
+                    allow_recovery=allow_recovery,
+                )
     finally:
         watchdog_stop.set()
         watchdog.join(timeout=1.0)
@@ -11031,8 +11075,11 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile",
         choices=PROFILE_CHOICES,
-        default=None,
-        help="start from a named preset; explicit options still override it",
+        default=DEFAULT_PROFILE,
+        help=(
+            "start from a named preset; defaults to the native-density "
+            f"{DEFAULT_PROFILE} quality profile"
+        ),
     )
     parser.add_argument(
         "--list-profiles",
@@ -11336,9 +11383,8 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
     probe = argparse.ArgumentParser(add_help=False)
     probe.add_argument("--profile", choices=PROFILE_CHOICES, default=None)
     probe_argv = sys.argv[1:] if argv is None else argv
-    selected = probe.parse_known_args(probe_argv)[0].profile
-    if selected is not None:
-        parser.set_defaults(**PROFILE_DEFAULTS[selected])
+    selected = probe.parse_known_args(probe_argv)[0].profile or DEFAULT_PROFILE
+    parser.set_defaults(profile=selected, **PROFILE_DEFAULTS[selected])
     return parser
 
 

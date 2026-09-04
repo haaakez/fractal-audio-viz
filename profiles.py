@@ -8,6 +8,11 @@ locked configuration.
 from __future__ import annotations
 
 
+# Normal renders favour source detail and encoder quality. The explicitly fast
+# 4K preset remains available for live-view-style experiments and quick checks.
+DEFAULT_PROFILE = "4k-e150-lossless"
+
+
 PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
     "preview": {
         "width": 960,
@@ -84,7 +89,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
         "separation": "auto",
         "video_preset": "slow",
         "crf": 0,
-        "resample": "bilinear",
+        "resample": "lanczos",
         "lossless": True,
     },
     "master-e150": {

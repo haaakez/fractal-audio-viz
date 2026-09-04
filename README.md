@@ -169,8 +169,10 @@ then choose the parts that matter for the render:
    `--keyframe-factor`.
 7. Add `--cache-dir` if the render may be resumed or repeated.
 
-profiles are shortcuts for a coherent set of these values. Explicit options
-override the profile, so this is a convenient starting point:
+profiles are shortcuts for a coherent set of these values. With no profile
+option, the default is the native-density `4k-e150-lossless` quality render;
+explicit options override the selected profile. Use the fast preset below when
+you want a quick, intentionally lower-detail result:
 
 ```sh
 python3 visualizer.py music/track.mp3 --profile 4k-e150 \
@@ -369,11 +371,11 @@ unless noted otherwise, the values in parentheses are the defaults.
 | --- | --- |
 | `audio` (`song.mp3`) | Positional input audio file. This is how you choose a custom song. |
 | `--output PATH` (`fractal_viz.mp4`) | Output video path. |
-| `--profile NAME` | Start from `preview`, `fullhd` (`1080p` alias), `4k-e150` (fast 4K/60 e150), `4k-e150-lossless`, `master-e150`, or `beat`; later options override it. |
+| `--profile NAME` | Start from `preview`, `fullhd` (`1080p` alias), `4k-e150` (fast 4K/60 e150), `4k-e150-lossless` (the default), `master-e150`, or `beat`; later options override it. |
 | `--list-profiles` | Print the built-in profiles and exit. |
-| `--width N` (`1920`) | Output width in pixels. |
-| `--height N` (`1080`) | Output height in pixels. |
-| `--fps N` (`30`) | Output frame rate and audio-analysis frame rate. |
+| `--width N` (`3840` with the default profile) | Output width in pixels. |
+| `--height N` (`2160` with the default profile) | Output height in pixels. |
+| `--fps N` (`60` with the default profile) | Output frame rate and audio-analysis frame rate. |
 | `--sample-rate HZ` (`44100`) | Sample rate used while loading and analysing audio. |
 | `--separation MODE` (`auto`) | `auto` tries Demucs and falls back to the full mix; `demucs` requires Demucs; `spectral` uses frequency-band proxies; `none` uses the full mix. |
 
@@ -522,10 +524,10 @@ parent/child crops at the display rate, and uses a streamed 8 kHz ffmpeg
 energy envelope instead of the full export analysis. The ladder follows the
 form's `base zoom` and `max zoom`, reaches the selected preview endpoint, and
 then resets to the base view when the song loops. This keeps startup and cpu
-use low while avoiding a stale shallow crop for a deep selection. The default
-e24 range uses a source field about every three-quarters of a decade (up to 96
-fields for longer ranges), and the first three fields are prepared before
-playback while the rest render in the background. This keeps startup short
+use low while avoiding a stale shallow crop for a deep selection. The selected
+range uses source fields about every three-quarters of a decade when it fits
+the live budget (up to 168 fields for longer ranges). The first three fields
+are prepared before playback while the rest render in the background. This keeps startup short
 without making the live crop magnify a parent by thousands of times. press `esc`
 to close it or `f11` to toggle fullscreen; the song loops until the window is
 closed.
@@ -536,12 +538,13 @@ python3 live_view.py song.mp3 --formula mandelbrot --palette aurora
 ```
 
 the live view is intentionally a preview: it caps the fractal source at
-640×360 with the native backend (320×180 for the python fallback), then
-upscales it smoothly. It prepares at most 96 absolute-zoom fields and caps
-the interactive preview at e300; the initial fields are displayed immediately
-while the remaining ladder is prepared in the background. Final renders still
-use the export pipeline and its deep-zoom precision, atlas, and encoding
-settings. `ffplay` is used
+480×270 with the native backend (240×135 for the python fallback), then
+upscales it to the fullscreen/window aspect with GTK. It uses the older fast,
+factor-eight-style atlas behaviour rather than the strict quality-render path,
+prepares at most 168 absolute-zoom fields, and caps the interactive preview at
+e300. The initial fields are displayed immediately while the remaining ladder
+is prepared in the background. Final renders still use the export pipeline and
+its deep-zoom precision, atlas, and encoding settings. `ffplay` is used
 for playback when installed; without it the visual preview remains usable.
 
 the built-in `preview` profile now keeps a native source at its requested

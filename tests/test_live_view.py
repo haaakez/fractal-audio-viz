@@ -14,10 +14,10 @@ import visualizer
 
 class LiveViewHelperTests(unittest.TestCase):
     def test_live_dimensions_cap_the_source_but_keep_aspect(self):
-        self.assertEqual(live_view.live_dimensions(3840, 2160), (640, 360))
+        self.assertEqual(live_view.live_dimensions(3840, 2160), (480, 270))
         self.assertEqual(
             live_view.live_dimensions(3840, 2160, native_available=False),
-            (320, 180),
+            (240, 135),
         )
         self.assertEqual(live_view.live_dimensions(400, 200), (400, 200))
 
