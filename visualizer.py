@@ -7932,7 +7932,7 @@ def _vaapi_encoder_usable(
                 "-f",
                 "lavfi",
                 "-i",
-                f"color=black:s={width}x{height}:d=0.05",
+                f"color=black:s={width}x{height}:r={fps}:d=0.05,format=rgb24",
                 "-r",
                 str(fps),
                 "-vf",
@@ -7982,6 +7982,12 @@ def _hardware_encoder_usable(
         # know the selected palette yet. The render path passes an explicit
         # value so smooth near-lossless palettes can stay on yuv420p.
         preserve_chroma = lossless or near_lossless
+    # 4:2:0 cannot represent odd frame dimensions. The render path selects
+    # 4:4:4 for odd RGB output on the codecs that support it; make the NVENC
+    # probe follow that same choice so auto-selection cannot pass one format
+    # and fail when the first real frame arrives.
+    if encoder == "h264_nvenc" and (width % 2 or height % 2):
+        preserve_chroma = True
     command = [
         ffmpeg,
         "-nostdin",
@@ -7994,7 +8000,7 @@ def _hardware_encoder_usable(
         # Use the real input dimensions. A tiny probe can pass even when the
         # selected hardware rejects an 8K frame, causing the first real frame
         # to fail after expensive atlas preparation has already started.
-        f"color=black:s={width}x{height}:d=0.05",
+        f"color=black:s={width}x{height}:r={fps}:d=0.05,format=rgb24",
         "-r",
         str(fps),
         "-frames:v",
@@ -8203,6 +8209,9 @@ def _video_pixel_format(
     palette_file: Optional[Path] = None,
     lossless: bool = False,
     crf: int = 18,
+    *,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
 ) -> str:
     """Choose a pixel format that keeps high-frequency KFP colour detail.
 
@@ -8216,7 +8225,16 @@ def _video_pixel_format(
     """
 
     kfp_profile = _kfp_profile_for_selection(palette, palette_file)
+    odd_dimensions = (
+        width is not None
+        and height is not None
+        and (int(width) % 2 or int(height) % 2)
+    )
     preserve_chroma = lossless or kfp_profile is not None
+    if odd_dimensions and codec in {"libx264", "h264_nvenc"}:
+        # yuv420p rejects odd dimensions. These two encoders accept 4:4:4,
+        # which preserves the requested output size without padding it.
+        preserve_chroma = True
     if codec == "libx264" and preserve_chroma:
         return "yuv444p"
     if codec == "h264_nvenc" and preserve_chroma:
@@ -10627,6 +10645,8 @@ def render_video(
             palette_file,
             lossless,
             crf,
+            width=width,
+            height=height,
         )
         preset_arguments = ["-preset", selected_preset] if selected_preset else []
         video_filters: list[str] = []

@@ -28,7 +28,7 @@ production-ready.
 
 - [ ] Add dependency-backed CI coverage for cache corruption, path safety,
   native concurrency, and preview failure cleanup.
-- [ ] Add a small end-to-end fixture render that verifies audio duration,
+- [x] Add a small end-to-end fixture render that verifies audio duration,
   frame count, pixel format, and manifest status.
 - [x] Probe hardware encoders with a real short encode before selecting them
   automatically; retain deterministic software fallback.

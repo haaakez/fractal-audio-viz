@@ -1641,6 +1641,18 @@ class AnimationTests(unittest.TestCase):
             ),
             "yuv420p",
         )
+        self.assertEqual(
+            visualizer._video_pixel_format(
+                "libx264", "aurora", width=641, height=480
+            ),
+            "yuv444p",
+        )
+        self.assertEqual(
+            visualizer._video_pixel_format(
+                "h264_nvenc", "aurora", width=640, height=481
+            ),
+            "yuv444p",
+        )
 
     def test_lossless_encoder_settings_use_real_lossless_controls(self):
         self.assertEqual(
@@ -1738,7 +1750,7 @@ class AnimationTests(unittest.TestCase):
         finally:
             visualizer._hardware_encoder_usable.cache_clear()
         command = run.call_args.args[0]
-        self.assertIn("color=black:s=256x256:d=0.05", command)
+        self.assertIn("color=black:s=256x256:r=30:d=0.05,format=rgb24", command)
 
     def test_hardware_probe_uses_render_dimensions(self):
         probe_result = mock.Mock(returncode=0)
@@ -1760,8 +1772,29 @@ class AnimationTests(unittest.TestCase):
         finally:
             visualizer._hardware_encoder_usable.cache_clear()
         command = run.call_args.args[0]
-        self.assertIn("color=black:s=7680x4320:d=0.05", command)
+        self.assertIn("color=black:s=7680x4320:r=30:d=0.05,format=rgb24", command)
         self.assertEqual(command[command.index("-r") + 1], "30")
+
+    def test_nvenc_probe_matches_odd_dimension_output_format(self):
+        probe_result = mock.Mock(returncode=0)
+        visualizer._hardware_encoder_usable.cache_clear()
+        try:
+            with mock.patch.object(
+                visualizer.shutil, "which", return_value="/usr/bin/ffmpeg"
+            ), mock.patch.object(
+                visualizer.subprocess, "run", return_value=probe_result
+            ) as run:
+                self.assertTrue(
+                    visualizer._hardware_encoder_usable(
+                        "h264_nvenc",
+                        width=641,
+                        height=480,
+                    )
+                )
+        finally:
+            visualizer._hardware_encoder_usable.cache_clear()
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv444p")
 
     def test_lossless_hardware_probe_matches_nvenc_output_format(self):
         probe_result = mock.Mock(returncode=0)
