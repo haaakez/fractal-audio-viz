@@ -335,6 +335,7 @@ if Gtk is not None:
             self.codec = self._entry("auto")
             self.crf = self._entry("18")
             self.resample = self._combo(("bilinear", "lanczos"), "bilinear")
+            self.lossless = Gtk.CheckButton(label="Lossless H.264 rate control")
             self.encoder_threads = self._entry("0")
             self.cache = self._entry(str(ROOT / "cache"))
             self.cache_limit_mb = self._entry("0")
@@ -383,6 +384,15 @@ if Gtk is not None:
                 ("Cache limit MB", self.cache_limit_mb, "0 means unlimited"),
             ):
                 technical_row = self._add_widget_row(technical_grid, technical_row, label, widget, hint)
+            technical_grid.attach(self.lossless, 0, technical_row, 2, 1)
+            technical_grid.attach(
+                self._label("forces the encoder's lossless mode when available"),
+                2,
+                technical_row,
+                1,
+                1,
+            )
+            technical_row += 1
             technical_grid.attach(self.durable_cache, 0, technical_row, 2, 1)
             technical_grid.attach(self._label("fsync each tile; safer but slower"), 2, technical_row, 1, 1)
             technical_row += 1
@@ -824,12 +834,17 @@ if Gtk is not None:
                 ("quality", self.quality),
                 ("keyframe_factor", self.keyframe_factor),
                 ("video_preset", self.video_preset),
+                ("crf", self.crf),
+                ("resample", self.resample),
+                ("lossless", self.lossless),
             ):
                 if key not in values:
                     continue
                 value = values[key]
                 if isinstance(widget, Gtk.ComboBoxText):
                     self._set_combo(widget, value)
+                elif isinstance(widget, Gtk.CheckButton):
+                    widget.set_active(bool(value))
                 else:
                     widget.set_text(str(value))
 
@@ -886,6 +901,8 @@ if Gtk is not None:
                 "--encoder-threads", self.encoder_threads.get_text(),
                 "--cache-limit-mb", self.cache_limit_mb.get_text(),
             ])
+            if self.lossless.get_active():
+                command.append("--lossless")
             if formula == "julia":
                 # Values beginning with '-' must be attached to the option;
                 # argparse otherwise treats a negative custom c as a flag.

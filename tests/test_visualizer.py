@@ -460,6 +460,14 @@ class AnimationTests(unittest.TestCase):
         self.assertGreater(PROFILE_DEFAULTS["4k-e150"]["max_zoom"].count("e"), 0)
         self.assertEqual(PROFILE_DEFAULTS["4k-e150"]["fractal_scale"], 0.25)
         self.assertEqual(PROFILE_DEFAULTS["4k-e150"]["keyframe_factor"], 8.0)
+        self.assertEqual(PROFILE_DEFAULTS["4k-e150-lossless"]["fps"], 60)
+        self.assertEqual(PROFILE_DEFAULTS["4k-e150-lossless"]["fractal_scale"], 1.0)
+        self.assertTrue(PROFILE_DEFAULTS["4k-e150-lossless"]["lossless"])
+        self.assertEqual(PROFILE_DEFAULTS["4k-e150-lossless"]["crf"], 0)
+        args = visualizer.build_parser(["--profile", "4k-e150-lossless"]).parse_args([])
+        self.assertTrue(args.lossless)
+        self.assertEqual(args.crf, 0)
+        self.assertEqual(args.fractal_scale, 1.0)
         self.assertEqual(PROFILE_DEFAULTS["preview"]["fractal_scale"], 1.0)
 
     def test_palette_file_and_frame_effects(self):
@@ -1546,6 +1554,28 @@ class AnimationTests(unittest.TestCase):
             visualizer._video_pixel_format("h264_nvenc", "kalles-default"),
             "yuv420p",
         )
+        self.assertEqual(
+            visualizer._video_pixel_format("h264_nvenc", "aurora", lossless=True),
+            "yuv444p",
+        )
+
+    def test_lossless_encoder_settings_use_real_lossless_controls(self):
+        self.assertEqual(
+            visualizer._video_encoder_settings(
+                "h264_nvenc",
+                "ultrafast",
+                18,
+                lossless=True,
+            )[1],
+            ["-tune", "lossless", "-rc", "constqp", "-qp", "0"],
+        )
+        codec, preset, rate_control = visualizer._select_video_encoder(
+            "libx264",
+            "slow",
+            18,
+            lossless=True,
+        )
+        self.assertEqual((codec, preset, rate_control), ("libx264", "slow", ["-crf", "0"]))
 
     def test_pitch_rotates_legacy_two_hue_gradient(self):
         field = np.linspace(0.0, 100.0, 64 * 64, dtype=np.float32).reshape(64, 64)
@@ -1626,6 +1656,44 @@ class AnimationTests(unittest.TestCase):
             visualizer._hardware_encoder_usable.cache_clear()
         command = run.call_args.args[0]
         self.assertIn("color=black:s=256x256:d=0.05", command)
+
+    def test_lossless_hardware_probe_matches_nvenc_output_format(self):
+        probe_result = mock.Mock(returncode=0)
+        visualizer._hardware_encoder_usable.cache_clear()
+        try:
+            with mock.patch.object(
+                visualizer.shutil, "which", return_value="/usr/bin/ffmpeg"
+            ), mock.patch.object(
+                visualizer.subprocess, "run", return_value=probe_result
+            ) as run:
+                self.assertTrue(visualizer._hardware_encoder_usable("h264_nvenc", True))
+        finally:
+            visualizer._hardware_encoder_usable.cache_clear()
+        command = run.call_args.args[0]
+        self.assertIn("-tune", command)
+        self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv444p")
+        self.assertGreater(command.index("-pix_fmt"), command.index("-i"))
+        output_format_index = len(command) - 1 - command[::-1].index("-f")
+        self.assertLess(command.index("-pix_fmt"), output_format_index)
+
+    def test_lossless_vaapi_probe_uses_qp_zero(self):
+        probe_result = mock.Mock(returncode=0)
+        visualizer._vaapi_encoder_usable.cache_clear()
+        try:
+            with mock.patch.object(
+                visualizer.shutil, "which", return_value="/usr/bin/ffmpeg"
+            ), mock.patch.object(
+                visualizer.Path, "exists", return_value=True
+            ), mock.patch.object(
+                visualizer.subprocess, "run", return_value=probe_result
+            ) as run:
+                self.assertTrue(
+                    visualizer._vaapi_encoder_usable(lossless=True)
+                )
+        finally:
+            visualizer._vaapi_encoder_usable.cache_clear()
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-qp") + 1], "0")
 
     def test_crop_factor_is_clamped_to_native_source(self):
         field = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)

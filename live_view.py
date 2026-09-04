@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -48,6 +48,10 @@ LIVE_MAX_PREVIEW_LOG_ZOOM = 300.0
 # e24 preview still uses the requested 0.75-decade spacing).
 LIVE_MAX_SOURCE_KEYFRAMES = 96
 LIVE_SOURCE_LOG_STEP = 0.75
+# Render only the first few sources before opening the window. The remaining
+# ladder is filled by a worker while audio and display playback are already
+# running; a screensaver should never wait for the deepest source set.
+LIVE_INITIAL_SOURCE_COUNT = 3
 # Keep the old name as the minimum for callers/tests that used the original
 # fixed-budget preview.  Deep alternate formulas need a larger budget: a
 # fixed 192-iteration cap classifies an e150 boundary tile as entirely
@@ -194,6 +198,72 @@ class LiveZoomSources:
     fields: tuple[Any, ...]
     iteration_caps: tuple[int, ...] = ()
     capped: bool = False
+
+
+@dataclass
+class LiveZoomSourceStore:
+    """Thread-safe, incrementally populated source ladder for live playback."""
+
+    requested_logs: Any
+    _log_zooms: list[float] = field(default_factory=list, init=False, repr=False)
+    _fields: list[Any] = field(default_factory=list, init=False, repr=False)
+    _iteration_caps: list[int] = field(default_factory=list, init=False, repr=False)
+    _capped: bool = field(default=False, init=False, repr=False)
+    _finished: bool = field(default=False, init=False, repr=False)
+    _error: Optional[BaseException] = field(default=None, init=False, repr=False)
+    _condition: threading.Condition = field(
+        default_factory=threading.Condition,
+        init=False,
+        repr=False,
+    )
+
+    @property
+    def count(self) -> int:
+        with self._condition:
+            return len(self._fields)
+
+    @property
+    def finished(self) -> bool:
+        with self._condition:
+            return self._finished
+
+    @property
+    def error(self) -> Optional[BaseException]:
+        with self._condition:
+            return self._error
+
+    def append(self, log_zoom: float, field_value: Any, iteration_cap: int) -> None:
+        with self._condition:
+            self._log_zooms.append(float(log_zoom))
+            self._fields.append(field_value)
+            self._iteration_caps.append(int(iteration_cap))
+            self._condition.notify_all()
+
+    def finish(self, *, capped: bool = False) -> None:
+        with self._condition:
+            self._capped = self._capped or bool(capped)
+            self._finished = True
+            self._condition.notify_all()
+
+    def fail(self, error: BaseException) -> None:
+        with self._condition:
+            self._error = error
+            self._finished = True
+            self._condition.notify_all()
+
+    def snapshot(self) -> LiveZoomSources:
+        np = visualizer._require_numpy()
+        with self._condition:
+            if not self._fields:
+                if self._error is not None:
+                    raise self._error
+                raise RuntimeError("live zoom source ladder is empty")
+            return LiveZoomSources(
+                np.asarray(tuple(self._log_zooms), dtype=np.float64),
+                tuple(self._fields),
+                tuple(self._iteration_caps),
+                self._capped,
+            )
 
 
 def live_dimensions(
@@ -542,10 +612,19 @@ def _render_live_source(
     log_zoom: float,
     native_library: Any,
     max_iter: int = LIVE_ITERATIONS,
+    native_references: Optional[list[tuple[float, Any]]] = None,
+    native_threads_override: Optional[int] = None,
 ) -> Any:
     """Render one absolute-zoom source with the cheapest valid backend."""
 
     max_iter = visualizer._validate_iteration_count(max_iter, "live iteration cap")
+    if native_threads_override is None:
+        render_threads = config.native_threads
+    else:
+        render_threads = visualizer._validate_thread_count(
+            native_threads_override,
+            "live source native thread count",
+        )
     render_options = None
     if native_library is not None:
         try:
@@ -555,11 +634,119 @@ def _render_live_source(
         except (OSError, RuntimeError, ValueError):
             render_options = visualizer.NativeRenderOptions()
 
-    # The native deep path needs a reference orbit. Build it for each live
-    # source rather than pretending that a float64 centre is still exact at
-    # e12+. The live ladder is small and the resulting fields can be reused
-    # for every display frame in the interval.
+    np = visualizer._require_numpy()
+
+    def validated_native_result(
+        result: Any,
+        reference: Any,
+        reference_root: Any = None,
+    ) -> Any:
+        """Repair a rare strict-BLA NaN mask before it reaches the GUI."""
+
+        array = np.asarray(result, dtype=np.float32)
+        if np.isfinite(array).all():
+            return array
+        if native_library is not None and reference is not None:
+            backend = int(getattr(render_options, "backend", 0))
+            try:
+                repaired = visualizer._atlas_glitch_reference_field(
+                    render_width=source_width,
+                    render_height=source_height,
+                    log10_zoom=log_zoom,
+                    x_center=config.x_center,
+                    y_center=config.y_center,
+                    max_iter=max_iter,
+                    series_order=3,
+                    series_block=128,
+                    native_threads=render_threads,
+                    native_library=native_library,
+                    native_backend=backend,
+                    native_reference=reference,
+                    native_reference_root=reference_root,
+                    fallback_field=None,
+                    fallback_zoom_factor=1.0,
+                    fallback_max_iter=None,
+                    allow_recovery=False,
+                )
+                repaired = np.asarray(repaired, dtype=np.float32)
+                if np.isfinite(repaired).all():
+                    return repaired
+            except (RuntimeError, ValueError):
+                pass
+        # This path is exceptional and only runs when the native strict pass
+        # could not cover every pixel. It is still preferable to handing GTK a
+        # partially initialized buffer, which presents as black noise or a
+        # rectangular fill artifact.
+        if log_zoom <= 300.0:
+            return np.asarray(
+                visualizer.render_fractal(
+                    source_width,
+                    source_height,
+                    log_zoom,
+                    config.x_center,
+                    config.y_center,
+                    max_iter,
+                    renderer="python",
+                    native_threads=render_threads,
+                    formula=config.formula,
+                    julia_constant=config.julia_constant,
+                ),
+                dtype=np.float32,
+            )
+        return array
+
+    # Reuse the same depth-safe references for every live source. Rebuilding a
+    # reference orbit once per ladder entry was the main reason a deep live
+    # preview could take longer to prepare than a cached export. The optional
+    # empty-list path retains the standalone helper's safe compatibility
+    # behaviour when no shared reference could be prepared.
     if config.formula == "mandelbrot" and log_zoom >= 12.0 and native_library is not None:
+        shared_reference = None
+        if native_references:
+            shared_reference = visualizer._select_native_reference(
+                native_references,
+                log_zoom,
+            )
+        if shared_reference is not None:
+            try:
+                return validated_native_result(
+                    visualizer.render_fractal(
+                        source_width,
+                        source_height,
+                        log_zoom,
+                        config.x_center,
+                        config.y_center,
+                        max_iter,
+                        renderer="native",
+                        native_threads=render_threads,
+                        native_reference=shared_reference,
+                        series_order=3,
+                        series_block=128,
+                        render_options=render_options,
+                        formula=config.formula,
+                        julia_constant=config.julia_constant,
+                    ),
+                    shared_reference,
+                    native_references[0][1] if native_references else None,
+                )
+            except RuntimeError:
+                # Keep the live preview useful if one shared tier is rejected
+                # by a native build with a stricter radius contract. The
+                # bounded Python fallback preserves the exact decimal centre.
+                if log_zoom > 300.0:
+                    raise
+                return visualizer.render_fractal(
+                    source_width,
+                    source_height,
+                    log_zoom,
+                    config.x_center,
+                    config.y_center,
+                    max_iter,
+                    renderer="python",
+                    native_threads=render_threads,
+                    formula=config.formula,
+                    julia_constant=config.julia_constant,
+                )
         reference_library: Any = None
         reference: Any = None
         try:
@@ -572,21 +759,24 @@ def _render_live_source(
                 log_zoom,
                 image_series_order=16,
             )
-            return visualizer.render_fractal(
-                source_width,
-                source_height,
-                log_zoom,
-                config.x_center,
-                config.y_center,
-                max_iter,
-                renderer="native",
-                native_threads=config.native_threads,
-                native_reference=reference,
-                series_order=3,
-                series_block=128,
-                render_options=render_options,
-                formula=config.formula,
-                julia_constant=config.julia_constant,
+            return validated_native_result(
+                visualizer.render_fractal(
+                    source_width,
+                    source_height,
+                    log_zoom,
+                    config.x_center,
+                    config.y_center,
+                    max_iter,
+                    renderer="native",
+                    native_threads=render_threads,
+                    native_reference=reference,
+                    series_order=3,
+                    series_block=128,
+                    render_options=render_options,
+                    formula=config.formula,
+                    julia_constant=config.julia_constant,
+                ),
+                reference,
             )
         except RuntimeError:
             # A live window must remain usable when a native build rejects a
@@ -604,7 +794,7 @@ def _render_live_source(
                 config.y_center,
                 max_iter,
                 renderer="python",
-                native_threads=config.native_threads,
+                native_threads=render_threads,
                 formula=config.formula,
                 julia_constant=config.julia_constant,
             )
@@ -627,7 +817,7 @@ def _render_live_source(
             config.y_center,
             max_iter,
             renderer=renderer,
-            native_threads=config.native_threads,
+            native_threads=render_threads,
             render_options=render_options,
             formula=config.formula,
             julia_constant=config.julia_constant,
@@ -646,11 +836,88 @@ def _render_live_source(
                 config.y_center,
                 max_iter,
                 renderer="python",
-                native_threads=config.native_threads,
+                native_threads=render_threads,
                 formula=config.formula,
                 julia_constant=config.julia_constant,
             )
         raise
+
+
+def _prepare_live_native_references(
+    config: LiveViewConfig,
+    native_library: Any,
+) -> list[tuple[float, Any]]:
+    """Prepare one reusable reference ladder for all deep live sources."""
+
+    if (
+        native_library is None
+        or config.formula != "mandelbrot"
+        or config.preview_max_log_zoom < 12.0
+    ):
+        return []
+    np = visualizer._require_numpy()
+    requested_logs = live_zoom_ladder(
+        config.base_zoom,
+        _live_zoom_text(config.preview_max_log_zoom),
+    )
+    if requested_logs.size < 2:
+        atlas_step = 0.75
+    else:
+        atlas_step = float(np.min(np.diff(requested_logs)))
+    reference_logs = visualizer._native_reference_tier_logs(
+        config.preview_max_log_zoom,
+        atlas_step,
+    )
+    if not reference_logs:
+        return []
+    references: list[tuple[float, Any]] = []
+    reference_iter = max(
+        LIVE_MAX_ITERATIONS,
+        live_iteration_cap(config.formula, config.preview_max_log_zoom),
+    )
+    clone_tiers = (
+        len(reference_logs) > 1
+        and hasattr(native_library, "fractal_create_reference_reusable")
+        and hasattr(native_library, "fractal_clone_reference")
+    )
+    try:
+        _, root_reference = visualizer._create_native_reference(
+            config.x_center,
+            config.y_center,
+            reference_iter,
+            config.preview_max_log_zoom,
+            3,
+            reference_logs[0],
+            image_series_order=16,
+            reusable=clone_tiers,
+        )
+        references.append((reference_logs[0], root_reference))
+        for start_log in reference_logs[1:]:
+            reference = None
+            if clone_tiers:
+                try:
+                    reference = visualizer._clone_native_reference(
+                        native_library,
+                        root_reference,
+                        start_log,
+                    )
+                except RuntimeError:
+                    reference = None
+            if reference is None:
+                _, reference = visualizer._create_native_reference(
+                    config.x_center,
+                    config.y_center,
+                    reference_iter,
+                    config.preview_max_log_zoom,
+                    3,
+                    start_log,
+                    image_series_order=16,
+                )
+            references.append((start_log, reference))
+    except (OSError, RuntimeError, ValueError, OverflowError):
+        visualizer._destroy_native_references(native_library, references)
+        return []
+    return references
 
 
 def build_live_zoom_sources(
@@ -660,86 +927,135 @@ def build_live_zoom_sources(
     native_library: Any,
     stop_event: Optional[threading.Event] = None,
     status: Optional[Callable[[str], None]] = None,
+    native_references: Optional[list[tuple[float, Any]]] = None,
+    store: Optional[LiveZoomSourceStore] = None,
+    max_sources: Optional[int] = None,
+    source_native_threads: Optional[int] = None,
 ) -> LiveZoomSources:
     """Prepare the small absolute-zoom atlas used by the live compositor."""
 
     np = visualizer._require_numpy()
     requested_logs = live_zoom_ladder(config.base_zoom, config.max_zoom)
-    rendered_logs: list[float] = []
-    fields: list[Any] = []
-    iteration_caps: list[int] = []
+    if store is None:
+        store = LiveZoomSourceStore(requested_logs)
+    elif len(store.requested_logs) != len(requested_logs) or not np.array_equal(
+        np.asarray(store.requested_logs, dtype=np.float64),
+        np.asarray(requested_logs, dtype=np.float64),
+    ):
+        raise ValueError("live source store does not match the requested zoom ladder")
+    if max_sources is not None:
+        try:
+            max_sources = int(max_sources)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("live source limit must be an integer") from error
+        if max_sources <= 0:
+            raise ValueError("live source limit must be positive")
     truncated_for_budget = False
-    for index, log_zoom in enumerate(requested_logs):
-        if stop_event is not None and stop_event.is_set():
-            raise _LiveCancelled
-        source_log_zoom = float(log_zoom)
-        source_iter = live_iteration_cap(config.formula, source_log_zoom)
-        if status is not None:
-            status(
-                f"rendering live zoom source {index + 1}/{len(requested_logs)} "
-                f"({_live_zoom_text(source_log_zoom)}, {source_iter} iterations)…"
-            )
-        # A shallow cap can make a valid deep target look entirely bounded.
-        # Retry only that pathological case, and only as far as the bounded
-        # live budget allows; ordinary sources still pay for one render.
-        field = None
-        final_iter = source_iter
-        while True:
-            field = _render_live_source(
-                config,
-                source_width,
-                source_height,
-                source_log_zoom,
-                native_library,
-                final_iter,
-            )
-            field = visualizer._validated_field(
-                field,
-                (source_height, source_width),
-                "live zoom source",
-            )
+    start_index = store.count
+    try:
+        for index in range(start_index, len(requested_logs)):
+            if max_sources is not None and store.count >= max_sources:
+                break
+            if stop_event is not None and stop_event.is_set():
+                raise _LiveCancelled
+            source_log_zoom = float(requested_logs[index])
+            source_iter = live_iteration_cap(config.formula, source_log_zoom)
+            if status is not None:
+                status(
+                    f"rendering live zoom source {index + 1}/{len(requested_logs)} "
+                    f"({_live_zoom_text(source_log_zoom)}, {source_iter} iterations)…"
+                )
+            # A shallow cap can make a valid deep target look entirely bounded.
+            # Retry only that pathological case, and only as far as the bounded
+            # live budget allows; ordinary sources still pay for one render.
+            field = None
+            final_iter = source_iter
+            while True:
+                if native_references is None and source_native_threads is None:
+                    field = _render_live_source(
+                        config,
+                        source_width,
+                        source_height,
+                        source_log_zoom,
+                        native_library,
+                        final_iter,
+                    )
+                elif source_native_threads is None:
+                    field = _render_live_source(
+                        config,
+                        source_width,
+                        source_height,
+                        source_log_zoom,
+                        native_library,
+                        final_iter,
+                        native_references,
+                    )
+                else:
+                    field = _render_live_source(
+                        config,
+                        source_width,
+                        source_height,
+                        source_log_zoom,
+                        native_library,
+                        final_iter,
+                        native_references,
+                        source_native_threads,
+                    )
+                field = visualizer._validated_field(
+                    field,
+                    (source_height, source_width),
+                    "live zoom source",
+                )
+                finite_exterior = np.isfinite(field) & (field < float(final_iter))
+                if np.any(finite_exterior) or final_iter >= LIVE_MAX_ITERATIONS:
+                    break
+                if final_iter <= LIVE_MIN_ITERATIONS:
+                    break
+                next_iter = min(LIVE_MAX_ITERATIONS, final_iter * 2)
+                if next_iter == final_iter:
+                    break
+                final_iter = next_iter
+                if status is not None:
+                    status(
+                        f"deep live source {_live_zoom_text(source_log_zoom)} reached "
+                        f"its cap; retrying with {final_iter} iterations…"
+                    )
+
+            assert field is not None
             finite_exterior = np.isfinite(field) & (field < float(final_iter))
-            if np.any(finite_exterior) or final_iter >= LIVE_MAX_ITERATIONS:
+            previous_log = (
+                float(requested_logs[index - 1])
+                if index > 0
+                else None
+            )
+            if not np.any(finite_exterior) and store.count and (
+                previous_log is None or source_log_zoom > previous_log + 1.0e-9
+            ):
+                # Do not expose an all-interior source as a black rectangular
+                # viewport. Hold the last source and clamp the live camera there;
+                # this is especially important for connected Julia targets whose
+                # boundary does not escape within a practical screensaver budget.
+                truncated_for_budget = True
+                if status is not None:
+                    status(
+                        f"live preview holding at "
+                        f"{_live_zoom_text(float(requested_logs[index - 1]))}; "
+                        f"{_live_zoom_text(source_log_zoom)} needs more than "
+                        f"{final_iter} iterations"
+                    )
                 break
-            if final_iter <= LIVE_MIN_ITERATIONS:
-                break
-            next_iter = min(LIVE_MAX_ITERATIONS, final_iter * 2)
-            if next_iter == final_iter:
-                break
-            final_iter = next_iter
-            if status is not None:
-                status(
-                    f"deep live source {_live_zoom_text(source_log_zoom)} reached "
-                    f"its cap; retrying with {final_iter} iterations…"
-                )
-
-        assert field is not None
-        finite_exterior = np.isfinite(field) & (field < float(final_iter))
-        if not np.any(finite_exterior) and fields and source_log_zoom > rendered_logs[-1] + 1.0e-9:
-            # Do not expose an all-interior source as a black rectangular
-            # viewport. Hold the last source and clamp the live camera there;
-            # this is especially important for connected Julia targets whose
-            # boundary does not escape within a practical screensaver budget.
-            truncated_for_budget = True
-            if status is not None:
-                status(
-                    f"live preview holding at {_live_zoom_text(rendered_logs[-1])}; "
-                    f"{_live_zoom_text(source_log_zoom)} needs more than "
-                    f"{final_iter} iterations"
-                )
-            break
-        rendered_logs.append(source_log_zoom)
-        fields.append(field)
-        iteration_caps.append(final_iter)
-
-    if not fields:
-        raise RuntimeError("live zoom source ladder produced no usable field")
-    return LiveZoomSources(
-        np.asarray(rendered_logs, dtype=np.float64),
-        tuple(fields),
-        tuple(iteration_caps),
-        config.preview_zoom_is_capped or truncated_for_budget,
-    )
+            store.append(source_log_zoom, field, final_iter)
+        is_complete = store.count >= len(requested_logs) or truncated_for_budget
+        if max_sources is None or is_complete:
+            store.finish(
+                capped=config.preview_zoom_is_capped or truncated_for_budget,
+            )
+        return store.snapshot()
+    except _LiveCancelled:
+        raise
+    except BaseException as error:
+        store.fail(error)
+        raise
 
 
 def _live_zoom_factor(log_zoom: float, source_log_zoom: float) -> float:
@@ -750,7 +1066,7 @@ def _live_zoom_factor(log_zoom: float, source_log_zoom: float) -> float:
 
 
 def _live_colour_frame(
-    sources: LiveZoomSources,
+    sources: LiveZoomSources | LiveZoomSourceStore,
     log_zoom: float,
     output_width: int,
     output_height: int,
@@ -762,6 +1078,8 @@ def _live_colour_frame(
     """Compose one continuous frame from the absolute live source ladder."""
 
     np = visualizer._require_numpy()
+    if isinstance(sources, LiveZoomSourceStore):
+        sources = sources.snapshot()
     logs = np.asarray(sources.log_zooms, dtype=np.float64)
     if logs.size == 0 or not sources.fields:
         raise RuntimeError("live zoom source ladder is empty")
@@ -1074,6 +1392,9 @@ if Gtk is not None:
 
         def _worker_main(self) -> None:
             player: Any = None
+            source_builder: Optional[threading.Thread] = None
+            native_library: Any = None
+            native_references: list[tuple[float, Any]] = []
             try:
                 self._post_status("analysing audio…")
                 try:
@@ -1129,6 +1450,29 @@ if Gtk is not None:
                     self.config.height,
                     native_available=native_preview,
                 )
+                # Keep the reference handles in one stable list so the
+                # background source worker can populate it before it reaches
+                # the first deep source. For the normal shallow-base case,
+                # defer the expensive MPFR/BLA setup until the first three
+                # displayable fields are already available.
+                native_references = []
+                requested_logs = live_zoom_ladder(
+                    self.config.base_zoom,
+                    self.config.max_zoom,
+                )
+                source_store = LiveZoomSourceStore(requested_logs)
+                initial_count = min(
+                    len(requested_logs),
+                    LIVE_INITIAL_SOURCE_COUNT,
+                )
+                initial_last_log = float(requested_logs[initial_count - 1])
+                if initial_last_log >= 12.0:
+                    native_references.extend(
+                        _prepare_live_native_references(
+                            self.config,
+                            native_library,
+                        )
+                    )
                 sources = build_live_zoom_sources(
                     self.config,
                     source_width,
@@ -1136,9 +1480,58 @@ if Gtk is not None:
                     native_library,
                     self._stop_event,
                     lambda message: self._post_status(message, dismiss_on_frame=False),
+                    native_references,
+                    source_store,
+                    initial_count,
                 )
                 if self._stop_event.is_set():
                     return
+
+                if source_store.count < len(requested_logs) and not source_store.finished:
+                    def finish_source_ladder() -> None:
+                        try:
+                            if (
+                                not native_references
+                                and native_library is not None
+                                and self.config.formula == "mandelbrot"
+                                and self.config.preview_max_log_zoom >= 12.0
+                            ):
+                                native_references.extend(
+                                    _prepare_live_native_references(
+                                        self.config,
+                                        native_library,
+                                    )
+                                )
+                            build_live_zoom_sources(
+                                self.config,
+                                source_width,
+                                source_height,
+                                native_library,
+                                self._stop_event,
+                                native_references=native_references,
+                                store=source_store,
+                                source_native_threads=(
+                                    max(1, self.config.native_threads // 2)
+                                    if self.config.native_threads > 0
+                                    else 1
+                                ),
+                            )
+                        except _LiveCancelled:
+                            return
+                        except BaseException as error:
+                            source_store.fail(error)
+                            self._post_status(
+                                f"live zoom ladder stopped: {error}",
+                                visible=True,
+                                dismiss_on_frame=False,
+                            )
+
+                    source_builder = threading.Thread(
+                        target=finish_source_ladder,
+                        name="fractal-live-sources",
+                        daemon=True,
+                    )
+                    source_builder.start()
 
                 if sources.capped:
                     actual_log_zoom = float(sources.log_zooms[-1])
@@ -1146,6 +1539,13 @@ if Gtk is not None:
                         "live preview capped at "
                         f"{_live_zoom_text(actual_log_zoom)}; Esc to exit · "
                         "F11 toggles fullscreen",
+                        visible=True,
+                        dismiss_on_frame=False,
+                    )
+                elif source_builder is not None:
+                    self._post_status(
+                        "live view ready · warming deep zoom sources · "
+                        "Esc to exit · F11 toggles fullscreen",
                         visible=True,
                         dismiss_on_frame=False,
                     )
@@ -1160,12 +1560,22 @@ if Gtk is not None:
                     )
                 else:
                     self._post_status("Esc to exit · F11 toggles fullscreen", visible=True)
-                self._run_frames(sources, track, native_library)
+                self._run_frames(source_store, track, native_library)
             except _LiveCancelled:
                 pass
             except Exception as error:  # keep a broken preview from killing GTK
                 self._post_status(f"live view error: {error}", visible=True)
             finally:
+                self._stop_event.set()
+                if source_builder is not None:
+                    source_builder.join(timeout=5.0)
+                if native_references and (
+                    source_builder is None or not source_builder.is_alive()
+                ):
+                    visualizer._destroy_native_references(
+                        native_library,
+                        native_references,
+                    )
                 self._stop_child("_audio_process")
                 if player is not None:
                     try:
@@ -1176,14 +1586,19 @@ if Gtk is not None:
 
         def _run_frames(
             self,
-            sources: LiveZoomSources,
+            sources: LiveZoomSources | LiveZoomSourceStore,
             track: LiveAudioTrack,
             native_library: Any,
         ) -> None:
             np = visualizer._require_numpy()
-            if not sources.fields:
+            initial_sources = (
+                sources.snapshot()
+                if isinstance(sources, LiveZoomSourceStore)
+                else sources
+            )
+            if not initial_sources.fields:
                 raise RuntimeError("live zoom source ladder is empty")
-            source_shape = np.asarray(sources.fields[0]).shape
+            source_shape = np.asarray(initial_sources.fields[0]).shape
             if len(source_shape) != 2:
                 raise RuntimeError("live zoom source has invalid dimensions")
             # Keep the expensive KFP/Aurora colour pass at the bounded source

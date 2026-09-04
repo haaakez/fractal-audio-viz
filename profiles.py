@@ -22,6 +22,9 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
         "max_zoom": "1e24",
         "separation": "none",
         "video_preset": "ultrafast",
+        "crf": 18,
+        "resample": "bilinear",
+        "lossless": False,
     },
     "fullhd": {
         "width": 1920,
@@ -33,6 +36,9 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
         "max_zoom": "1e80",
         "separation": "auto",
         "video_preset": "veryfast",
+        "crf": 18,
+        "resample": "bilinear",
+        "lossless": False,
     },
     # Keep the older spelling for scripts and commands that already use it.
     "1080p": {
@@ -45,6 +51,9 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
         "max_zoom": "1e80",
         "separation": "auto",
         "video_preset": "veryfast",
+        "crf": 18,
+        "resample": "bilinear",
+        "lossless": False,
     },
     "4k-e150": {
         "width": 3840,
@@ -60,6 +69,23 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
         "max_zoom": "1e150",
         "separation": "auto",
         "video_preset": "ultrafast",
+        "crf": 18,
+        "resample": "bilinear",
+        "lossless": False,
+    },
+    "4k-e150-lossless": {
+        "width": 3840,
+        "height": 2160,
+        "fps": 60,
+        "quality": "quality",
+        "fractal_scale": 1.0,
+        "keyframe_factor": 4.0,
+        "max_zoom": "1e150",
+        "separation": "auto",
+        "video_preset": "slow",
+        "crf": 0,
+        "resample": "bilinear",
+        "lossless": True,
     },
     "master-e150": {
         "width": 3840,
@@ -71,6 +97,9 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
         "max_zoom": "1e150",
         "separation": "auto",
         "video_preset": "fast",
+        "crf": 18,
+        "resample": "bilinear",
+        "lossless": False,
     },
     "beat": {
         "width": 1920,
@@ -83,6 +112,9 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
         "separation": "auto",
         "beat_strength": 1.25,
         "video_preset": "veryfast",
+        "crf": 18,
+        "resample": "bilinear",
+        "lossless": False,
     },
 }
 
@@ -91,6 +123,10 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "fullhd": "Balanced Full HD (1920x1080) render through 1e80.",
     "1080p": "Alias for the Full HD profile.",
     "4k-e150": "The practical 4K/e150 speed target: 960x540 fractal source.",
+    "4k-e150-lossless": (
+        "Native-density 4K/60 e150 render with lossless H.264 and 4:4:4 colour; "
+        "expect a much larger file and a longer render."
+    ),
     "master-e150": "Higher-density 4K/e150 master; expect a longer render.",
     "beat": "1080p render with onset-driven zoom punches enabled.",
 }

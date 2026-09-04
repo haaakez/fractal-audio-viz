@@ -7854,8 +7854,11 @@ def _ffmpeg_encoder_names() -> set[str]:
     return names
 
 
-@lru_cache(maxsize=2)
-def _vaapi_encoder_usable(device: str = "/dev/dri/renderD128") -> bool:
+@lru_cache(maxsize=4)
+def _vaapi_encoder_usable(
+    device: str = "/dev/dri/renderD128",
+    lossless: bool = False,
+) -> bool:
     """Probe the complete upload/encode path, not just FFmpeg's name list."""
 
     ffmpeg = shutil.which("ffmpeg")
@@ -7880,7 +7883,7 @@ def _vaapi_encoder_usable(device: str = "/dev/dri/renderD128") -> bool:
                 "-c:v",
                 "h264_vaapi",
                 "-qp",
-                "24",
+                "0" if lossless else "24",
                 "-f",
                 "null",
                 "-",
@@ -7897,8 +7900,8 @@ def _vaapi_encoder_usable(device: str = "/dev/dri/renderD128") -> bool:
     return result.returncode == 0
 
 
-@lru_cache(maxsize=8)
-def _hardware_encoder_usable(encoder: str) -> bool:
+@lru_cache(maxsize=16)
+def _hardware_encoder_usable(encoder: str, lossless: bool = False) -> bool:
     """Run a tiny encode so ``auto`` never selects a merely advertised codec."""
 
     ffmpeg = shutil.which("ffmpeg")
@@ -7922,10 +7925,21 @@ def _hardware_encoder_usable(encoder: str) -> bool:
         "1",
     ]
     try:
-        _, rate_control, _ = _video_encoder_settings(encoder, "ultrafast", 24)
+        _, rate_control, _ = _video_encoder_settings(
+            encoder,
+            "ultrafast",
+            0 if lossless else 24,
+            lossless=lossless,
+        )
     except ValueError:
         return False
     command.extend(["-c:v", encoder, *rate_control, "-f", "null", "-"])
+    if lossless and encoder == "h264_nvenc":
+        # Probe the same 4:4:4 output format used by the real lossless path;
+        # a plain yuv420 probe can succeed on a device that rejects the KFP
+        # detail-preserving format at encode time.
+        format_index = len(command) - 1 - command[::-1].index("-f")
+        command[format_index:format_index] = ["-pix_fmt", "yuv444p"]
     try:
         result = subprocess.run(
             command,
@@ -7945,9 +7959,13 @@ def _video_encoder_settings(
     encoder: str,
     video_preset: str,
     crf: int,
+    *,
+    lossless: bool = False,
 ) -> tuple[str, list[str], bool]:
     """Return ``(preset, rate-control, needs-vaapi-upload)`` for one codec."""
 
+    if lossless:
+        crf = 0
     if encoder == "h264_nvenc":
         nvenc_presets = {
             "ultrafast": "p1",
@@ -7958,6 +7976,14 @@ def _video_encoder_settings(
             "medium": "p6",
             "slow": "p7",
         }
+        if lossless:
+            # NVENC's lossless tune is materially different from CQ 0: CQ 0
+            # still uses the VBR quantiser and can soften high-frequency KFP
+            # edges.  constqp/qp 0 plus 4:4:4 input preserves the RGB frame
+            # after the encoder's colour conversion.
+            return nvenc_presets.get(video_preset, "p3"), [
+                "-tune", "lossless", "-rc", "constqp", "-qp", "0",
+            ], False
         return nvenc_presets.get(video_preset, "p3"), [
             "-cq", str(crf), "-rc", "vbr",
         ], False
@@ -7972,7 +7998,7 @@ def _video_encoder_settings(
     if encoder == "h264_videotoolbox":
         # VideoToolbox uses a quality scale rather than CRF.  Map the CLI's
         # 0..51 quality range onto its documented 1..63 range.
-        quality = max(1, min(63, int(round(float(crf) * 63.0 / 51.0))))
+        quality = 1 if lossless else max(1, min(63, int(round(float(crf) * 63.0 / 51.0))))
         return "", ["-q:v", str(quality)], False
     return video_preset, ["-crf", str(crf)], False
 
@@ -7981,6 +8007,7 @@ def _select_video_encoder(
     requested: str,
     video_preset: str,
     crf: int,
+    lossless: bool = False,
 ) -> tuple[str, str, list[str]]:
     """Resolve ``auto`` without making a render depend on unavailable hardware."""
 
@@ -7990,11 +8017,14 @@ def _select_video_encoder(
     if not 0 <= crf <= 51:
         raise ValueError("crf must be between 0 and 51")
     hardware = {"h264_nvenc", "h264_qsv", "h264_vaapi", "h264_videotoolbox"}
+    lossless = bool(lossless)
+    if lossless:
+        crf = 0
     if requested in hardware:
         usable = (
-            _vaapi_encoder_usable()
+            _vaapi_encoder_usable(lossless=lossless)
             if requested == "h264_vaapi"
-            else _hardware_encoder_usable(requested)
+            else _hardware_encoder_usable(requested, lossless)
         )
         if not usable:
             raise RuntimeError(
@@ -8002,12 +8032,12 @@ def _select_video_encoder(
                 "failed the hardware probe"
             )
         preset, rate_control, _ = _video_encoder_settings(
-            requested, video_preset, crf
+            requested, video_preset, crf, lossless=lossless
         )
         return requested, preset, rate_control
     if requested != "auto":
         preset, rate_control, _ = _video_encoder_settings(
-            requested, video_preset, crf
+            requested, video_preset, crf, lossless=lossless
         )
         return requested, preset, rate_control
     available = _ffmpeg_encoder_names()
@@ -8022,24 +8052,24 @@ def _select_video_encoder(
         if encoder not in available:
             continue
         if encoder == "h264_nvenc":
-            if not _hardware_encoder_usable(encoder):
+            if not _hardware_encoder_usable(encoder, lossless):
                 continue
             preset, rate_control, _ = _video_encoder_settings(
-                encoder, video_preset, crf
+                encoder, video_preset, crf, lossless=lossless
             )
             return encoder, preset, rate_control
         if encoder == "h264_vaapi":
-            if not _vaapi_encoder_usable():
+            if not _vaapi_encoder_usable(lossless=lossless):
                 continue
             preset, rate_control, _ = _video_encoder_settings(
-                encoder, video_preset, crf
+                encoder, video_preset, crf, lossless=lossless
             )
             return encoder, preset, rate_control
         if encoder in {"h264_qsv", "h264_videotoolbox"}:
-            if not _hardware_encoder_usable(encoder):
+            if not _hardware_encoder_usable(encoder, lossless):
                 continue
         preset, rate_control, _ = _video_encoder_settings(
-            encoder, video_preset, crf
+            encoder, video_preset, crf, lossless=lossless
         )
         return encoder, preset, rate_control
     if available and "libx264" not in available:
@@ -8054,20 +8084,23 @@ def _video_pixel_format(
     codec: str,
     palette: str,
     palette_file: Optional[Path] = None,
+    lossless: bool = False,
 ) -> str:
     """Choose a pixel format that keeps high-frequency KFP colour detail.
 
     The normal H.264 default is 4:2:0, which is a good compatibility choice
     for Aurora-like gradients but smears KFP's one-pixel cyan/green edge
-    detail into visibly blocky chroma squares. libx264 can retain that detail
-    with 4:4:4; hardware H.264 paths keep 4:2:0 because their accepted input
-    formats are device-dependent and VAAPI is explicitly NV12.
+    detail into visibly blocky chroma squares. Software x264 and NVENC's
+    explicit lossless mode can retain that detail with 4:4:4; other hardware
+    H.264 paths keep 4:2:0 because their accepted input formats are
+    device-dependent and VAAPI is explicitly NV12.
     """
 
-    if (
-        codec == "libx264"
-        and _kfp_profile_for_selection(palette, palette_file) is not None
+    if codec == "libx264" and (
+        lossless or _kfp_profile_for_selection(palette, palette_file) is not None
     ):
+        return "yuv444p"
+    if codec == "h264_nvenc" and lossless:
         return "yuv444p"
     return "yuv420p"
 
@@ -10073,6 +10106,7 @@ def render_video(
     palette_file: Optional[Path] = None,
     glow: float = 0.0,
     motion_blur: float = 0.0,
+    lossless: bool = False,
 ) -> dict[str, Any]:
     np = _require_numpy()
     audio_path, output_path, _, cache_dir = _validate_render_paths(
@@ -10137,6 +10171,9 @@ def render_video(
     crf = _index_value(crf, "crf")
     if not 0 <= crf <= 51:
         raise ValueError("crf must be between 0 and 51")
+    lossless = bool(lossless)
+    if lossless:
+        crf = 0
     formula = _formula_name(formula)
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
@@ -10145,6 +10182,7 @@ def render_video(
         video_codec,
         video_preset,
         crf,
+        lossless,
     )
     if selected_codec == "h264_vaapi" and (
         width < 128
@@ -10162,6 +10200,7 @@ def render_video(
             "libx264",
             video_preset,
             crf,
+            lossless,
         )
 
     if formula != "mandelbrot" and native_backend == "auto":
@@ -10453,11 +10492,12 @@ def render_video(
             selected_codec,
             palette,
             palette_file,
+            lossless,
         )
         preset_arguments = ["-preset", selected_preset] if selected_preset else []
         video_filters: list[str] = []
         if (frame_width, frame_height) != (int(width), int(height)):
-            video_filters.append(f"scale={int(width)}:{int(height)}:flags=bilinear")
+            video_filters.append(f"scale={int(width)}:{int(height)}:flags={resample}")
         if using_vaapi:
             video_filters.extend(["format=nv12", "hwupload"])
         filter_arguments = ["-vf", ",".join(video_filters)] if video_filters else []
@@ -11217,10 +11257,18 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
         help="constant-rate-factor passed to the selected video encoder (0-51)",
     )
     parser.add_argument(
+        "--lossless",
+        action="store_true",
+        help=(
+            "use lossless H.264 rate control where the selected encoder supports it; "
+            "also preserves 4:4:4 chroma"
+        ),
+    )
+    parser.add_argument(
         "--resample",
         choices=("lanczos", "bilinear"),
         default="bilinear",
-        help="crop resize filter; bilinear is fastest, lanczos selects bicubic quality filtering",
+        help="crop resize filter; bilinear is fastest, lanczos is sharper",
     )
     parser.add_argument(
         "--palette",
@@ -11583,6 +11631,7 @@ def _main_impl() -> None:
             args.palette_file,
             args.glow,
             args.motion_blur,
+            args.lossless,
         )
     except Exception as error:
         if manifest_path is not None:

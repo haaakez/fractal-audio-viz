@@ -179,6 +179,19 @@ python3 visualizer.py music/track.mp3 --profile 4k-e150 \
 
 inspect the available presets with `python3 visualizer.py --list-profiles`.
 
+for a crisp native-density 4k/60 export with lossless h.264 and 4:4:4 colour,
+use the explicit quality profile:
+
+```sh
+python3 visualizer.py music/track.mp3 \
+  --profile 4k-e150-lossless \
+  --point random --random-seed 42 \
+  --output renders/track-4k-e150-lossless.mp4
+```
+
+this profile is intentionally much slower and produces a much larger file
+than `4k-e150`; the latter remains the practical speed preset.
+
 ### common examples
 
 a normal Full HD render using a named e150-capable point:
@@ -309,6 +322,10 @@ ten-minute ceiling matters more than the smoothest outer crop, add
 `--keyframe-factor 16`; use `--keyframe-factor 4` with a larger source when
 source detail matters more than render time.
 
+`4k-e150-lossless` uses a native 3840×2160 scalar source, lossless encoder
+rate control, and 4:4:4 output. It is the quality choice when source detail
+matters more than the 100-second speed target.
+
 use `--estimate` to analyse the song and print the planned source resolution
 and keyframe count without rendering video:
 
@@ -352,7 +369,7 @@ unless noted otherwise, the values in parentheses are the defaults.
 | --- | --- |
 | `audio` (`song.mp3`) | Positional input audio file. This is how you choose a custom song. |
 | `--output PATH` (`fractal_viz.mp4`) | Output video path. |
-| `--profile NAME` | Start from `preview`, `fullhd` (`1080p` alias), `4k-e150` (4K/60 e150), `master-e150`, or `beat`; later options override it. |
+| `--profile NAME` | Start from `preview`, `fullhd` (`1080p` alias), `4k-e150` (fast 4K/60 e150), `4k-e150-lossless`, `master-e150`, or `beat`; later options override it. |
 | `--list-profiles` | Print the built-in profiles and exit. |
 | `--width N` (`1920`) | Output width in pixels. |
 | `--height N` (`1080`) | Output height in pixels. |
@@ -412,7 +429,8 @@ unless noted otherwise, the values in parentheses are the defaults.
 | `--video-preset MODE` (`ultrafast`) | x264 speed/size preset. Hardware encoders map this to their own speed levels when supported. |
 | `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox where applicable, then falls back to `libx264`. |
 | `--crf N` (`18`) | Quality value from `0` to `51`. It is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
-| `--resample MODE` (`bilinear`) | Crop filter: `bilinear` is faster; `lanczos` gives a smoother, slower resize. |
+| `--lossless` | Use lossless H.264 rate control where supported (`constqp/qp 0` for NVENC, CRF 0 for x264) and preserve 4:4:4 chroma where the encoder accepts it. |
+| `--resample MODE` (`bilinear`) | Crop and final upscale filter: `bilinear` is faster; `lanczos` is sharper and slower. |
 | `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, `mono`, `midnight`, `ember-night`, `terminal`, or `kalles-default`. The night themes use dark exteriors with white interiors; `kalles-default` matches the bundled Kalles Fraktaler profile in `palettes/kalles-default.kfp`. Its first exterior key is intentionally white and its separate interior colour is black, matching Kalles' defaults. |
 | `--palette-file PATH` | Read at least two `#rrggbb` or `r g b` stops from a text file, or import a Kalles `.kfp` gradient and its colour settings. ordinary text palettes use the fast Aurora wave path; `.kfp` uses the Kalles-style transfer path. |
 | `--glow N` (`0`) | Add a low-resolution bloom pass after colourisation, from `0` to `1`. It is off by default for the 10-minute target. |
@@ -505,9 +523,10 @@ energy envelope instead of the full export analysis. The ladder follows the
 form's `base zoom` and `max zoom`, reaches the selected preview endpoint, and
 then resets to the base view when the song loops. This keeps startup and cpu
 use low while avoiding a stale shallow crop for a deep selection. The default
-e24 range uses a source field about every three-quarters of a decade (up to 48
-fields for longer ranges), so the live crop never magnifies a parent by
-thousands of times. press `esc`
+e24 range uses a source field about every three-quarters of a decade (up to 96
+fields for longer ranges), and the first three fields are prepared before
+playback while the rest render in the background. This keeps startup short
+without making the live crop magnify a parent by thousands of times. press `esc`
 to close it or `f11` to toggle fullscreen; the song loops until the window is
 closed.
 The standalone form is:
@@ -518,15 +537,17 @@ python3 live_view.py song.mp3 --formula mandelbrot --palette aurora
 
 the live view is intentionally a preview: it caps the fractal source at
 640×360 with the native backend (320×180 for the python fallback), then
-upscales it smoothly. It prepares at most 48 absolute-zoom fields and caps
-the interactive preview at e300; final renders still use the export pipeline
-and its deep-zoom precision, atlas, and encoding settings. `ffplay` is used
+upscales it smoothly. It prepares at most 96 absolute-zoom fields and caps
+the interactive preview at e300; the initial fields are displayed immediately
+while the remaining ladder is prepared in the background. Final renders still
+use the export pipeline and its deep-zoom precision, atlas, and encoding
+settings. `ffplay` is used
 for playback when installed; without it the visual preview remains usable.
 
 the built-in `preview` profile now keeps a native source at its requested
-960×540 density; the e150 4k profile remains a deliberate 2k-source speed
-trade-off. Use `master-e150` when the final 4k image must retain source-pixel
-detail all the way through the export.
+960×540 density; the e150 4k profile remains a deliberate 960×540-source
+speed trade-off. Use `master-e150` or `4k-e150-lossless` when the final 4k
+image must retain source-pixel detail all the way through the export.
 
 the repository also includes `examples/make_test_tone.py` for a dependency-free
 audio smoke test, `point_sheet.py` for catalogue previews, and

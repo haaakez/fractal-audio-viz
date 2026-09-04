@@ -106,6 +106,114 @@ class LiveViewHelperTests(unittest.TestCase):
             self.assertEqual(len(sources.fields), len(sources.iteration_caps))
             self.assertTrue(all(cap >= live_view.LIVE_MIN_ITERATIONS for cap in calls))
 
+    def test_live_sources_can_be_populated_incrementally(self):
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="tricorn",
+                x_center="-1.00000000000000000000",
+                y_center="0.10000000000000000000",
+                max_zoom="1e4",
+            )
+
+            def fake_render(_config, width, height, _log_zoom, _library, max_iter):
+                return np.full((height, width), max_iter - 1.0, dtype=np.float32)
+
+            ladder = live_view.live_zoom_ladder(config.base_zoom, config.max_zoom)
+            store = live_view.LiveZoomSourceStore(ladder)
+            with mock.patch("live_view._render_live_source", side_effect=fake_render):
+                first = live_view.build_live_zoom_sources(
+                    config,
+                    8,
+                    4,
+                    None,
+                    store=store,
+                    max_sources=2,
+                )
+                self.assertEqual(len(first.fields), 2)
+                self.assertFalse(store.finished)
+                complete = live_view.build_live_zoom_sources(
+                    config,
+                    8,
+                    4,
+                    None,
+                    store=store,
+                )
+            self.assertEqual(len(complete.fields), len(ladder))
+            self.assertTrue(store.finished)
+
+    def test_shared_live_reference_is_used_without_rebuilding_each_source(self):
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="mandelbrot",
+                x_center="-0.743643887037151000000000000000000000000000",
+                y_center="0.131825904205330000000000000000000000000000",
+                max_zoom="1e12",
+            )
+            reference = object()
+            with mock.patch.object(
+                live_view.visualizer,
+                "_select_native_reference",
+                return_value=reference,
+            ), mock.patch.object(
+                live_view.visualizer,
+                "render_fractal",
+                return_value=np.ones((4, 8), dtype=np.float32),
+            ) as render:
+                result = live_view._render_live_source(
+                    config,
+                    8,
+                    4,
+                    12.0,
+                    object(),
+                    192,
+                    [(12.0, reference)],
+                )
+            self.assertEqual(result.shape, (4, 8))
+            self.assertIs(render.call_args.kwargs["native_reference"], reference)
+
+    def test_nonfinite_shared_live_field_is_repaired_before_display(self):
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="mandelbrot",
+                x_center="-0.743643887037151000000000000000000000000000",
+                y_center="0.131825904205330000000000000000000000000000",
+                max_zoom="1e12",
+            )
+            reference = object()
+            repaired = np.ones((4, 8), dtype=np.float32)
+            with mock.patch.object(
+                live_view.visualizer,
+                "_select_native_reference",
+                return_value=reference,
+            ), mock.patch.object(
+                live_view.visualizer,
+                "render_fractal",
+                return_value=np.full((4, 8), np.nan, dtype=np.float32),
+            ), mock.patch.object(
+                live_view.visualizer,
+                "_atlas_glitch_reference_field",
+                return_value=repaired,
+            ):
+                result = live_view._render_live_source(
+                    config,
+                    8,
+                    4,
+                    12.0,
+                    object(),
+                    192,
+                    [(12.0, reference)],
+                )
+            np.testing.assert_array_equal(result, repaired)
+
     def test_live_sources_drop_an_unresolved_deep_tile(self):
         with TemporaryDirectory() as directory:
             audio = Path(directory) / "song.mp3"
