@@ -441,7 +441,7 @@ unless noted otherwise, the values in parentheses are the defaults.
 | argument | description |
 | --- | --- |
 | `--video-preset MODE` (`faster` with a resolution profile) | x264 speed/size preset. Hardware encoders map this to their own speed levels when supported. |
-| `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox where applicable, then falls back to `libx264`. |
+| `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox at the requested output size, then validates the `libx264` fallback before selecting it. |
 | `--crf N` (`10` with a resolution profile) | Quality value from `0` to `51`. CRF 10 is the near-lossless profile target; it is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
 | `--lossless` | Use lossless H.264 rate control where supported (`constqp/qp 0` for NVENC, CRF 0 for x264) and preserve 4:4:4 chroma where the encoder accepts it. |
 | `--resample MODE` (`lanczos` with a resolution profile) | Crop and final upscale filter: `bilinear` is faster; `lanczos` is sharper and slower. |
@@ -654,7 +654,8 @@ this project is released under the [MIT License](LICENSE).
 - **Demucs error:** use `--separation none` for full-mix control, or install
   Demucs and keep `--separation auto`/`demucs`.
 - **Hardware encoder error:** leave `--codec auto` enabled so the complete
-  hardware path is probed and `libx264` is selected when necessary.
+  hardware path is probed at the requested output size and `libx264` is
+  validated as a fallback when necessary.
 - **Alternate formula is slow at extreme depth:** the Mandelbrot e150+ path
   uses the validated native BLA implementation; Julia, Burning Ship, and
   Tricorn use a correctness-oriented Python perturbation fallback for deep

@@ -7975,6 +7975,8 @@ def _hardware_encoder_usable(
     height: int = 256,
     fps: int = 30,
     preserve_chroma: Optional[bool] = None,
+    *,
+    video_preset: str = "ultrafast",
 ) -> bool:
     """Probe the encoder at the dimensions and quality the render will use."""
 
@@ -7984,6 +7986,9 @@ def _hardware_encoder_usable(
     try:
         width, height = _validate_dimensions(width, height, "hardware encoder probe")
         fps = _validate_fps(fps)
+        video_preset = _validate_ffmpeg_token(video_preset, "video preset")
+        if video_preset not in VIDEO_PRESET_CHOICES:
+            return False
     except ValueError:
         return False
     if preserve_chroma is None:
@@ -8018,19 +8023,27 @@ def _hardware_encoder_usable(
     try:
         _, rate_control, _ = _video_encoder_settings(
             encoder,
-            "ultrafast",
+            video_preset,
             0 if lossless else (NEAR_LOSSLESS_CRF if near_lossless else 24),
             lossless=lossless,
         )
     except ValueError:
         return False
-    command.extend(["-c:v", encoder, *rate_control, "-f", "null", "-"])
-    if preserve_chroma and encoder == "h264_nvenc":
-        # Probe the same 4:4:4 output format used by the real lossless path;
-        # a plain yuv420 probe can succeed on a device that rejects the KFP
-        # detail-preserving format at encode time.
-        format_index = len(command) - 1 - command[::-1].index("-f")
-        command[format_index:format_index] = ["-pix_fmt", "yuv444p"]
+    output_pixel_format = (
+        "yuv444p"
+        if preserve_chroma and encoder == "h264_nvenc"
+        else "yuv420p"
+    )
+    command.extend([
+        "-c:v",
+        encoder,
+        *rate_control,
+        "-pix_fmt",
+        output_pixel_format,
+        "-f",
+        "null",
+        "-",
+    ])
     try:
         result = subprocess.run(
             command,
@@ -8055,6 +8068,8 @@ def _software_encoder_usable(
     height: int = 256,
     fps: int = 30,
     preserve_chroma: bool = False,
+    *,
+    video_preset: str = "ultrafast",
 ) -> bool:
     """Probe the software fallback at the same RGB frame shape as a render."""
 
@@ -8066,6 +8081,9 @@ def _software_encoder_usable(
     try:
         width, height = _validate_dimensions(width, height, "software encoder probe")
         fps = _validate_fps(fps)
+        video_preset = _validate_ffmpeg_token(video_preset, "video preset")
+        if video_preset not in VIDEO_PRESET_CHOICES:
+            return False
     except ValueError:
         return False
     # Keep this in lockstep with _video_pixel_format for software output. A
@@ -8078,7 +8096,7 @@ def _software_encoder_usable(
     try:
         preset, rate_control, _ = _video_encoder_settings(
             encoder,
-            "ultrafast",
+            video_preset,
             0 if lossless else (NEAR_LOSSLESS_CRF if near_lossless else 24),
             lossless=lossless,
         )
@@ -8217,6 +8235,7 @@ def _select_video_encoder(
                 probe_height,
                 probe_fps,
                 preserve_chroma,
+                video_preset=video_preset,
             )
         )
         if not usable:
@@ -8237,6 +8256,7 @@ def _select_video_encoder(
             probe_height,
             probe_fps,
             preserve_chroma,
+            video_preset=video_preset,
         ):
             raise RuntimeError(
                 "libx264 was requested, but its complete FFmpeg encode path "
@@ -8271,6 +8291,7 @@ def _select_video_encoder(
                 probe_height,
                 probe_fps,
                 preserve_chroma,
+                video_preset=video_preset,
             ):
                 continue
             preset, rate_control, _ = _video_encoder_settings(
@@ -8298,6 +8319,7 @@ def _select_video_encoder(
                 probe_height,
                 probe_fps,
                 preserve_chroma,
+                video_preset=video_preset,
             ):
                 continue
         preset, rate_control, _ = _video_encoder_settings(
@@ -8317,6 +8339,7 @@ def _select_video_encoder(
         probe_height,
         probe_fps,
         preserve_chroma,
+        video_preset=video_preset,
     ):
         raise RuntimeError(
             "no usable hardware encoder was found and the libx264 software "

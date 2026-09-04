@@ -1745,6 +1745,7 @@ class AnimationTests(unittest.TestCase):
                         height=4320,
                         fps=60,
                         near_lossless=True,
+                        video_preset="faster",
                     )
                 )
         finally:
@@ -1756,6 +1757,7 @@ class AnimationTests(unittest.TestCase):
         )
         self.assertEqual(command[command.index("-r") + 1], "60")
         self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv420p")
+        self.assertEqual(command[command.index("-preset") + 1], "faster")
 
     def test_software_probe_uses_four_four_four_for_odd_dimensions(self):
         probe_result = mock.Mock(returncode=0)
@@ -1804,6 +1806,7 @@ class AnimationTests(unittest.TestCase):
             visualizer._hardware_encoder_usable.cache_clear()
         command = run.call_args.args[0]
         self.assertIn("color=black:s=256x256:r=30:d=0.05,format=rgb24", command)
+        self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv420p")
 
     def test_hardware_probe_uses_render_dimensions(self):
         probe_result = mock.Mock(returncode=0)
