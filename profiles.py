@@ -11,8 +11,8 @@ from __future__ import annotations
 # The canonical presets are deliberately boring and predictable: the name
 # describes the output tier, every tier is 60 fps, every tier targets e100,
 # and CRF 10 is visually near-lossless for this material while still producing
-# a useful compressed file. The 4K and 8K defaults use the proven half-density
-# native field path; users who need one scalar sample per output pixel can add
+# a useful compressed file. Outputs above Full HD use a native C++ field capped
+# at 1920x1080; users who need one scalar sample per output pixel can add
 # ``--quality quality --fractal-scale 1``. Exact bit-level output remains
 # available with ``--lossless``.
 DEFAULT_PROFILE = "4k60"
@@ -66,14 +66,25 @@ def _native_quality_profile(
 
 
 PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
-    "sd60": _native_quality_profile(720, 480),
-    "hd60": _native_quality_profile(1280, 720),
-    "fhd60": _native_quality_profile(1920, 1080),
-    "2k60": _native_quality_profile(2560, 1440),
-    # This is the pre-live/native pipeline that produced the practical
-    # ~250-second 4K renders: native C++ fields at 2K density, then one final
-    # output upscale. It is deliberately distinct from the quarter-size
-    # ``4k-e150`` compatibility speed profile below.
+    "sd60": _native_quality_profile(
+        720, 480, quality="balanced", fractal_scale=1.0, keyframe_factor=8.0
+    ),
+    "hd60": _native_quality_profile(
+        1280, 720, quality="balanced", fractal_scale=1.0, keyframe_factor=8.0
+    ),
+    "fhd60": _native_quality_profile(
+        1920, 1080, quality="balanced", fractal_scale=1.0, keyframe_factor=8.0
+    ),
+    # The 1080p field cap keeps every canonical native profile on the same
+    # fast, fused C++ path.  At or below Full HD the field is output-density;
+    # larger outputs receive one final high-quality upscale.
+    "2k60": _native_quality_profile(
+        2560,
+        1440,
+        quality="balanced",
+        fractal_scale=0.75,
+        keyframe_factor=8.0,
+    ),
     "4k60": _native_quality_profile(
         3840,
         2160,
@@ -85,7 +96,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
         7680,
         4320,
         quality="balanced",
-        fractal_scale=0.5,
+        fractal_scale=0.25,
         keyframe_factor=8.0,
     ),
 }
@@ -113,9 +124,9 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "sd60": "Native 720x480 60 fps, near-lossless CRF 10, e100.",
     "hd60": "Native 1280x720 60 fps, near-lossless CRF 10, e100.",
     "fhd60": "Native 1920x1080 60 fps, near-lossless CRF 10, e100.",
-    "2k60": "Native 2560x1440 60 fps, near-lossless CRF 10, e100.",
+    "2k60": "2K/60 native C++ pipeline from a 1920x1080 source, CRF 10, e100.",
     "4k60": "4K/60 native C++ pipeline from a 1920x1080 source, CRF 10, e100.",
-    "8k60": "8K/60 native C++ pipeline from a 3840x2160 source, CRF 10, e100.",
+    "8k60": "8K/60 native C++ pipeline from a 1920x1080 source, CRF 10, e100.",
     "4k-e150": "Fast 4K/60 e150 export from a 960x540 source, enlarged at the end.",
 }
 

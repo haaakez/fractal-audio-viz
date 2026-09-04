@@ -10373,8 +10373,9 @@ def _quality_source_settings(
 
     ``source_mode`` is deliberately separate from the quality preset.  The
     normal/native path honors the profile's selected scalar density, so the
-    practical 4K/8K profiles can use the proven half-density native pipeline;
-    ``--quality quality --fractal-scale 1`` requests full output density.
+    practical profiles above Full HD can use the proven 1920x1080 native
+    pipeline; ``--quality quality --fractal-scale 1`` requests full output
+    density.
     The explicit upscaled path caps the field at the old quarter-resolution
     source that made 4K quick renders practical. The final FFmpeg filter is
     responsible for enlarging either undersampled source to the requested
