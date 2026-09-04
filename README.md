@@ -3,106 +3,91 @@
 [![render preview](images/preview.GIF)](images/preview.GIF)
 
 
-fractal audio viz renders audio-reactive zooms through the Mandelbrot family:
-mandelbrot, Julia, Burning Ship, and Tricorn. It reads one local
-song, turns the audio into animation controls, renders reusable scalar
-keyframes, and sends the final RGB frames to FFmpeg. The Mandelbrot path is
-the production path for e150+ deep zooms; the other formulas are first-class
-high-precision modes with formula-specific deep boundary targets.
+fractal audio viz turns a song into a zoom through the Mandelbrot family:
+Mandelbrot, Julia, Burning Ship, and Tricorn. Give it a local audio file and it
+uses the music to control the camera and colours, then writes the video with
+FFmpeg. The native Mandelbrot renderer is the fast path for very deep zooms;
+the other formulas work too, but their deepest renders use a slower
+formula-specific fallback.
 
 ## how it works
 
-the render is split into five stages.
+the render is roughly five stages:
 
-1. **audio analysis.** the input is loaded as mono audio and resampled to
-   `--sample-rate`. A frame-aligned loudness envelope drives the camera. YIN
-   pitch tracking controls the colour movement. With `--separation auto`, the
-   program tries Demucs first; if no usable vocal/instrumental split is
-   available, the whole song drives both controls. `--separation spectral`
-   enables frequency-band proxies instead. An onset-strength curve is also
-   cached; enable its contribution with `--beat-strength`.
+1. **audio analysis.** the song is loaded as mono audio and resampled to
+   `--sample-rate`. Loudness moves the camera, and pitch adds some colour
+   movement. `--separation auto` tries Demucs first and falls back to the full
+   mix if a vocal/instrumental split is not available. `--separation spectral`
+   uses simpler frequency-band proxies. Onset strength is cached too, and can
+   be added with `--beat-strength`.
 
-2. **zoom planning.** the camera moves in logarithmic zoom space from
-   `--base-zoom` to `--max-zoom`. Instrumental energy changes the speed. The
-   default `--zoom-speed -0.04` allows small pullbacks during quiet passages,
-   while the final frame is still placed exactly at the requested maximum.
+2. **zoom planning.** the camera moves from `--base-zoom` to `--max-zoom` in
+   logarithmic zoom space. Instrumental energy changes the speed. The default
+   `--zoom-speed -0.04` lets it pull back a little during quiet parts, while
+   the last frame still reaches the requested maximum.
 
-3. **source images.** the default `atlas` mode builds a fixed ladder of nested
-   keyframes. A keyframe covers one `--keyframe-factor` interval. Frames between
-   keyframes are centred crops of the source images, so the expensive fractal
-   calculation is not repeated for every video frame. The older full-field
-   chunk renderer remains available as `--keyframe-mode legacy`.
+3. **source images.** the default `atlas` mode builds a ladder of nested
+   keyframes. Each one covers a `--keyframe-factor` interval. In-between frames
+   are crops of those images, so the fractal is not recalculated 60 times a
+   second. The older full-field renderer is still available with
+   `--keyframe-mode legacy`.
 
-4. **fractal rendering.** shallow formula views use the direct native renderer.
-   At Mandelbrot e150+ depths, the C++ backend builds a high-precision MPFR
-   reference orbit and renders pixel offsets with perturbation arithmetic.
-   Scaled mantissa/exponent values preserve tiny offsets, while BLA maps, an
-   adaptive image-wide series, OpenMP, and depth-specific reference tiers
-   reduce the per-pixel cost. Julia, Burning Ship, and Tricorn use
-   formula-aware direct iteration and a high-precision Python perturbation
-   fallback for deep boundary targets.
+4. **fractal rendering.** shallow views use the native renderer directly. For
+   very deep Mandelbrot views, the C++ code builds an MPFR reference orbit and
+   uses perturbation arithmetic, BLA maps, OpenMP, and a few depth-specific
+   reference tiers to keep the work manageable. Julia, Burning Ship, and
+   Tricorn use their own formula-aware path.
 
-5. **colour and encoding.** keyframes store scalar iteration data. the native
-   colour path or Pillow turns that data into RGB after cropping. ordinary
-   palettes reuse Aurora's detail-preserving waves with their own RGB accents;
-   `.kfp` files keep Kalles' cyclic transfer, distance, multi-colour, and slope
-   settings, including the bundled default key colours. KFP crop, atlas, and
-   direct colourisation stay in the native path when it is available. atlas levels are
-   prepared before they become visible and use an interior-aware feathered
-   handoff, so a freshly resolved child tile does not become a rectangle or
-   ghost over the parent. optional glow and motion blur are applied at this
-   stage, and
-   FFmpeg writes the video with the original audio. `--codec auto` probes
-   available hardware encoders and falls back to `libx264`.
+5. **colour and encoding.** keyframes contain scalar iteration data. It is
+   colourised after cropping, using the native code when available. Ordinary
+   palettes use Aurora's detailed wave as a base with different accents;
+   `.kfp` files use Kalles' cyclic transfer, distance, colour, and slope
+   settings. Atlas parent and child fields are joined before the KFP stencil is
+   run, which keeps a new tile from showing up as a rectangle. Glow and motion
+   blur are optional. FFmpeg then adds the original audio; `--codec auto` tries
+   hardware encoders before falling back to `libx264`.
 
-the KFP path follows Kalles Fraktaler's normal CPU colour pipeline: it builds
-the 1024-entry cyclic palette with sine interpolation, keeps the exact
-iteration cap as the interior marker, reconstructs interior neighbours as
-`max_iter + 1` for distance/slope stencils, applies the selected transfer and
-glossy slope pass, and uses Kalles' deterministic 8-bit dither. The lookup
-table and immutable profile are cached, and the native implementation performs
-the crop, atlas re-projection, shared stencil, and colour conversion without a
-Python image round-trip. atlas parent and child fields meet on one screen-space
-scalar surface, so a new tile cannot reset the glossy gradient into a visible
-rectangle. KFP features that require extra Kalles buffers—custom GLSL colour
-functions, textures, analytic derivatives, and phase channels—remain outside
-the scalar-field compatibility path.
+if you are using a `.kfp` palette, the native path follows the useful parts of
+Kalles Fraktaler's CPU colour pipeline: a 1024-entry cyclic palette, sine
+interpolation, distance and slope shading, and Kalles-style 8-bit dithering.
+The palette and profile are cached. For atlas frames, both scalar tiles are
+reprojected onto one screen-sized surface before colouring, so the glossy
+gradient does not restart at the tile boundary.
 
-the output dimensions are controlled by `--width` and `--height`. The default
-`--source-mode lossless-compressed` uses the profile's native C++ field
-pipeline; profiles above Full HD use a 1920×1080 source to retain the old
-render time. `--source-mode native` forces one source sample per output pixel,
-while `--quality quality --fractal-scale 1` is also a full-density request.
-The explicit `--source-mode upscaled` (or `--upscaling`)
-uses the old fast quarter-resolution source and enlarges it to the output.
-`--render-scale` and `--fractal-scale` remain available for deliberate source
-supersampling or custom quality experiments.
+the output size comes from `--width` and `--height`. The default
+`lossless-compressed` source mode uses the native C++ field pipeline; profiles
+above Full HD use a 1920×1080 source to keep the render practical.
+`--source-mode native` renders one source sample per output pixel. For the fast,
+lower-detail version, use `--source-mode upscaled` (or `--upscaling`), which
+starts from a quarter-resolution source and enlarges it at the end.
+`--render-scale` and `--fractal-scale` are there when you want to tune the
+source density yourself.
 
 ### repository layout
 
 | file | purpose |
 | --- | --- |
-| `visualizer.py` | Audio analysis, zoom planning, keyframes, colour, and FFmpeg. |
-| `renderer.cpp` / `renderer.h` | Native C ABI, MPFR deep rendering, BLA, OpenMP, and colour paths. |
-| `deep_zoom_points.py` | Formula-specific point catalogues and exact decimal centres. |
-| `palettes/` | Built-in palette files, including the Kalles Fraktaler default `.kfp`. |
-| `profiles.py` | Shared render presets used by the CLI and GUI. |
-| `gui.py` | Optional GTK3/PyGObject launcher; the CLI remains the reproducible interface. |
-| `live_view.py` | Low-latency fullscreen GTK preview for listening/screen-saver use. |
-| `images/` | README preview and GUI screenshots/placeholders. |
-| `make_preview.py` | Converts the newest high-resolution render to a GIF or short MP4. |
-| `point_sheet.py` | Creates a labelled catalogue contact sheet. |
-| `benchmark.py` | Field, compositor, and atlas benchmarks without audio or video encoding. |
-| `tests/` | Python and native correctness tests. |
-| `shell.nix` / `Makefile` | Reproducible dependencies and the native build. |
+| `visualizer.py` | audio analysis, zoom planning, keyframes, colour, and FFmpeg |
+| `renderer.cpp` / `renderer.h` | the native renderer, deep zoom maths, and colour paths |
+| `deep_zoom_points.py` | formula-specific point lists and long decimal centres |
+| `palettes/` | built-in palettes, including the bundled Kalles `.kfp` file |
+| `profiles.py` | render presets shared by the CLI and GUI |
+| `gui.py` | the optional GTK launcher |
+| `live_view.py` | the small fullscreen preview |
+| `images/` | README and GUI images |
+| `make_preview.py` | turns a render into a GIF or short MP4 |
+| `point_sheet.py` | makes a labelled point catalogue image |
+| `benchmark.py` | native field, compositor, and atlas benchmarks |
+| `tests/` | Python and native tests |
+| `shell.nix` / `Makefile` | the development environment and native build |
 
 ## installation and build
 
-the supplied Nix shell provides Python, NumPy, librosa, Pillow, mpmath,
-ffmpeg, GCC, GMP, MPFR, GTK3, and PyGObject. OpenCL support is enabled when the host has
-the headers and ICD available. A regular Python environment can use
-`pip install -r requirements.txt`, followed by `make` if GMP/MPFR and a C++
-compiler are installed.
+the supplied Nix shell includes Python, NumPy, librosa, Pillow, mpmath, ffmpeg,
+GCC, GMP, MPFR, GTK3, and PyGObject. OpenCL is picked up when the host has the
+right headers and ICD. If you are not using Nix, install the Python packages
+from `requirements.txt` and run `make` with GMP, MPFR, and a C++ compiler
+available.
 
 ```sh
 nix-shell
@@ -110,16 +95,16 @@ make
 make test
 ```
 
-`make` creates `mandelbrot.so`. GMP and MPFR are required for native deep
-zooms. The Python renderer is useful for shallow previews and tests, but it is
-not a replacement for the native Mandelbrot e150+ path. The GTK launcher is an
-optional desktop dependency; headless CLI renders do not need PyGObject or GTK.
+`make` creates `mandelbrot.so`. GMP and MPFR are needed for native deep zooms.
+The Python renderer is handy for shallow previews and tests, but the deep
+Mandelbrot path needs the native build. GTK is only needed for the GUI; command
+line renders do not need it.
 
 ## running a render
 
-the input song is the first positional argument. It is not fixed to
-`song.mp3`; pass any local file that librosa can decode, such as MP3, WAV, or
-flac. If the argument is omitted, the default is `song.mp3`.
+the input song is the first argument. It can be any local file that librosa can
+read, not just `song.mp3`. If you leave it out, the program looks for
+`song.mp3`.
 
 ```sh
 python3 visualizer.py path/to/my-song.mp3 \
@@ -133,8 +118,8 @@ python3 visualizer.py "Music/Live set.flac" \
   --output "renders/Live set.mp4"
 ```
 
-the program creates the output directory when needed. Use `python3
-visualizer.py --help` for the parser’s built-in summary.
+the output directory is created when needed. Run `python3 visualizer.py --help`
+if you want the full option list.
 
 for a quick desktop launcher:
 
@@ -142,16 +127,12 @@ for a quick desktop launcher:
 python3 gui.py
 ```
 [![gtk gui](images/gui.png)](images/gui.png)
-the GUI only starts the same CLI in a child process, so it stays responsive
-and every render can still be copied from the log and reproduced in a shell.
-profiles, formulas, palettes, catalogue points, and the audio/effects values
-are available at the top. The complete technical options—including precision,
-iteration, native backend, encoder, cache, and manifest controls—are collapsed
-behind the `Technical options` expander by default; expand it when needed. It
-uses GTK's configured system theme and standard controls, plus a real scrolled
-container, so collapsing the advanced section cannot leave the form at an
-empty scroll offset. The selected palette also has a live preview strip; for
-KFP themes it shows the cyclic Kalles gradient and its interior colour.
+
+the GUI starts the same CLI in a child process. That keeps the window
+responsive, and the command can still be copied from the log if you want to
+run it again in a terminal. The advanced options are tucked away until you
+need them. It follows the system GTK theme and shows a small preview for the
+selected palette, including the cyclic gradient used by KFP themes.
 
 ## constructing a command
 
@@ -161,28 +142,26 @@ start with this shape:
 python3 visualizer.py AUDIO --output OUTPUT [options]
 ```
 
-then choose the parts that matter for the render:
+then add the options you care about:
 
-1. Set the input song and output file.
-2. Set `--width`, `--height`, and `--fps`.
-3. Choose a formula with `--formula`; for Julia, set its constant with
+1. choose the input song and output file.
+2. set `--width`, `--height`, and `--fps`.
+3. choose a formula with `--formula`; for Julia, set its constant with
    `--julia-c`.
-4. Choose a centre with `--point`, `--random-point`, or `--x-center` plus
+4. choose a centre with `--point`, `--random-point`, or `--x-center` plus
    `--y-center`.
-5. Set `--max-zoom` and, for a deep custom point, provide enough decimal
+5. set `--max-zoom` and, for a deep custom point, provide enough decimal
    digits in both coordinates.
-6. Choose a quality/speed trade-off with `--quality`, `--fractal-scale`, and
+6. choose a quality/speed trade-off with `--quality`, `--fractal-scale`, and
    `--keyframe-factor`; choose `--source-mode upscaled` when the fastest,
    lower-detail export is preferable to the lossless-compressed C++ pipeline.
-7. Add `--cache-dir` if the render may be resumed or repeated.
+7. add `--cache-dir` if you plan to resume or repeat the render.
 
-profiles are shortcuts for a coherent set of these values. The canonical
-presets are `sd60`, `hd60`, `fhd60`, `2k60`, `4k60`, and `8k60`. Every one uses
-60 fps, e100, the fused native bilinear crop path, and near-lossless CRF 10
-encoding. The SD–FHD profiles use output-density fields; `2k60`, `4k60`, and
-`8k60` use a 1920×1080 field, matching the proven pre-live C++ pipeline.
-With no profile option, `4k60` is selected; explicit options still override
-the profile.
+profiles are just shortcuts for a group of settings. The main presets are
+`sd60`, `hd60`, `fhd60`, `2k60`, `4k60`, and `8k60`. They all use 60 fps, e100,
+the native bilinear colour path, and CRF 10. The larger three profiles use a
+1920×1080 source field and upscale that to the requested output. Without a
+profile, `4k60` is used. Options written after the profile override it.
 
 ```sh
 python3 visualizer.py music/track.mp3 --profile 4k60 \
@@ -215,11 +194,10 @@ python3 visualizer.py music/track.mp3 --profile 8k60 \
   --output renders/track-8k60.mp4
 ```
 
-CRF 10 is intended to be visually transparent while retaining useful
-compression. Add `--lossless` when exact H.264 losslessness matters more than
-file size, or choose a larger CRF explicitly when speed and storage matter
-more. Ordinary palettes use the faster 4:2:0 pixel path; KFP palettes and
-exact-lossless output use 4:4:4 to retain their sharp colour edges.
+CRF 10 is meant to look lossless while keeping the file smaller. Use
+`--lossless` if you need actual H.264 losslessness, or choose a larger CRF if
+you care more about render time and file size. Ordinary palettes use 4:2:0;
+KFP and exact-lossless output use 4:4:4 so their colour edges stay sharp.
 
 ### common examples
 
@@ -233,11 +211,10 @@ python3 visualizer.py music/track.mp3 \
   --cache-dir cache/track
 ```
 
-The old names `preview`, `fullhd`, `1080p`, and `beat` remain accepted as
-compatibility aliases for the new resolution tiers. Use `--source-mode
-upscaled` when the faster quarter-density path is preferable; the named e150
-export profiles were removed so output depth and source density are no longer
-coupled.
+the old names `preview`, `fullhd`, `1080p`, and `beat` still work as aliases for
+the resolution tiers. Use `--source-mode upscaled` for the faster
+quarter-density path. The old e150 profile names are gone; zoom depth and
+source density are now separate options.
 
 a reproducible random point:
 
@@ -263,19 +240,13 @@ python3 visualizer.py --list-points --formula burning-ship
 python3 visualizer.py --list-points --formula julia
 ```
 
-each formula has its own point list. Mandelbrot contains screened e150+ entries
-from named KFR files in the [MDZ gallery](https://mathr.co.uk/mdz/gallery/) and
-deep test views in [FractalShark](https://github.com/mattsaccount364/FractalShark),
-including labelled conjugate mirrors. Burning Ship and Tricorn use their own
-formula-specific boundary targets: the Burning Ship list includes generated
-helm and mini-ship preperiodic roots, while Tricorn includes generated
-branching-junction roots instead of the uninformative `-2` cusp. Julia presets
-also include their fixed `c` value, so choosing `julia-douady-rabbit`, for
-example, changes both
-the preset and the Julia constant. `random` and `--random-point` select from
-the catalogue for the currently selected formula. Mandelbrot entries are
-screened for the production native e150+ path; alternate entries are screened
-as Python high-precision boundary targets at the same depth.
+each formula has its own point list. The Mandelbrot entries come from named KFR
+files in the [MDZ gallery](https://mathr.co.uk/mdz/gallery/) and deep test views
+in [FractalShark](https://github.com/mattsaccount364/FractalShark). Burning Ship
+and Tricorn have separate hand-picked/generated boundary targets, and the
+Julia presets include their `c` value. `random` chooses from the list for the
+currently selected formula. Mandelbrot points are checked for the native deep
+path; the alternate-formula points use the Python high-precision path.
 
 to use your own centre, pass a comma-separated pair to `--point`. This works
 for every formula and replaces that formula's preset:
@@ -287,12 +258,12 @@ python3 visualizer.py music/track.mp3 \
 ```
 
 for a deep Mandelbrot render, replace that short pair with the full decimal
-export from your zoom tool. The production guard requires at least
-`ceil(log10(max-zoom)) + 16` fractional decimal places in both coordinates.
-this prevents a short decimal from silently producing a different deep
-target. `--allow-underspecified-center` is for exploratory Mandelbrot renders
-only. Alternate formulas accept their own presets or exact pairs and remain
-limited to the exploratory Python path at extreme depth.
+export from your zoom tool. The safety check wants at least
+`ceil(log10(max-zoom)) + 16` fractional digits in both coordinates. That avoids
+silently following a different target because the centre was rounded.
+`--allow-underspecified-center` is for exploratory Mandelbrot renders. The
+alternate formulas have their own presets and use the Python path at extreme
+depth.
 
 the two-coordinate form is also available for scripts and Kalles exports:
 
@@ -309,36 +280,34 @@ would otherwise be mistaken for another command-line option.
 
 ### formula examples
 
-the default is Mandelbrot. The native direct renderer also handles the
-alternate formulas below; their coordinates describe the visible viewport.
+the default is Mandelbrot. These examples show the other formulas; their
+coordinates describe the visible viewport.
 
 ```sh
-# Julia set for c = -0.8 + 0.156i, centred on the Julia plane
+# Julia set for c = -0.8 + 0.156i
 python3 visualizer.py music/track.mp3 --formula julia --julia-c=-0.8,0.156 \
   --max-zoom 1e8 --output renders/julia.mp4
 
-# Burning Ship, with onset-driven punches and a custom palette
+# Burning Ship with onset-driven punches and a custom palette
 python3 visualizer.py music/track.mp3 --formula burning-ship \
   --max-zoom 1e8 --beat-strength 1.0 \
   --palette-file examples/palette-neon.txt --output renders/ship.mp4
 
-# The remaining built-in is tricorn (Mandelbar).
+# the remaining built-in is Tricorn (Mandelbar)
 python3 visualizer.py music/track.mp3 --formula tricorn --max-zoom 1e7
 ```
 
-use `python3 visualizer.py --list-formulas` for the complete list. The
-validated MPFR/BLA e150+ accelerator is currently specific to the Mandelbrot
-parameter plane. Alternate formulas use their own Python high-precision
-perturbation path for deep targets up to about e300; they are not silently
-routed through an incompatible Mandelbrot reference.
+use `python3 visualizer.py --list-formulas` for the complete list. The MPFR/BLA
+deep-zoom accelerator is for the Mandelbrot parameter plane. Julia, Burning
+Ship, and Tricorn use their own high-precision perturbation path, up to about
+e300, instead of pretending to be Mandelbrot.
 
 ### resolution profiles
 
-the six canonical profiles share a 60 fps frame rate, e100 maximum zoom,
-balanced atlas rendering, the fused bilinear native colour path, and CRF 10
-near-lossless compression. Profiles above Full HD intentionally cap the
-native field at 1920×1080; this keeps the render practical while retaining
-the same high-quality native fractal and colour pipeline.
+the six profiles all use 60 fps, e100, balanced atlas rendering, the native
+bilinear colour path, and CRF 10. The larger profiles use a 1920×1080 source
+field and upscale it, which is considerably more practical than calculating
+the whole atlas at 4K or 8K.
 
 | profile | output / default field source | max zoom | compression |
 | --- | --- | --- | --- |
@@ -349,10 +318,10 @@ the same high-quality native fractal and colour pipeline.
 | `4k60` | 3840×2160 / 1920×1080 | e100 | CRF 10 |
 | `8k60` | 7680×4320 / 1920×1080 | e100 | CRF 10 |
 
-`4k60` is the default lossless-compressed C++ pipeline. For a full-density field, add
-`--quality quality --fractal-scale 1`; add `--lossless` for exact H.264 rate
-control. Use `--source-mode upscaled`, a larger `--keyframe-factor`, or a larger
-CRF explicitly when rendering speed matters more.
+`4k60` is the default lossless-compressed C++ pipeline. Add
+`--quality quality --fractal-scale 1` for a full-density field, and
+`--lossless` for actual lossless H.264. If speed matters more, use
+`--source-mode upscaled`, a larger `--keyframe-factor`, or a larger CRF.
 
 for example, an 8K render is:
 
@@ -378,14 +347,14 @@ python3 visualizer.py music/track.mp3 \
 
 ### previews and point browsing
 
-after a render, the small helper chooses the newest filename containing one
-of the resolution profile names and creates a looping GIF:
+after a render, this helper finds the newest matching file and creates a
+looping GIF:
 
 ```sh
 python3 make_preview.py
 ```
 
-choose a source or make a short MP4 explicitly:
+or make a short MP4 explicitly:
 
 ```sh
 python3 make_preview.py renders/track-4k60.mp4 \
@@ -491,35 +460,28 @@ unless noted otherwise, the values in parentheses are the defaults.
 
 ### safety and resource limits
 
-public entry points validate dimensions before allocating fields (at most
-100,000,000 pixels), decoded audio (at most 120,000,000 float32 samples),
-video frames (at most 10,000,000), frame rate (1–1,000), sample rate
-(1–768,000 Hz), and iteration budgets (1–10,000,000). Zoom exponents are
-bounded to `10^-300` through `10^9800` for the native scaled path; the Python
-fallback remains limited to approximately `10^300`. Coordinate text is capped
-at 50,000 characters and each cache entry is bounded before NumPy opens it.
+there are some deliberately boring safety limits here: image sizes, audio
+length, frame counts, sample rates, iteration counts, and coordinate strings
+are checked before anything large is allocated. Native scaled arithmetic is
+limited to zooms from `10^-300` to `10^9800`; the Python fallback tops out at
+roughly `10^300`.
 
-rendered videos, previews, manifests, and cache fields are written beside
-their final targets and replaced atomically, so an interrupted operation does
-not publish a partial result. Cache loading disables pickle and rejects
-malformed, non-finite, oversized, or zip-bomb-like entries. FFmpeg and the
-optional Demucs process drain only a bounded diagnostic tail and are started in
-a private process group so cancellation also reaches their descendants.
+video files, previews, manifests, and cache fields are written atomically, so a
+half-finished render should not replace a good one. Cache files are checked
+before NumPy loads them. FFmpeg and Demucs also run in their own process group,
+so cancelling a render can clean up their child processes too.
 
-when `--codec auto` is used, the advertised hardware encoders are filtered by
-a short real encode probe. NVENC uses `-cq`, QSV uses `-global_quality`, VAAPI
-uses `format=nv12,hwupload` with `-qp`, and VideoToolbox uses its mapped
-`-q:v` scale. If the selected hardware path is unavailable or fails its
-probe, the deterministic `libx264` software path is selected.
+with `--codec auto`, the available hardware encoders get a small real encode
+probe first. If the selected hardware path is unavailable, the renderer falls
+back to `libx264`.
 
 ### reproducibility and fallback matrix
 
-for reproducible output, keep the same Git revision, Python/native dependency
-versions, command-line arguments, audio bytes, and exact centre coordinates.
-the cache namespace includes the active field-renderer implementation, but
-encoded bytes can still differ across FFmpeg builds, hardware encoders, CPU
-instruction sets, and parallel floating-point runtimes. Compare decoded
-frames or scalar fields when checking numerical output across machines.
+for reproducible output, keep the same Git revision, dependencies, command,
+audio bytes, and exact centre coordinates. The cache knows about the renderer
+version, but encoded bytes can still vary between FFmpeg builds, hardware
+encoders, CPUs, and thread counts. Compare decoded frames or scalar fields when
+that distinction matters.
 
 | requested path | actual path | boundary |
 | --- | --- | --- |
@@ -532,63 +494,48 @@ frames or scalar fields when checking numerical output across machines.
 
 ## caching and reruns
 
-keyframe cache entries include the centre, absolute zoom, dimensions, iteration
-budget, renderer identity, and approximation settings. Old entries are not
-silently reused after a numerical renderer change. Writes are atomic, so an
-interrupted tile does not replace a completed tile.
+cache entries include the centre, zoom, dimensions, iteration budget, renderer
+version, and approximation settings. A renderer change gets a new cache
+namespace, and tile writes are atomic.
 
-the final video is assembled from the beginning on every run. This is required
-for a valid compressed stream, even when most keyframes and the audio analysis
-are already cached.
+the video is still assembled from the beginning on every run. That is necessary
+for a valid compressed stream, even when the keyframes and audio analysis are
+already cached.
 
-every normal render also writes a JSON manifest beside the output. It records
-the command, Git revision, audio path, formula, Julia constant, resolved point,
-zoom plan, settings, timings, and whether the render completed. Use
-`--no-manifest` when a sidecar is not wanted.
+normal renders also write a JSON manifest beside the output. It contains the
+command, Git revision, audio path, formula, point, zoom plan, settings,
+timings, and completion status. Use `--no-manifest` to skip it.
 
 ## gui and project tools
 
-gtk3 with PyGObject uses the desktop's configured GTK theme—including its
-light/dark choice—on Linux and other platforms with GTK installed. The GUI is
-intentionally a launcher rather than a second renderer, which keeps the command
-line reproducible:
+the GTK3 launcher uses the desktop's configured theme, including its light/dark
+choice. It is only a front end for the CLI, so the same command can be run
+without the GUI:
 
 ```sh
 python3 gui.py
 ```
 
-the gui also has a **live view** button for a screen-saver-like listening
-preview. It prepares a small absolute-zoom source ladder, colourises smooth
-parent/child crops at the display rate, and uses a streamed 8 kHz ffmpeg
-energy envelope instead of the full export analysis. The ladder follows the
-form's `base zoom` and `max zoom`, reaches the selected preview endpoint, and
-then resets to the base view when the song loops. This keeps startup and cpu
-use low while avoiding a stale shallow crop for a deep selection. The selected
-range uses source fields about every three-quarters of a decade when it fits
-the live budget (up to 168 fields for longer ranges). The first three fields
-are prepared before playback while the rest render in the background. This keeps startup short
-without making the live crop magnify a parent by thousands of times. press `esc`
-to close it or `f11` to toggle fullscreen; the song loops until the window is
-closed.
-The standalone form is:
+the GUI also has a **live view** button. It is a small screen-saver-style
+preview: it prepares a short zoom ladder, follows the selected `base zoom` and
+`max zoom`, and resets to the base view when the song loops. The first few
+fields are prepared before playback and the rest are filled in in the
+background. Press `esc` to close it or `f11` to toggle fullscreen.
+
+the standalone command is:
 
 ```sh
 python3 live_view.py song.mp3 --formula mandelbrot --palette aurora
 ```
 
-the live view is intentionally a preview: it caps the fractal source at
-480×270 with the native backend (240×135 for the python fallback), then
-upscales it to the fullscreen/window aspect with GTK. It uses the older fast,
-factor-eight-style atlas behaviour rather than the strict quality-render path,
-prepares at most 168 absolute-zoom fields, and caps the interactive preview at
-e300. The initial fields are displayed immediately while the remaining ladder
-is prepared in the background. Final renders still use the export pipeline and
-its deep-zoom precision, atlas, and encoding settings. `ffplay` is used
-for playback when installed; without it the visual preview remains usable.
+the live view is deliberately much cheaper than an export. It caps the native
+source at 480×270 (240×135 with the Python fallback), enlarges it to the window
+size, and prepares at most 168 fields. It uses the fast atlas path and caps the
+interactive zoom at e300. `ffplay` is used for audio playback when installed;
+without it, the visual preview still works.
 
-the live view is independent of the export profiles. It keeps its own small
-fast source ladder and only enlarges the RGB result in GTK; selecting `8k60`
-for an export never makes the live window allocate an 8K surface.
+the live view is separate from the export profiles. Choosing `8k60` does not
+make it allocate an 8K surface.
 
 the repository also includes `examples/make_test_tone.py` for a dependency-free
 audio smoke test, `point_sheet.py` for catalogue previews, and
@@ -597,8 +544,8 @@ and native build products are ignored by Git.
 
 ## benchmarking
 
-`benchmark.py` measures native work without decoding audio or encoding video.
-the usual field probe is:
+`benchmark.py` measures the native renderer without involving audio or video
+encoding. For example:
 
 ```sh
 python3 benchmark.py --renderer native \
@@ -607,7 +554,7 @@ python3 benchmark.py --renderer native \
   --threads 6 --repeat 1 --stats
 ```
 
-the benchmark can also sweep the atlas or isolate the compositor:
+you can also sweep the atlas or time the colour/compositor on its own:
 
 ```sh
 python3 benchmark.py --stage atlas --renderer native \
@@ -648,20 +595,17 @@ benchmark arguments:
 
 ## deep-zoom notes
 
-the deep-zoom design follows the standard reference-orbit and perturbation
-approach described in [mathr’s deep-zoom
-notes](https://mathr.co.uk/web/deep-zoom.html). The renderer keeps the MPFR
-reference separate from the small per-pixel offsets, then uses scaled values
-and BLA maps in the hot loop. The reference orbit is built once for a render;
-additional depth tiers reuse its compact orbit and rebuild only the
-radius-dependent approximation bounds.
+the deep-zoom code uses the usual reference-orbit and perturbation approach
+described in [mathr’s deep-zoom notes](https://mathr.co.uk/web/deep-zoom.html).
+The MPFR reference is kept separate from the small per-pixel offsets, and the
+hot loop uses scaled values and BLA maps. Extra depth tiers reuse the orbit and
+only rebuild the radius-dependent bounds.
 
-the bundled centre contains 129 fractional decimal places. It is suitable for
-the project’s tested e100 path, but it is intentionally rejected for an
-unqualified e150 render. Use a catalogue point or provide the full-precision
-centre from a zoom tool.
+the bundled centre has 129 fractional decimal places. That is enough for the
+tested e100 path, but not for an unqualified e150 render. Use a catalogue point
+or paste the full-precision centre from a zoom tool.
 
-for further native details, see the public declarations in
+for more native-renderer details, see the declarations in
 [`renderer.h`](renderer.h) and the source-attributed catalogue in
 [`deep_zoom_points.py`](deep_zoom_points.py).
 
@@ -671,22 +615,21 @@ this project is released under the [MIT License](LICENSE).
 
 ## troubleshooting
 
-- **Audio file not found:** pass the path as the first argument, for example
+- **audio file not found:** pass the path as the first argument, for example
   `python3 visualizer.py "Music/track.mp3"`.
-- **Native renderer unavailable:** run `nix-shell` followed by `make`. Deep
+- **native renderer unavailable:** run `nix-shell` followed by `make`. Deep
   renders cannot use the Python fallback beyond its supported range.
-- **Centre precision error:** use `--list-points`, lower `--max-zoom`, or pass
+- **centre precision error:** use `--list-points`, lower `--max-zoom`, or pass
   the full decimal coordinates. Only use `--allow-underspecified-center` when
   the exact deep target is not important.
 - **Demucs error:** use `--separation none` for full-mix control, or install
   Demucs and keep `--separation auto`/`demucs`.
-- **Hardware encoder error:** leave `--codec auto` enabled so the complete
+- **hardware encoder error:** leave `--codec auto` enabled so the available
   hardware path is probed at the requested output size and `libx264` is
   validated as a fallback when necessary.
-- **Alternate formula is slow at extreme depth:** the Mandelbrot e150+ path
-  uses the validated native BLA implementation; Julia, Burning Ship, and
-  Tricorn use a correctness-oriented Python perturbation fallback for deep
-  boundary targets.
+- **alternate formula is slow at extreme depth:** the Mandelbrot e150+ path
+  has the native BLA accelerator. Julia, Burning Ship, and Tricorn use the
+  slower Python perturbation fallback for deep boundary targets.
 - **GUI will not start:** install GTK3 and PyGObject for the system Python, or
   enter the supplied `nix-shell`. Headless CLI renders do not need GUI
   dependencies.
