@@ -193,7 +193,8 @@ python3 visualizer.py music/track.mp3 --profile 8k60 \
 CRF 10 is intended to be visually transparent while retaining useful
 compression. Add `--lossless` when exact H.264 losslessness matters more than
 file size, or choose a larger CRF explicitly when speed and storage matter
-more.
+more. Ordinary palettes use the faster 4:2:0 pixel path; KFP palettes and
+exact-lossless output use 4:4:4 to retain their sharp colour edges.
 
 ### common examples
 
@@ -439,7 +440,7 @@ unless noted otherwise, the values in parentheses are the defaults.
 
 | argument | description |
 | --- | --- |
-| `--video-preset MODE` (`slow` with a resolution profile) | x264 speed/size preset. Hardware encoders map this to their own speed levels when supported. |
+| `--video-preset MODE` (`faster` with a resolution profile) | x264 speed/size preset. Hardware encoders map this to their own speed levels when supported. |
 | `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox where applicable, then falls back to `libx264`. |
 | `--crf N` (`10` with a resolution profile) | Quality value from `0` to `51`. CRF 10 is the near-lossless profile target; it is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
 | `--lossless` | Use lossless H.264 rate control where supported (`constqp/qp 0` for NVENC, CRF 0 for x264) and preserve 4:4:4 chroma where the encoder accepts it. |

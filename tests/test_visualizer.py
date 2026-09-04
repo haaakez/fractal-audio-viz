@@ -472,6 +472,7 @@ class AnimationTests(unittest.TestCase):
             self.assertEqual(values["max_zoom"], "1e100")
             self.assertEqual(values["quality"], "quality")
             self.assertEqual(values["fractal_scale"], 1.0)
+            self.assertEqual(values["video_preset"], "faster")
             self.assertEqual(values["crf"], NEAR_LOSSLESS_CRF)
             self.assertFalse(values["lossless"])
             self.assertEqual(values["resample"], "lanczos")
@@ -1618,16 +1619,17 @@ class AnimationTests(unittest.TestCase):
             visualizer._video_pixel_format("libx264", "aurora"),
             "yuv420p",
         )
+        # Smooth ordinary palettes keep the faster 4:2:0 path even at CRF 10.
         self.assertEqual(
             visualizer._video_pixel_format(
                 "libx264", "aurora", crf=NEAR_LOSSLESS_CRF
             ),
-            "yuv444p",
+            "yuv420p",
         )
-        # Hardware H.264 inputs remain on their device-compatible format.
+        # KFP retains its one-pixel chroma detail on both software and NVENC.
         self.assertEqual(
             visualizer._video_pixel_format("h264_nvenc", "kalles-default"),
-            "yuv420p",
+            "yuv444p",
         )
         self.assertEqual(
             visualizer._video_pixel_format("h264_nvenc", "aurora", lossless=True),
@@ -1637,7 +1639,7 @@ class AnimationTests(unittest.TestCase):
             visualizer._video_pixel_format(
                 "h264_nvenc", "aurora", crf=NEAR_LOSSLESS_CRF
             ),
-            "yuv444p",
+            "yuv420p",
         )
 
     def test_lossless_encoder_settings_use_real_lossless_controls(self):

@@ -36,7 +36,10 @@ def _native_quality_profile(width: int, height: int) -> dict[str, object]:
         "keyframe_factor": 4.0,
         "max_zoom": "1e100",
         "separation": "auto",
-        "video_preset": "slow",
+        # CRF controls the visual quality; a faster preset primarily trades
+        # compression efficiency for much shorter encode time. This is the
+        # sensible default for a near-lossless export, especially at 8K.
+        "video_preset": "faster",
         "crf": NEAR_LOSSLESS_CRF,
         "resample": "lanczos",
         "lossless": False,

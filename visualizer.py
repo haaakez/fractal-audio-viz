@@ -7965,6 +7965,7 @@ def _hardware_encoder_usable(
     width: int = 256,
     height: int = 256,
     fps: int = 30,
+    preserve_chroma: Optional[bool] = None,
 ) -> bool:
     """Probe the encoder at the dimensions and quality the render will use."""
 
@@ -7976,6 +7977,11 @@ def _hardware_encoder_usable(
         fps = _validate_fps(fps)
     except ValueError:
         return False
+    if preserve_chroma is None:
+        # Preserve the old private-helper behaviour for callers that do not
+        # know the selected palette yet. The render path passes an explicit
+        # value so smooth near-lossless palettes can stay on yuv420p.
+        preserve_chroma = lossless or near_lossless
     command = [
         ffmpeg,
         "-nostdin",
@@ -8004,7 +8010,7 @@ def _hardware_encoder_usable(
     except ValueError:
         return False
     command.extend(["-c:v", encoder, *rate_control, "-f", "null", "-"])
-    if (lossless or near_lossless) and encoder == "h264_nvenc":
+    if preserve_chroma and encoder == "h264_nvenc":
         # Probe the same 4:4:4 output format used by the real lossless path;
         # a plain yuv420 probe can succeed on a device that rejects the KFP
         # detail-preserving format at encode time.
@@ -8082,6 +8088,7 @@ def _select_video_encoder(
     probe_width: int = 256,
     probe_height: int = 256,
     probe_fps: int = 30,
+    preserve_chroma: bool = False,
 ) -> tuple[str, str, list[str]]:
     """Resolve ``auto`` without making a render depend on unavailable hardware."""
 
@@ -8094,6 +8101,7 @@ def _select_video_encoder(
     lossless = bool(lossless)
     if lossless:
         crf = 0
+    preserve_chroma = bool(preserve_chroma or lossless)
     near_lossless = not lossless and crf <= NEAR_LOSSLESS_CRF
     if requested in hardware:
         usable = (
@@ -8111,6 +8119,7 @@ def _select_video_encoder(
                 probe_width,
                 probe_height,
                 probe_fps,
+                preserve_chroma,
             )
         )
         if not usable:
@@ -8146,6 +8155,7 @@ def _select_video_encoder(
                 probe_width,
                 probe_height,
                 probe_fps,
+                preserve_chroma,
             ):
                 continue
             preset, rate_control, _ = _video_encoder_settings(
@@ -8172,6 +8182,7 @@ def _select_video_encoder(
                 probe_width,
                 probe_height,
                 probe_fps,
+                preserve_chroma,
             ):
                 continue
         preset, rate_control, _ = _video_encoder_settings(
@@ -8197,20 +8208,18 @@ def _video_pixel_format(
 
     The normal H.264 default is 4:2:0, which is a good compatibility choice
     for Aurora-like gradients but smears KFP's one-pixel cyan/green edge
-    detail into visibly blocky chroma squares. Near-lossless software and
-    NVENC profiles retain that detail with 4:4:4; other hardware H.264 paths
-    keep 4:2:0 because their accepted input formats are device-dependent and
+    detail into visibly blocky chroma squares. KFP profiles and exact
+    lossless output retain that detail with 4:4:4; ordinary CRF 10 output
+    stays on 4:2:0 for faster, smaller files. Other hardware H.264 paths keep
+    4:2:0 because their accepted input formats are device-dependent and
     VAAPI is explicitly NV12.
     """
 
-    near_lossless = not lossless and int(crf) <= NEAR_LOSSLESS_CRF
-    if codec == "libx264" and (
-        lossless
-        or near_lossless
-        or _kfp_profile_for_selection(palette, palette_file) is not None
-    ):
+    kfp_profile = _kfp_profile_for_selection(palette, palette_file)
+    preserve_chroma = lossless or kfp_profile is not None
+    if codec == "libx264" and preserve_chroma:
         return "yuv444p"
-    if codec == "h264_nvenc" and (lossless or near_lossless):
+    if codec == "h264_nvenc" and preserve_chroma:
         return "yuv444p"
     return "yuv420p"
 
@@ -10315,6 +10324,17 @@ def render_video(
         "fractal source",
     )
     formula = _formula_name(formula)
+    if palette_file is not None:
+        palette_file = _normalise_path(palette_file)
+        if not palette_file.is_file():
+            raise RuntimeError(f"palette file not found: {palette_file}")
+        if _paths_refer_to_same_target(palette_file, audio_path):
+            raise ValueError("palette file must be different from the input audio file")
+        if _paths_refer_to_same_target(palette_file, output_path):
+            raise ValueError("palette file must be different from the output video")
+    preserve_chroma = (
+        lossless or _kfp_profile_for_selection(palette, palette_file) is not None
+    )
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None:
         raise RuntimeError("ffmpeg is required to encode the video, but it was not found on PATH")
@@ -10326,6 +10346,7 @@ def render_video(
         probe_width=render_width,
         probe_height=render_height,
         probe_fps=fps,
+        preserve_chroma=preserve_chroma,
     )
     if selected_codec == "h264_vaapi" and (
         width < 128
@@ -10347,6 +10368,7 @@ def render_video(
             probe_width=render_width,
             probe_height=render_height,
             probe_fps=fps,
+            preserve_chroma=preserve_chroma,
         )
 
     if formula != "mandelbrot" and native_backend == "auto":
@@ -10356,14 +10378,6 @@ def render_video(
             f"--native-backend {native_backend} is only available for Mandelbrot; "
             "use --native-backend scalar for alternate formulas"
         )
-    if palette_file is not None:
-        palette_file = _normalise_path(palette_file)
-        if not palette_file.is_file():
-            raise RuntimeError(f"palette file not found: {palette_file}")
-        if _paths_refer_to_same_target(palette_file, audio_path):
-            raise ValueError("palette file must be different from the input audio file")
-        if _paths_refer_to_same_target(palette_file, output_path):
-            raise ValueError("palette file must be different from the output video")
     if not math.isfinite(float(glow)) or not 0.0 <= float(glow) <= 1.0:
         raise ValueError("glow must be between 0 and 1")
     if not math.isfinite(float(motion_blur)) or not 0.0 <= float(motion_blur) < 1.0:
