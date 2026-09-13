@@ -4,6 +4,8 @@ import math
 import locale
 import os
 import struct
+import io
+from contextlib import redirect_stdout
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -28,6 +30,17 @@ from profiles import (
 
 
 class AnimationTests(unittest.TestCase):
+    def test_cli_launch_without_audio_prints_help_and_exits_cleanly(self):
+        output = io.StringIO()
+        with mock.patch.object(visualizer.sys, "argv", ["visualizer.py"]), \
+             mock.patch.object(visualizer, "_default_audio_path", return_value=None), \
+             redirect_stdout(output):
+            visualizer._main_impl()
+
+        text = output.getvalue()
+        self.assertIn("No audio file supplied", text)
+        self.assertIn("usage:", text)
+
     def test_fractional_decimal_places_respect_scientific_notation(self):
         self.assertEqual(visualizer._fractional_decimal_places("1.23e-4"), 6)
         self.assertEqual(visualizer._fractional_decimal_places("-1.2300"), 4)
@@ -2003,6 +2016,21 @@ class AnimationTests(unittest.TestCase):
         self.assertAlmostEqual(
             visualizer._atlas_child_fraction(overscan * factor, factor),
             1.0,
+        )
+        self.assertAlmostEqual(
+            visualizer._atlas_child_fraction(1.0, factor, 1.0),
+            1.0 / factor,
+        )
+
+    def test_atlas_storage_overscan_matches_colour_pipeline(self):
+        palette_file = (
+            Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp"
+        )
+        self.assertEqual(visualizer._atlas_storage_overscan("aurora", None), 1.0)
+        self.assertEqual(visualizer._atlas_storage_overscan("fire", None), 1.0)
+        self.assertEqual(
+            visualizer._atlas_storage_overscan("aurora", palette_file),
+            visualizer.ATLAS_TILE_OVERSCAN_FACTOR,
         )
 
     def test_atlas_compositor_uses_child_only_in_central_region(self):

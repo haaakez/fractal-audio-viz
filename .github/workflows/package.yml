@@ -31,13 +31,19 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: conda-incubator/setup-miniconda@v4
         with:
+          activate-environment: fractal-build
+          auto-activate-base: false
+          miniforge-version: latest
           python-version: "3.11"
-      - name: Install Python runtime and PyInstaller
+      - name: Install Python, GTK, and PyInstaller runtime
+        shell: bash -el {0}
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pyinstaller
+          conda install --name fractal-build --yes --channel conda-forge gtk3 pygobject pycairo
+          conda run --name fractal-build python -m pip install --upgrade pip
+          conda run --name fractal-build python -m pip install -r requirements.txt pyinstaller
+          conda run --name fractal-build python -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk, Gdk, GdkPixbuf"
       - name: Install MinGW native dependencies
         uses: msys2/setup-msys2@v2
         with:
@@ -67,9 +73,11 @@ jobs:
           }
           "FFMPEG_DIR=$($ffmpeg.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build source archive
-        run: python packaging/release.py windows --native mandelbrot.dll --runtime-dir .release-runtime --output dist
+        shell: pwsh
+        run: conda run --name fractal-build python packaging/release.py windows --native mandelbrot.dll --runtime-dir .release-runtime --output dist
       - name: Build standalone executable archive
-        run: python packaging/build_windows_exe.py --native mandelbrot.dll --runtime-dir .release-runtime --ffmpeg-dir "$env:FFMPEG_DIR" --output dist
+        shell: pwsh
+        run: conda run --name fractal-build python packaging/build_windows_exe.py --native mandelbrot.dll --runtime-dir .release-runtime --ffmpeg-dir "$env:FFMPEG_DIR" --output dist
       - uses: actions/upload-artifact@v4
         with:
           name: fractal-audio-viz-windows-x86_64-source

@@ -132,19 +132,22 @@ variable if you want to select another native build.
 
 the same workflow also creates a standalone executable archive:
 `fractal-audio-viz-<version>-windows-x86_64-exe.zip`. it contains
-`fractal-viz.exe`, the python runtime, the native renderer, and ffmpeg. it can
-render without a separate python or pip installation. run it from powershell
-with:
+`fractal-viz.exe`, the python runtime, the GTK gui, the native renderer, and
+ffmpeg. double-clicking `fractal-viz.exe` opens the same window as `gui.py`,
+and the audio file can be chosen after the window opens. `render.bat` remains
+available for command-line renders without a separate python or pip
+installation:
 
 ```powershell
-.\fractal-viz.exe "C:\Music\song.mp3" --output fractal_viz.mp4 --profile fhd60
+.\render.bat "C:\Music\song.mp3" --output fractal_viz.mp4 --profile fhd60
 ```
 
 ## running a render
 
 the input song is the first argument. it can be any local file that librosa can
-read, not just `song.mp3`. If you leave it out, the program looks for
-`song.mp3`.
+read, not just `song.mp3`. if you leave it out, the program looks for
+`song.mp3` beside the launch directory, executable, or script. if no song is
+available, it prints the help screen and exits cleanly instead of failing.
 
 ```sh
 python3 visualizer.py path/to/my-song.mp3 \

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Build the standalone Windows executable release.
+"""Build the standalone Windows GUI executable release.
 
 This script is intentionally run on Windows. PyInstaller embeds the Python
-runtime and application modules into one executable; the native renderer,
-MinGW/GMP/MPFR DLL dependencies, and FFmpeg tools are added as embedded
-binaries.
+runtime and application modules into one executable; the GTK/PyGObject GUI,
+native renderer, MinGW/GMP/MPFR DLL dependencies, and FFmpeg tools are added
+as embedded binaries. Running the result opens the same window as ``gui.py``.
 """
 
 from __future__ import annotations
@@ -43,8 +43,17 @@ HIDDEN_IMPORTS = (
     "audioread.ffdec",
     "audioread.ffmpeg",
     "deep_zoom_points",
+    "live_view",
     "profiles",
+    "cairo",
+    "gi",
+    "gi._gi",
+    "gi.repository.GLib",
+    "gi.repository.Gtk",
+    "gi.repository.Gdk",
+    "gi.repository.GdkPixbuf",
 )
+GUI_PACKAGE_NAMES = ("cairo", "gi")
 FFMPEG_TOOLS = ("ffmpeg.exe", "ffprobe.exe", "ffplay.exe")
 
 
@@ -124,26 +133,32 @@ def _write_manifest(stage: Path, version: str) -> None:
 
 def _write_readme(stage: Path, version: str, bundled_ffmpeg: list[str]) -> None:
     tools = ", ".join(bundled_ffmpeg) if bundled_ffmpeg else "none"
-    text = f"""fractal audio viz {version} — standalone windows renderer
+    text = f"""fractal audio viz {version} — standalone windows gui
 
-this is the easy, self-contained version. it already includes python, the
-native fractal renderer, its numerical/runtime dlls, and the media tools. you
-do not need to install python or any pip packages.
-
-render a file from powershell or command prompt:
-
-  .\\fractal-viz.exe "C:\\Music\\song.mp3" --output fractal_viz.mp4 --profile fhd60
+double-click fractal-viz.exe to open the same graphical interface as gui.py.
+the audio field may point to a missing song when the window opens; choose an
+audio file before pressing render or live view. no separate python, pip
+packages, gtk installation, or ffmpeg installation is needed.
 
 the bundled media tools are: {tools}.
 they are unpacked into the executable's private runtime directory when needed.
 
-the command-line renderer supports the normal formulas, palettes, deep zoom
-profiles, and kalles .kfp palettes. the executable creates the output video
-next to the path you give it.
+to render without using the gui, run render.bat from powershell or command
+prompt:
+
+  .\\render.bat "C:\\Music\\song.mp3" --output fractal_viz.mp4 --profile fhd60
+
+the command-line renderer behind render.bat supports the normal formulas,
+palettes, deep zoom profiles, and kalles .kfp palettes.
 """
     (stage / "README.txt").write_text(text, encoding="utf-8")
-    (stage / "render.bat").write_text(
+    (stage / "run_gui.bat").write_text(
         '@echo off\r\n"%~dp0fractal-viz.exe" %*\r\n',
+        encoding="utf-8",
+        newline="",
+    )
+    (stage / "render.bat").write_text(
+        '@echo off\r\n"%~dp0fractal-viz.exe" --fractal-cli %*\r\n',
         encoding="utf-8",
         newline="",
     )
@@ -164,7 +179,7 @@ def _pyinstaller_command(
         "--noconfirm",
         "--clean",
         "--onefile",
-        "--console",
+        "--windowed",
         "--name",
         "fractal-viz",
         "--distpath",
@@ -179,13 +194,13 @@ def _pyinstaller_command(
         f"{native}{separator}.",
         "--add-data",
         f"{ROOT / 'palettes'}{separator}palettes",
-        str(ROOT / "visualizer.py"),
+        str(ROOT / "gui.py"),
     ]
     for runtime_dll in runtime_dlls:
         command.extend(["--add-binary", f"{runtime_dll}{separator}."])
     for media_binary in media_binaries:
         command.extend(["--add-binary", f"{media_binary}{separator}."])
-    for package in PACKAGE_NAMES:
+    for package in (*PACKAGE_NAMES, *GUI_PACKAGE_NAMES):
         command.extend(["--collect-all", package])
     for package in METADATA_NAMES:
         command.extend(["--copy-metadata", package])

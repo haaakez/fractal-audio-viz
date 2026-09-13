@@ -22,6 +22,51 @@ from pathlib import Path
 
 import visualizer
 
+
+# A frozen build is the GUI application, not a second copy of the command-line
+# entry point. The GUI still needs to launch the exact same renderer in a child
+# process, so the frozen executable has a private dispatch flag for that child.
+# Keeping this dispatch before the GTK import avoids initializing a second GTK
+# application in the renderer process.
+FROZEN_CLI_FLAG = "--fractal-cli"
+RESOURCE_ROOT = Path(__file__).resolve().parent
+
+
+def _restore_frozen_cli_streams() -> None:
+    """Reconnect stdout/stderr for a CLI child of a windowed PyInstaller app."""
+
+    for name, file_descriptor in (("stdout", 1), ("stderr", 2)):
+        if getattr(sys, name, None) is not None:
+            continue
+        try:
+            stream = os.fdopen(
+                file_descriptor,
+                "w",
+                buffering=1,
+                encoding="utf-8",
+                errors="replace",
+                closefd=False,
+            )
+        except OSError:
+            stream = open(os.devnull, "w", encoding="utf-8")
+        setattr(sys, name, stream)
+
+
+def _run_frozen_renderer_if_requested() -> None:
+    """Run the shared CLI when the GUI launches its frozen child process."""
+
+    if not getattr(sys, "frozen", False) or len(sys.argv) < 2:
+        return
+    if sys.argv[1] != FROZEN_CLI_FLAG:
+        return
+    sys.argv[1:] = sys.argv[2:]
+    _restore_frozen_cli_streams()
+    visualizer.main()
+    raise SystemExit(0)
+
+
+_run_frozen_renderer_if_requested()
+
 try:
     import gi
 
@@ -44,8 +89,27 @@ from profiles import (
 )
 
 
-ROOT = Path(__file__).resolve().parent
-VISUALIZER = ROOT / "visualizer.py"
+# ``__file__`` is inside PyInstaller's temporary extraction directory, while
+# user-facing defaults should live beside the executable. In a source run the
+# two roots are naturally the same directory.
+if getattr(sys, "frozen", False):
+    try:
+        ROOT = Path(sys.executable).resolve().parent
+    except (OSError, RuntimeError, ValueError):
+        ROOT = Path.cwd()
+else:
+    ROOT = RESOURCE_ROOT
+VISUALIZER = RESOURCE_ROOT / "visualizer.py"
+
+
+def _renderer_command(arguments: list[str]) -> list[str]:
+    """Build the renderer command for source and frozen GUI launches."""
+
+    if getattr(sys, "frozen", False):
+        return [sys.executable, FROZEN_CLI_FLAG, *arguments]
+    return [sys.executable, "-u", str(VISUALIZER), *arguments]
+
+
 OUTPUT_QUEUE_LIMIT = 2048
 MAX_LOG_LINES = 20_000
 MAX_LOG_LINE_CHARS = 16_384
@@ -896,7 +960,7 @@ if Gtk is not None:
             output_path = Path(self.output.get_text()).expanduser().absolute()
             formula = self._combo_text(self.formula)
             julia_preset = FORMULA_POINTS_BY_SLUG.get(formula, {}).get(point_spec.casefold())
-            command = [sys.executable, "-u", str(VISUALIZER), str(audio_path)]
+            command = _renderer_command([str(audio_path)])
             command.extend(["--output", str(output_path), "--profile", self._combo_text(self.profile)])
             command.extend([
                 "--formula", formula,

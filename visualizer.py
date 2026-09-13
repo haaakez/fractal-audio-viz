@@ -395,12 +395,10 @@ ATLAS_MIN_CHILD_PIXELS = 4
 # KFP's spatial shading: it becomes a rectangular border. Once the uncovered
 # margin is below 2%, promote the child to the complete view instead.
 ATLAS_NEAR_FULL_CHILD_FRACTION = 0.98
-# Render each atlas tile a little wider than its nominal viewport. A camera
-# can pull back between two adjacent levels; without this margin the child
-# then covers only (for example) 88% of the frame and KFP's spatial stencil
-# makes the low-resolution parent perimeter visible as a rectangular block.
-# The same fixed overscan is used at every level, so adjacent tile scales and
-# the exact crop geometry remain self-consistent.
+# KFP's relief/slope stencil needs a little extra source area at each atlas
+# edge. The fused Aurora and ordinary palette paths use nominal tiles instead;
+# passing their overscanned fields to the old fast compositor was the source of
+# the visible centred replacement rectangle in older builds.
 ATLAS_TILE_OVERSCAN_FACTOR = 1.2
 # KFP's relief transfer needs enough pixels to preserve its fine gradients,
 # but colouring an 8K atlas tile for every level is needlessly expensive.  A
@@ -409,15 +407,19 @@ ATLAS_TILE_OVERSCAN_FACTOR = 1.2
 KFP_ATLAS_MAX_WORKING_DIMENSION = 3840
 
 
-def _atlas_child_fraction(parent_zoom: float, interval_factor: float) -> float:
-    """Return the visible child fraction for an overscanned atlas pair.
+def _atlas_child_fraction(
+    parent_zoom: float,
+    interval_factor: float,
+    storage_overscan: float = ATLAS_TILE_OVERSCAN_FACTOR,
+) -> float:
+    """Return the visible child fraction for an atlas parent/child pair.
 
-    ``parent_zoom`` is measured against the stored parent tile, which is
-    deliberately 1.2x wider than its nominal camera view.  The visible child
-    still represents the nominal interval, so the overscan must be removed
-    from the fraction as well as from the child's source crop.  Omitting that
-    division makes every partial child 1.2x too large and leaves a perfectly
-    rectangular KFP boundary around it.
+    ``parent_zoom`` is measured against the stored parent tile. KFP tiles are
+    deliberately 1.2x wider than their nominal camera view, while the fused
+    non-KFP tiles use nominal storage. The visible child still represents the
+    nominal interval, so the selected storage margin must be removed from the
+    fraction as well as from the child's source crop. Omitting that division
+    makes every partial child too large and leaves a rectangular boundary.
     """
 
     try:
@@ -429,7 +431,32 @@ def _atlas_child_fraction(parent_zoom: float, interval_factor: float) -> float:
         raise ValueError("atlas parent zoom must be finite and positive")
     if not math.isfinite(factor) or factor <= 0.0:
         raise ValueError("atlas interval factor must be finite and positive")
-    return min(1.0, max(0.0, zoom / (factor * ATLAS_TILE_OVERSCAN_FACTOR)))
+    try:
+        overscan = float(storage_overscan)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("atlas storage overscan must be numeric") from error
+    if not math.isfinite(overscan) or overscan <= 0.0:
+        raise ValueError("atlas storage overscan must be finite and positive")
+    return min(1.0, max(0.0, zoom / (factor * overscan)))
+
+
+def _atlas_storage_overscan(palette_name: str, palette_file: Optional[Path]) -> float:
+    """Return the tile margin required by the selected colour pipeline.
+
+    KFP's relief/slope stencil benefits from a small stored margin so its
+    neighbour samples remain valid at a tile edge. The fused Aurora and
+    ordinary palette paths do not consume that margin themselves; keeping
+    their tiles at nominal zoom is both cheaper and, importantly, keeps the
+    child crop in the same coordinate system as the native compositor.
+    """
+
+    return (
+        ATLAS_TILE_OVERSCAN_FACTOR
+        if _kfp_profile_for_selection(palette_name, palette_file) is not None
+        else 1.0
+    )
+
+
 # Alternate formula perturbation uses a decimal reference once the viewport
 # is narrower than a float64 centre can represent reliably. Keep this single
 # threshold shared by the direct renderer and the video planner so an atlas
@@ -1997,6 +2024,34 @@ def _normalise_path(path: Path) -> Path:
         # make validation itself fail. ``absolute`` still gives us a useful
         # collision check for ordinary paths.
         return Path(os.path.abspath(str(candidate)))
+
+
+def _default_audio_path() -> Optional[Path]:
+    """Find the optional default song beside the launch location."""
+
+    candidates = [Path(DEFAULT_AUDIO)]
+    if getattr(sys, "frozen", False):
+        try:
+            candidates.append(Path(sys.executable).resolve().parent / DEFAULT_AUDIO)
+        except (OSError, RuntimeError, ValueError):
+            pass
+    try:
+        candidates.append(Path(__file__).resolve().parent / DEFAULT_AUDIO)
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            candidate = candidate.resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _absolute_path(path: Path) -> Path:
@@ -7499,9 +7554,8 @@ def _atlas_colour_frame(
     child. At the beginning of an atlas interval it is roughly 1/factor; at
     the end it reaches one. The child is therefore rendered only into its
     visible central rectangle instead of being expanded into a full temporary
-    frame. Overscanned tiles can be slightly wider than the frame when the
-    child takes over; ``child_zoom`` preserves that crop in the full-child
-    path.
+    frame. KFP tiles can be slightly wider than the frame when the child takes
+    over; ``child_zoom`` preserves that crop in the full-child path.
     """
 
     np = _require_numpy()
@@ -7661,10 +7715,9 @@ def _atlas_colour_frame(
         and hasattr(native_library, "fractal_crop_colourise")
         and resample == "bilinear"
     ):
-        # Overscan makes the full child wider than the nominal viewport. Use
-        # the native crop compositor here instead of treating the whole stored
-        # tile as the frame; otherwise the zoom would jump by the overscan
-        # factor exactly at an atlas boundary.
+        # Keep the full-child path on the native crop compositor. This also
+        # keeps compatibility with older native libraries; KFP supplies its
+        # own raw screen-space path above.
         interior_color = _ordinary_interior_color(palette_name, palette_file)
         accents = (
             None
@@ -8059,9 +8112,9 @@ def _render_video_atlas(
     This path ties them only to absolute logarithmic zoom, so a tile is
     rendered once and can be reused by every camera path through the same
     centre. A bounded three-tile window is retained in memory so both forward
-    and audio-driven reverse zooms remain cheap. Tiles include a small fixed
-    overscan margin so reverse zooms never expose a low-resolution perimeter
-    around a nearly complete child.
+    and audio-driven reverse zooms remain cheap. KFP tiles include a small
+    fixed overscan margin; fused non-KFP tiles stay nominal so their native
+    compositor and child geometry remain aligned.
     """
 
     np = _require_numpy()
@@ -8076,7 +8129,9 @@ def _render_video_atlas(
     )
     origin, step, level_count = _atlas_geometry(zooms, keyframe_factor)
     factor = 10.0 ** step
-    tile_overscan_log = math.log10(ATLAS_TILE_OVERSCAN_FACTOR)
+    kfp_profile = _kfp_profile_for_selection(palette, palette_file)
+    tile_overscan = _atlas_storage_overscan(palette, palette_file)
+    tile_overscan_log = math.log10(tile_overscan)
     maximum_log = float(max(float(value) for value in zooms))
     total_frames = features.frame_count
     print(
@@ -8087,7 +8142,6 @@ def _render_video_atlas(
 
     tile_cache: dict[int, Any] = {}
     tile_iterations: dict[int, int] = {}
-    kfp_profile = _kfp_profile_for_selection(palette, palette_file)
     kfp_centered_fields = (
         kfp_profile is not None
         and native_library is not None
@@ -8153,7 +8207,7 @@ def _render_video_atlas(
         return origin + step * float(level)
 
     def tile_log(level: int) -> float:
-        """Effective field zoom, widened by the fixed atlas overscan."""
+        """Effective field zoom, including the selected tile margin."""
 
         return tile_display_log(level) - tile_overscan_log
 
@@ -8403,7 +8457,7 @@ def _render_video_atlas(
             )
             parent_zoom = max(1.0, 10.0 ** (frame_log_zoom - parent_log))
             child_fraction = (
-                _atlas_child_fraction(parent_zoom, factor)
+                _atlas_child_fraction(parent_zoom, factor, tile_overscan)
                 if child is not None else 0.0
             )
             parent_max_iter = tile_iter(level)
@@ -8412,15 +8466,11 @@ def _render_video_atlas(
                 float(max(parent_max_iter, int(child_max_iter or parent_max_iter)))
                 if kfp_centered_fields else 0.0
             )
-            # With fixed tile overscan, a full child can still be wider than
-            # the nominal camera viewport. Preserve that crop when it takes
-            # over the frame instead of showing the whole stored tile.
-            # Atlas tiles are rendered with fixed overscan. The child crop
-            # removes that 1.2x storage margin, so the visible child fraction
-            # is computed by _atlas_child_fraction above; using
-            # parent_zoom/factor here makes the replacement rectangle 1.2x
-            # too large and exposes its KFP stencil boundary.
-            child_zoom = ATLAS_TILE_OVERSCAN_FACTOR if child is not None else 1.0
+            # KFP tiles are rendered with a fixed overscan. The child crop
+            # removes that storage margin, so the visible child fraction is
+            # computed with the selected tile margin above. Non-KFP tiles use
+            # nominal storage and therefore pass a crop zoom of one.
+            child_zoom = tile_overscan if child is not None else 1.0
             phase = float(features.phase[frame_index])
             gradient = float(features.gradient[frame_index])
             instrumental = float(features.instrumental[frame_index])
@@ -12462,7 +12512,14 @@ def _build_manifest(
 
 def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("audio", nargs="?", default=DEFAULT_AUDIO, type=Path)
+    parser.add_argument(
+        "audio",
+        nargs="?",
+        default=None,
+        type=Path,
+        metavar="AUDIO",
+        help="optional audio file; if omitted, song.mp3 is searched for automatically",
+    )
     parser.add_argument("--output", type=Path, default=Path(DEFAULT_OUTPUT))
     parser.add_argument(
         "--profile",
@@ -12801,7 +12858,8 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
 
 
 def _main_impl() -> None:
-    args = build_parser(sys.argv[1:]).parse_args()
+    parser = build_parser(sys.argv[1:])
+    args = parser.parse_args()
     if args.list_profiles:
         _print_profiles()
         return
@@ -12833,6 +12891,16 @@ def _main_impl() -> None:
     if args.list_points:
         _print_deep_zoom_points(args.formula)
         return
+    if args.audio is None:
+        args.audio = _default_audio_path()
+        if args.audio is None:
+            print(
+                "No audio file supplied. Pass an audio path or place song.mp3 "
+                "beside the executable.",
+                flush=True,
+            )
+            parser.print_help()
+            return
     try:
         args.x_center, args.y_center, selected_point = _resolve_render_point(
             point_spec=args.point,
