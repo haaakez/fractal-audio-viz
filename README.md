@@ -6,9 +6,9 @@
 fractal audio viz turns a song into a zoom through the Mandelbrot family:
 Mandelbrot, Julia, Burning Ship, and Tricorn. Give it a local audio file and it
 uses the music to control the camera and colours, then writes the video with
-FFmpeg. The native Mandelbrot renderer is the fast path for very deep zooms;
-the other formulas work too, but their deepest renders use a slower
-formula-specific fallback.
+FFmpeg. The native renderer handles all four formulas when it is available;
+deep Mandelbrot, Julia, Burning Ship, and Tricorn views use their own
+formula-aware reference paths.
 
 ## how it works
 
@@ -55,8 +55,11 @@ reprojected onto one screen-sized surface before colouring, so the glossy
 gradient does not restart at the tile boundary.
 
 the output size comes from `--width` and `--height`. The default
-`lossless-compressed` source mode uses the native C++ field pipeline; profiles
-above Full HD use a 1920×1080 source to keep the render practical.
+`lossless-compressed` source mode uses the native C++ field pipeline; ordinary
+profiles above Full HD use a 1920×1080 source to keep the render practical.
+Imported `.kfp` palettes are denser by design, up to a 3840×2160 source, since
+Kalles' distance and slope shading needs real screen-space neighbours to stay
+sharp instead of magnifying a soft 1080p stencil.
 `--source-mode native` renders one source sample per output pixel. For the fast,
 lower-detail version, use `--source-mode upscaled` (or `--upscaling`), which
 starts from a quarter-resolution source and enlarges it at the end.
@@ -100,9 +103,46 @@ The Python renderer is handy for shallow previews and tests, but the deep
 Mandelbrot path needs the native build. GTK is only needed for the GUI; command
 line renders do not need it.
 
+### release archives
+
+there are two simple release bundles:
+
+```sh
+make package-linux
+```
+
+this creates `dist/fractal-audio-viz-<version>-linux-x86_64.tar.gz`. it contains
+the app, the portable `mandelbrot.so`, the palettes, and launch scripts. it
+does not copy your music, videos, caches, python, ffmpeg, or gtk installation.
+after unpacking it, install the packages from `requirements.txt` and run
+`run_gui.sh`, `render.sh`, or `live-view.sh`.
+
+the windows source bundle uses the same c++ renderer and produces a `.zip` with
+`mandelbrot.dll`. the github actions workflow builds it with mingw, gmp, mpfr,
+and the runtime dlls it needs. run it from the actions tab or push a `v*` tag.
+on a windows/msys2 machine, the equivalent command is:
+
+```sh
+make package-windows
+```
+
+the windows archive has `run_gui.bat`, `render.bat`, and `live-view.bat`. the
+loader finds the bundled dll automatically, so you only need an environment
+variable if you want to select another native build.
+
+the same workflow also creates a standalone executable archive:
+`fractal-audio-viz-<version>-windows-x86_64-exe.zip`. it contains
+`fractal-viz.exe`, the python runtime, the native renderer, and ffmpeg. it can
+render without a separate python or pip installation. run it from powershell
+with:
+
+```powershell
+.\fractal-viz.exe "C:\Music\song.mp3" --output fractal_viz.mp4 --profile fhd60
+```
+
 ## running a render
 
-the input song is the first argument. It can be any local file that librosa can
+the input song is the first argument. it can be any local file that librosa can
 read, not just `song.mp3`. If you leave it out, the program looks for
 `song.mp3`.
 
@@ -159,9 +199,11 @@ then add the options you care about:
 
 profiles are just shortcuts for a group of settings. The main presets are
 `sd60`, `hd60`, `fhd60`, `2k60`, `4k60`, and `8k60`. They all use 60 fps, e100,
-the native bilinear colour path, and CRF 10. The larger three profiles use a
-1920×1080 source field and upscale that to the requested output. Without a
-profile, `4k60` is used. Options written after the profile override it.
+the native C++ colour path, and CRF 10. Lower-density sources are enlarged
+with crisp nearest-neighbour sampling; the atlas crop itself stays continuous
+so the zoom remains smooth. The larger three profiles use a 1920×1080 source
+field and upscale that to the requested output. Without a profile, `4k60` is
+used. Options written after the profile override it.
 
 ```sh
 python3 visualizer.py music/track.mp3 --profile 4k60 \
@@ -245,8 +287,9 @@ files in the [MDZ gallery](https://mathr.co.uk/mdz/gallery/) and deep test views
 in [FractalShark](https://github.com/mattsaccount364/FractalShark). Burning Ship
 and Tricorn have separate hand-picked/generated boundary targets, and the
 Julia presets include their `c` value. `random` chooses from the list for the
-currently selected formula. Mandelbrot points are checked for the native deep
-path; the alternate-formula points use the Python high-precision path.
+currently selected formula. All formula points are checked for the native deep
+path when the native renderer is available; Python high precision remains the
+fallback when it is not.
 
 to use your own centre, pass a comma-separated pair to `--point`. This works
 for every formula and replaces that formula's preset:
@@ -261,9 +304,9 @@ for a deep Mandelbrot render, replace that short pair with the full decimal
 export from your zoom tool. The safety check wants at least
 `ceil(log10(max-zoom)) + 16` fractional digits in both coordinates. That avoids
 silently following a different target because the centre was rounded.
-`--allow-underspecified-center` is for exploratory Mandelbrot renders. The
-alternate formulas have their own presets and use the Python path at extreme
-depth.
+`--allow-underspecified-center` is for exploratory renders. The alternate
+formulas have their own presets and use the same native formula-aware deep
+renderer when available, with the Python path as a fallback.
 
 the two-coordinate form is also available for scripts and Kalles exports:
 
@@ -297,17 +340,19 @@ python3 visualizer.py music/track.mp3 --formula burning-ship \
 python3 visualizer.py music/track.mp3 --formula tricorn --max-zoom 1e7
 ```
 
-use `python3 visualizer.py --list-formulas` for the complete list. The MPFR/BLA
-deep-zoom accelerator is for the Mandelbrot parameter plane. Julia, Burning
-Ship, and Tricorn use their own high-precision perturbation path, up to about
-e300, instead of pretending to be Mandelbrot.
+use `python3 visualizer.py --list-formulas` for the complete list. The
+deep-zoom accelerator is formula-aware. Mandelbrot uses its MPFR/BLA
+parameter-plane path, while Julia, Burning Ship, and Tricorn use matching
+native reference arithmetic instead of pretending to be Mandelbrot.
 
 ### resolution profiles
 
 the six profiles all use 60 fps, e100, balanced atlas rendering, the native
-bilinear colour path, and CRF 10. The larger profiles use a 1920×1080 source
-field and upscale it, which is considerably more practical than calculating
-the whole atlas at 4K or 8K.
+C++ colour path, nearest-neighbour final enlargement, and CRF 10. The larger
+profiles use a 1920×1080 source field for ordinary palettes and upscale it,
+which is considerably more practical than calculating the whole atlas at 4K
+or 8K. KFP palettes use the denser 4K-capped source automatically so their
+relief gradients stay clean.
 
 | profile | output / default field source | max zoom | compression |
 | --- | --- | --- | --- |
@@ -440,7 +485,7 @@ unless noted otherwise, the values in parentheses are the defaults.
 | `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox at the requested output size, then validates the `libx264` fallback before selecting it. |
 | `--crf N` (`10` with a resolution profile) | Quality value from `0` to `51`. CRF 10 is the near-lossless profile target; it is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
 | `--lossless` | Use lossless H.264 rate control where supported (`constqp/qp 0` for NVENC, CRF 0 for x264) and preserve 4:4:4 chroma where the encoder accepts it. |
-| `--resample MODE` (`bilinear` with a resolution profile) | Crop and final upscale filter. Bilinear keeps the fused native colourizer active and is the fast pre-live path; Lanczos is sharper for explicit quality experiments but slower. |
+| `--resample MODE` (`nearest` with a resolution profile) | Final output resize filter. Nearest-neighbour keeps an enlarged lossless-compressed source crisp; bilinear and Lanczos remain available for explicit smooth-output experiments. Internal atlas crops stay continuous and native. |
 | `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, `mono`, `midnight`, `ember-night`, `terminal`, or `kalles-default`. The night themes use dark exteriors with white interiors; `kalles-default` matches the bundled Kalles Fraktaler profile in `palettes/kalles-default.kfp`. Its first exterior key is intentionally white and its separate interior colour is black, matching Kalles' defaults. |
 | `--palette-file PATH` | Read at least two `#rrggbb` or `r g b` stops from a text file, or import a Kalles `.kfp` gradient and its colour settings. ordinary text palettes use the fast Aurora wave path; `.kfp` uses the Kalles-style transfer path. |
 | `--glow N` (`0`) | Add a low-resolution bloom pass after colourisation, from `0` to `1`. It is off by default for the 10-minute target. |
@@ -488,7 +533,7 @@ that distinction matters.
 | `--renderer python` | Python direct/perturbed renderer | All formulas; exploratory fallback supports up to approximately `10^300`. |
 | `--renderer auto` + shallow zoom | Native direct CPU renderer when available; Python fallback otherwise | All formulas; OpenCL is used only when explicitly selected. |
 | `--renderer auto` + deep Mandelbrot | Native MPFR reference + scaled perturbation/BLA | Production path from approximately `10^12` through the validated catalogue depth. |
-| `--renderer auto` + deep alternate formula | Python high-precision perturbation fallback | Julia, Burning Ship, and Tricorn use formula-specific boundary targets. |
+| `--renderer auto` + deep alternate formula | Native formula-aware MPFR reference + scaled perturbation/BLA when available; Python high-precision fallback otherwise | Julia, Burning Ship, and Tricorn use formula-specific boundary targets. |
 | `--native-backend opencl` | Native OpenCL direct renderer | Mandelbrot-only shallow views; unavailable or deep paths fail clearly rather than silently changing numerical mode. |
 | `--codec auto` | First passing hardware probe, otherwise `libx264` | The selected encoder is recorded in the manifest; hardware output is not byte-for-byte portable. |
 
@@ -528,11 +573,18 @@ the standalone command is:
 python3 live_view.py song.mp3 --formula mandelbrot --palette aurora
 ```
 
-the live view is deliberately much cheaper than an export. It caps the native
-source at 480×270 (240×135 with the Python fallback), enlarges it to the window
-size, and prepares at most 168 fields. It uses the fast atlas path and caps the
-interactive zoom at e300. `ffplay` is used for audio playback when installed;
-without it, the visual preview still works.
+the live view is deliberately cheaper than an export. It renders a real
+854×480 widescreen source for every native formula, enlarges it to the window
+size with nearest-neighbour sampling, and prepares at most 224 fields.
+It pre-renders source coverage for the first 75% of the song before starting
+audio, then builds the remaining zoom sources in the background. Native live
+sources use a fixed bounded draft budget and one pass, so startup does not
+fall into the export renderer's repeated deep retries. If a deep source is
+still building, playback holds the last complete source instead of showing a
+tile slideshow. It uses the fast atlas path and caps the interactive zoom at
+e300. Live native rendering uses all available OpenMP threads by default;
+`--native-threads` can still set an explicit limit. `ffplay` is used for audio
+playback when installed; without it, the visual preview still works.
 
 the live view is separate from the export profiles. Choosing `8k60` does not
 make it allocate an 8K surface.

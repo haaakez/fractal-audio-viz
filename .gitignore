@@ -8,10 +8,24 @@ __pycache__/
 *.mkv
 *.webm
 *.gif
+*.dll
+*.zip
+*.tar.gz
+*.pyd
 # Render caches and generated keyframes
 keyframes*/
 cache/
 renders/
+dist/
+.release-runtime/
+.release-build/
+build/
+*.exe
 *.json
 .cache/
 .gitdata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.venv/

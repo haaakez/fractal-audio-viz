@@ -6,7 +6,7 @@ That makes it the wrong thing to run once per screen-refresh in a
 screensaver-like preview.  This module renders a small ladder of native
 scalar fields, colourises a continuous parent/child atlas between them, and
 keeps the audio decoder, renderer, and GTK main loop separate.  The result
-starts quickly, remains responsive, and is smoothly upscaled by the window
+starts quickly, remains responsive, and is crisply upscaled by the window
 when it is fullscreen.  The ladder follows the selected base/max zoom range
 and the song resets to the base view when it reaches the selected maximum.
 """
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import shutil
 import subprocess
 import threading
@@ -27,50 +28,100 @@ import visualizer
 
 
 LIVE_AUDIO_SAMPLE_RATE = 8_000
-LIVE_DEFAULT_WIDTH = 640
-LIVE_DEFAULT_HEIGHT = 360
+# The live window may be enlarged to the monitor, but its working source is a
+# real widescreen 480p frame.  This is deliberately separate from export
+# resolution: Cairo performs the final nearest-neighbour enlargement once.
+LIVE_DEFAULT_WIDTH = 854
+LIVE_DEFAULT_HEIGHT = 480
 LIVE_DEFAULT_FPS = 30
 LIVE_MAX_FPS = 60
-# Live view deliberately uses the old fast-render density, reduced one more
-# step for a screensaver. GTK/Cairo performs the only upscale to the actual
-# window or monitor; no 4K surface is allocated for the live path.
-LIVE_NATIVE_MAX_WIDTH = 480
-LIVE_NATIVE_MAX_HEIGHT = 270
-LIVE_PYTHON_MAX_WIDTH = 240
-LIVE_PYTHON_MAX_HEIGHT = 135
+# Live view renders one bounded 854x480 source surface and only enlarges that
+# surface in GTK/Cairo. Keep the same source dimensions for every native
+# formula; a hidden 144p Burning Ship exception was one reason the preview
+# looked like a postage stamp at deep zoom. The Python fallback keeps the same
+# geometry too, although native is strongly preferred for deep previews.
+LIVE_NATIVE_MAX_WIDTH = 854
+LIVE_NATIVE_MAX_HEIGHT = 480
+LIVE_NATIVE_ALTERNATE_MAX_WIDTH = LIVE_NATIVE_MAX_WIDTH
+LIVE_NATIVE_ALTERNATE_MAX_HEIGHT = LIVE_NATIVE_MAX_HEIGHT
+LIVE_PYTHON_MAX_WIDTH = LIVE_NATIVE_MAX_WIDTH
+LIVE_PYTHON_MAX_HEIGHT = LIVE_NATIVE_MAX_HEIGHT
 LIVE_DEFAULT_MAX_ZOOM = "1e4"
 # The live view is a preview, but it should still follow normal deep-zoom
 # selections (including the GUI's usual e150 range).  Beyond e300 the Python
 # alternate-formula path is deliberately not made a blocking screensaver.
 LIVE_MAX_PREVIEW_LOG_ZOOM = 300.0
-# Keep live view's atlas at about 0.75 decades per replacement: that gives it
-# enough intermediate coverage to hide tile changes without paying for export
-# resolution. Its fields stay at the smaller screensaver source size above.
-# The first fields are still shown immediately and later fields are built in
-# the background.
-LIVE_MAX_SOURCE_KEYFRAMES = 168
-LIVE_SOURCE_LOG_STEP = 0.75
-# Render only the first few sources before opening the window. The remaining
-# ladder is filled by a worker while audio and display playback are already
-# running; a screensaver should never wait for the deepest source set.
+# Keep live view's atlas at about 0.60 decades per replacement: that gives it
+# enough intermediate coverage to hide tile changes without making the 480p
+# source handoff obvious.
+# The first fields are prepared before audio playback starts. Once the camera
+# has coverage for this fraction of the song, the remaining source ladder is
+# built in the background while playback continues.
+LIVE_MAX_SOURCE_KEYFRAMES = 224
+LIVE_SOURCE_LOG_STEP = 0.60
+# Render only the first few sources before opening the window, then wait until
+# the source ladder covers this much of the song's actual camera path. The
+# remaining ladder is filled by a worker while audio and display playback are
+# already running; a screensaver should never wait for the deepest source set.
 LIVE_INITIAL_SOURCE_COUNT = 3
+# Playback starts only after source coverage reaches this fraction of the
+# first loop. This is based on the highest zoom actually visited in the prefix,
+# not merely on a source-count percentage, so audio-driven pullbacks are safe.
+LIVE_PRERENDER_FRACTION = 0.75
 # Keep the old name as the minimum for callers/tests that used the original
 # fixed-budget preview.  Deep alternate formulas need a larger budget: a
 # fixed 192-iteration cap classifies an e150 boundary tile as entirely
 # interior, which is indistinguishable from a black rendering failure.
 LIVE_ITERATIONS = 192
 LIVE_MIN_ITERATIONS = LIVE_ITERATIONS
-LIVE_MAX_ITERATIONS = 4096
+# Keep ordinary sources cheap, but allow a deep-only retry beyond the
+# 4096-iteration plateau. The default Mandelbrot target reaches real
+# boundaries well past that point; stopping at 4096 made the live camera cap
+# early even though the same native orbit resolves those pixels at 16384.
+LIVE_MAX_ITERATIONS = 16384
 LIVE_ITERATION_QUANTUM = 32
+# A live source is a draft image, but it still needs enough iterations to
+# expose useful boundaries at deep zoom.  The native recovery path makes this
+# fixed budget cheap; keeping it fixed also prevents the old 192->16384 retry
+# staircase from turning startup time into an unpredictable multi-minute wait.
+LIVE_FAST_NATIVE_ITERATIONS = 2048
 LIVE_FRAME_READ_BYTES = 256 * 1024
 LIVE_FALLBACK_DURATION = 300.0
-LIVE_DEFAULT_NATIVE_THREADS = 4
+
+
+def _find_live_tool(name: str) -> Optional[str]:
+    """Prefer media tools bundled beside a frozen executable."""
+
+    return visualizer._bundled_external_tool(name) or shutil.which(name)
+
+
+def _live_available_cpu_count() -> int:
+    """Return the number of CPUs available to this live-view process."""
+
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+# Pass the full available team size into every native live call. The export
+# pipeline deliberately interprets zero as a conservative host default, but a
+# screensaver should use all CPUs unless the GUI/CLI supplies an explicit
+# positive limit. This also overrides a stale OMP_NUM_THREADS inherited from a
+# shell or an already-running GUI process.
+LIVE_DEFAULT_NATIVE_THREADS = min(
+    visualizer.MAX_THREAD_COUNT,
+    _live_available_cpu_count(),
+)
 # Source fields are prepared in the background. When playback catches the
 # builder, let the latest field carry the camera only to the next requested
 # source boundary, and approach that boundary at a bounded rate. Without
 # this, the camera freezes at the last completed field and then jumps when the
 # worker appends the next one, which looks like an atlas-tile slideshow.
 LIVE_MAX_ZOOM_RATE = 2.5
+# Cairo's public enum value for FILTER_NEAREST. Keeping this local avoids
+# importing cairo just to select the final display filter.
+LIVE_CAIRO_FILTER_NEAREST = 3
 
 
 class _LiveCancelled(Exception):
@@ -143,7 +194,11 @@ class LiveViewConfig:
                 "palette_file",
                 palette_file.resolve(),
             )
-        width, height = live_dimensions(self.width, self.height)
+        width, height = live_dimensions(
+            self.width,
+            self.height,
+            formula=self.formula,
+        )
         object.__setattr__(self, "width", width)
         object.__setattr__(self, "height", height)
         try:
@@ -220,6 +275,11 @@ class LiveZoomSourceStore:
     _capped: bool = field(default=False, init=False, repr=False)
     _finished: bool = field(default=False, init=False, repr=False)
     _error: Optional[BaseException] = field(default=None, init=False, repr=False)
+    _snapshot_cache: Optional[LiveZoomSources] = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
     _condition: threading.Condition = field(
         default_factory=threading.Condition,
         init=False,
@@ -246,18 +306,21 @@ class LiveZoomSourceStore:
             self._log_zooms.append(float(log_zoom))
             self._fields.append(field_value)
             self._iteration_caps.append(int(iteration_cap))
+            self._snapshot_cache = None
             self._condition.notify_all()
 
     def finish(self, *, capped: bool = False) -> None:
         with self._condition:
             self._capped = self._capped or bool(capped)
             self._finished = True
+            self._snapshot_cache = None
             self._condition.notify_all()
 
     def fail(self, error: BaseException) -> None:
         with self._condition:
             self._error = error
             self._finished = True
+            self._snapshot_cache = None
             self._condition.notify_all()
 
     def display_zoom_limit(self) -> Optional[float]:
@@ -283,6 +346,23 @@ class LiveZoomSourceStore:
                     return next_log
             return last_log
 
+    def wait_until_count(
+        self,
+        target_count: int,
+        stop_event: Optional[threading.Event] = None,
+    ) -> bool:
+        """Wait for enough sources, or return when the builder finishes."""
+
+        target_count = max(0, int(target_count))
+        with self._condition:
+            while len(self._fields) < target_count and not self._finished:
+                if stop_event is not None and stop_event.is_set():
+                    raise _LiveCancelled
+                # A timeout keeps Esc responsive even if a worker fails before
+                # it can notify this condition.
+                self._condition.wait(timeout=0.1)
+            return len(self._fields) >= target_count
+
     def snapshot(self) -> LiveZoomSources:
         np = visualizer._require_numpy()
         with self._condition:
@@ -290,12 +370,19 @@ class LiveZoomSourceStore:
                 if self._error is not None:
                     raise self._error
                 raise RuntimeError("live zoom source ladder is empty")
-            return LiveZoomSources(
-                np.asarray(tuple(self._log_zooms), dtype=np.float64),
-                tuple(self._fields),
-                tuple(self._iteration_caps),
-                self._capped,
-            )
+            if self._snapshot_cache is None:
+                log_zooms = np.asarray(tuple(self._log_zooms), dtype=np.float64)
+                # A cached snapshot is safe to share between the renderer and
+                # the source worker only when its index array cannot be
+                # changed by a caller between frames.
+                log_zooms.setflags(write=False)
+                self._snapshot_cache = LiveZoomSources(
+                    log_zooms,
+                    tuple(self._fields),
+                    tuple(self._iteration_caps),
+                    self._capped,
+                )
+            return self._snapshot_cache
 
 
 def live_dimensions(
@@ -303,13 +390,14 @@ def live_dimensions(
     height: int,
     *,
     native_available: bool = True,
+    formula: Optional[str] = None,
 ) -> tuple[int, int]:
     """Return a bounded 16:9-ish source size that the live view can upscale.
 
-    The requested dimensions describe the window/aspect ratio, not a promise
-    to calculate a full 4K field every 1/30 second. Native colourisation uses
-    a 480x270 ceiling on the supported machines; the Python fallback is capped
-    at 240x135 so a missing native library cannot make the GUI appear hung.
+    The requested dimensions describe the window/aspect ratio. Native and
+    Python live sources are capped at a real 854x480 480p working frame; the
+    display may enlarge that frame to fullscreen with nearest-neighbour
+    sampling.
     """
 
     try:
@@ -319,8 +407,19 @@ def live_dimensions(
         raise ValueError("live dimensions must be integers") from error
     if requested_width <= 0 or requested_height <= 0:
         raise ValueError("live dimensions must be positive")
-    max_width = LIVE_NATIVE_MAX_WIDTH if native_available else LIVE_PYTHON_MAX_WIDTH
-    max_height = LIVE_NATIVE_MAX_HEIGHT if native_available else LIVE_PYTHON_MAX_HEIGHT
+    if native_available:
+        normalised_formula = (
+            visualizer._formula_name(formula) if formula is not None else None
+        )
+        if normalised_formula == "burning-ship":
+            max_width = LIVE_NATIVE_ALTERNATE_MAX_WIDTH
+            max_height = LIVE_NATIVE_ALTERNATE_MAX_HEIGHT
+        else:
+            max_width = LIVE_NATIVE_MAX_WIDTH
+            max_height = LIVE_NATIVE_MAX_HEIGHT
+    else:
+        max_width = LIVE_PYTHON_MAX_WIDTH
+        max_height = LIVE_PYTHON_MAX_HEIGHT
     scale = min(1.0, max_width / requested_width, max_height / requested_height)
     result_width = max(1, int(round(requested_width * scale)))
     result_height = max(1, int(round(requested_height * scale)))
@@ -367,6 +466,38 @@ def live_zoom_ladder(base_zoom: Any, max_zoom: Any) -> Any:
         point_count,
         dtype=np.float64,
     )
+
+
+def live_prerender_target(
+    track: LiveAudioTrack,
+    requested_logs: Any,
+    fraction: float = LIVE_PRERENDER_FRACTION,
+) -> tuple[int, float]:
+    """Return source coverage needed before starting live playback.
+
+    The live source ladder is indexed by zoom while the audio track is
+    indexed by time. Use the highest zoom visited in the requested prefix so
+    a temporary pullback cannot make an earlier deep excursion depend on a
+    source that is still being rendered.
+    """
+
+    np = visualizer._require_numpy()
+    try:
+        fraction = float(fraction)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("live pre-render fraction must be numeric") from error
+    if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+        raise ValueError("live pre-render fraction must be between 0 and 1")
+    logs = np.asarray(requested_logs, dtype=np.float64).reshape(-1)
+    zoom = np.asarray(track.zoom, dtype=np.float64).reshape(-1)
+    if logs.size == 0 or zoom.size == 0:
+        raise ValueError("live pre-render target requires a non-empty track and ladder")
+    prefix_size = max(1, min(zoom.size, int(math.ceil(zoom.size * fraction))))
+    target_log = float(np.max(zoom[:prefix_size]))
+    target_log = min(float(logs[-1]), max(float(logs[0]), target_log))
+    source_index = int(np.searchsorted(logs, target_log, side="left"))
+    target_count = max(1, min(int(logs.size), source_index + 1))
+    return target_count, target_log
 
 
 def _live_zoom_text(log_zoom: float) -> str:
@@ -487,7 +618,7 @@ def build_live_track(
 def _probe_audio_duration(audio_path: Path) -> Optional[float]:
     """Ask ffprobe for a duration when PCM decoding is unavailable."""
 
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = _find_live_tool("ffprobe")
     if ffprobe is None:
         return None
     try:
@@ -530,7 +661,7 @@ def _decode_audio_energy(
     """
 
     np = visualizer._require_numpy()
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = _find_live_tool("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg is unavailable for live audio analysis")
     frame_samples = max(1, round(LIVE_AUDIO_SAMPLE_RATE / int(fps)))
@@ -708,6 +839,8 @@ def _render_live_source(
                     fallback_zoom_factor=1.0,
                     fallback_max_iter=None,
                     allow_recovery=False,
+                    formula=config.formula,
+                    julia_constant=config.julia_constant,
                 )
                 repaired = np.asarray(repaired, dtype=np.float32)
                 if np.isfinite(repaired).all():
@@ -741,7 +874,7 @@ def _render_live_source(
     # preview could take longer to prepare than a cached export. The optional
     # empty-list path retains the standalone helper's safe compatibility
     # behaviour when no shared reference could be prepared.
-    if config.formula == "mandelbrot" and log_zoom >= 12.0 and native_library is not None:
+    if log_zoom >= 12.0 and native_library is not None:
         shared_reference = None
         if native_references:
             shared_reference = visualizer._select_native_reference(
@@ -799,6 +932,8 @@ def _render_live_source(
                 3,
                 log_zoom,
                 image_series_order=16,
+                formula=config.formula,
+                julia_constant=config.julia_constant,
             )
             return validated_native_result(
                 visualizer.render_fractal(
@@ -844,7 +979,7 @@ def _render_live_source(
                 reference_library.fractal_destroy_reference(reference)
 
     renderer = "auto"
-    if config.formula == "mandelbrot" and log_zoom >= 12.0:
+    if log_zoom >= 12.0:
         # This is only reached when the native library is missing.  Explicitly
         # select the bounded high-precision fallback so the error from the
         # native reference API does not turn the live window into a blank one.
@@ -890,11 +1025,7 @@ def _prepare_live_native_references(
 ) -> list[tuple[float, Any]]:
     """Prepare one reusable reference ladder for all deep live sources."""
 
-    if (
-        native_library is None
-        or config.formula != "mandelbrot"
-        or config.preview_max_log_zoom < 12.0
-    ):
+    if native_library is None or config.preview_max_log_zoom < 12.0:
         return []
     np = visualizer._require_numpy()
     requested_logs = live_zoom_ladder(
@@ -902,9 +1033,13 @@ def _prepare_live_native_references(
         _live_zoom_text(config.preview_max_log_zoom),
     )
     if requested_logs.size < 2:
-        atlas_step = 0.75
+        atlas_step = LIVE_SOURCE_LOG_STEP
     else:
         atlas_step = float(np.min(np.diff(requested_logs)))
+    # Alternate formulas use the same radius-tiered reference ladder as
+    # Mandelbrot now that their native handles carry formula-aware linear
+    # perturbation maps. This keeps deep live sources from replaying the full
+    # scalar tail at every zoom level.
     reference_logs = visualizer._native_reference_tier_logs(
         config.preview_max_log_zoom,
         atlas_step,
@@ -918,8 +1053,13 @@ def _prepare_live_native_references(
     )
     clone_tiers = (
         len(reference_logs) > 1
-        and hasattr(native_library, "fractal_create_reference_reusable")
         and hasattr(native_library, "fractal_clone_reference")
+        and (
+            config.formula == "mandelbrot"
+            and hasattr(native_library, "fractal_create_reference_reusable")
+            or config.formula != "mandelbrot"
+            and hasattr(native_library, "fractal_create_reference_ex")
+        )
     )
     try:
         _, root_reference = visualizer._create_native_reference(
@@ -931,6 +1071,8 @@ def _prepare_live_native_references(
             reference_logs[0],
             image_series_order=16,
             reusable=clone_tiers,
+            formula=config.formula,
+            julia_constant=config.julia_constant,
         )
         references.append((reference_logs[0], root_reference))
         for start_log in reference_logs[1:]:
@@ -953,6 +1095,8 @@ def _prepare_live_native_references(
                     3,
                     start_log,
                     image_series_order=16,
+                    formula=config.formula,
+                    julia_constant=config.julia_constant,
                 )
             references.append((start_log, reference))
     except (OSError, RuntimeError, ValueError, OverflowError):
@@ -972,8 +1116,15 @@ def build_live_zoom_sources(
     store: Optional[LiveZoomSourceStore] = None,
     max_sources: Optional[int] = None,
     source_native_threads: Optional[int] = None,
+    fast_mode: bool = False,
 ) -> LiveZoomSources:
-    """Prepare the small absolute-zoom atlas used by the live compositor."""
+    """Prepare the small absolute-zoom atlas used by the live compositor.
+
+    ``fast_mode`` is used by the screensaver worker. It renders each source
+    once with the bounded live budget; the strict retry/escalation policy is
+    retained for callers that explicitly want the older quality-first helper
+    behaviour.
+    """
 
     np = visualizer._require_numpy()
     requested_logs = live_zoom_ladder(config.base_zoom, config.max_zoom)
@@ -1001,6 +1152,8 @@ def build_live_zoom_sources(
                 raise _LiveCancelled
             source_log_zoom = float(requested_logs[index])
             source_iter = live_iteration_cap(config.formula, source_log_zoom)
+            if fast_mode and native_library is not None:
+                source_iter = max(source_iter, LIVE_FAST_NATIVE_ITERATIONS)
             if status is not None:
                 status(
                     f"rendering live zoom source {index + 1}/{len(requested_logs)} "
@@ -1048,6 +1201,12 @@ def build_live_zoom_sources(
                     "live zoom source",
                 )
                 finite_exterior = np.isfinite(field) & (field < float(final_iter))
+                if fast_mode:
+                    # The native live renderer rebases recoverable deep
+                    # perturbation glitches in-place. Do not run the old
+                    # all-interior retry staircase after that bounded pass;
+                    # it is the source of the multi-minute startup stall.
+                    break
                 if np.any(finite_exterior) or final_iter >= LIVE_MAX_ITERATIONS:
                     break
                 if final_iter <= LIVE_MIN_ITERATIONS:
@@ -1069,7 +1228,7 @@ def build_live_zoom_sources(
                 if index > 0
                 else None
             )
-            if not np.any(finite_exterior) and store.count and (
+            if not fast_mode and not np.any(finite_exterior) and store.count and (
                 previous_log is None or source_log_zoom > previous_log + 1.0e-9
             ):
                 # Do not expose an all-interior source as a black rectangular
@@ -1126,6 +1285,72 @@ def _live_source_zoom_limit(
     return value if math.isfinite(value) else None
 
 
+def _live_kfp_static_profile(
+    config: LiveViewConfig,
+    native_library: Any,
+) -> Any:
+    """Return a KFP profile that is safe to colourise once per live tile.
+
+    KFP's default profile is independent of the audio controls, so its
+    screen-space stencil can be evaluated once when a source arrives and
+    reused while the camera crops through that source.  Profiles that request
+    phase-driven colour changes must stay on the dynamic raw compositor.
+    """
+
+    if native_library is None:
+        return None
+    if not hasattr(native_library, "fractal_crop_rgb") or not hasattr(
+        native_library,
+        "fractal_atlas_composite_rgb",
+    ):
+        return None
+    profile = visualizer._kfp_profile_for_selection(
+        config.palette,
+        config.palette_file,
+    )
+    if profile is None:
+        return None
+    try:
+        phase_strength = float(profile.phase_color_strength)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(phase_strength) or abs(phase_strength) > 1.0e-12:
+        return None
+    return profile
+
+
+def _live_kfp_colour_tile(
+    field: Any,
+    max_iter: int,
+    profile: Any,
+    native_library: Any,
+    native_threads: int,
+) -> Any:
+    """Colour one live KFP source once, keeping the hot path crop-only."""
+
+    np = visualizer._require_numpy()
+    rgb = visualizer._colourise_kfp_native(
+        field,
+        int(max_iter),
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        profile,
+        native_library,
+        int(native_threads),
+        precise=False,
+    )
+    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+    expected_shape = np.asarray(field).shape + (3,)
+    if rgb.shape != expected_shape:
+        raise RuntimeError(
+            "live KFP colourizer returned "
+            f"{rgb.shape}, expected {expected_shape}"
+        )
+    return rgb
+
+
 def _live_colour_frame(
     sources: LiveZoomSources | LiveZoomSourceStore,
     log_zoom: float,
@@ -1135,6 +1360,8 @@ def _live_colour_frame(
     energy: float,
     native_library: Any,
     config: LiveViewConfig,
+    kfp_colour_cache: Optional[dict[int, Any]] = None,
+    kfp_profile: Any = None,
 ) -> Any:
     """Compose one continuous frame from the absolute live source ladder."""
 
@@ -1181,6 +1408,40 @@ def _live_colour_frame(
         if config.native_threads > 0
         else LIVE_DEFAULT_NATIVE_THREADS
     )
+    static_kfp_profile = (
+        kfp_profile
+        if kfp_profile is not None
+        else _live_kfp_static_profile(config, native_library)
+        if kfp_colour_cache is not None
+        else None
+    )
+    kfp_parent_rgb = None
+    kfp_child_rgb = None
+    if static_kfp_profile is not None and kfp_colour_cache is not None:
+        if index not in kfp_colour_cache:
+            kfp_colour_cache[index] = _live_kfp_colour_tile(
+                parent,
+                parent_iter,
+                static_kfp_profile,
+                native_library,
+                colour_threads,
+            )
+        kfp_parent_rgb = kfp_colour_cache[index]
+        # Do not pre-colour the child. Its independently computed relief
+        # stencil has no neighbour pixels from the parent, so compositing it
+        # into the centre before the handoff can expose a bright rectangle.
+        # Once the camera promotes the child it becomes ``parent`` on the
+        # next frame and is cached naturally. During the final near-full
+        # portion, _atlas_colour_frame falls back to its native screen-space
+        # KFP crop, which keeps the handoff seamless.
+    atlas_optional_kwargs: dict[str, Any] = {}
+    if static_kfp_profile is not None:
+        atlas_optional_kwargs = {
+            "child_zoom": 1.0,
+            "kfp_parent_rgb": kfp_parent_rgb,
+            "kfp_child_rgb": kfp_child_rgb,
+            "use_static_kfp": True,
+        }
     return visualizer._atlas_colour_frame(
         parent,
         child,
@@ -1199,13 +1460,14 @@ def _live_colour_frame(
         config.palette,
         0.5,
         config.palette_file,
+        **atlas_optional_kwargs,
     )
 
 
 def _audio_player_command(audio_path: Path) -> Optional[list[str]]:
     """Return a quiet ffplay command, or None when ffplay is not installed."""
 
-    ffplay = shutil.which("ffplay")
+    ffplay = _find_live_tool("ffplay")
     if ffplay is None:
         return None
     return [
@@ -1434,7 +1696,7 @@ if Gtk is not None:
             context.translate(left, top)
             context.scale(scale, scale)
             Gdk.cairo_set_source_pixbuf(context, self._pixbuf, 0.0, 0.0)
-            context.get_source().set_filter(4)  # Cairo FILTER_BILINEAR.
+            context.get_source().set_filter(LIVE_CAIRO_FILTER_NEAREST)
             context.paint()
             context.restore()
             return False
@@ -1470,6 +1732,7 @@ if Gtk is not None:
         def _worker_main(self) -> None:
             player: Any = None
             source_builder: Optional[threading.Thread] = None
+            source_builder_done = threading.Event()
             native_library: Any = None
             native_references: list[tuple[float, Any]] = []
             try:
@@ -1518,14 +1781,12 @@ if Gtk is not None:
                     native_library = visualizer._get_native_library()
                 except (OSError, RuntimeError):
                     native_library = None
-                native_preview = native_library is not None and (
-                    self.config.formula == "mandelbrot"
-                    or self.config.max_log_zoom < visualizer.ALTERNATE_PERTURBATION_MIN_LOG
-                )
+                native_preview = native_library is not None
                 source_width, source_height = live_dimensions(
                     self.config.width,
                     self.config.height,
                     native_available=native_preview,
+                    formula=self.config.formula,
                 )
                 # Keep the reference handles in one stable list so the
                 # background source worker can populate it before it reaches
@@ -1536,6 +1797,10 @@ if Gtk is not None:
                 requested_logs = live_zoom_ladder(
                     self.config.base_zoom,
                     self.config.max_zoom,
+                )
+                prerender_source_count, prerender_log_zoom = live_prerender_target(
+                    track,
+                    requested_logs,
                 )
                 source_store = LiveZoomSourceStore(requested_logs)
                 initial_count = min(
@@ -1560,6 +1825,7 @@ if Gtk is not None:
                     native_references,
                     source_store,
                     initial_count,
+                    fast_mode=True,
                 )
                 if self._stop_event.is_set():
                     return
@@ -1570,7 +1836,6 @@ if Gtk is not None:
                             if (
                                 not native_references
                                 and native_library is not None
-                                and self.config.formula == "mandelbrot"
                                 and self.config.preview_max_log_zoom >= 12.0
                             ):
                                 native_references.extend(
@@ -1588,10 +1853,11 @@ if Gtk is not None:
                                 native_references=native_references,
                                 store=source_store,
                                 source_native_threads=(
-                                    max(1, self.config.native_threads // 2)
+                                    self.config.native_threads
                                     if self.config.native_threads > 0
-                                    else 1
+                                    else LIVE_DEFAULT_NATIVE_THREADS
                                 ),
+                                fast_mode=True,
                             )
                         except _LiveCancelled:
                             return
@@ -1602,6 +1868,8 @@ if Gtk is not None:
                                 visible=True,
                                 dismiss_on_frame=False,
                             )
+                        finally:
+                            source_builder_done.set()
 
                     source_builder = threading.Thread(
                         target=finish_source_ladder,
@@ -1609,6 +1877,29 @@ if Gtk is not None:
                         daemon=True,
                     )
                     source_builder.start()
+                else:
+                    source_builder_done.set()
+
+                # Do not start the audio clock against a source ladder that
+                # only covers the first few preview tiles. Wait until the
+                # highest zoom visited in the first 75% of the song has a
+                # completed source. The rest of the ladder can then continue
+                # rendering concurrently with playback.
+                prerender_ready = source_store.count >= prerender_source_count
+                if not prerender_ready:
+                    prerender_percent = int(round(LIVE_PRERENDER_FRACTION * 100.0))
+                    self._post_status(
+                        f"pre-rendering first {prerender_percent}% of live view "
+                        f"through {_live_zoom_text(prerender_log_zoom)} before playback…",
+                        visible=True,
+                        dismiss_on_frame=False,
+                    )
+                    prerender_ready = source_store.wait_until_count(
+                        prerender_source_count,
+                        self._stop_event,
+                    )
+                    if not prerender_ready and self._stop_event.is_set():
+                        return
 
                 if sources.capped:
                     actual_log_zoom = float(sources.log_zooms[-1])
@@ -1620,8 +1911,10 @@ if Gtk is not None:
                         dismiss_on_frame=False,
                     )
                 elif source_builder is not None:
+                    prerender_percent = int(round(LIVE_PRERENDER_FRACTION * 100.0))
                     self._post_status(
-                        "live view ready · warming deep zoom sources · "
+                        f"live view ready · first {prerender_percent}% pre-rendered · "
+                        "warming the remainder · "
                         "Esc to exit · F11 toggles fullscreen",
                         visible=True,
                         dismiss_on_frame=False,
@@ -1637,7 +1930,12 @@ if Gtk is not None:
                     )
                 else:
                     self._post_status("Esc to exit · F11 toggles fullscreen", visible=True)
-                self._run_frames(source_store, track, native_library)
+                self._run_frames(
+                    source_store,
+                    track,
+                    native_library,
+                    source_builder_done,
+                )
             except _LiveCancelled:
                 pass
             except Exception as error:  # keep a broken preview from killing GTK
@@ -1666,6 +1964,7 @@ if Gtk is not None:
             sources: LiveZoomSources | LiveZoomSourceStore,
             track: LiveAudioTrack,
             native_library: Any,
+            source_builder_done: Optional[threading.Event] = None,
         ) -> None:
             np = visualizer._require_numpy()
             initial_sources = (
@@ -1679,10 +1978,15 @@ if Gtk is not None:
             if len(source_shape) != 2:
                 raise RuntimeError("live zoom source has invalid dimensions")
             # Keep the expensive KFP/Aurora colour pass at the bounded source
-            # density. The DrawingArea applies one bilinear upscale to the
-            # window; rendering a 1920x1080 RGB frame here would do the same
-            # resize twice and make the GUI the dominant live-view bottleneck.
+            # density. The DrawingArea applies one nearest-neighbour upscale
+            # to the window; rendering a larger RGB frame here would do the
+            # same resize twice and make the GUI the dominant bottleneck.
             source_height, source_width = int(source_shape[0]), int(source_shape[1])
+            kfp_profile = _live_kfp_static_profile(
+                self.config,
+                native_library,
+            )
+            kfp_colour_cache = {} if kfp_profile is not None else None
             frame_interval = 1.0 / float(track.fps)
             started = time.monotonic()
             next_deadline = started
@@ -1690,8 +1994,34 @@ if Gtk is not None:
             phase_span = float(track.phase[-1]) if track.phase.size else 0.0
             display_log_zoom: Optional[float] = None
             last_zoom_update = started
+            prewarm_deadline = (
+                started + max(0.0, track.duration) * LIVE_PRERENDER_FRACTION
+            )
+            prewarm_warning_sent = False
+            ladder_ready_reported = (
+                source_builder_done is None or source_builder_done.is_set()
+            )
             while not self._stop_event.is_set():
                 elapsed = time.monotonic() - started
+                if source_builder_done is not None:
+                    if source_builder_done.is_set() and not ladder_ready_reported:
+                        ladder_ready_reported = True
+                        self._post_status(
+                            "live atlas ready · Esc to exit · F11 toggles fullscreen",
+                            visible=True,
+                            dismiss_on_frame=False,
+                        )
+                    elif (
+                        not source_builder_done.is_set()
+                        and not prewarm_warning_sent
+                        and elapsed >= prewarm_deadline
+                    ):
+                        prewarm_warning_sent = True
+                        self._post_status(
+                            "remaining live atlas still warming; using completed zoom sources",
+                            visible=True,
+                            dismiss_on_frame=False,
+                        )
                 if track.duration <= 0.0:
                     local_time = 0.0
                     cycle = 0
@@ -1740,6 +2070,8 @@ if Gtk is not None:
                     energy,
                     native_library,
                     self.config,
+                    kfp_colour_cache,
+                    kfp_profile,
                 )
                 self._publish_frame(np.asarray(rgb, dtype=np.uint8))
                 next_deadline += frame_interval

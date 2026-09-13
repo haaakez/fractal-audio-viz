@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -13,11 +14,143 @@ import visualizer
 
 
 class LiveViewHelperTests(unittest.TestCase):
+    def test_live_source_snapshots_are_cached_and_refresh_on_updates(self):
+        store = live_view.LiveZoomSourceStore(np.asarray([0.0, 1.0]))
+        store.append(0.0, np.zeros((4, 8), dtype=np.float32), 192)
+        first = store.snapshot()
+        self.assertIs(first, store.snapshot())
+
+        store.finish(capped=True)
+        finished = store.snapshot()
+        self.assertIsNot(first, finished)
+        self.assertTrue(finished.capped)
+
+        store.append(1.0, np.ones((4, 8), dtype=np.float32), 224)
+        updated = store.snapshot()
+        self.assertIsNot(finished, updated)
+        self.assertEqual(len(updated.fields), 2)
+
+    def test_native_live_frames_render_for_every_formula_and_palette(self):
+        """Exercise the complete bounded live frame sequence, not one sample."""
+
+        native_library = visualizer._get_native_library()
+        if native_library is None:
+            self.skipTest("native renderer is unavailable")
+
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            track = live_view.build_live_track(
+                np.linspace(0.0, 1.0, 90, dtype=np.float64),
+                30,
+                "1.0",
+                "1e12",
+            )
+
+            for formula in visualizer.FORMULA_CHOICES:
+                x_center, y_center, _point = visualizer._resolve_render_point(
+                    point_spec=None,
+                    random_point=False,
+                    x_center=None,
+                    y_center=None,
+                    random_seed=None,
+                    max_log_zoom=12.0,
+                    formula=formula,
+                    julia_constant=visualizer.DEFAULT_JULIA_C,
+                )
+                config = live_view.LiveViewConfig(
+                    audio_path=audio,
+                    formula=formula,
+                    x_center=x_center,
+                    y_center=y_center,
+                    julia_constant=visualizer.DEFAULT_JULIA_C,
+                    max_zoom="1e12",
+                    width=64,
+                    height=36,
+                    native_threads=2,
+                )
+                references = live_view._prepare_live_native_references(
+                    config,
+                    native_library,
+                )
+                try:
+                    sources = live_view.build_live_zoom_sources(
+                        config,
+                        64,
+                        36,
+                        native_library,
+                        native_references=references,
+                        source_native_threads=2,
+                    )
+                    self.assertEqual(
+                        len(sources.fields),
+                        len(live_view.live_zoom_ladder("1.0", "1e12")),
+                        formula,
+                    )
+                    frame_zooms = np.asarray(track.zoom, dtype=np.float64).copy()
+                    # Make the final frame an exact source endpoint; the
+                    # normalised audio envelope can otherwise end at the
+                    # next representable float just below 12.0.
+                    frame_zooms[-1] = float(sources.log_zooms[-1])
+
+                    for palette in ("aurora", "kalles-default"):
+                        palette_config = replace(config, palette=palette)
+                        kfp_cache = {} if palette == "kalles-default" else None
+                        first = None
+                        last = None
+                        for index in range(track.energy.size):
+                            frame = live_view._live_colour_frame(
+                                sources,
+                                float(frame_zooms[index]),
+                                64,
+                                36,
+                                float(track.phase[index]),
+                                float(track.energy[index]),
+                                native_library,
+                                palette_config,
+                                kfp_cache,
+                            )
+                            frame = np.asarray(frame)
+                            self.assertEqual(
+                                frame.shape,
+                                (36, 64, 3),
+                                f"{formula}/{palette} frame {index}",
+                            )
+                            self.assertEqual(frame.dtype, np.uint8)
+                            self.assertTrue(
+                                np.isfinite(frame).all(),
+                                f"{formula}/{palette} frame {index} is not finite",
+                            )
+                            if first is None:
+                                first = frame.copy()
+                            last = frame
+                        assert first is not None and last is not None
+                        self.assertGreater(
+                            int(np.count_nonzero(first != last)),
+                            0,
+                            f"{formula}/{palette} did not produce a changing sequence",
+                        )
+                        if kfp_cache is not None:
+                            self.assertEqual(len(kfp_cache), len(sources.fields))
+                finally:
+                    visualizer._destroy_native_references(
+                        native_library,
+                        references,
+                    )
+
     def test_live_dimensions_cap_the_source_but_keep_aspect(self):
-        self.assertEqual(live_view.live_dimensions(3840, 2160), (480, 270))
+        self.assertEqual(
+            (live_view.LIVE_DEFAULT_WIDTH, live_view.LIVE_DEFAULT_HEIGHT),
+            (854, 480),
+        )
+        self.assertEqual(live_view.live_dimensions(3840, 2160), (853, 480))
+        self.assertEqual(
+            live_view.live_dimensions(3840, 2160, formula="burning-ship"),
+            (853, 480),
+        )
         self.assertEqual(
             live_view.live_dimensions(3840, 2160, native_available=False),
-            (240, 135),
+            (853, 480),
         )
         self.assertEqual(live_view.live_dimensions(400, 200), (400, 200))
 
@@ -42,6 +175,28 @@ class LiveViewHelperTests(unittest.TestCase):
         self.assertAlmostEqual(float(track.zoom[-1]), 24.0)
         self.assertAlmostEqual(track.duration, 5.0 / 30.0)
 
+    def test_prerender_target_covers_the_highest_zoom_in_the_prefix(self):
+        track = live_view.LiveAudioTrack(
+            np.zeros(10, dtype=np.float32),
+            np.zeros(10, dtype=np.float32),
+            np.zeros(10, dtype=np.float32),
+            np.asarray(
+                [0.0, 0.8, 2.2, 1.4, 3.7, 2.9, 5.0, 4.0, 6.0, 7.0],
+                dtype=np.float64,
+            ),
+            1.0,
+            10,
+        )
+        count, target = live_view.live_prerender_target(
+            track,
+            np.arange(8.0, dtype=np.float64),
+            0.60,
+        )
+        # Explicitly exercise a 60% prefix; the 3.7 excursion requires the
+        # source at 4.0, even though the prefix ends by pulling back to 2.9.
+        self.assertEqual(count, 5)
+        self.assertAlmostEqual(target, 3.7)
+
     def test_silence_does_not_create_nan_controls(self):
         track = live_view.build_live_track([0.0, 0.0, 0.0], 24, "1.0", "1e4")
         self.assertTrue((track.energy == 0.0).all())
@@ -61,7 +216,10 @@ class LiveViewHelperTests(unittest.TestCase):
         self.assertLessEqual(float(np.max(np.diff(ladder))), 150.0 / 95.0 + 1.0e-9)
 
         default_range = live_view.live_zoom_ladder("1e0", "1e24")
-        self.assertEqual(len(default_range), 33)
+        self.assertEqual(
+            len(default_range),
+            int(np.ceil(24.0 / live_view.LIVE_SOURCE_LOG_STEP)) + 1,
+        )
         self.assertLessEqual(
             float(np.max(np.diff(default_range))),
             live_view.LIVE_SOURCE_LOG_STEP + 1.0e-9,

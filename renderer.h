@@ -8,8 +8,8 @@ extern "C" {
 #endif
 
 #define FRACTAL_ABI_VERSION 10
-#define FRACTAL_RENDER_OPTIONS_VERSION 1
-#define FRACTAL_KFP_OPTIONS_VERSION 1
+#define FRACTAL_RENDER_OPTIONS_VERSION 2
+#define FRACTAL_KFP_OPTIONS_VERSION 2
 #define FRACTAL_KFP_MAX_MULTI_COLORS 256
 
 /* Formula ids used by render_fractal_ex. */
@@ -41,6 +41,10 @@ typedef struct FractalRenderOptions {
     int32_t max_linear_bla_length;
     int32_t backend;
     int32_t reserved[3];
+    /* Optional per-pixel offset used to preserve fractional escape precision
+     * when a high-iteration field is stored as float32.  A zero value keeps
+     * the historical absolute encoding. */
+    double output_bias;
 } FractalRenderOptions;
 
 /*
@@ -74,6 +78,8 @@ typedef struct FractalKfpOptions {
     double slope_angle;
     int32_t differences;
     int32_t interior_color[3];
+    /* The scalar field may be stored relative to this iteration offset. */
+    double field_bias;
 } FractalKfpOptions;
 
 int fractal_abi_version(void);
@@ -103,12 +109,40 @@ void *fractal_create_reference_reusable(
     int precision_bits,
     int series_order
 );
+/* Formula-aware reference creation.  The legacy creators remain Mandelbrot
+ * wrappers; alternate formulas use this entry point so their exact Julia
+ * constant and native deep renderer travel with the reference handle. */
+void *fractal_create_reference_ex(
+    const char *x_center,
+    const char *y_center,
+    const char *viewport_zoom,
+    int max_iter,
+    int precision_bits,
+    int series_order,
+    int formula,
+    const char *julia_real,
+    const char *julia_imag
+);
 /* Rebuild only radius-dependent series/BLA tables around a shared orbit. */
 void *fractal_clone_reference(void *source_handle, const char *viewport_zoom);
 void fractal_destroy_reference(void *handle);
 int fractal_get_reference_stats(void *handle, uint64_t *values, int capacity);
 
 int fractal_render_mandelbrot_reference_ex(
+    float *output,
+    int width,
+    int height,
+    const char *zoom_text,
+    void *handle,
+    int max_iter,
+    int threads,
+    int series_order,
+    int series_block,
+    const FractalRenderOptions *options
+);
+
+/* Formula-aware version of the reusable-reference renderer. */
+int fractal_render_reference_ex(
     float *output,
     int width,
     int height,
@@ -150,9 +184,7 @@ int render_mandelbrot_ex(
     const FractalRenderOptions *options
 );
 
-/* Direct renderer for the Mandelbrot family.  Alternate formulas are
- * intentionally direct/shallow for now; the validated MPFR+BLA deep path
- * remains attached to the Mandelbrot parameter plane. */
+/* Direct/deep renderer for the complete supported Mandelbrot-family set. */
 int render_fractal_ex(
     float *output,
     int width,
@@ -247,8 +279,43 @@ int fractal_colourise_kfp(
     int lut_size,
     int threads
 );
+/* Diagnostic exact Kalles transfer path. The ordinary entry point uses the
+ * validated AVX2/default kernel whenever the imported profile permits it. */
+int fractal_colourise_kfp_precise(
+    const float *field,
+    uint8_t *output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions *options,
+    const uint8_t *lut,
+    int lut_size,
+    int threads
+);
 /* Interior-aware centred crop followed by the native KFP colour pass. */
 int fractal_crop_colourise_kfp(
+    const float *source,
+    int source_width,
+    int source_height,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions *options,
+    const uint8_t *lut,
+    int lut_size,
+    int threads
+);
+int fractal_crop_colourise_kfp_precise(
     const float *source,
     int source_width,
     int source_height,
@@ -289,6 +356,29 @@ int fractal_atlas_colourise_kfp(
     int lut_size,
     int threads
 );
+int fractal_atlas_colourise_kfp_precise(
+    const float *parent,
+    int parent_width,
+    int parent_height,
+    const float *child,
+    int child_width,
+    int child_height,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    int max_iter,
+    int child_left,
+    int child_top,
+    int feather,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions *options,
+    const uint8_t *lut,
+    int lut_size,
+    int threads
+);
 /* Crop raw parent/child scalar tiles into one shared surface, then run one
  * native KFP pass so screen-space differences and slopes remain continuous
  * across the atlas handoff. */
@@ -306,6 +396,32 @@ int fractal_atlas_colourise_kfp_raw(
     int output_height,
     double parent_zoom,
     double child_fraction,
+    double child_zoom,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions *options,
+    const uint8_t *lut,
+    int lut_size,
+    int threads
+);
+int fractal_atlas_colourise_kfp_raw_precise(
+    const float *parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float *child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    uint8_t *output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
     int max_iter,
     double phase,
     double vocal,

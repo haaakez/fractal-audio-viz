@@ -6,17 +6,19 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
-#include <cerrno>
 #include <cstdint>
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <locale>
 #include <stdexcept>
 #include <string>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -77,6 +79,19 @@ constexpr std::size_t MAX_NATIVE_TEXT_LENGTH = 50'000;
 constexpr long double MIN_NATIVE_LOG10_ZOOM = -300.0L;
 constexpr long double MAX_NATIVE_LOG10_ZOOM = 9800.0L;
 
+// Store a large iteration field relative to a nearby bias when the caller is
+// going to quantise it to float32.  Keeping the fractional part close to zero
+// avoids losing Kalles' smooth escape transition once the absolute iteration
+// count reaches tens of thousands.  A zero bias is exactly the historical
+// representation.
+inline float encode_render_value(long double value, double output_bias) noexcept {
+    return static_cast<float>(value - static_cast<long double>(output_bias));
+}
+
+inline float encode_render_iteration(int iteration, double output_bias) noexcept {
+    return encode_render_value(static_cast<long double>(iteration), output_bias);
+}
+
 bool valid_formula(int formula) noexcept {
     return formula >= FRACTAL_FORMULA_MANDELBROT
         && formula <= FRACTAL_FORMULA_TRICORN;
@@ -126,14 +141,28 @@ bool valid_c_string(const char* text) noexcept {
     return false;
 }
 
+bool parse_classic_long_double(const char* text, long double& value) {
+    if (!valid_c_string(text)) return false;
+
+    // The GTK process inherits the user's desktop locale.  std::strtold()
+    // follows LC_NUMERIC, so a locale using a comma decimal separator rejects
+    // the ASCII coordinate strings exported by the Python/GUI side.  Keep the
+    // wire format locale-neutral by parsing with the classic C++ locale on a
+    // local stream instead of changing the process-global locale.
+    std::istringstream stream(text);
+    stream.imbue(std::locale::classic());
+    stream >> value;
+    if (stream.fail()) return false;
+    stream >> std::ws;
+    return stream.eof();
+}
+
 long double parse_coordinate(const char* text, const char* label) {
     if (!valid_c_string(text) || !label) {
         throw std::runtime_error("native coordinate text is too long or null");
     }
-    errno = 0;
-    char* end = nullptr;
-    const long double value = std::strtold(text, &end);
-    if (end == text || *end != '\0' || !std::isfinite(value)) {
+    long double value = 0.0L;
+    if (!parse_classic_long_double(text, value) || !std::isfinite(value)) {
         throw std::runtime_error(std::string("invalid ") + label + " coordinate");
     }
     // Underflow to zero is harmless for the direct fallback and the original
@@ -216,7 +245,8 @@ __kernel void mandelbrot_direct(
     const double center_imag,
     const double width_span,
     const double height_span,
-    const int max_iter
+    const int max_iter,
+    const double output_bias
 ) {
     const size_t pixel = get_global_id(0);
     const size_t count = (size_t)width * (size_t)height;
@@ -233,7 +263,7 @@ __kernel void mandelbrot_direct(
     const int in_cardioid = q * (q + cx - 0.25) <= 0.25 * cy * cy;
     const int in_bulb = (cx + 1.0) * (cx + 1.0) + cy * cy <= 0.0625;
     if (in_cardioid || in_bulb) {
-        output[pixel] = (float)max_iter;
+        output[pixel] = (float)((double)max_iter - output_bias);
         return;
     }
 
@@ -249,11 +279,11 @@ __kernel void mandelbrot_direct(
         if (magnitude_squared > 4.0) {
             const double magnitude = sqrt(fmax(magnitude_squared, 4.0000001));
             output[pixel] = (float)((double)(iteration + 1)
-                - log(log(magnitude)) / log(2.0));
+                - log(log(magnitude)) / log(2.0) - output_bias);
             return;
         }
     }
-    output[pixel] = (float)max_iter;
+    output[pixel] = (float)((double)max_iter - output_bias);
 }
 )CLC";
 
@@ -438,7 +468,8 @@ void render_direct_opencl(
     double zoom,
     double x_center,
     double y_center,
-    int max_iter
+    int max_iter,
+    double output_bias
 ) {
     initialise_opencl();
     if (!opencl_available()) {
@@ -469,6 +500,7 @@ void render_direct_opencl(
     status |= clSetKernelArg(runtime.kernel, 5, sizeof(width_span), &width_span);
     status |= clSetKernelArg(runtime.kernel, 6, sizeof(height_span), &height_span);
     status |= clSetKernelArg(runtime.kernel, 7, sizeof(max_iter), &max_iter);
+    status |= clSetKernelArg(runtime.kernel, 8, sizeof(output_bias), &output_bias);
     if (status != CL_SUCCESS) {
         release_output();
         throw std::runtime_error(opencl_error_text(status));
@@ -616,6 +648,7 @@ FractalRenderOptions default_render_options() {
     options.max_bla_length = MAX_SAFE_BLA_LENGTH;
     options.max_linear_bla_length = MAX_SAFE_LINEAR_BLA_LENGTH;
     options.backend = 0; // scalar/native backend; future values are explicit.
+    options.output_bias = 0.0;
     return options;
 }
 
@@ -644,6 +677,9 @@ FractalRenderOptions checked_render_options(const FractalRenderOptions* supplied
         options.max_linear_bla_length, 1, MAX_SAFE_LINEAR_BLA_LENGTH);
     if (options.time_budget_ms < 0) {
         throw std::runtime_error("render time budget cannot be negative");
+    }
+    if (!std::isfinite(options.output_bias) || options.output_bias < 0.0) {
+        throw std::runtime_error("render output bias must be finite and non-negative");
     }
     return options;
 }
@@ -846,28 +882,36 @@ void fill_bilinear_axis(
 // Fill a bilinear map for a window that extends beyond the logical
 // destination rectangle.  The KFP atlas uses a one/two-pixel halo around the
 // visible child so its 3x3 difference/slope stencil can read real neighbours
-// instead of reflecting the moving child edge.  ``destination_origin`` and
+// instead of reflecting the moving child edge. ``destination_origin`` and
 // ``destination_span`` are expressed in pixels of the logical output child.
+// ``source_zoom`` applies the same centred crop as fill_bilinear_axis while
+// retaining the extra destination pixels needed by the KFP stencil halo.
 void fill_bilinear_axis_window(
     BilinearAxis& axis,
     int source_size,
     int destination_size,
     double destination_origin,
-    double destination_span
+    double destination_span,
+    double source_zoom = 1.0
 ) {
     if (source_size <= 0 || destination_size <= 0
         || !std::isfinite(destination_origin)
-        || !std::isfinite(destination_span) || destination_span <= 0.0) {
+        || !std::isfinite(destination_span) || destination_span <= 0.0
+        || !std::isfinite(source_zoom) || source_zoom <= 0.0) {
         throw std::runtime_error("invalid bilinear window dimensions");
     }
+    source_zoom = std::max(source_zoom, 1.0);
+    const double crop_size = static_cast<double>(source_size) / source_zoom;
+    const double source_left = (
+        static_cast<double>(source_size) - crop_size) * 0.5;
     axis.index0.resize(static_cast<size_t>(destination_size));
     axis.index1.resize(static_cast<size_t>(destination_size));
     axis.weight.resize(static_cast<size_t>(destination_size));
     for (int destination = 0; destination < destination_size; ++destination) {
         const double logical_pixel = destination_origin
             + static_cast<double>(destination) + 0.5;
-        double source = logical_pixel * static_cast<double>(source_size)
-            / destination_span - 0.5;
+        double source = source_left
+            + logical_pixel * crop_size / destination_span - 0.5;
         source = std::clamp(source, 0.0, static_cast<double>(source_size - 1));
         const int index0 = static_cast<int>(std::floor(source));
         axis.index0[static_cast<size_t>(destination)] = index0;
@@ -894,6 +938,25 @@ struct BilinearWorkspace {
 };
 
 thread_local BilinearWorkspace bilinear_workspace;
+
+// Quality KFP calls opt out of the compact approximation kernel while keeping
+// the fast entry points ABI-compatible for the live/upscaled renderer.  The
+// flag is only consulted before an OpenMP loop is selected; the worker loop
+// itself is already routed by that decision, so OpenMP thread-local state does
+// not need to be inherited.
+thread_local bool kfp_force_precise = false;
+
+struct KfpPreciseGuard {
+    bool previous = false;
+
+    KfpPreciseGuard() noexcept : previous(kfp_force_precise) {
+        kfp_force_precise = true;
+    }
+
+    ~KfpPreciseGuard() {
+        kfp_force_precise = previous;
+    }
+};
 
 inline float sample_bilinear_mapped(
     const float* source,
@@ -931,7 +994,8 @@ inline float sample_bilinear_mapped_preserving_interior(
     int x,
     int y,
     int source_max_iter,
-    bool& inside
+    bool& inside,
+    double source_field_bias = 0.0
 ) {
     const int x_index = x_axis.index0[static_cast<size_t>(x)];
     const int x_next = x_axis.index1[static_cast<size_t>(x)];
@@ -962,11 +1026,13 @@ inline float sample_bilinear_mapped_preserving_interior(
         const float value = values[index];
         const double weight = weights[index];
         if (std::isfinite(value)
-            && value >= static_cast<float>(source_max_iter)) {
+            && static_cast<double>(value)
+                >= static_cast<double>(source_max_iter) - source_field_bias) {
             interior_weight += weight;
         } else if (std::isfinite(value)) {
             exterior_weight += weight;
-            exterior_value += static_cast<double>(value) * weight;
+            exterior_value += (
+                static_cast<double>(value) + source_field_bias) * weight;
         }
     }
     if (interior_weight >= 0.5) {
@@ -1020,6 +1086,22 @@ inline std::uint8_t rounded_colour_byte(double value) {
         255));
 }
 
+inline float kfp_colour_dither_mask(
+    int x,
+    int y,
+    int channel
+) noexcept {
+    // Kalles' final srgb8 conversion uses the compact ordered mask from
+    // colour.h.  The Burtle hash in fraktal_sft.cpp is used for positional
+    // jitter, not for colour quantisation. Keep the arithmetic in uint32_t so
+    // an unusually large but valid frame still has defined wraparound.
+    const std::uint32_t coordinate =
+        (static_cast<std::uint32_t>(x)
+            + static_cast<std::uint32_t>(channel) * 67U
+            + static_cast<std::uint32_t>(y) * 236U) * 119U;
+    return static_cast<float>(coordinate & 255U) / 256.0F;
+}
+
 inline void sample_rgb_bilinear_mapped(
     const std::uint8_t* source,
     int source_width,
@@ -1065,15 +1147,11 @@ inline std::uint8_t kfp_dithered_colour_byte(
     int y,
     int channel
 ) {
-    // Kalles uses a tiny deterministic ordered dither when converting the
-    // final sRGB colour to 8-bit. Keep the calculation in uint32_t so the
-    // result remains defined for large, valid image dimensions.
+    // Kalles adds a deterministic 8-bit ordered dither before truncating the
+    // final sRGB colour. This is intentionally separate from the Burtle hash
+    // used by Kalles for positional jitter.
     if (!std::isfinite(value)) value = 0.0;
-    const std::uint32_t mixed = (
-        static_cast<std::uint32_t>(x)
-        + static_cast<std::uint32_t>(channel * 67)
-        + static_cast<std::uint32_t>(y) * 236U) * 119U;
-    const double mask = static_cast<double>(mixed & 255U) / 256.0;
+    const double mask = static_cast<double>(kfp_colour_dither_mask(x, y, channel));
     return static_cast<std::uint8_t>(std::clamp(
         static_cast<int>(std::floor(std::clamp(value, 0.0, 255.0) + mask)),
         0,
@@ -1086,7 +1164,8 @@ inline double kfp_safe_sample(
     int height,
     int x,
     int y,
-    int max_iter
+    int max_iter,
+    double field_bias = 0.0
 ) {
     x = std::clamp(x, 0, width - 1);
     y = std::clamp(y, 0, height - 1);
@@ -1104,15 +1183,81 @@ inline double kfp_safe_sample(
         // rectangular black interior through the atlas.
         return 0.0;
     }
-    if (value >= static_cast<float>(max_iter)) {
+    const double interior_limit = static_cast<double>(max_iter) - field_bias;
+    if (static_cast<double>(value) >= interior_limit) {
         return static_cast<double>(max_iter) + 1.0;
     }
-    return std::clamp(static_cast<double>(value), 0.0, static_cast<double>(max_iter));
+    return std::clamp(
+        static_cast<double>(value) + field_bias,
+        0.0,
+        static_cast<double>(max_iter));
 }
 
-inline bool kfp_inside_value(float value, int max_iter) noexcept {
+inline bool kfp_inside_value(
+    float value,
+    int max_iter,
+    double field_bias = 0.0
+) noexcept {
     return std::isfinite(value)
-        && value >= static_cast<float>(max_iter);
+        && static_cast<double>(value)
+            >= static_cast<double>(max_iter) - field_bias;
+}
+
+// The renderer stores the compact smooth-iteration value produced by its
+// own scalar path.  Kalles reconstructs its colour value from nIter and
+// transition as
+//
+//   nIter + 1 - log(log(|z|) / log(10000)) / log(power)
+//
+// while the scalar renderer deliberately omits the constant bailout term.
+// Add that constant only inside the KFP transfer; changing the shared scalar
+// field would move ordinary Aurora palettes as well.  The default Kalles
+// palette uses only the distance transfer, so its branch-free hot path keeps
+// the unshifted scalar differences where the constant cancels exactly.
+inline double kfp_smooth_offset(const FractalKfpOptions& options) noexcept {
+    if (options.smooth_method != 0
+        || !std::isfinite(options.power) || options.power <= 0.0
+        || std::abs(options.power - 1.0) < 1.0e-12) {
+        return 0.0;
+    }
+    return 1.0 + std::log(std::log(10000.0)) / std::log(options.power);
+}
+
+// The bundled/default profile always uses Power=2. Keep its edge-only
+// correction in float so the AVX and scalar fast paths take the same route.
+constexpr float KFP_DEFAULT_SMOOTH_OFFSET = 4.2032545F;
+
+inline double kfp_colour_sample(
+    const float* field,
+    int width,
+    int height,
+    int x,
+    int y,
+    int max_iter,
+    double smooth_offset,
+    double field_bias = 0.0
+) {
+    x = std::clamp(x, 0, width - 1);
+    y = std::clamp(y, 0, height - 1);
+    const float value = field[static_cast<size_t>(y) * static_cast<size_t>(width)
+        + static_cast<size_t>(x)];
+    // Match the scalar colouriser's escaped fallback: invalid samples are
+    // treated as a zero iteration value, then receive the same fixed smooth
+    // offset as every other escaped sample.  Returning a bare zero here made
+    // the precise native stencil disagree with the portable Kalles path
+    // beside a numerical fault.
+    if (!std::isfinite(value)) return std::max(0.0, smooth_offset);
+    if (static_cast<double>(value)
+        >= static_cast<double>(max_iter) - field_bias) {
+        return static_cast<double>(max_iter) + 1.0;
+    }
+    return std::max(
+        0.0,
+        std::clamp(
+            static_cast<double>(value) + field_bias,
+            0.0,
+            static_cast<double>(max_iter))
+            + smooth_offset);
 }
 
 inline double kfp_reflected_sample(
@@ -1124,12 +1269,22 @@ inline double kfp_reflected_sample(
     int offset_x,
     int offset_y,
     int max_iter,
-    double centre
+    double centre,
+    double smooth_offset,
+    double field_bias = 0.0
 ) {
     const int sample_x = x + offset_x;
     const int sample_y = y + offset_y;
     if (sample_x >= 0 && sample_x < width && sample_y >= 0 && sample_y < height) {
-        return kfp_safe_sample(field, width, height, sample_x, sample_y, max_iter);
+        return kfp_colour_sample(
+            field,
+            width,
+            height,
+            sample_x,
+            sample_y,
+            max_iter,
+            smooth_offset,
+            field_bias);
     }
     // Match Kalles' reflected boundary stencil. A one-pixel dimension has no
     // opposite sample, so use the centre value instead of propagating NaNs.
@@ -1137,8 +1292,15 @@ inline double kfp_reflected_sample(
     const int opposite_y = y - offset_y;
     if (opposite_x >= 0 && opposite_x < width
         && opposite_y >= 0 && opposite_y < height) {
-        return 2.0 * centre - kfp_safe_sample(
-            field, width, height, opposite_x, opposite_y, max_iter);
+        return 2.0 * centre - kfp_colour_sample(
+            field,
+            width,
+            height,
+            opposite_x,
+            opposite_y,
+            max_iter,
+            smooth_offset,
+            field_bias);
     }
     return centre;
 }
@@ -1316,13 +1478,19 @@ inline float kfp_fast_log1p(float value) noexcept {
     const float z = (mantissa - 1.0F) / (mantissa + 1.0F);
     const float z_squared = z * z;
     // The atanh series converges rapidly because the reduced mantissa is in
-    // [1, 2). The omitted term is below 2e-6 over the whole range relevant
-    // to a KFP distance transfer, well below one 8-bit LUT step.
+    // [1, 2). Keep a few more odd terms than the original approximation: KFP
+    // divides this result by IterDiv (0.01 in the default palette), so a
+    // seemingly tiny log error can otherwise move a colour several 8-bit
+    // levels at a cyclic LUT boundary.
     const float series = 1.0F + z_squared * (
         1.0F / 3.0F + z_squared * (
             1.0F / 5.0F + z_squared * (
                 1.0F / 7.0F + z_squared * (
-                    1.0F / 9.0F + z_squared / 11.0F))));
+                    1.0F / 9.0F + z_squared * (
+                        1.0F / 11.0F + z_squared * (
+                            1.0F / 13.0F + z_squared * (
+                                1.0F / 15.0F + z_squared * (
+                                    1.0F / 17.0F + z_squared / 19.0F))))))));
     return 2.0F * z * series
         + static_cast<float>(exponent) * 0.6931471805599453F;
 }
@@ -1346,40 +1514,54 @@ inline float kfp_fast_atan_nonnegative(float value) noexcept {
 inline float kfp_fast_sample_inner(
     const float* field,
     size_t index,
-    int max_iter
+    int max_iter,
+    double field_bias = 0.0
 ) noexcept {
     const float value = field[index];
     if (!std::isfinite(value)) return 0.0F;
-    if (value >= static_cast<float>(max_iter)) {
-        return static_cast<float>(max_iter) + 1.0F;
+    const float bias = static_cast<float>(field_bias);
+    const float limit = static_cast<float>(max_iter) - bias;
+    if (value >= limit) {
+        return static_cast<float>(max_iter) + 1.0F - bias;
     }
-    return std::max(value, 0.0F);
+    return std::clamp(value, -bias, limit);
 }
 
 #if defined(__AVX2__)
-inline __m256 kfp_fast_sample_inner_avx(
-    const float* field,
-    size_t index,
-    int max_iter
-) {
-    const __m256 raw = _mm256_loadu_ps(field + index);
+inline __m256 kfp_fast_inside_avx(__m256 raw, __m256 limit) {
     const __m256 absolute = _mm256_andnot_ps(
         _mm256_set1_ps(-0.0F), raw);
     const __m256 finite = _mm256_cmp_ps(
         absolute,
         _mm256_set1_ps(std::numeric_limits<float>::infinity()),
         _CMP_LT_OQ);
-    const __m256 zero = _mm256_setzero_ps();
-    const __m256 limit = _mm256_set1_ps(static_cast<float>(max_iter));
-    __m256 value = _mm256_max_ps(raw, zero);
-    value = _mm256_min_ps(value, limit);
-    value = _mm256_blendv_ps(zero, value, finite);
-    const __m256 inside = _mm256_and_ps(
+    return _mm256_and_ps(
         finite,
         _mm256_cmp_ps(raw, limit, _CMP_GE_OQ));
+}
+
+inline __m256 kfp_fast_sample_inner_avx(
+    __m256 raw,
+    int max_iter,
+    double field_bias = 0.0
+) {
+    const __m256 absolute = _mm256_andnot_ps(
+        _mm256_set1_ps(-0.0F), raw);
+    const __m256 finite = _mm256_cmp_ps(
+        absolute,
+        _mm256_set1_ps(std::numeric_limits<float>::infinity()),
+        _CMP_LT_OQ);
+    const float bias = static_cast<float>(field_bias);
+    const __m256 zero = _mm256_setzero_ps();
+    const __m256 lower = _mm256_set1_ps(-bias);
+    const __m256 limit = _mm256_set1_ps(static_cast<float>(max_iter) - bias);
+    __m256 value = _mm256_max_ps(raw, lower);
+    value = _mm256_min_ps(value, limit);
+    value = _mm256_blendv_ps(zero, value, finite);
+    const __m256 inside = kfp_fast_inside_avx(raw, limit);
     return _mm256_blendv_ps(
         value,
-        _mm256_set1_ps(static_cast<float>(max_iter) + 1.0F),
+        _mm256_set1_ps(static_cast<float>(max_iter) + 1.0F - bias),
         inside);
 }
 
@@ -1400,7 +1582,15 @@ inline __m256 kfp_fast_log1p_avx(__m256 value) {
         _mm256_sub_ps(mantissa, _mm256_set1_ps(1.0F)),
         _mm256_add_ps(mantissa, _mm256_set1_ps(1.0F)));
     const __m256 z_squared = _mm256_mul_ps(z, z);
-    __m256 series = _mm256_set1_ps(1.0F / 11.0F);
+    __m256 series = _mm256_set1_ps(1.0F / 19.0F);
+    series = _mm256_add_ps(
+        _mm256_set1_ps(1.0F / 17.0F), _mm256_mul_ps(z_squared, series));
+    series = _mm256_add_ps(
+        _mm256_set1_ps(1.0F / 15.0F), _mm256_mul_ps(z_squared, series));
+    series = _mm256_add_ps(
+        _mm256_set1_ps(1.0F / 13.0F), _mm256_mul_ps(z_squared, series));
+    series = _mm256_add_ps(
+        _mm256_set1_ps(1.0F / 11.0F), _mm256_mul_ps(z_squared, series));
     series = _mm256_add_ps(
         _mm256_set1_ps(1.0F / 9.0F), _mm256_mul_ps(z_squared, series));
     series = _mm256_add_ps(
@@ -1453,7 +1643,8 @@ inline void write_kfp_default_fast_block8(
     int max_iter,
     const std::uint8_t* lut,
     int lut_size,
-    std::uint8_t* destination
+    std::uint8_t* destination,
+    double field_bias = 0.0
 ) {
     const size_t centre_index = static_cast<size_t>(source_y)
         * static_cast<size_t>(width) + static_cast<size_t>(source_x);
@@ -1464,24 +1655,37 @@ inline void write_kfp_default_fast_block8(
         absolute,
         _mm256_set1_ps(std::numeric_limits<float>::infinity()),
         _CMP_LT_OQ);
-    const __m256 limit = _mm256_set1_ps(static_cast<float>(max_iter));
-    const __m256 inside = _mm256_and_ps(
-        finite,
-        _mm256_cmp_ps(raw, limit, _CMP_GE_OQ));
+    const float bias = static_cast<float>(field_bias);
+    const __m256 lower_bound = _mm256_set1_ps(-bias);
+    const __m256 limit = _mm256_set1_ps(static_cast<float>(max_iter) - bias);
+    const __m256 inside = kfp_fast_inside_avx(raw, limit);
     const __m256 zero = _mm256_setzero_ps();
-    __m256 centre = _mm256_max_ps(raw, zero);
+    __m256 centre = _mm256_max_ps(raw, lower_bound);
     centre = _mm256_min_ps(centre, limit);
     centre = _mm256_blendv_ps(zero, centre, finite);
 
     const size_t row_width = static_cast<size_t>(width);
+    const __m256 left_raw = _mm256_loadu_ps(field + centre_index - 1U);
+    const __m256 up_raw = _mm256_loadu_ps(field + centre_index - row_width);
+    const __m256 top_left_raw = _mm256_loadu_ps(
+        field + centre_index - row_width - 1U);
     const __m256 left = kfp_fast_sample_inner_avx(
-        field, centre_index - 1U, max_iter);
+        left_raw, max_iter, field_bias);
     const __m256 up = kfp_fast_sample_inner_avx(
-        field, centre_index - row_width, max_iter);
+        up_raw, max_iter, field_bias);
     const __m256 top_left = kfp_fast_sample_inner_avx(
-        field, centre_index - row_width - 1U, max_iter);
-    const __m256 difference_x = _mm256_sub_ps(top_left, centre);
-    const __m256 difference_y = _mm256_sub_ps(left, up);
+        top_left_raw, max_iter, field_bias);
+    const __m256 smooth_offset = _mm256_set1_ps(KFP_DEFAULT_SMOOTH_OFFSET);
+    const __m256 difference_x = _mm256_sub_ps(
+        _mm256_sub_ps(top_left, centre),
+        _mm256_and_ps(
+            kfp_fast_inside_avx(top_left_raw, limit),
+            smooth_offset));
+    const __m256 difference_y = _mm256_add_ps(
+        _mm256_sub_ps(left, up),
+        _mm256_sub_ps(
+            _mm256_and_ps(kfp_fast_inside_avx(up_raw, limit), smooth_offset),
+            _mm256_and_ps(kfp_fast_inside_avx(left_raw, limit), smooth_offset)));
     const __m256 gradient = _mm256_mul_ps(
         _mm256_sqrt_ps(_mm256_max_ps(
             zero,
@@ -1502,15 +1706,16 @@ inline void write_kfp_default_fast_block8(
     const __m256 position = _mm256_sub_ps(
         raw_position,
         _mm256_mul_ps(_mm256_floor_ps(_mm256_div_ps(raw_position, cycle)), cycle));
-    __m256i lower = _mm256_cvttps_epi32(position);
-    lower = _mm256_min_epi32(lower, _mm256_set1_epi32(lut_size - 1));
-    __m256i upper = _mm256_add_epi32(lower, _mm256_set1_epi32(1));
+    __m256i lower_index = _mm256_cvttps_epi32(position);
+    lower_index = _mm256_min_epi32(lower_index, _mm256_set1_epi32(lut_size - 1));
+    __m256i upper_index = _mm256_add_epi32(lower_index, _mm256_set1_epi32(1));
     const __m256i upper_wrap = _mm256_cmpgt_epi32(
-        upper, _mm256_set1_epi32(lut_size - 1));
-    upper = _mm256_blendv_epi8(upper, _mm256_setzero_si256(), upper_wrap);
+        upper_index, _mm256_set1_epi32(lut_size - 1));
+    upper_index = _mm256_blendv_epi8(
+        upper_index, _mm256_setzero_si256(), upper_wrap);
     const __m256 fraction = _mm256_sub_ps(
         position,
-        _mm256_cvtepi32_ps(lower));
+        _mm256_cvtepi32_ps(lower_index));
     const __m256 inverse_fraction = _mm256_sub_ps(
         _mm256_set1_ps(1.0F), fraction);
     const __m256i three = _mm256_set1_epi32(3);
@@ -1522,12 +1727,12 @@ inline void write_kfp_default_fast_block8(
     // pixels or a sporadic crash.
     const __m256i last_index = _mm256_set1_epi32(lut_size - 1);
     const __m256i safe_index = _mm256_set1_epi32(lut_size - 2);
-    const __m256i lower_last = _mm256_cmpeq_epi32(lower, last_index);
-    const __m256i upper_last = _mm256_cmpeq_epi32(upper, last_index);
+    const __m256i lower_last = _mm256_cmpeq_epi32(lower_index, last_index);
+    const __m256i upper_last = _mm256_cmpeq_epi32(upper_index, last_index);
     const __m256i lower_offsets = _mm256_mullo_epi32(
-        _mm256_min_epi32(lower, safe_index), three);
+        _mm256_min_epi32(lower_index, safe_index), three);
     const __m256i upper_offsets = _mm256_mullo_epi32(
-        _mm256_min_epi32(upper, safe_index), three);
+        _mm256_min_epi32(upper_index, safe_index), three);
     const __m256i lower_packed = _mm256_i32gather_epi32(
         reinterpret_cast<const int*>(lut), lower_offsets, 1);
     const __m256i upper_packed = _mm256_i32gather_epi32(
@@ -1580,8 +1785,16 @@ inline void write_kfp_default_fast_block8(
         _mm256_mul_ps(lower_blue, inverse_fraction),
         _mm256_mul_ps(upper_blue, fraction));
 
-    const __m256 horizontal = _mm256_sub_ps(left, centre);
-    const __m256 vertical = _mm256_sub_ps(up, centre);
+    const __m256 horizontal = _mm256_sub_ps(
+        _mm256_sub_ps(left, centre),
+        _mm256_and_ps(
+            kfp_fast_inside_avx(left_raw, limit),
+            smooth_offset));
+    const __m256 vertical = _mm256_sub_ps(
+        _mm256_sub_ps(up, centre),
+        _mm256_and_ps(
+            kfp_fast_inside_avx(up_raw, limit),
+            smooth_offset));
     const __m256 projected = _mm256_mul_ps(
         _mm256_add_ps(horizontal, vertical),
         _mm256_set1_ps(
@@ -1642,19 +1855,22 @@ inline void write_kfp_default_fast_pixel(
     int max_iter,
     const std::uint8_t* lut,
     int lut_size,
-    std::uint8_t* destination
+    std::uint8_t* destination,
+    double field_bias = 0.0
 ) {
     const size_t centre_index = static_cast<size_t>(y)
         * static_cast<size_t>(width) + static_cast<size_t>(x);
     const float raw_value = field[centre_index];
-    if (std::isfinite(raw_value) && raw_value >= static_cast<float>(max_iter)) {
+    const float bias = static_cast<float>(field_bias);
+    const float limit = static_cast<float>(max_iter) - bias;
+    if (std::isfinite(raw_value) && raw_value >= limit) {
         destination[0] = 0;
         destination[1] = 0;
         destination[2] = 0;
         return;
     }
     const float centre = std::isfinite(raw_value)
-        ? std::clamp(raw_value, 0.0F, static_cast<float>(max_iter))
+        ? std::clamp(raw_value, -bias, limit)
         : 0.0F;
 
     float left;
@@ -1662,25 +1878,110 @@ inline void write_kfp_default_fast_pixel(
     float top_left;
     float right = centre;
     float down = centre;
+    float stencil_centre = centre;
+    bool left_inside = false;
+    bool up_inside = false;
+    bool top_left_inside = false;
     if (x > 0 && y > 0 && x + 1 < width && y + 1 < height) {
-        left = kfp_fast_sample_inner(field, centre_index - 1U, max_iter);
-        up = kfp_fast_sample_inner(field, centre_index - static_cast<size_t>(width), max_iter);
+        left_inside = kfp_inside_value(
+            field[centre_index - 1U], max_iter, field_bias);
+        up_inside = kfp_inside_value(
+            field[centre_index - static_cast<size_t>(width)], max_iter, field_bias);
+        top_left_inside = kfp_inside_value(
+            field[centre_index - static_cast<size_t>(width) - 1U], max_iter, field_bias);
+        left = kfp_fast_sample_inner(
+            field,
+            centre_index - 1U,
+            max_iter,
+            field_bias);
+        up = kfp_fast_sample_inner(
+            field,
+            centre_index - static_cast<size_t>(width),
+            max_iter,
+            field_bias);
         top_left = kfp_fast_sample_inner(
-            field, centre_index - static_cast<size_t>(width) - 1U, max_iter);
+            field,
+            centre_index - static_cast<size_t>(width) - 1U,
+            max_iter,
+            field_bias);
     } else {
-        left = static_cast<float>(kfp_reflected_sample(field, width, height, x, y, -1, 0, max_iter, centre));
-        up = static_cast<float>(kfp_reflected_sample(field, width, height, x, y, 0, -1, max_iter, centre));
-        top_left = static_cast<float>(kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre));
+        // Edge samples returned by kfp_reflected_sample are decoded back to
+        // the absolute smooth-iteration domain. Bring the centred field's
+        // centre into that same domain before taking the reflected stencil;
+        // otherwise every edge pixel compares an absolute neighbour with a
+        // bias-relative centre and gets a visibly different slope.
+        stencil_centre = centre + bias + KFP_DEFAULT_SMOOTH_OFFSET;
+        left = static_cast<float>(kfp_reflected_sample(
+            field,
+            width,
+            height,
+            x,
+            y,
+            -1,
+            0,
+            max_iter,
+            stencil_centre,
+            KFP_DEFAULT_SMOOTH_OFFSET,
+            field_bias));
+        up = static_cast<float>(kfp_reflected_sample(
+            field,
+            width,
+            height,
+            x,
+            y,
+            0,
+            -1,
+            max_iter,
+            stencil_centre,
+            KFP_DEFAULT_SMOOTH_OFFSET,
+            field_bias));
+        top_left = static_cast<float>(kfp_reflected_sample(
+            field,
+            width,
+            height,
+            x,
+            y,
+            -1,
+            -1,
+            max_iter,
+            stencil_centre,
+            KFP_DEFAULT_SMOOTH_OFFSET,
+            field_bias));
         if (x == 0) {
-            right = static_cast<float>(kfp_reflected_sample(field, width, height, x, y, 1, 0, max_iter, centre));
+            right = static_cast<float>(kfp_reflected_sample(
+                field,
+                width,
+                height,
+                x,
+                y,
+                1,
+                0,
+                max_iter,
+                stencil_centre,
+                KFP_DEFAULT_SMOOTH_OFFSET,
+                field_bias));
         }
         if (y == 0) {
-            down = static_cast<float>(kfp_reflected_sample(field, width, height, x, y, 0, 1, max_iter, centre));
+            down = static_cast<float>(kfp_reflected_sample(
+                field,
+                width,
+                height,
+                x,
+                y,
+                0,
+                1,
+                max_iter,
+                stencil_centre,
+                KFP_DEFAULT_SMOOTH_OFFSET,
+                field_bias));
         }
     }
 
-    const float difference_x = top_left - centre;
-    const float difference_y = left - up;
+    const float difference_x = top_left - stencil_centre
+        - (top_left_inside ? KFP_DEFAULT_SMOOTH_OFFSET : 0.0F);
+    const float difference_y = left - up
+        + (up_inside ? KFP_DEFAULT_SMOOTH_OFFSET : 0.0F)
+        - (left_inside ? KFP_DEFAULT_SMOOTH_OFFSET : 0.0F);
     const float gradient = std::sqrt(std::max(
         0.0F,
         (difference_x * difference_x + difference_y * difference_y) * 0.5F))
@@ -1705,8 +2006,14 @@ inline void write_kfp_default_fast_pixel(
     float blue = static_cast<float>(lut[lower * 3 + 2]) * inverse_fraction
         + static_cast<float>(lut[upper * 3 + 2]) * fraction;
 
-    const float horizontal = x > 0 ? left - centre : centre - right;
-    const float vertical = y == 0 ? centre - down : up - centre;
+    const float horizontal = x > 0
+        ? left - stencil_centre
+            - (left_inside ? KFP_DEFAULT_SMOOTH_OFFSET : 0.0F)
+        : stencil_centre - right;
+    const float vertical = y == 0
+        ? stencil_centre - down
+        : up - stencil_centre
+            - (up_inside ? KFP_DEFAULT_SMOOTH_OFFSET : 0.0F);
     const float projected = (horizontal + vertical) * 0.7071067811865475F
         * 50.0F * static_cast<float>(spatial_width) / 640.0F;
     const float strength = std::clamp(
@@ -1728,6 +2035,48 @@ inline void write_kfp_default_fast_pixel(
     destination[2] = kfp_dithered_colour_byte(blue, dither_x, dither_y, 2);
 }
 
+#if !defined(__AVX2__)
+// The atlas compositor uses the same eight-pixel helper on both the AVX2 and
+// scalar builds.  Keep a scalar implementation for portable release builds;
+// otherwise the non-AVX2 compiler never sees the AVX2 definition above and a
+// portable Linux/MinGW build fails even though the scalar pixel path exists.
+inline void write_kfp_default_fast_block8(
+    const float* field,
+    int width,
+    int source_x,
+    int source_y,
+    int dither_x,
+    int dither_y,
+    int spatial_width,
+    int max_iter,
+    const std::uint8_t* lut,
+    int lut_size,
+    std::uint8_t* destination,
+    double field_bias = 0.0
+) {
+    // All callers establish an interior eight-pixel run.  The scalar writer
+    // only needs a height large enough to keep that already-established row
+    // on its interior stencil path.
+    const int scalar_height = source_y + 2;
+    for (int lane = 0; lane < 8; ++lane) {
+        write_kfp_default_fast_pixel(
+            field,
+            width,
+            scalar_height,
+            source_x + lane,
+            source_y,
+            dither_x + lane,
+            dither_y,
+            spatial_width,
+            max_iter,
+            lut,
+            lut_size,
+            destination + static_cast<size_t>(dither_x + lane) * 3U,
+            field_bias);
+    }
+}
+#endif
+
 inline void colourise_kfp_default_fast_field(
     const float* field,
     int width,
@@ -1736,7 +2085,8 @@ inline void colourise_kfp_default_fast_field(
     const std::uint8_t* lut,
     int lut_size,
     std::uint8_t* output,
-    int threads
+    int threads,
+    double field_bias = 0.0
 ) {
 #ifdef _OPENMP
     if (threads > 0) {
@@ -1759,7 +2109,8 @@ inline void colourise_kfp_default_fast_field(
             max_iter,
             lut,
             lut_size,
-            output + static_cast<size_t>(y) * static_cast<size_t>(width) * 3U);
+            output + static_cast<size_t>(y) * static_cast<size_t>(width) * 3U,
+            field_bias);
         x = 1;
 #if defined(__AVX2__)
         if (y > 0 && y + 1 < height && width >= 10) {
@@ -1777,7 +2128,8 @@ inline void colourise_kfp_default_fast_field(
                     max_iter,
                     lut,
                     lut_size,
-                    output + row_offset);
+                    output + row_offset,
+                    field_bias);
             }
         }
 #endif
@@ -1795,7 +2147,8 @@ inline void colourise_kfp_default_fast_field(
                 lut,
                 lut_size,
                 output + (static_cast<size_t>(y) * static_cast<size_t>(width)
-                    + static_cast<size_t>(x)) * 3U);
+                    + static_cast<size_t>(x)) * 3U,
+                field_bias);
         }
     }
 }
@@ -1818,25 +2171,9 @@ inline void write_kfp_pixel(
     const KfpSlopeDirection& slope_direction,
     std::uint8_t* destination
 ) {
-    if (kfp_is_default_fast_options(options)) {
-        write_kfp_default_fast_pixel(
-            field,
-            width,
-            height,
-            x,
-            y,
-            dither_x,
-            dither_y,
-            spatial_width,
-            max_iter,
-            lut,
-            lut_size,
-            destination);
-        return;
-    }
     const float raw_value = field[static_cast<size_t>(y) * static_cast<size_t>(width)
         + static_cast<size_t>(x)];
-    const bool inside = kfp_inside_value(raw_value, max_iter);
+    const bool inside = kfp_inside_value(raw_value, max_iter, options.field_bias);
     if (inside) {
         destination[0] = static_cast<std::uint8_t>(options.interior_color[0]);
         destination[1] = static_cast<std::uint8_t>(options.interior_color[1]);
@@ -1844,13 +2181,32 @@ inline void write_kfp_pixel(
         return;
     }
 
+    const double smooth_offset = kfp_smooth_offset(options);
     const double safe = std::isfinite(raw_value)
         ? std::clamp(
-            static_cast<double>(raw_value), 0.0, static_cast<double>(max_iter))
+            static_cast<double>(raw_value) + options.field_bias,
+            0.0,
+            static_cast<double>(max_iter))
         : 0.0;
-    const double smooth_iter = safe;
-    const double colour_iter = options.flat ? std::floor(safe) : safe;
-    const double centre = safe;
+    const double smooth_iter = std::max(0.0, safe + smooth_offset);
+    const double colour_iter = options.flat
+        ? std::floor(smooth_iter)
+        : smooth_iter;
+    const double centre = smooth_iter;
+    const auto reflected = [&](int offset_x, int offset_y) {
+        return kfp_reflected_sample(
+            field,
+            width,
+            height,
+            x,
+            y,
+            offset_x,
+            offset_y,
+            max_iter,
+            centre,
+            smooth_offset,
+            options.field_bias);
+    };
     const bool needs_difference = options.color_method >= 5
         && options.color_method <= 8;
     const bool needs_slopes = options.slopes
@@ -1865,8 +2221,8 @@ inline void write_kfp_pixel(
     double bottom_left = centre;
     double bottom_right = centre;
     if (needs_difference || needs_slopes) {
-        left = kfp_reflected_sample(field, width, height, x, y, -1, 0, max_iter, centre);
-        up = kfp_reflected_sample(field, width, height, x, y, 0, -1, max_iter, centre);
+        left = reflected(-1, 0);
+        up = reflected(0, -1);
         if (needs_difference) {
             // Keep the stencil narrow for the common Kalles default
             // (Differences=3). Its operator uses only the upper-left,
@@ -1874,29 +2230,29 @@ inline void write_kfp_pixel(
             // made every pixel pay for values that were immediately ignored.
             switch (options.differences) {
                 case 0:
-                    top_left = kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre);
-                    bottom_left = kfp_reflected_sample(field, width, height, x, y, -1, 1, max_iter, centre);
+                    top_left = reflected(-1, -1);
+                    bottom_left = reflected(-1, 1);
                     break;
                 case 1:
                 case 2:
                 case 5:
                 case 6:
-                    right = kfp_reflected_sample(field, width, height, x, y, 1, 0, max_iter, centre);
-                    down = kfp_reflected_sample(field, width, height, x, y, 0, 1, max_iter, centre);
-                    top_left = kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre);
-                    top_right = kfp_reflected_sample(field, width, height, x, y, 1, -1, max_iter, centre);
-                    bottom_left = kfp_reflected_sample(field, width, height, x, y, -1, 1, max_iter, centre);
-                    bottom_right = kfp_reflected_sample(field, width, height, x, y, 1, 1, max_iter, centre);
+                    right = reflected(1, 0);
+                    down = reflected(0, 1);
+                    top_left = reflected(-1, -1);
+                    top_right = reflected(1, -1);
+                    bottom_left = reflected(-1, 1);
+                    bottom_right = reflected(1, 1);
                     break;
                 case 3:
-                    top_left = kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre);
+                    top_left = reflected(-1, -1);
                     break;
                 case 4:
-                    top_left = kfp_reflected_sample(field, width, height, x, y, -1, -1, max_iter, centre);
+                    top_left = reflected(-1, -1);
                     break;
                 default:
-                    right = kfp_reflected_sample(field, width, height, x, y, 1, 0, max_iter, centre);
-                    down = kfp_reflected_sample(field, width, height, x, y, 0, 1, max_iter, centre);
+                    right = reflected(1, 0);
+                    down = reflected(0, 1);
                     break;
             }
         }
@@ -1906,10 +2262,10 @@ inline void write_kfp_pixel(
         // an edge slope actually needs them.
         if (needs_slopes) {
             if (x == 0) {
-                right = kfp_reflected_sample(field, width, height, x, y, 1, 0, max_iter, centre);
+                right = reflected(1, 0);
             }
             if (y == 0) {
-                down = kfp_reflected_sample(field, width, height, x, y, 0, 1, max_iter, centre);
+                down = reflected(0, 1);
             }
         }
     }
@@ -2108,7 +2464,8 @@ KfpTransferBounds kfp_transfer_bounds(
     const float* field,
     int width,
     int height,
-    int max_iter
+    int max_iter,
+    double field_bias = 0.0
 ) {
     double minimum = std::numeric_limits<double>::infinity();
     double maximum = -std::numeric_limits<double>::infinity();
@@ -2117,10 +2474,12 @@ KfpTransferBounds kfp_transfer_bounds(
 #endif
     for (int pixel = 0; pixel < width * height; ++pixel) {
         const float raw_value = field[pixel];
-        if (kfp_inside_value(raw_value, max_iter)) continue;
+        if (kfp_inside_value(raw_value, max_iter, field_bias)) continue;
         const double safe = std::isfinite(raw_value)
             ? std::clamp(
-                static_cast<double>(raw_value), 0.0, static_cast<double>(max_iter))
+                static_cast<double>(raw_value) + field_bias,
+                0.0,
+                static_cast<double>(max_iter))
             : 0.0;
         // CFraktalSFT::GetIterations reports the integer nIter0 range for
         // ColorMethod_Stretched; the fractional transition is applied only
@@ -2156,7 +2515,9 @@ bool valid_kfp_options(const FractalKfpOptions* options, int lut_size) noexcept 
         || !std::isfinite(options->slope_power) || options->slope_power < 0.0
         || !std::isfinite(options->slope_ratio) || options->slope_ratio < 0.0
         || !std::isfinite(options->slope_angle)
-        || options->differences < 0 || options->differences > 7) {
+        || options->differences < 0 || options->differences > 7
+        || !std::isfinite(options->field_bias)
+        || options->field_bias < 0.0) {
         return false;
     }
     for (std::uint32_t index = 0; index < options->multi_color_count; ++index) {
@@ -2181,10 +2542,8 @@ KfpSlopeDirection kfp_slope_direction(const FractalKfpOptions& options) noexcept
 
 long double parse_zoom(const char* text) {
     if (!valid_c_string(text)) throw std::runtime_error("native zoom text is too long or null");
-    errno = 0;
-    char* end = nullptr;
-    const long double zoom = std::strtold(text, &end);
-    if (end == text || *end != '\0' || errno == ERANGE
+    long double zoom = 0.0L;
+    if (!parse_classic_long_double(text, zoom)
         || !std::isfinite(zoom) || zoom <= 0.0L) {
         throw std::runtime_error("invalid Mandelbrot zoom");
     }
@@ -2348,6 +2707,10 @@ inline ScaledComplex sc_neg(const ScaledComplex& value) {
     return {-value.real, -value.imag, value.exponent};
 }
 
+inline ScaledComplex sc_conjugate(const ScaledComplex& value) {
+    return {value.real, -value.imag, value.exponent};
+}
+
 inline ScaledComplex sc_sub(const ScaledComplex& a, const ScaledComplex& b) {
     return sc_add(a, sc_neg(b));
 }
@@ -2436,16 +2799,24 @@ inline double sc_to_double(const ScaledComplex& value) {
     return std::ldexp(value.real, value.exponent);
 }
 
-inline float smooth_escape_scaled(int iteration, const ScaledNorm& norm) {
-    if (norm.mantissa == 0.0) return static_cast<float>(iteration);
+inline long double smooth_escape_value(int iteration, const ScaledNorm& norm) {
+    if (norm.mantissa == 0.0) return static_cast<long double>(iteration);
     const long double log_magnitude = 0.5L * (
         std::log(static_cast<long double>(norm.mantissa))
         + static_cast<long double>(norm.exponent) * LOG_TWO);
     if (!(log_magnitude > 0.0L) || !std::isfinite(log_magnitude)) {
-        return static_cast<float>(iteration);
+        return static_cast<long double>(iteration);
     }
-    return static_cast<float>(static_cast<long double>(iteration)
-        - std::log(log_magnitude) / LOG_TWO);
+    return static_cast<long double>(iteration)
+        - std::log(log_magnitude) / LOG_TWO;
+}
+
+inline float smooth_escape_scaled(
+    int iteration,
+    const ScaledNorm& norm,
+    double output_bias = 0.0
+) {
+    return encode_render_value(smooth_escape_value(iteration, norm), output_bias);
 }
 
 inline FloatExp fe_neg(const FloatExp& value) {
@@ -2690,6 +3061,24 @@ inline FloatExp sc_escape_margin_with_delta(
     return fec_escape_margin_with_delta(reference_parts, delta_parts);
 }
 
+inline FloatExp sc_escape_margin_with_reference_margin(
+    const FloatExp& reference_margin,
+    const ScaledComplex& reference,
+    const ScaledComplex& delta
+) {
+    const FloatExp cross = fe_mul(
+        fe_add(
+            fe_mul(sc_component_as_float_exp(reference, false),
+                   sc_component_as_float_exp(delta, false)),
+            fe_mul(sc_component_as_float_exp(reference, true),
+                   sc_component_as_float_exp(delta, true))),
+        2.0);
+    const ScaledNorm delta_norm = sc_norm_squared(delta);
+    return fe_add(
+        fe_add(reference_margin, cross),
+        FloatExp{delta_norm.mantissa, delta_norm.exponent});
+}
+
 inline ScaledNorm sc_norm_squared_with_delta(
     const ScaledComplex& reference,
     const ScaledComplex& delta
@@ -2739,6 +3128,73 @@ struct LinearBlaStep {
     ScaledComplex B;
     FloatExp radius_squared;
     int length = 1;
+};
+
+// Alternate formulas are still quadratic maps, but Tricorn is
+// anti-holomorphic and Burning Ship is piecewise.  A complex A/B BLA cannot
+// represent either derivative without silently turning one of those maps
+// into Mandelbrot.  Keep the same compact block idea as the Mandelbrot path,
+// but store the derivative and the constant-parameter response as two real
+// 2x2 matrices:
+//
+//     d' = M d + P dc
+//
+// The nonlinear d^2 term is bounded by radius_squared and is replayed exactly
+// whenever a block approaches the escape boundary.  This keeps the hot path
+// native and SIMD-friendly at deep zooms while retaining formula-specific
+// perturbation arithmetic at seams and absolute-value axes.
+struct AlternateLinearBlaStep {
+    // M row-major followed by P row-major.
+    std::array<FloatExp, 8> coefficients{};
+    FloatExp radius_squared;
+    int length = 1;
+};
+
+struct AlternateLinearBlaLevels {
+    std::vector<std::vector<AlternateLinearBlaStep>> levels;
+    FloatExp input_radius;
+    FloatExp input_radius_squared;
+    int start_index = 0;
+
+    static int highest_level_for_length(int max_length) noexcept {
+        return max_length > 0
+            ? 31 - __builtin_clz(static_cast<unsigned int>(max_length))
+            : 0;
+    }
+
+    const AlternateLinearBlaStep* lookup(
+        int start,
+        const FloatExp& delta_norm_squared,
+        const FloatExp& parameter_norm_squared,
+        int max_length
+    ) const noexcept {
+        if (levels.empty() || start < start_index || max_length <= 0
+            || !delta_norm_squared.finite() || !parameter_norm_squared.finite()) {
+            return nullptr;
+        }
+        const int offset = start - start_index;
+        const int base_count = static_cast<int>(levels[0].size());
+        if (offset < 0 || offset >= base_count) return nullptr;
+        int highest_level = highest_level_for_length(max_length);
+        highest_level = std::min(
+            highest_level,
+            static_cast<int>(levels.size()) - 1);
+        for (int level = highest_level; level >= 0; --level) {
+            const int span_mask = (1 << level) - 1;
+            if ((offset & span_mask) != 0) continue;
+            const int index = offset >> level;
+            if (index >= static_cast<int>(levels[level].size())) continue;
+            const AlternateLinearBlaStep& candidate =
+                levels[level][static_cast<size_t>(index)];
+            if (candidate.length > 1
+                && candidate.radius_squared.finite()
+                && fe_compare(delta_norm_squared, candidate.radius_squared) < 0
+                && fe_compare(parameter_norm_squared, input_radius_squared) <= 0) {
+                return &candidate;
+            }
+        }
+        return nullptr;
+    }
 };
 
 struct LinearBlaBuilderStep {
@@ -2955,12 +3411,18 @@ struct ReferenceOrbitData {
     std::vector<ScaledComplex> scaled;
     std::vector<double> real_double;
     std::vector<double> imag_double;
+    // Keep the MPFR-computed signed escape margin alongside the compact orbit.
+    // Reconstructing |Z + delta|^2 from a rounded reference can lose the sign
+    // of a perturbation sitting on |Z| = 2, which used to create rectangular
+    // fills in deep alternate-formula tiles.
+    std::vector<FloatExp> escape_margin;
 };
 
 struct ReferenceContext {
     std::vector<FloatExpComplex> fast_orbit;
     std::shared_ptr<const ReferenceOrbitData> orbit;
     BlaLevels bla;
+    AlternateLinearBlaLevels alternate_bla;
     ImageSeries image_series;
     int requested_max_iter = 0;
     int requested_series_order = 8;
@@ -2969,10 +3431,110 @@ struct ReferenceContext {
     std::uint64_t bla_build_ns = 0;
     long double x_center = 0.0L;
     long double y_center = 0.0L;
+    int formula = FRACTAL_FORMULA_MANDELBROT;
+    double julia_real = 0.0;
+    double julia_imag = 0.0;
+    ScaledComplex parameter;
 #ifdef FRACTAL_HAVE_MPFR
     mpfr_prec_t precision_bits = 0;
 #endif
 };
+
+void stabilize_alternate_reference_cycle(
+    std::vector<FloatExpComplex>& fast_orbit,
+    ReferenceOrbitData& orbit
+) {
+    // A decimal deep-zoom target can be a periodic point whose last supplied
+    // digits are still amplified by a repelling cycle. MPFR faithfully
+    // iterates those digits, but the projected reference then drifts away
+    // from the intended target and makes every pixel follow the wrong
+    // perturbation path. Mirror the Python alternate renderer's conservative
+    // cycle test and repeat the settled projected cycle before building the
+    // native linear hierarchy.
+    const size_t count = std::min(fast_orbit.size(), orbit.scaled.size());
+    if (count < 6 || orbit.real_double.size() != count
+        || orbit.imag_double.size() != count) {
+        return;
+    }
+    size_t last_finite = count;
+    while (last_finite > 0) {
+        const size_t index = last_finite - 1;
+        if (std::isfinite(orbit.real_double[index])
+            && std::isfinite(orbit.imag_double[index])) {
+            break;
+        }
+        --last_finite;
+    }
+    if (last_finite < 6) return;
+    const size_t scan_limit = std::min<size_t>(last_finite - 1, 1024);
+    const int max_period = std::min<int>(
+        64, static_cast<int>((scan_limit + 1) / 4));
+    constexpr double tolerance = 1.0e-12;
+    for (int period = 1; period <= max_period; ++period) {
+        for (size_t end = static_cast<size_t>(4 * period - 1);
+             end <= scan_limit;
+             ++end) {
+            const size_t cycle_start = end
+                - static_cast<size_t>(3 * period) + 1U;
+            bool matches = true;
+            for (int offset = 0; offset < period && matches; ++offset) {
+                const size_t previous = cycle_start + static_cast<size_t>(offset);
+                const size_t current = previous + static_cast<size_t>(period);
+                const size_t following = current + static_cast<size_t>(period);
+                const double previous_real = orbit.real_double[previous];
+                const double previous_imag = orbit.imag_double[previous];
+                const double current_real = orbit.real_double[current];
+                const double current_imag = orbit.imag_double[current];
+                const double following_real = orbit.real_double[following];
+                const double following_imag = orbit.imag_double[following];
+                const double previous_radius = std::hypot(
+                    previous_real, previous_imag);
+                const double current_radius = std::hypot(
+                    current_real, current_imag);
+                const double following_radius = std::hypot(
+                    following_real, following_imag);
+                if (!std::isfinite(previous_radius)
+                    || !std::isfinite(current_radius)
+                    || !std::isfinite(following_radius)
+                    || previous_radius * previous_radius >= 4.0
+                    || current_radius * current_radius >= 4.0
+                    || following_radius * following_radius >= 4.0) {
+                    matches = false;
+                    break;
+                }
+                const double scale = std::max(
+                    1.0,
+                    std::max(
+                        previous_radius,
+                        std::max(current_radius, following_radius)));
+                const double current_difference = std::hypot(
+                    current_real - previous_real,
+                    current_imag - previous_imag);
+                const double following_difference = std::hypot(
+                    following_real - current_real,
+                    following_imag - current_imag);
+                if (!(current_difference <= tolerance * scale
+                      && following_difference <= tolerance * scale)) {
+                    matches = false;
+                }
+            }
+            if (!matches) continue;
+            for (size_t target = cycle_start; target < count; ++target) {
+                const size_t source = cycle_start
+                    + (target - cycle_start) % static_cast<size_t>(period);
+                fast_orbit[target] = fast_orbit[source];
+                orbit.scaled[target] = orbit.scaled[source];
+                orbit.real_double[target] = orbit.real_double[source];
+                orbit.imag_double[target] = orbit.imag_double[source];
+                if (target < orbit.escape_margin.size()
+                    && source < orbit.escape_margin.size()) {
+                    orbit.escape_margin[target] = orbit.escape_margin[source];
+                }
+            }
+            return;
+        }
+    }
+}
 
 // Opaque C-ABI handles must not be blindly cast and dereferenced.  In
 // addition to turning accidental double-destroys into a safe diagnostic, the
@@ -3028,7 +3590,11 @@ void render_direct_avx2(
     const std::vector<double>& x_coordinates,
     const std::vector<double>& y_coordinates,
     int max_iter,
-    int threads
+    int threads,
+    int formula,
+    double julia_real,
+    double julia_imag,
+    double output_bias
 ) {
 #ifdef _OPENMP
     if (threads > 0) {
@@ -3047,22 +3613,34 @@ void render_direct_avx2(
                 4,
                 cx_values);
             int active_bits = 0;
-            for (int lane = 0; lane < 4; ++lane) {
-                const double cx = cx_values[lane];
-                const double q = (cx - 0.25) * (cx - 0.25) + cy_scalar * cy_scalar;
-                const bool in_cardioid = q * (q + cx - 0.25)
-                    <= 0.25 * cy_scalar * cy_scalar;
-                const bool in_bulb = (cx + 1.0) * (cx + 1.0)
-                    + cy_scalar * cy_scalar <= 0.0625;
-                if (!in_cardioid && !in_bulb) active_bits |= 1 << lane;
-                else output[py * width + px + lane] = static_cast<float>(max_iter);
+            if (formula == FRACTAL_FORMULA_MANDELBROT) {
+                for (int lane = 0; lane < 4; ++lane) {
+                    const double cx = cx_values[lane];
+                    const double q = (cx - 0.25) * (cx - 0.25)
+                        + cy_scalar * cy_scalar;
+                    const bool in_cardioid = q * (q + cx - 0.25)
+                        <= 0.25 * cy_scalar * cy_scalar;
+                    const bool in_bulb = (cx + 1.0) * (cx + 1.0)
+                        + cy_scalar * cy_scalar <= 0.0625;
+                    if (!in_cardioid && !in_bulb) active_bits |= 1 << lane;
+                    else output[py * width + px + lane] = encode_render_iteration(
+                        max_iter, output_bias);
+                }
+            } else {
+                active_bits = 0x0f;
             }
             if (active_bits == 0) continue;
 
-            __m256d zr = _mm256_setzero_pd();
-            __m256d zi = _mm256_setzero_pd();
             const __m256d cx = _mm256_loadu_pd(cx_values);
             const __m256d cy = _mm256_set1_pd(cy_scalar);
+            const bool julia = formula == FRACTAL_FORMULA_JULIA;
+            __m256d zr = julia ? cx : _mm256_setzero_pd();
+            __m256d zi = julia ? cy : _mm256_setzero_pd();
+            const __m256d parameter_real = julia
+                ? _mm256_set1_pd(julia_real) : cx;
+            const __m256d parameter_imag = julia
+                ? _mm256_set1_pd(julia_imag) : cy;
+            const __m256d sign_mask = _mm256_set1_pd(-0.0);
             int escaped_iteration[4] = {
                 max_iter + 1,
                 max_iter + 1,
@@ -3071,14 +3649,22 @@ void render_direct_avx2(
             };
             double escaped_norm[4] = {0.0, 0.0, 0.0, 0.0};
             for (int iteration = 0; iteration < max_iter && active_bits != 0; ++iteration) {
-                const __m256d zr_squared = _mm256_mul_pd(zr, zr);
-                const __m256d zi_squared = _mm256_mul_pd(zi, zi);
+                const __m256d formula_real = formula == FRACTAL_FORMULA_BURNING_SHIP
+                    ? _mm256_andnot_pd(sign_mask, zr) : zr;
+                const __m256d formula_imag = formula == FRACTAL_FORMULA_BURNING_SHIP
+                    ? _mm256_andnot_pd(sign_mask, zi) : zi;
+                const __m256d zr_squared = _mm256_mul_pd(formula_real, formula_real);
+                const __m256d zi_squared = _mm256_mul_pd(formula_imag, formula_imag);
                 const __m256d next_real = _mm256_add_pd(
                     _mm256_sub_pd(zr_squared, zi_squared),
-                    cx);
-                const __m256d next_imag = _mm256_add_pd(
-                    _mm256_mul_pd(_mm256_add_pd(zr, zr), zi),
-                    cy);
+                    parameter_real);
+                __m256d cross = _mm256_mul_pd(
+                    _mm256_add_pd(formula_real, formula_real),
+                    formula_imag);
+                if (formula == FRACTAL_FORMULA_TRICORN) {
+                    cross = _mm256_sub_pd(_mm256_setzero_pd(), cross);
+                }
+                const __m256d next_imag = _mm256_add_pd(cross, parameter_imag);
                 zr = next_real;
                 zi = next_imag;
                 const __m256d norm = _mm256_add_pd(
@@ -3099,13 +3685,14 @@ void render_direct_avx2(
             for (int lane = 0; lane < 4; ++lane) {
                 const int index = py * width + px + lane;
                 if (escaped_iteration[lane] > max_iter) {
-                    output[index] = static_cast<float>(max_iter);
+                    output[index] = encode_render_iteration(max_iter, output_bias);
                     continue;
                 }
                 const double magnitude = std::sqrt(std::max(escaped_norm[lane], 4.0000001));
-                output[index] = static_cast<float>(
-                    static_cast<double>(escaped_iteration[lane])
-                    - std::log(std::log(magnitude)) / static_cast<double>(LOG_TWO));
+                output[index] = encode_render_value(
+                    static_cast<long double>(escaped_iteration[lane])
+                        - std::log(std::log(magnitude)) / static_cast<double>(LOG_TWO),
+                    output_bias);
             }
         }
         // Scalar cleanup handles a non-multiple-of-four width without a
@@ -3113,23 +3700,47 @@ void render_direct_avx2(
         for (; px < width; ++px) {
             const double cx = x_coordinates[static_cast<size_t>(px)];
             const int index = py * width + px;
-            double zr = 0.0;
-            double zi = 0.0;
+            if (formula == FRACTAL_FORMULA_MANDELBROT) {
+                const double q = (cx - 0.25) * (cx - 0.25)
+                    + cy_scalar * cy_scalar;
+                const bool in_cardioid = q * (q + cx - 0.25)
+                    <= 0.25 * cy_scalar * cy_scalar;
+                const bool in_bulb = (cx + 1.0) * (cx + 1.0)
+                    + cy_scalar * cy_scalar <= 0.0625;
+                if (in_cardioid || in_bulb) {
+                    output[index] = encode_render_iteration(max_iter, output_bias);
+                    continue;
+                }
+            }
+            double zr = formula == FRACTAL_FORMULA_JULIA ? cx : 0.0;
+            double zi = formula == FRACTAL_FORMULA_JULIA ? cy_scalar : 0.0;
+            const double parameter_real = formula == FRACTAL_FORMULA_JULIA
+                ? julia_real : cx;
+            const double parameter_imag = formula == FRACTAL_FORMULA_JULIA
+                ? julia_imag : cy_scalar;
             int iteration = 0;
             for (; iteration < max_iter; ++iteration) {
-                const double next_real = zr * zr - zi * zi + cx;
-                const double next_imag = 2.0 * zr * zi + cy_scalar;
+                double next_real = 0.0;
+                double next_imag = 0.0;
+                iterate_direct_formula(
+                    formula, zr, zi, parameter_real, parameter_imag,
+                    next_real, next_imag);
                 zr = next_real;
                 zi = next_imag;
                 const double magnitude_squared = zr * zr + zi * zi;
                 if (magnitude_squared > ESCAPE_RADIUS_SQUARED) {
                     const double magnitude = std::sqrt(std::max(magnitude_squared, 4.0000001));
-                    output[index] = static_cast<float>(static_cast<double>(iteration + 1)
-                        - std::log(std::log(magnitude)) / static_cast<double>(LOG_TWO));
+                    output[index] = encode_render_value(
+                        static_cast<long double>(iteration + 1)
+                            - std::log(std::log(magnitude))
+                                / std::log(static_cast<double>(formula_power(formula))),
+                        output_bias);
                     break;
                 }
             }
-            if (iteration == max_iter) output[index] = static_cast<float>(max_iter);
+            if (iteration == max_iter) {
+                output[index] = encode_render_iteration(max_iter, output_bias);
+            }
         }
     }
 }
@@ -3147,7 +3758,8 @@ void render_direct(
     int backend = 0,
     int formula = FRACTAL_FORMULA_MANDELBROT,
     double julia_real = 0.0,
-    double julia_imag = 0.0
+    double julia_imag = 0.0,
+    double output_bias = 0.0
 ) {
     // This path is deliberately ordinary double precision.  The Python
     // layer routes only shallow views here; using long double for every
@@ -3183,8 +3795,7 @@ void render_direct(
         y_coordinates[static_cast<size_t>(py)] = center_imag + y_offset;
     }
 #if defined(__AVX2__)
-    if (formula == FRACTAL_FORMULA_MANDELBROT
-        && backend == 1 && avx2_runtime_available()) {
+    if (backend == 1 && avx2_runtime_available()) {
         render_direct_avx2(
             output,
             width,
@@ -3192,13 +3803,14 @@ void render_direct(
             x_coordinates,
             y_coordinates,
             max_iter,
-            threads);
+            threads,
+            formula,
+            julia_real,
+            julia_imag,
+            output_bias);
         return;
     }
     if (backend == 1) {
-        if (formula != FRACTAL_FORMULA_MANDELBROT) {
-            throw std::runtime_error("AVX2 alternate-formula rendering is not implemented");
-        }
         throw std::runtime_error("AVX2 backend requested but the CPU does not support AVX2");
     }
 #else
@@ -3215,14 +3827,16 @@ void render_direct(
             static_cast<double>(zoom),
             static_cast<double>(x_center),
             static_cast<double>(y_center),
-            max_iter);
+            max_iter,
+            output_bias);
         return;
+    }
+    if (backend == 2) {
+        throw std::runtime_error(
+            "OpenCL direct rendering currently supports only the Mandelbrot formula");
     }
 #else
     if (backend == 2) {
-        if (formula != FRACTAL_FORMULA_MANDELBROT) {
-            throw std::runtime_error("OpenCL alternate-formula rendering is not implemented");
-        }
         throw std::runtime_error("OpenCL backend is not available in this build");
     }
 #endif
@@ -3247,7 +3861,7 @@ void render_direct(
                 const bool in_cardioid = q * (q + cx - 0.25) <= 0.25 * cy * cy;
                 const bool in_bulb = (cx + 1.0) * (cx + 1.0) + cy * cy <= 0.0625;
                 if (in_cardioid || in_bulb) {
-                    output[index] = static_cast<float>(max_iter);
+                    output[index] = encode_render_iteration(max_iter, output_bias);
                     continue;
                 }
             }
@@ -3274,13 +3888,17 @@ void render_direct(
                         ? std::max(magnitude_squared, 4.0000001)
                         : std::numeric_limits<double>::max();
                     const double magnitude = std::sqrt(safe_squared);
-                    output[index] = static_cast<float>(static_cast<double>(iteration + 1)
-                        - std::log(std::log(magnitude))
-                            / std::log(static_cast<double>(formula_power(formula))));
+                    output[index] = encode_render_value(
+                        static_cast<long double>(iteration + 1)
+                            - std::log(std::log(magnitude))
+                                / std::log(static_cast<double>(formula_power(formula))),
+                        output_bias);
                     break;
                 }
             }
-            if (iteration == max_iter) output[index] = static_cast<float>(max_iter);
+            if (iteration == max_iter) {
+                output[index] = encode_render_iteration(max_iter, output_bias);
+            }
         }
     }
 }
@@ -3289,24 +3907,63 @@ void render_direct(
 
 struct MpfrWorkspace {
     mpfr_t cx, cy, viewport_zoom, viewport_radius;
+    mpfr_t parameter_real, parameter_imag;
     mpfr_t zr, zi, next_real, next_imag, temporary;
+    mpfr_t absolute_real, absolute_imag, norm_squared, margin;
+    // Scratch values for recovering the repelling fixed point used by Julia
+    // catalogue targets.  Iterating a finite decimal approximation is not a
+    // valid deep reference: the last supplied digit is eventually amplified
+    // and turns the target itself into an apparent escape.
+    mpfr_t discriminant_real, discriminant_imag, discriminant_magnitude;
+    mpfr_t root_real, root_imag;
+    mpfr_t root_a_real, root_a_imag, root_b_real, root_b_imag;
+    mpfr_t root_a_norm, root_b_norm, distance_squared, multiplier_squared;
+    mpfr_t fixed_tolerance, viewport_log10;
 
     explicit MpfrWorkspace(mpfr_prec_t precision_bits) {
         mpfr_init2(cx, precision_bits);
         mpfr_init2(cy, precision_bits);
         mpfr_init2(viewport_zoom, precision_bits);
         mpfr_init2(viewport_radius, precision_bits);
+        mpfr_init2(parameter_real, precision_bits);
+        mpfr_init2(parameter_imag, precision_bits);
         mpfr_init2(zr, precision_bits);
         mpfr_init2(zi, precision_bits);
         mpfr_init2(next_real, precision_bits);
         mpfr_init2(next_imag, precision_bits);
         mpfr_init2(temporary, precision_bits);
+        mpfr_init2(absolute_real, precision_bits);
+        mpfr_init2(absolute_imag, precision_bits);
+        mpfr_init2(norm_squared, precision_bits);
+        mpfr_init2(margin, precision_bits);
+        mpfr_init2(discriminant_real, precision_bits);
+        mpfr_init2(discriminant_imag, precision_bits);
+        mpfr_init2(discriminant_magnitude, precision_bits);
+        mpfr_init2(root_real, precision_bits);
+        mpfr_init2(root_imag, precision_bits);
+        mpfr_init2(root_a_real, precision_bits);
+        mpfr_init2(root_a_imag, precision_bits);
+        mpfr_init2(root_b_real, precision_bits);
+        mpfr_init2(root_b_imag, precision_bits);
+        mpfr_init2(root_a_norm, precision_bits);
+        mpfr_init2(root_b_norm, precision_bits);
+        mpfr_init2(distance_squared, precision_bits);
+        mpfr_init2(multiplier_squared, precision_bits);
+        mpfr_init2(fixed_tolerance, precision_bits);
+        mpfr_init2(viewport_log10, precision_bits);
     }
 
     ~MpfrWorkspace() {
         mpfr_clears(
-            cx, cy, viewport_zoom, viewport_radius, zr, zi,
-            next_real, next_imag, temporary, nullptr);
+            cx, cy, viewport_zoom, viewport_radius,
+            parameter_real, parameter_imag, zr, zi,
+            next_real, next_imag, temporary,
+            absolute_real, absolute_imag, norm_squared, margin,
+            discriminant_real, discriminant_imag, discriminant_magnitude,
+            root_real, root_imag,
+            root_a_real, root_a_imag, root_b_real, root_b_imag,
+            root_a_norm, root_b_norm, distance_squared, multiplier_squared,
+            fixed_tolerance, viewport_log10, nullptr);
     }
 
     MpfrWorkspace(const MpfrWorkspace&) = delete;
@@ -3319,10 +3976,16 @@ void make_reference_orbit(
     const char* y_text,
     const char* viewport_zoom_text,
     int max_iter,
-    int precision_bits
+    int precision_bits,
+    int formula,
+    const char* julia_real_text,
+    const char* julia_imag_text
 ) {
     if (!valid_c_string(x_text) || !valid_c_string(y_text)
-        || (viewport_zoom_text && !valid_c_string(viewport_zoom_text))) {
+        || (viewport_zoom_text && !valid_c_string(viewport_zoom_text))
+        || !valid_formula(formula)
+        || !valid_c_string(julia_real_text)
+        || !valid_c_string(julia_imag_text)) {
         throw std::runtime_error("native reference text is too long or null");
     }
     context.requested_max_iter = max_iter;
@@ -3332,11 +3995,32 @@ void make_reference_orbit(
     mpfr_ptr cy = workspace.cy;
     mpfr_ptr viewport_zoom = workspace.viewport_zoom;
     mpfr_ptr viewport_radius = workspace.viewport_radius;
+    mpfr_ptr parameter_real = workspace.parameter_real;
+    mpfr_ptr parameter_imag = workspace.parameter_imag;
     mpfr_ptr zr = workspace.zr;
     mpfr_ptr zi = workspace.zi;
     mpfr_ptr next_real = workspace.next_real;
     mpfr_ptr next_imag = workspace.next_imag;
     mpfr_ptr temporary = workspace.temporary;
+    mpfr_ptr absolute_real = workspace.absolute_real;
+    mpfr_ptr absolute_imag = workspace.absolute_imag;
+    mpfr_ptr norm_squared = workspace.norm_squared;
+    mpfr_ptr margin = workspace.margin;
+    mpfr_ptr discriminant_real = workspace.discriminant_real;
+    mpfr_ptr discriminant_imag = workspace.discriminant_imag;
+    mpfr_ptr discriminant_magnitude = workspace.discriminant_magnitude;
+    mpfr_ptr root_real = workspace.root_real;
+    mpfr_ptr root_imag = workspace.root_imag;
+    mpfr_ptr root_a_real = workspace.root_a_real;
+    mpfr_ptr root_a_imag = workspace.root_a_imag;
+    mpfr_ptr root_b_real = workspace.root_b_real;
+    mpfr_ptr root_b_imag = workspace.root_b_imag;
+    mpfr_ptr root_a_norm = workspace.root_a_norm;
+    mpfr_ptr root_b_norm = workspace.root_b_norm;
+    mpfr_ptr distance_squared = workspace.distance_squared;
+    mpfr_ptr multiplier_squared = workspace.multiplier_squared;
+    mpfr_ptr fixed_tolerance = workspace.fixed_tolerance;
+    mpfr_ptr viewport_log10 = workspace.viewport_log10;
     if (mpfr_set_str(cx, x_text, 10, MPFR_RNDN) != 0 || mpfr_set_str(cy, y_text, 10, MPFR_RNDN) != 0) {
         throw std::runtime_error("invalid MPFR Mandelbrot centre");
     }
@@ -3351,24 +4035,149 @@ void make_reference_orbit(
     } else {
         context.bla.input_radius = FloatExp::from_parts(1.0, 0);
     }
-    mpfr_set_zero(zr, 0); mpfr_set_zero(zi, 0);
+    if (formula == FRACTAL_FORMULA_JULIA) {
+        if (mpfr_set_str(parameter_real, julia_real_text, 10, MPFR_RNDN) != 0
+            || mpfr_set_str(parameter_imag, julia_imag_text, 10, MPFR_RNDN) != 0) {
+            throw std::runtime_error("invalid MPFR Julia constant");
+        }
+        mpfr_set(zr, cx, MPFR_RNDN);
+        mpfr_set(zi, cy, MPFR_RNDN);
+    } else {
+        mpfr_set(parameter_real, cx, MPFR_RNDN);
+        mpfr_set(parameter_imag, cy, MPFR_RNDN);
+        mpfr_set_zero(zr, 0);
+        mpfr_set_zero(zi, 0);
+    }
+    context.formula = formula;
+    context.julia_real = parse_coordinate(julia_real_text, "Julia real");
+    context.julia_imag = parse_coordinate(julia_imag_text, "Julia imaginary");
+    context.parameter = ScaledComplex::from_float_exp(
+        FloatExp::from_mpfr(parameter_real),
+        FloatExp::from_mpfr(parameter_imag));
     context.precision_bits = static_cast<mpfr_prec_t>(precision_bits);
+
+    bool fixed_point_reference = false;
+    if (formula == FRACTAL_FORMULA_JULIA) {
+        // A Julia catalogue centre is exported as a decimal approximation to
+        // the repelling fixed point of z^2+c.  Letting MPFR iterate that
+        // approximation is still wrong at deep zooms: its final decimal bit
+        // is amplified until the reference escapes. Recover the algebraic
+        // root exactly at the working precision, matching the Python fallback
+        // and keeping the centre bounded while pixel deltas remain active.
+        mpfr_set_ui(temporary, 4, MPFR_RNDN);
+        mpfr_mul(discriminant_real, parameter_real, temporary, MPFR_RNDN);
+        mpfr_ui_sub(discriminant_real, 1, discriminant_real, MPFR_RNDN);
+        mpfr_mul(discriminant_imag, parameter_imag, temporary, MPFR_RNDN);
+        mpfr_neg(discriminant_imag, discriminant_imag, MPFR_RNDN);
+
+        mpfr_mul(norm_squared, discriminant_real, discriminant_real, MPFR_RNDN);
+        mpfr_mul(temporary, discriminant_imag, discriminant_imag, MPFR_RNDN);
+        mpfr_add(norm_squared, norm_squared, temporary, MPFR_RNDN);
+        mpfr_sqrt(discriminant_magnitude, norm_squared, MPFR_RNDN);
+
+        mpfr_add(root_real, discriminant_magnitude, discriminant_real, MPFR_RNDN);
+        mpfr_div_2ui(root_real, root_real, 1, MPFR_RNDN);
+        mpfr_sqrt(root_real, root_real, MPFR_RNDN);
+        mpfr_sub(root_imag, discriminant_magnitude, discriminant_real, MPFR_RNDN);
+        mpfr_div_2ui(root_imag, root_imag, 1, MPFR_RNDN);
+        mpfr_sqrt(root_imag, root_imag, MPFR_RNDN);
+        if (mpfr_sgn(discriminant_imag) < 0) {
+            mpfr_neg(root_imag, root_imag, MPFR_RNDN);
+        }
+
+        mpfr_add_ui(root_a_real, root_real, 1, MPFR_RNDN);
+        mpfr_div_2ui(root_a_real, root_a_real, 1, MPFR_RNDN);
+        mpfr_div_2ui(root_a_imag, root_imag, 1, MPFR_RNDN);
+        mpfr_set_ui(temporary, 1, MPFR_RNDN);
+        mpfr_sub(root_b_real, temporary, root_real, MPFR_RNDN);
+        mpfr_div_2ui(root_b_real, root_b_real, 1, MPFR_RNDN);
+        mpfr_neg(root_b_imag, root_a_imag, MPFR_RNDN);
+
+        mpfr_mul(root_a_norm, root_a_real, root_a_real, MPFR_RNDN);
+        mpfr_mul(temporary, root_a_imag, root_a_imag, MPFR_RNDN);
+        mpfr_add(root_a_norm, root_a_norm, temporary, MPFR_RNDN);
+        mpfr_mul(root_b_norm, root_b_real, root_b_real, MPFR_RNDN);
+        mpfr_mul(temporary, root_b_imag, root_b_imag, MPFR_RNDN);
+        mpfr_add(root_b_norm, root_b_norm, temporary, MPFR_RNDN);
+
+        if (mpfr_cmp(root_a_norm, root_b_norm) >= 0) {
+            mpfr_set(next_real, root_a_real, MPFR_RNDN);
+            mpfr_set(next_imag, root_a_imag, MPFR_RNDN);
+            mpfr_set(norm_squared, root_a_norm, MPFR_RNDN);
+        } else {
+            mpfr_set(next_real, root_b_real, MPFR_RNDN);
+            mpfr_set(next_imag, root_b_imag, MPFR_RNDN);
+            mpfr_set(norm_squared, root_b_norm, MPFR_RNDN);
+        }
+        mpfr_mul_ui(multiplier_squared, norm_squared, 4, MPFR_RNDN);
+
+        mpfr_log10(viewport_log10, viewport_zoom, MPFR_RNDN);
+        const double log_zoom = mpfr_get_d(viewport_log10, MPFR_RNDN);
+        const int required_digits = std::max(
+            32,
+            static_cast<int>(std::ceil(std::max(0.0, log_zoom))) + 16);
+        mpfr_set_ui(fixed_tolerance, 10, MPFR_RNDN);
+        mpfr_pow_si(
+            fixed_tolerance,
+            fixed_tolerance,
+            -static_cast<long>(required_digits),
+            MPFR_RNDN);
+
+        mpfr_sub(temporary, cx, next_real, MPFR_RNDN);
+        mpfr_mul(distance_squared, temporary, temporary, MPFR_RNDN);
+        mpfr_sub(temporary, cy, next_imag, MPFR_RNDN);
+        mpfr_mul(norm_squared, temporary, temporary, MPFR_RNDN);
+        mpfr_add(distance_squared, distance_squared, norm_squared, MPFR_RNDN);
+        mpfr_mul(norm_squared, fixed_tolerance, fixed_tolerance, MPFR_RNDN);
+        if (mpfr_cmp_ui(multiplier_squared, 1) > 0
+            && mpfr_cmp(distance_squared, norm_squared) <= 0) {
+            mpfr_set(zr, next_real, MPFR_RNDN);
+            mpfr_set(zi, next_imag, MPFR_RNDN);
+            fixed_point_reference = true;
+        }
+    }
     context.fast_orbit.clear();
     context.fast_orbit.reserve(static_cast<size_t>(max_iter) + 1U);
+    std::vector<FloatExp> escape_margins;
+    escape_margins.reserve(static_cast<size_t>(max_iter) + 1U);
     FloatExp orbit_real_value = FloatExp::from_mpfr(zr);
     FloatExp orbit_imag_value = FloatExp::from_mpfr(zi);
     size_t finite_orbit_size = 0;
     for (int i = 0; i <= max_iter; ++i) {
         if (!orbit_real_value.finite() || !orbit_imag_value.finite()) break;
         context.fast_orbit.push_back({orbit_real_value, orbit_imag_value});
-        finite_orbit_size = context.fast_orbit.size();
-        mpfr_mul(next_real, zr, zr, MPFR_RNDN);
+        mpfr_mul(norm_squared, zr, zr, MPFR_RNDN);
         mpfr_mul(temporary, zi, zi, MPFR_RNDN);
-        mpfr_sub(next_real, next_real, temporary, MPFR_RNDN);
-        mpfr_add(next_real, next_real, cx, MPFR_RNDN);
-        mpfr_mul(next_imag, zr, zi, MPFR_RNDN);
-        mpfr_mul_ui(next_imag, next_imag, 2, MPFR_RNDN);
-        mpfr_add(next_imag, next_imag, cy, MPFR_RNDN);
+        mpfr_add(norm_squared, norm_squared, temporary, MPFR_RNDN);
+        mpfr_sub_ui(margin, norm_squared, 4, MPFR_RNDN);
+        escape_margins.push_back(FloatExp::from_mpfr(margin));
+        finite_orbit_size = context.fast_orbit.size();
+        if (fixed_point_reference) continue;
+        if (formula == FRACTAL_FORMULA_BURNING_SHIP) {
+            mpfr_abs(absolute_real, zr, MPFR_RNDN);
+            mpfr_abs(absolute_imag, zi, MPFR_RNDN);
+            mpfr_mul(next_real, absolute_real, absolute_real, MPFR_RNDN);
+            mpfr_mul(temporary, absolute_imag, absolute_imag, MPFR_RNDN);
+            mpfr_sub(next_real, next_real, temporary, MPFR_RNDN);
+            mpfr_add(next_real, next_real, parameter_real, MPFR_RNDN);
+            mpfr_mul(next_imag, absolute_real, absolute_imag, MPFR_RNDN);
+            mpfr_mul_ui(next_imag, next_imag, 2, MPFR_RNDN);
+            mpfr_add(next_imag, next_imag, parameter_imag, MPFR_RNDN);
+        } else {
+            mpfr_mul(next_real, zr, zr, MPFR_RNDN);
+            mpfr_mul(temporary, zi, zi, MPFR_RNDN);
+            mpfr_sub(next_real, next_real, temporary, MPFR_RNDN);
+            if (formula == FRACTAL_FORMULA_TRICORN) {
+                mpfr_mul(next_imag, zr, zi, MPFR_RNDN);
+                mpfr_mul_ui(next_imag, next_imag, 2, MPFR_RNDN);
+                mpfr_neg(next_imag, next_imag, MPFR_RNDN);
+            } else {
+                mpfr_mul(next_imag, zr, zi, MPFR_RNDN);
+                mpfr_mul_ui(next_imag, next_imag, 2, MPFR_RNDN);
+            }
+            mpfr_add(next_real, next_real, parameter_real, MPFR_RNDN);
+            mpfr_add(next_imag, next_imag, parameter_imag, MPFR_RNDN);
+        }
         mpfr_set(zr, next_real, MPFR_RNDN); mpfr_set(zi, next_imag, MPFR_RNDN);
         orbit_real_value = FloatExp::from_mpfr(zr);
         orbit_imag_value = FloatExp::from_mpfr(zi);
@@ -3395,6 +4204,7 @@ void make_reference_orbit(
     }
     auto render_orbit = std::make_shared<ReferenceOrbitData>();
     render_orbit->scaled.resize(context.fast_orbit.size());
+    render_orbit->escape_margin = std::move(escape_margins);
     for (size_t index = 0; index < context.fast_orbit.size(); ++index) {
         render_orbit->scaled[index] = ScaledComplex::from_float_exp(
             context.fast_orbit[index].real,
@@ -3407,12 +4217,33 @@ void make_reference_orbit(
         render_orbit->real_double[index] = std::ldexp(value.real, value.exponent);
         render_orbit->imag_double[index] = std::ldexp(value.imag, value.exponent);
     }
+    if (formula != FRACTAL_FORMULA_MANDELBROT) {
+        stabilize_alternate_reference_cycle(
+            context.fast_orbit,
+            *render_orbit);
+        // A false projected escape before cycle stabilization must not
+        // shorten the alternate linear hierarchy. Recompute its endpoint
+        // from the stabilized orbit; the exact perturbation loop still owns
+        // the final escape classification.
+        context.bla.map_end = static_cast<int>(render_orbit->scaled.size()) - 1;
+        for (size_t index = 1; index < render_orbit->scaled.size(); ++index) {
+            if (fe_compare(
+                    fec_norm_squared(context.fast_orbit[index]),
+                    escape_radius_squared) > 0) {
+                context.bla.map_end = static_cast<int>(index);
+                break;
+            }
+        }
+    }
     context.orbit = std::move(render_orbit);
 }
 
 #else
 
-void make_reference_orbit(ReferenceContext&, const char*, const char*, const char*, int, int) {
+void make_reference_orbit(
+    ReferenceContext&, const char*, const char*, const char*, int, int,
+    int, const char*, const char*
+) {
     throw std::runtime_error("deep rendering requires MPFR/GMP; rebuild with make");
 }
 
@@ -3464,6 +4295,8 @@ void build_image_series(
     const std::vector<FloatExpComplex>* builder_orbit_override = nullptr
 ) {
     context.image_series = ImageSeries{};
+    const bool julia = context.formula == FRACTAL_FORMULA_JULIA;
+    if (context.formula != FRACTAL_FORMULA_MANDELBROT && !julia) return;
     const std::vector<FloatExpComplex>& builder_orbit = builder_orbit_override
         ? *builder_orbit_override
         : context.fast_orbit;
@@ -3504,6 +4337,16 @@ void build_image_series(
     std::vector<FloatExpComplex> coefficients(static_cast<size_t>(order + 1));
     std::vector<FloatExpComplex> next_coefficients(static_cast<size_t>(order + 1));
     std::array<FloatExpComplex, 12> exact{};
+    if (julia) {
+        // For a Julia frame the pixel offset is the initial-state
+        // perturbation: delta_0 = dc, while the parameter remains fixed.
+        // This is the same polynomial recurrence as Mandelbrot with the
+        // per-step parameter term removed.
+        coefficients[1] = {FloatExp::from_parts(1.0, 0), FloatExp{0.0, 0}};
+        for (size_t probe = 0; probe < probes.size(); ++probe) {
+            exact[probe] = probes[probe];
+        }
+    }
     std::vector<FloatExpComplex> best_coefficients;
     int best_iteration = 1;
     const FloatExp tolerance_squared = FloatExp::from_parts(
@@ -3524,7 +4367,7 @@ void build_image_series(
                         coefficients[static_cast<size_t>(left)],
                         coefficients[static_cast<size_t>(term - left)]));
             }
-            if (term == 1) {
+            if (!julia && term == 1) {
                 value = fec_add(
                     value,
                     {FloatExp::from_parts(1.0, 0), FloatExp{0.0, 0}});
@@ -3538,7 +4381,11 @@ void build_image_series(
             const FloatExpComplex& dc = probes[probe];
             const FloatExpComplex exact_next = fec_add(
                 fec_mul(fec_mul(reference, exact[probe]), FloatExp::from_parts(2.0, 0)),
-                fec_add(fec_mul(exact[probe], exact[probe]), dc));
+                fec_add(
+                    fec_mul(exact[probe], exact[probe]),
+                    julia
+                        ? FloatExpComplex{FloatExp{0.0, 0}, FloatExp{0.0, 0}}
+                        : dc));
             exact[probe] = exact_next;
             if (iteration + 1 >= order) {
                 const FloatExpComplex approximate = series_evaluate(coefficients, dc);
@@ -3574,6 +4421,194 @@ void build_image_series(
 
 FloatExp fe_min(const FloatExp& a, const FloatExp& b) {
     return fe_compare(a, b) <= 0 ? a : b;
+}
+
+inline FloatExp alternate_matrix_norm(
+    const std::array<FloatExp, 8>& coefficients,
+    int offset
+) {
+    FloatExp sum{0.0, 0};
+    sum = fe_add(sum, fe_sqr(coefficients[static_cast<size_t>(offset)]));
+    sum = fe_add(sum, fe_sqr(coefficients[static_cast<size_t>(offset + 1)]));
+    sum = fe_add(sum, fe_sqr(coefficients[static_cast<size_t>(offset + 2)]));
+    sum = fe_add(sum, fe_sqr(coefficients[static_cast<size_t>(offset + 3)]));
+    return fe_sqrt(sum);
+}
+
+AlternateLinearBlaStep merge_alternate_linear_bla(
+    const AlternateLinearBlaStep& y,
+    const AlternateLinearBlaStep& x,
+    const FloatExp& input_parameter_radius
+) {
+    const auto& yc = y.coefficients;
+    const auto& xc = x.coefficients;
+    std::array<FloatExp, 8> coefficients{};
+    // M = My * Mx.
+    coefficients[0] = fe_add(
+        fe_mul(yc[0], xc[0]), fe_mul(yc[1], xc[2]));
+    coefficients[1] = fe_add(
+        fe_mul(yc[0], xc[1]), fe_mul(yc[1], xc[3]));
+    coefficients[2] = fe_add(
+        fe_mul(yc[2], xc[0]), fe_mul(yc[3], xc[2]));
+    coefficients[3] = fe_add(
+        fe_mul(yc[2], xc[1]), fe_mul(yc[3], xc[3]));
+    // P = My * Px + Py.
+    coefficients[4] = fe_add(
+        fe_add(fe_mul(yc[0], xc[4]), fe_mul(yc[1], xc[6])), yc[4]);
+    coefficients[5] = fe_add(
+        fe_add(fe_mul(yc[0], xc[5]), fe_mul(yc[1], xc[7])), yc[5]);
+    coefficients[6] = fe_add(
+        fe_add(fe_mul(yc[2], xc[4]), fe_mul(yc[3], xc[6])), yc[6]);
+    coefficients[7] = fe_add(
+        fe_add(fe_mul(yc[2], xc[5]), fe_mul(yc[3], xc[7])), yc[7]);
+
+    // The input parameter is constant across a block. Reserve enough of the
+    // outer map's radius for its response to that parameter, then bound the
+    // incoming state with the composed derivative. This is the matrix form
+    // of the same conservative radius calculation used by Mandelbrot BLA.
+    const FloatExp x_state_norm = alternate_matrix_norm(xc, 0);
+    const FloatExp x_parameter_norm = alternate_matrix_norm(xc, 4);
+    FloatExp radius = fe_sqrt(x.radius_squared);
+    const FloatExp remaining = fe_sub(
+        fe_sqrt(y.radius_squared),
+        fe_mul(x_parameter_norm, input_parameter_radius));
+    if (fe_compare(remaining, FloatExp{0.0, 0}) > 0
+        && fe_compare(x_state_norm, FloatExp{0.0, 0}) > 0) {
+        radius = fe_min(radius, fe_div(remaining, x_state_norm));
+    } else {
+        radius = FloatExp{0.0, 0};
+    }
+    radius = fe_mul(radius, 1.0 - std::ldexp(1.0, -40));
+    return {coefficients, fe_sqr(radius), x.length + y.length};
+}
+
+inline ScaledComplex apply_alternate_linear_bla(
+    const AlternateLinearBlaStep& step,
+    const ScaledComplex& delta,
+    const ScaledComplex& parameter
+) {
+    const auto& c = step.coefficients;
+    const FloatExp delta_real = sc_component_as_float_exp(delta, false);
+    const FloatExp delta_imag = sc_component_as_float_exp(delta, true);
+    const FloatExp parameter_real = sc_component_as_float_exp(parameter, false);
+    const FloatExp parameter_imag = sc_component_as_float_exp(parameter, true);
+    const FloatExp result_real = fe_add(
+        fe_add(fe_mul(c[0], delta_real), fe_mul(c[1], delta_imag)),
+        fe_add(fe_mul(c[4], parameter_real), fe_mul(c[5], parameter_imag)));
+    const FloatExp result_imag = fe_add(
+        fe_add(fe_mul(c[2], delta_real), fe_mul(c[3], delta_imag)),
+        fe_add(fe_mul(c[6], parameter_real), fe_mul(c[7], parameter_imag)));
+    return ScaledComplex::from_float_exp(result_real, result_imag);
+}
+
+FloatExp alternate_reference_radius(const FloatExpComplex& reference) {
+    const FloatExp magnitude = fe_sqrt(fec_norm_squared(reference));
+    const FloatExp one = FloatExp::from_parts(1.0, 0);
+    return fe_compare(magnitude, one) > 0 ? magnitude : one;
+}
+
+void build_alternate_linear_bla(
+    ReferenceContext& context,
+    bool retain_builder_orbit = false
+) {
+    context.alternate_bla.levels.clear();
+    context.alternate_bla.levels.reserve(32);
+    context.alternate_bla.input_radius = context.bla.input_radius;
+    context.alternate_bla.input_radius_squared = fe_sqr(context.bla.input_radius);
+    context.alternate_bla.start_index =
+        context.formula == FRACTAL_FORMULA_JULIA ? 0 : 1;
+    if (context.fast_orbit.size() < 2) return;
+
+    const int first_index = context.alternate_bla.start_index;
+    const int last_index = std::min(
+        context.bla.map_end,
+        static_cast<int>(context.fast_orbit.size()) - 1);
+    const int base_count = last_index - first_index;
+    if (base_count <= 0) return;
+
+    const FloatExp tolerance = FloatExp::from_long_double(
+        std::ldexp(1.0L, -38));
+    const FloatExp two = FloatExp::from_parts(2.0, 0);
+    const FloatExp quarter = FloatExp::from_parts(0.25, 0);
+    auto& base = context.alternate_bla.levels.emplace_back(
+        static_cast<size_t>(base_count));
+    for (int offset = 0; offset < base_count; ++offset) {
+        const FloatExpComplex& reference = context.fast_orbit[
+            static_cast<size_t>(first_index + offset)];
+        const FloatExp& real = reference.real;
+        const FloatExp& imag = reference.imag;
+        std::array<FloatExp, 8> coefficients{};
+        if (context.formula == FRACTAL_FORMULA_TRICORN) {
+            coefficients[0] = fe_mul(real, two);
+            coefficients[1] = fe_mul(imag, -2.0);
+            coefficients[2] = fe_mul(imag, -2.0);
+            coefficients[3] = fe_mul(real, -2.0);
+        } else if (context.formula == FRACTAL_FORMULA_BURNING_SHIP) {
+            const FloatExp absolute_real = fe_abs(real);
+            const FloatExp absolute_imag = fe_abs(imag);
+            const double real_sign = real.mantissa < 0.0 ? -1.0 : 1.0;
+            const double imag_sign = imag.mantissa < 0.0 ? -1.0 : 1.0;
+            coefficients[0] = fe_mul(absolute_real, 2.0 * real_sign);
+            coefficients[1] = fe_mul(absolute_imag, -2.0 * imag_sign);
+            coefficients[2] = fe_mul(absolute_imag, 2.0 * real_sign);
+            coefficients[3] = fe_mul(absolute_real, 2.0 * imag_sign);
+        } else {
+            coefficients[0] = fe_mul(real, two);
+            coefficients[1] = fe_mul(imag, -2.0);
+            coefficients[2] = fe_mul(imag, two);
+            coefficients[3] = fe_mul(real, two);
+        }
+        if (context.formula != FRACTAL_FORMULA_JULIA) {
+            coefficients[4] = FloatExp::from_parts(1.0, 0);
+            coefficients[7] = FloatExp::from_parts(1.0, 0);
+        }
+
+        FloatExp radius = fe_mul(
+            tolerance,
+            alternate_reference_radius(reference));
+        if (context.formula == FRACTAL_FORMULA_BURNING_SHIP) {
+            // The derivative above is valid only while the perturbation stays
+            // on the same side of both absolute-value axes. A zero component
+            // deliberately disables multi-step maps for that orbit state;
+            // the exact formula-aware step handles the cusp without creating
+            // a rectangular interior fill.
+            if (real.zero() || imag.zero()) {
+                radius = FloatExp{0.0, 0};
+            } else {
+                radius = fe_min(radius, fe_mul(fe_abs(real), quarter));
+                radius = fe_min(radius, fe_mul(fe_abs(imag), quarter));
+            }
+        }
+        base[static_cast<size_t>(offset)] = {
+            coefficients,
+            fe_sqr(radius),
+            1,
+        };
+    }
+
+    for (size_t level = 1; ; ++level) {
+        if ((1ULL << level) > static_cast<unsigned long long>(MAX_SAFE_LINEAR_BLA_LENGTH)) {
+            break;
+        }
+        const auto& previous = context.alternate_bla.levels[level - 1];
+        const size_t current_size = (previous.size() + 1) / 2;
+        if (current_size == 0) break;
+        auto& current = context.alternate_bla.levels.emplace_back(current_size);
+        for (size_t index = 0; index < current_size; ++index) {
+            const size_t first = index * 2;
+            if (first + 1 < previous.size()) {
+                current[index] = merge_alternate_linear_bla(
+                    previous[first + 1], previous[first],
+                    context.alternate_bla.input_radius);
+            } else {
+                current[index] = previous[first];
+            }
+        }
+    }
+    if (!retain_builder_orbit) {
+        context.fast_orbit.clear();
+        context.fast_orbit.shrink_to_fit();
+    }
 }
 
 BlaStep merge_bla(const BlaStep& y, const BlaStep& x, const FloatExp& input_radius) {
@@ -3965,6 +5000,449 @@ FloatExp parse_zoom_float_exp(const char* text, mpfr_prec_t precision_bits) {
     return result;
 }
 
+inline ScaledComplex scaled_formula_step(
+    int formula,
+    const ScaledComplex& value,
+    const ScaledComplex& parameter
+) {
+    if (formula == FRACTAL_FORMULA_BURNING_SHIP) {
+        const ScaledComplex absolute{
+            std::abs(value.real), std::abs(value.imag), value.exponent};
+        return sc_add(sc_mul(absolute, absolute), parameter);
+    }
+    const ScaledComplex squared = formula == FRACTAL_FORMULA_TRICORN
+        ? sc_mul(sc_conjugate(value), sc_conjugate(value))
+        : sc_mul(value, value);
+    return sc_add(squared, parameter);
+}
+
+inline ScaledComplex alternate_delta_step(
+    const ReferenceContext& context,
+    int reference_index,
+    const ScaledComplex& delta,
+    const ScaledComplex& parameter_delta
+) {
+    const int formula = context.formula;
+    const ScaledComplex& reference =
+        context.orbit->scaled[static_cast<size_t>(reference_index)];
+    if (formula == FRACTAL_FORMULA_TRICORN) {
+        const ScaledComplex conjugate_reference = sc_conjugate(reference);
+        const ScaledComplex conjugate_delta = sc_conjugate(delta);
+        return sc_add(
+            sc_double(sc_mul(conjugate_reference, conjugate_delta)),
+            sc_add(sc_mul(conjugate_delta, conjugate_delta), parameter_delta));
+    }
+    if (formula == FRACTAL_FORMULA_BURNING_SHIP) {
+        // Away from an axis the absolute-value map has a stable real 2x2
+        // derivative. Keeping this as FloatExp components preserves a tiny
+        // perturbation that would disappear if we reconstructed
+        // |Z + delta| and subtracted the rounded reference orbit.
+        const FloatExp reference_real = sc_component_as_float_exp(reference, false);
+        const FloatExp reference_imag = sc_component_as_float_exp(reference, true);
+        const FloatExp delta_real = sc_component_as_float_exp(delta, false);
+        const FloatExp delta_imag = sc_component_as_float_exp(delta, true);
+        const FloatExp absolute_real = fe_abs(reference_real);
+        const FloatExp absolute_imag = fe_abs(reference_imag);
+        // Match the piecewise map's actual sign transition, rather than
+        // treating |delta| >= |reference| as a crossing.  A perturbation can
+        // be larger than the reference while remaining on the same side of
+        // an axis; forcing the exact fallback in that case introduces a
+        // projected-centre subtraction on every step and slowly smears the
+        // deep field.  The FloatExp sign test also handles reference==0 with
+        // the same >= 0 convention as the Python reference path.
+        const FloatExp actual_real = fe_add(reference_real, delta_real);
+        const FloatExp actual_imag = fe_add(reference_imag, delta_imag);
+        const bool crosses_real =
+            (fe_compare(reference_real, FloatExp{0.0, 0}) >= 0)
+            != (fe_compare(actual_real, FloatExp{0.0, 0}) >= 0);
+        const bool crosses_imag =
+            (fe_compare(reference_imag, FloatExp{0.0, 0}) >= 0)
+            != (fe_compare(actual_imag, FloatExp{0.0, 0}) >= 0);
+        if (crosses_real || crosses_imag) {
+            // Do not form reference + delta as ScaledComplex here.  Its
+            // aligned add intentionally drops terms more than 60 binary
+            // exponents below the reference, which is exactly what happens
+            // when a deep pixel crosses an absolute-value axis after a long
+            // amplification.  FloatExp components retain the crossing
+            // perturbation, and the projected reference/parameter terms are
+            const FloatExp absolute_total_real = fe_abs(actual_real);
+            const FloatExp absolute_total_imag = fe_abs(actual_imag);
+            const ScaledComplex& next_reference =
+                context.orbit->scaled[static_cast<size_t>(reference_index + 1)];
+            const FloatExp parameter_offset_real = fe_sub(
+                sc_component_as_float_exp(context.parameter, false),
+                sc_component_as_float_exp(next_reference, false));
+            const FloatExp parameter_offset_imag = fe_sub(
+                sc_component_as_float_exp(context.parameter, true),
+                sc_component_as_float_exp(next_reference, true));
+            const FloatExp next_real = fe_add(
+                fe_sub(
+                    fe_sqr(absolute_total_real),
+                    fe_sqr(absolute_total_imag)),
+                fe_add(
+                    parameter_offset_real,
+                    sc_component_as_float_exp(parameter_delta, false)));
+            const FloatExp next_imag = fe_add(
+                fe_mul(
+                    fe_mul(absolute_total_real, absolute_total_imag),
+                    2.0),
+                fe_add(
+                    parameter_offset_imag,
+                    sc_component_as_float_exp(parameter_delta, true)));
+            return ScaledComplex::from_float_exp(
+                next_real,
+                next_imag);
+        }
+        const double real_sign = reference_real.mantissa < 0.0 ? -1.0 : 1.0;
+        const double imag_sign = reference_imag.mantissa < 0.0 ? -1.0 : 1.0;
+        const FloatExp real_linear = fe_sub(
+            fe_mul(fe_mul(absolute_real, delta_real), 2.0 * real_sign),
+            fe_mul(fe_mul(absolute_imag, delta_imag), 2.0 * imag_sign));
+        const FloatExp imag_linear = fe_add(
+            fe_mul(fe_mul(absolute_real, delta_imag), 2.0 * imag_sign),
+            fe_mul(fe_mul(absolute_imag, delta_real), 2.0 * real_sign));
+        const FloatExp delta_square_real = fe_sub(
+            fe_sqr(delta_real), fe_sqr(delta_imag));
+        const FloatExp delta_square_imag = fe_mul(
+            fe_mul(delta_real, delta_imag), 2.0 * real_sign * imag_sign);
+        return ScaledComplex::from_float_exp(
+            fe_add(fe_add(real_linear, delta_square_real),
+                   sc_component_as_float_exp(parameter_delta, false)),
+            fe_add(fe_add(imag_linear, delta_square_imag),
+                   sc_component_as_float_exp(parameter_delta, true)));
+    }
+    // Mandelbrot and Julia are holomorphic z² maps. Julia keeps c fixed, so
+    // its parameter delta is zero and the incoming pixel offset is the
+    // initial-state perturbation instead.
+    return sc_add(
+        sc_double(sc_mul(reference, delta)),
+        sc_add(sc_mul(delta, delta), parameter_delta));
+}
+
+inline FloatExp alternate_escape_margin(
+    const ReferenceContext& context,
+    int reference_index,
+    const ScaledComplex& delta
+) {
+    const auto& orbit = *context.orbit;
+    if (reference_index >= 0
+        && reference_index < static_cast<int>(orbit.escape_margin.size())) {
+        return sc_escape_margin_with_reference_margin(
+            orbit.escape_margin[static_cast<size_t>(reference_index)],
+            orbit.scaled[static_cast<size_t>(reference_index)],
+            delta);
+    }
+    return sc_escape_margin_with_delta(
+        orbit.scaled[static_cast<size_t>(reference_index)], delta);
+}
+
+inline ScaledNorm norm_from_escape_margin(const FloatExp& margin) {
+    const FloatExp norm = fe_add(FloatExp::from_parts(4.0, 0), margin);
+    return {norm.mantissa, norm.exponent};
+}
+
+void render_alternate_reference_impl(
+    float* __restrict output,
+    int width,
+    int height,
+    const char* zoom_text,
+    const ReferenceContext& context,
+    int max_iter,
+    int threads,
+    const FractalRenderOptions& options,
+    RenderStats* stats_out,
+    const std::vector<ScaledComplex>* point_offsets = nullptr,
+    const FloatExp* point_radius = nullptr
+) {
+    if (!context.orbit || context.orbit->scaled.size() < 2) {
+        throw std::runtime_error("alternate reference orbit is incomplete");
+    }
+    const auto render_started = std::chrono::steady_clock::now();
+    const FloatExp zoom = parse_zoom_float_exp(zoom_text, context.precision_bits);
+    const FloatExp view_height = fe_mul(
+        fe_div(FloatExp::from_parts(1.0, 0), zoom), 2.8);
+    const FloatExp view_width = fe_mul(
+        view_height, static_cast<double>(width) / static_cast<double>(height));
+    std::vector<FloatExp> x_offsets;
+    std::vector<FloatExp> y_offsets;
+    if (point_offsets == nullptr) {
+        x_offsets.resize(static_cast<size_t>(width));
+        y_offsets.resize(static_cast<size_t>(height));
+        for (int px = 0; px < width; ++px) {
+            const double fraction =
+                (static_cast<double>(px) - static_cast<double>(width - 1) / 2.0)
+                / static_cast<double>(width);
+            x_offsets[static_cast<size_t>(px)] = fe_mul(view_width, fraction);
+        }
+        for (int py = 0; py < height; ++py) {
+            const double fraction =
+                (static_cast<double>(height - 1) / 2.0 - static_cast<double>(py))
+                / static_cast<double>(height);
+            y_offsets[static_cast<size_t>(py)] = fe_mul(view_height, fraction);
+        }
+    } else if (point_offsets->size() != static_cast<size_t>(width * height)) {
+        throw std::runtime_error("alternate point renderer dimensions do not match offset count");
+    }
+
+    RenderTimeBudget render_budget;
+    if (options.time_budget_ms > 0) {
+        render_budget.enabled = true;
+        render_budget.deadline = std::chrono::steady_clock::now()
+            + std::chrono::milliseconds(options.time_budget_ms);
+    }
+    RenderTimeBudget* time_budget = render_budget.enabled ? &render_budget : nullptr;
+    const bool cycle_detection_enabled = options.disable_cycle == 0
+        && (options.strict == 0 || options.strict_cycle != 0);
+    const bool julia = context.formula == FRACTAL_FORMULA_JULIA;
+    const bool image_series_available = julia
+        && context.image_series.enabled
+        && context.image_series.iteration < max_iter
+        && (point_radius == nullptr
+            || fe_compare(
+                *point_radius,
+                fe_sqrt(context.image_series.radius_squared)) <= 0);
+    const bool alternate_bla_enabled = options.disable_bla == 0
+        && !context.alternate_bla.levels.empty();
+    const int max_alternate_block_length = std::clamp(
+        options.max_linear_bla_length,
+        2,
+        MAX_SAFE_LINEAR_BLA_LENGTH);
+
+#ifdef _OPENMP
+    if (threads > 0) {
+        omp_set_dynamic(0);
+        omp_set_num_threads(threads);
+    }
+#pragma omp parallel for schedule(dynamic, 256)
+#endif
+    for (int linear_pixel = 0; linear_pixel < width * height; ++linear_pixel) {
+        const int py = linear_pixel / width;
+        const int px = linear_pixel - py * width;
+        const int index = py * width + px;
+        const ScaledComplex dc = point_offsets != nullptr
+            ? (*point_offsets)[static_cast<size_t>(linear_pixel)]
+            : ScaledComplex::from_float_exp(
+                x_offsets[static_cast<size_t>(px)],
+                y_offsets[static_cast<size_t>(py)]);
+        const ScaledComplex parameter_delta = julia ? ScaledComplex{} : dc;
+        const ScaledNorm parameter_norm = sc_norm_squared(parameter_delta);
+        const FloatExp parameter_norm_squared{
+            parameter_norm.mantissa,
+            parameter_norm.exponent,
+        };
+        ScaledComplex delta = dc;
+        int reference_index = julia ? 0 : 1;
+        int iteration = julia ? 0 : 1;
+        if (image_series_available
+            && sc_compare_norm(
+                sc_norm_squared(dc),
+                ScaledNorm{
+                    context.image_series.radius_squared.mantissa,
+                    context.image_series.radius_squared.exponent,
+                }) <= 0) {
+            delta = evaluate_image_series(context.image_series, dc);
+            reference_index = context.image_series.iteration;
+            iteration = context.image_series.iteration;
+        }
+        bool escaped = false;
+        bool deadline_abort = false;
+        bool unresolved_pixel = false;
+        std::uint32_t budget_ticks = 0;
+        ScaledComplex total = sc_add(
+            context.orbit->scaled[static_cast<size_t>(reference_index)], delta);
+        ScaledNorm total_norm = norm_from_escape_margin(
+            alternate_escape_margin(context, reference_index, delta));
+
+        if (sc_outside_escape(total_norm)) {
+            output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
+            continue;
+        }
+
+        ScaledComplex cycle_tortoise{};
+        int cycle_power = 1;
+        int cycle_length = 0;
+        bool cycle_ready = false;
+        int cycle_hits = 0;
+        while (iteration < max_iter) {
+            if (render_time_budget_expired(time_budget, budget_ticks)) {
+                output[index] = std::numeric_limits<float>::quiet_NaN();
+                deadline_abort = true;
+                unresolved_pixel = true;
+                break;
+            }
+
+            const int next_index = reference_index + 1;
+            if (next_index >= static_cast<int>(context.orbit->scaled.size())) {
+                // A reference that escaped before max_iter cannot be extended
+                // with the compact perturbation relation. Continue from the
+                // reconstructed state using the exact scaled recurrence; this
+                // branch is rare for boundary references and preserves a
+                // finite answer instead of painting the remainder as inside.
+                const ScaledComplex parameter = julia
+                    ? context.parameter
+                    : sc_add(context.parameter, dc);
+                total = scaled_formula_step(context.formula, total, parameter);
+                ++iteration;
+                total_norm = sc_norm_squared(total);
+                if (sc_outside_escape(total_norm)) {
+                    output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
+                    escaped = true;
+                    break;
+                }
+                continue;
+            }
+
+            const ScaledNorm delta_norm = sc_norm_squared(delta);
+            const AlternateLinearBlaStep* linear_step = alternate_bla_enabled
+                ? context.alternate_bla.lookup(
+                    reference_index,
+                    FloatExp{delta_norm.mantissa, delta_norm.exponent},
+                    parameter_norm_squared,
+                    std::min(max_alternate_block_length, max_iter - iteration))
+                : nullptr;
+            if (linear_step != nullptr
+                && reference_index + linear_step->length
+                    < static_cast<int>(context.orbit->scaled.size())) {
+                const ScaledComplex previous_delta = delta;
+                const int previous_reference_index = reference_index;
+                const int previous_iteration = iteration;
+                const int endpoint_index = reference_index + linear_step->length;
+                const ScaledComplex candidate_delta = apply_alternate_linear_bla(
+                    *linear_step, delta, parameter_delta);
+                const FloatExp candidate_margin = alternate_escape_margin(
+                    context, endpoint_index, candidate_delta);
+                const ScaledNorm candidate_norm = norm_from_escape_margin(
+                    candidate_margin);
+                const ScaledComplex candidate_total = sc_add(
+                    context.orbit->scaled[static_cast<size_t>(endpoint_index)],
+                    candidate_delta);
+                const bool candidate_bad = !sc_finite(candidate_delta)
+                    || !candidate_margin.finite()
+                    || !sc_finite(candidate_total)
+                    || fe_compare(candidate_margin, FloatExp{0.0, 0}) > 0
+                    || sc_compare_norm(candidate_norm, ScaledNorm{0.75, 2}) >= 0;
+                if (!candidate_bad) {
+                    delta = candidate_delta;
+                    reference_index = endpoint_index;
+                    iteration = previous_iteration + linear_step->length;
+                    total = candidate_total;
+                    total_norm = candidate_norm;
+                    continue;
+                }
+
+                // A linear block is a throughput optimization, never a
+                // classification shortcut. Replay a block that approaches
+                // an escape boundary or leaves its conservative domain one
+                // formula-aware step at a time. This is also where Burning
+                // Ship axis crossings are handled exactly.
+                delta = previous_delta;
+                reference_index = previous_reference_index;
+                iteration = previous_iteration;
+                for (int replay = 0;
+                     replay < linear_step->length && iteration < max_iter;
+                     ++replay) {
+                    delta = alternate_delta_step(
+                        context, reference_index, delta, parameter_delta);
+                    ++reference_index;
+                    ++iteration;
+                    if (!sc_finite(delta)) {
+                        output[index] = options.strict
+                            ? std::numeric_limits<float>::quiet_NaN()
+                            : encode_render_iteration(iteration, options.output_bias);
+                        unresolved_pixel = true;
+                        break;
+                    }
+                    const FloatExp replay_margin = alternate_escape_margin(
+                        context, reference_index, delta);
+                    total_norm = norm_from_escape_margin(replay_margin);
+                    total = sc_add(
+                        context.orbit->scaled[static_cast<size_t>(reference_index)],
+                        delta);
+                    if (fe_compare(replay_margin, FloatExp{0.0, 0}) > 0
+                        || sc_outside_escape(total_norm)) {
+                        output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
+                        escaped = true;
+                        break;
+                    }
+                }
+                if (escaped || unresolved_pixel) break;
+                continue;
+            }
+
+            delta = alternate_delta_step(
+                context, reference_index, delta, parameter_delta);
+            reference_index = next_index;
+            ++iteration;
+            if (!sc_finite(delta)) {
+                output[index] = options.strict
+                    ? std::numeric_limits<float>::quiet_NaN()
+                    : encode_render_iteration(iteration, options.output_bias);
+                unresolved_pixel = true;
+                break;
+            }
+            const FloatExp margin = alternate_escape_margin(
+                context, reference_index, delta);
+            total_norm = norm_from_escape_margin(margin);
+            total = sc_add(
+                context.orbit->scaled[static_cast<size_t>(reference_index)], delta);
+            if (fe_compare(margin, FloatExp{0.0, 0}) > 0
+                || sc_outside_escape(total_norm)) {
+                output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
+                escaped = true;
+                break;
+            }
+
+            // Confirm a bounded cycle several times before declaring the
+            // pixel interior. The perturbation is included in the comparison,
+            // so a repelling fixed point cannot look periodic merely because
+            // the rounded reference state repeats.
+            if (cycle_detection_enabled
+                && iteration >= 2048
+                && (iteration & 31) == 0
+                && sc_compare_norm(total_norm, ScaledNorm{0.75, 2}) < 0) {
+                if (!cycle_ready) {
+                    cycle_tortoise = total;
+                    cycle_power = 1;
+                    cycle_length = 0;
+                    cycle_hits = 0;
+                    cycle_ready = true;
+                } else {
+                    const ScaledNorm distance = sc_norm_squared(
+                        sc_sub(total, cycle_tortoise));
+                    const int scale_exponent = std::max(total_norm.exponent, 0);
+                    if (distance.mantissa == 0.0
+                        || distance.exponent <= scale_exponent - 78) {
+                        ++cycle_hits;
+                        if (cycle_hits >= 3) {
+                            output[index] = encode_render_iteration(max_iter, options.output_bias);
+                            escaped = true;
+                            break;
+                        }
+                    } else {
+                        cycle_hits = 0;
+                    }
+                    ++cycle_length;
+                    if (cycle_length >= cycle_power) {
+                        cycle_tortoise = total;
+                        cycle_power = std::min(cycle_power * 2, 1 << 20);
+                        cycle_length = 0;
+                    }
+                }
+            }
+        }
+        if (!escaped && !deadline_abort && !unresolved_pixel) {
+            output[index] = encode_render_iteration(max_iter, options.output_bias);
+        }
+    }
+    if (stats_out != nullptr) {
+        stats_out->pixels = static_cast<std::uint64_t>(width)
+            * static_cast<std::uint64_t>(height);
+        stats_out->render_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - render_started).count());
+    }
+}
+
 template <bool CollectStats, bool EnableCycleDetection>
 bool render_scaled_double_tail(
     float& output,
@@ -3977,6 +5455,7 @@ bool render_scaled_double_tail(
     bool disable_cycle_detection,
     bool strict_cycle_detection,
     bool strict_render,
+    double output_bias,
     RenderTimeBudget* time_budget,
     std::uint32_t& budget_ticks,
     bool& deadline_abort,
@@ -3993,7 +5472,7 @@ bool render_scaled_double_tail(
     const double dc_imag = std::ldexp(dc.imag, dc.exponent);
     double delta_real = sc_to_double(delta);
     double delta_imag = std::ldexp(delta.imag, delta.exponent);
-    output = static_cast<float>(max_iter);
+    output = encode_render_iteration(max_iter, output_bias);
     double tortoise_real = 0.0;
     double tortoise_imag = 0.0;
     int cycle_power = 1;
@@ -4035,7 +5514,7 @@ bool render_scaled_double_tail(
             unresolved_tail = true;
             output = strict_render
                 ? std::numeric_limits<float>::quiet_NaN()
-                : static_cast<float>(iteration);
+                : encode_render_iteration(iteration, output_bias);
             return true;
         }
         if constexpr (CollectStats) {
@@ -4059,13 +5538,15 @@ bool render_scaled_double_tail(
             }
             output = strict_render
                 ? std::numeric_limits<float>::quiet_NaN()
-                : static_cast<float>(iteration);
+                : encode_render_iteration(iteration, output_bias);
             return false;
         }
         if (magnitude_squared > 4.0) {
             const double magnitude = std::sqrt(std::max(magnitude_squared, 4.0000001));
-            output = static_cast<float>(static_cast<double>(iteration)
-                - std::log(std::log(magnitude)) / static_cast<double>(LOG_TWO));
+            output = encode_render_value(
+                static_cast<long double>(iteration)
+                    - std::log(std::log(magnitude)) / static_cast<double>(LOG_TWO),
+                output_bias);
             return false;
         }
         const double delta_magnitude_squared =
@@ -4127,7 +5608,7 @@ bool render_scaled_double_tail(
                 unresolved_tail = true;
                 output = strict_render
                     ? std::numeric_limits<float>::quiet_NaN()
-                    : static_cast<float>(iteration);
+                    : encode_render_iteration(iteration, output_bias);
                 return true;
             }
         }
@@ -4139,7 +5620,7 @@ bool render_scaled_double_tail(
         if constexpr (CollectStats) ++stats->unresolved_pixels;
         output = strict_render
             ? std::numeric_limits<float>::quiet_NaN()
-            : static_cast<float>(iteration);
+            : encode_render_iteration(iteration, output_bias);
     }
     return false;
 }
@@ -4357,7 +5838,7 @@ void render_bla_impl(
                 }
                 if (reference_index < 0
                     || reference_index >= static_cast<int>(context.orbit->scaled.size())) {
-                    output[index] = static_cast<float>(iteration);
+                    output[index] = encode_render_iteration(iteration, options.output_bias);
                     escaped = true;
                     break;
                 }
@@ -4388,6 +5869,21 @@ void render_bla_impl(
                     && fe_compare(
                         FloatExp{total_norm.mantissa, total_norm.exponent},
                         fe_mul(reference_norm, 1.0e-7)) < 0) {
+                    // The compact reference has lost enough low bits for a
+                    // direct subtraction to be unsafe.  Live/draft callers
+                    // explicitly allow recovery, so rebase from the already
+                    // reconstructed total instead of returning a NaN that
+                    // forces the Python layer into a full secondary-reference
+                    // tree.  Strict export calls keep the old sentinel and
+                    // are repaired by the quality-preserving atlas path.
+                    if (options.allow_recovery != 0
+                        && sc_finite(total)
+                        && ++perturbation_rebases <= 64) {
+                        delta = total;
+                        reference_index = 0;
+                        have_total = false;
+                        continue;
+                    }
                     output[index] = std::numeric_limits<float>::quiet_NaN();
                     unresolved_pixel = true;
                     if constexpr (CollectStats) {
@@ -4400,7 +5896,7 @@ void render_bla_impl(
                     || sc_outside_escape_with_delta(
                         reference_state,
                         delta)) {
-                    output[index] = smooth_escape_scaled(iteration, total_norm);
+                    output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
                     escaped = true;
                     break;
                 }
@@ -4430,7 +5926,7 @@ void render_bla_impl(
                             if (cycle_distance.mantissa == 0.0
                                 || cycle_distance.exponent <= scale_exponent - cycle_exponent_margin) {
                                 if constexpr (CollectStats) ++stats->cycle_inside;
-                                output[index] = static_cast<float>(max_iter);
+                                output[index] = encode_render_iteration(max_iter, options.output_bias);
                                 escaped = true;
                                 break;
                             }
@@ -4459,6 +5955,10 @@ void render_bla_impl(
                         const ScaledComplex parameter = sc_add(
                             context.orbit->scaled[1],
                             dc);
+                        ScaledComplex exact_cycle_tortoise{};
+                        int exact_cycle_power = 1;
+                        int exact_cycle_length = 0;
+                        bool exact_cycle_ready = false;
                         while (iteration < max_iter) {
                             if (render_time_budget_expired(time_budget, budget_ticks)) {
                                 output[index] = std::numeric_limits<float>::quiet_NaN();
@@ -4478,13 +5978,54 @@ void render_bla_impl(
                             }
                             total_norm = sc_norm_squared(total);
                             if (sc_outside_escape(total_norm)) {
-                                output[index] = smooth_escape_scaled(iteration, total_norm);
+                                output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
                                 escaped = true;
                                 break;
                             }
+                            // Once a pixel has left the compact reference
+                            // orbit, it still needs an interior exit. Without
+                            // this check the live path iterates every settled
+                            // pixel all the way to its draft cap, even though
+                            // the surrounding perturbation/BLA path already
+                            // has a conservative cycle detector. Strict
+                            // exports keep cycle_detection_enabled false.
+                            if (cycle_detection_enabled
+                                && iteration >= cycle_minimum_iteration
+                                && (iteration & 31) == 0
+                                && sc_compare_norm(total_norm, ScaledNorm{0.75, 2}) < 0) {
+                                if (!exact_cycle_ready) {
+                                    exact_cycle_tortoise = total;
+                                    exact_cycle_power = 1;
+                                    exact_cycle_length = 0;
+                                    exact_cycle_ready = true;
+                                } else {
+                                    const ScaledNorm exact_cycle_distance = sc_norm_squared(
+                                        sc_sub(total, exact_cycle_tortoise));
+                                    const int scale_exponent = std::max(total_norm.exponent, 0);
+                                    if (exact_cycle_distance.mantissa == 0.0
+                                        || exact_cycle_distance.exponent
+                                            <= scale_exponent - cycle_exponent_margin) {
+                                        output[index] = encode_render_iteration(
+                                            max_iter,
+                                            options.output_bias);
+                                        escaped = true;
+                                        break;
+                                    }
+                                    ++exact_cycle_length;
+                                    if (exact_cycle_length >= exact_cycle_power) {
+                                        exact_cycle_tortoise = total;
+                                        exact_cycle_power = std::min(
+                                            exact_cycle_power * 2,
+                                            1 << 20);
+                                        exact_cycle_length = 0;
+                                    }
+                                }
+                            }
                         }
                         if (deadline_abort) break;
-                        if (!escaped) output[index] = static_cast<float>(max_iter);
+                        if (!escaped) {
+                            output[index] = encode_render_iteration(max_iter, options.output_bias);
+                        }
                         escaped = true;
                         break;
                     }
@@ -4506,6 +6047,10 @@ void render_bla_impl(
                     const ScaledComplex parameter = sc_add(
                         context.orbit->scaled[1],
                         dc);
+                    ScaledComplex exact_cycle_tortoise{};
+                    int exact_cycle_power = 1;
+                    int exact_cycle_length = 0;
+                    bool exact_cycle_ready = false;
                     while (iteration < max_iter) {
                         if (render_time_budget_expired(time_budget, budget_ticks)) {
                             output[index] = std::numeric_limits<float>::quiet_NaN();
@@ -4527,14 +6072,46 @@ void render_bla_impl(
                         }
                         total_norm = sc_norm_squared(total);
                         if (sc_outside_escape(total_norm)) {
-                            output[index] = smooth_escape_scaled(iteration, total_norm);
+                            output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
                             escaped = true;
                             break;
+                        }
+                        if (cycle_detection_enabled
+                            && iteration >= cycle_minimum_iteration
+                            && (iteration & 31) == 0
+                            && sc_compare_norm(total_norm, ScaledNorm{0.75, 2}) < 0) {
+                            if (!exact_cycle_ready) {
+                                exact_cycle_tortoise = total;
+                                exact_cycle_power = 1;
+                                exact_cycle_length = 0;
+                                exact_cycle_ready = true;
+                            } else {
+                                const ScaledNorm exact_cycle_distance = sc_norm_squared(
+                                    sc_sub(total, exact_cycle_tortoise));
+                                const int scale_exponent = std::max(total_norm.exponent, 0);
+                                if (exact_cycle_distance.mantissa == 0.0
+                                    || exact_cycle_distance.exponent
+                                        <= scale_exponent - cycle_exponent_margin) {
+                                    output[index] = encode_render_iteration(
+                                        max_iter,
+                                        options.output_bias);
+                                    escaped = true;
+                                    break;
+                                }
+                                ++exact_cycle_length;
+                                if (exact_cycle_length >= exact_cycle_power) {
+                                    exact_cycle_tortoise = total;
+                                    exact_cycle_power = std::min(
+                                        exact_cycle_power * 2,
+                                        1 << 20);
+                                    exact_cycle_length = 0;
+                                }
+                            }
                         }
                     }
                     if (deadline_abort) break;
                     if (!escaped) {
-                        output[index] = static_cast<float>(max_iter);
+                        output[index] = encode_render_iteration(max_iter, options.output_bias);
                         escaped = true;
                     }
                     break;
@@ -4585,6 +6162,7 @@ void render_bla_impl(
                                 iteration, reference_index, delta,
                                 !cycle_detection_enabled, strict_cycle_detection,
                                 options.strict != 0,
+                                options.output_bias,
                                 time_budget, budget_ticks, deadline_abort,
                                 unresolved_pixel,
                                 stats)
@@ -4593,6 +6171,7 @@ void render_bla_impl(
                                 iteration, reference_index, delta,
                                 !cycle_detection_enabled, strict_cycle_detection,
                                 options.strict != 0,
+                                options.output_bias,
                                 time_budget, budget_ticks, deadline_abort,
                                 unresolved_pixel,
                                 stats);
@@ -4602,6 +6181,7 @@ void render_bla_impl(
                             iteration, reference_index, delta,
                             true, strict_cycle_detection,
                             options.strict != 0,
+                            options.output_bias,
                             time_budget, budget_ticks, deadline_abort,
                             unresolved_pixel,
                             stats);
@@ -4717,7 +6297,7 @@ void render_bla_impl(
                                 || sc_outside_escape_with_delta(
                                     context.orbit->scaled[static_cast<size_t>(reference_index)],
                                     delta)) {
-                                output[index] = smooth_escape_scaled(iteration, replay_norm);
+                                output[index] = smooth_escape_scaled(iteration, replay_norm, options.output_bias);
                                 escaped = true;
                                 break;
                             }
@@ -4766,7 +6346,7 @@ void render_bla_impl(
                 }
             }
             if (!escaped && !deadline_abort && !unresolved_pixel) {
-                output[index] = static_cast<float>(max_iter);
+                output[index] = encode_render_iteration(max_iter, options.output_bias);
             }
             if constexpr (CollectStats) {
                 stats->max_pixel_iterations = std::max(
@@ -4853,7 +6433,10 @@ std::unique_ptr<ReferenceContext> create_reference_context(
     int max_iter,
     int precision_bits,
     int series_order,
-    bool retain_builder_orbit
+    bool retain_builder_orbit,
+    int formula = FRACTAL_FORMULA_MANDELBROT,
+    const char* julia_real_text = "0",
+    const char* julia_imag_text = "0"
 ) {
     if (!valid_c_string(x_center) || !valid_c_string(y_center)
         || !valid_c_string(viewport_zoom)) {
@@ -4870,17 +6453,43 @@ std::unique_ptr<ReferenceContext> create_reference_context(
     (void)parse_zoom(viewport_zoom);
 #endif
     auto context = std::make_unique<ReferenceContext>();
+    if (!valid_formula(formula)
+        || !valid_c_string(julia_real_text)
+        || !valid_c_string(julia_imag_text)) {
+        throw std::runtime_error("invalid native reference formula or Julia constant");
+    }
     context->x_center = parse_coordinate(x_center, "real");
     context->y_center = parse_coordinate(y_center, "imaginary");
+    context->formula = formula;
+    context->julia_real = parse_coordinate(julia_real_text, "Julia real");
+    context->julia_imag = parse_coordinate(julia_imag_text, "Julia imaginary");
     context->requested_series_order = std::clamp(series_order, 8, 32);
     const auto reference_started = std::chrono::steady_clock::now();
     make_reference_orbit(
-        *context, x_center, y_center, viewport_zoom, max_iter, precision_bits);
+        *context, x_center, y_center, viewport_zoom, max_iter, precision_bits,
+        formula, julia_real_text, julia_imag_text);
     context->reference_build_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - reference_started).count());
     const auto bla_started = std::chrono::steady_clock::now();
-    build_bla(*context, retain_builder_orbit);
+    if (formula == FRACTAL_FORMULA_MANDELBROT) {
+        build_bla(*context, retain_builder_orbit);
+    } else {
+        // The ordinary complex BLA table models only the holomorphic
+        // Mandelbrot parameter plane. Alternate formulas use their own
+        // formula-aware real-linear hierarchy: Tricorn keeps conjugation in
+        // its 2x2 derivative and Burning Ship disables blocks at cusps.
+        if (formula == FRACTAL_FORMULA_JULIA) {
+            const auto series_started = std::chrono::steady_clock::now();
+            build_image_series(*context);
+            context->series_build_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - series_started).count());
+        } else {
+            context->series_build_ns = 0;
+        }
+        build_alternate_linear_bla(*context, retain_builder_orbit);
+    }
     context->bla_build_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - bla_started).count());
@@ -4904,16 +6513,42 @@ std::unique_ptr<ReferenceContext> clone_reference_context(
     context->requested_series_order = source.requested_series_order;
     context->x_center = source.x_center;
     context->y_center = source.y_center;
+    context->formula = source.formula;
+    context->julia_real = source.julia_real;
+    context->julia_imag = source.julia_imag;
+    context->parameter = source.parameter;
     context->precision_bits = source.precision_bits;
-
-    // Only the BLA/series input domain changes between depth tiers.  The
-    // expensive MPFR recurrence and compact render orbit remain shared.
-    const FloatExp zoom = parse_zoom_float_exp(viewport_zoom, context->precision_bits);
-    context->bla.input_radius = fe_div(FloatExp::from_parts(2.8, 0), zoom);
     context->reference_build_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - reference_started).count());
     const auto bla_started = std::chrono::steady_clock::now();
+    const FloatExp zoom = parse_zoom_float_exp(viewport_zoom, context->precision_bits);
+    context->bla.input_radius = fe_div(FloatExp::from_parts(2.8, 0), zoom);
+
+    if (source.formula != FRACTAL_FORMULA_MANDELBROT) {
+        // Alternate references use a real-linear hierarchy rather than the
+        // holomorphic Mandelbrot BLA. The MPFR orbit is still reusable: only
+        // the input-radius-dependent matrices need rebuilding for a clone.
+        context->fast_orbit = source.fast_orbit;
+        if (source.formula == FRACTAL_FORMULA_JULIA) {
+            const auto series_started = std::chrono::steady_clock::now();
+            build_image_series(*context);
+            context->series_build_ns = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - series_started).count());
+        }
+        build_alternate_linear_bla(*context);
+        if (source.formula != FRACTAL_FORMULA_JULIA) {
+            context->series_build_ns = 0;
+        }
+        context->bla_build_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - bla_started).count());
+        return context;
+    }
+
+    // Only the BLA/series input domain changes between depth tiers.  The
+    // expensive MPFR recurrence and compact render orbit remain shared.
     build_retargeted_bla(*context, source);
     context->bla_build_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -5181,6 +6816,9 @@ int fractal_colourise_kfp(
             throw std::runtime_error("invalid native KFP colour dimensions or controls");
         }
         const FractalKfpOptions& transfer_options = *options;
+        if (transfer_options.field_bias > static_cast<double>(max_iter)) {
+            throw std::runtime_error("native KFP field bias exceeds iteration cap");
+        }
         const KfpSlopeDirection slope_direction = kfp_slope_direction(transfer_options);
         double transfer_minimum = 0.0;
         double transfer_maximum = 1.0;
@@ -5191,11 +6829,12 @@ int fractal_colourise_kfp(
         }
         if (transfer_options.color_method == 4) {
             const KfpTransferBounds bounds = kfp_transfer_bounds(
-                field, width, height, max_iter);
+                field, width, height, max_iter, transfer_options.field_bias);
             transfer_minimum = bounds.minimum;
             transfer_maximum = bounds.maximum;
         }
-        const bool fast_default = kfp_is_default_fast_options(transfer_options);
+        const bool fast_default = kfp_is_default_fast_options(transfer_options)
+            && !kfp_force_precise;
         if (fast_default) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -5217,7 +6856,8 @@ int fractal_colourise_kfp(
                         max_iter,
                         lut,
                         lut_size,
-                        destination);
+                        destination,
+                        transfer_options.field_bias);
                 }
                 x = 1;
 #if defined(__AVX2__)
@@ -5236,7 +6876,8 @@ int fractal_colourise_kfp(
                             max_iter,
                             lut,
                             lut_size,
-                            output + row_offset);
+                            output + row_offset,
+                            transfer_options.field_bias);
                     }
                 }
 #endif
@@ -5255,7 +6896,8 @@ int fractal_colourise_kfp(
                         max_iter,
                         lut,
                         lut_size,
-                        destination);
+                        destination,
+                        transfer_options.field_bias);
                 }
             }
         } else {
@@ -5354,13 +6996,27 @@ int fractal_atlas_colourise_kfp(
 #endif
         }
         const FractalKfpOptions& transfer_options = *options;
+        if (transfer_options.field_bias > static_cast<double>(max_iter)) {
+            throw std::runtime_error("native KFP field bias exceeds iteration cap");
+        }
         const KfpSlopeDirection slope_direction = kfp_slope_direction(transfer_options);
-        const bool fast_default = kfp_is_default_fast_options(transfer_options);
+        const bool fast_default = kfp_is_default_fast_options(transfer_options)
+            && !kfp_force_precise;
         const KfpTransferBounds parent_bounds = transfer_options.color_method == 4
-            ? kfp_transfer_bounds(parent, parent_width, parent_height, max_iter)
+            ? kfp_transfer_bounds(
+                parent,
+                parent_width,
+                parent_height,
+                max_iter,
+                transfer_options.field_bias)
             : KfpTransferBounds{};
         const KfpTransferBounds child_bounds = use_child && transfer_options.color_method == 4
-            ? kfp_transfer_bounds(child, child_width, child_height, max_iter)
+            ? kfp_transfer_bounds(
+                child,
+                child_width,
+                child_height,
+                max_iter,
+                transfer_options.field_bias)
             : KfpTransferBounds{};
 
         std::vector<float> child_edge_x;
@@ -5412,7 +7068,8 @@ int fractal_atlas_colourise_kfp(
                                 max_iter,
                                 lut,
                                 lut_size,
-                                output + row_offset);
+                                output + row_offset,
+                                transfer_options.field_bias);
                             x += 8;
                             continue;
                         }
@@ -5429,7 +7086,8 @@ int fractal_atlas_colourise_kfp(
                             lut,
                             lut_size,
                             output + (static_cast<size_t>(y) * static_cast<size_t>(output_width)
-                                + static_cast<size_t>(x)) * 3U);
+                                + static_cast<size_t>(x)) * 3U,
+                            transfer_options.field_bias);
                         ++x;
                         continue;
                     }
@@ -5445,8 +7103,8 @@ int fractal_atlas_colourise_kfp(
                         const int full_end = feather >= 2
                             ? child_left + child_width - feather
                             : child_left + child_width;
-                        if (y > 0 && y + 1 < output_height && child_x > 0
-                            && child_x + 7 < child_width - 1
+                        if (child_y > 0 && child_y + 1 < child_height
+                            && child_x > 0 && child_x + 7 < child_width - 1
                             && x + 7 < full_end) {
                             write_kfp_default_fast_block8(
                                 child,
@@ -5459,7 +7117,8 @@ int fractal_atlas_colourise_kfp(
                                 max_iter,
                                 lut,
                                 lut_size,
-                                output + row_offset);
+                                output + row_offset,
+                                transfer_options.field_bias);
                             x += 8;
                             continue;
                         }
@@ -5476,7 +7135,8 @@ int fractal_atlas_colourise_kfp(
                             lut,
                             lut_size,
                             output + (static_cast<size_t>(y) * static_cast<size_t>(output_width)
-                                + static_cast<size_t>(x)) * 3U);
+                                + static_cast<size_t>(x)) * 3U,
+                            transfer_options.field_bias);
                         ++x;
                         continue;
                     }
@@ -5487,7 +7147,10 @@ int fractal_atlas_colourise_kfp(
                     if (feather < 2) {
                         const float parent_raw = parent[static_cast<size_t>(y)
                             * static_cast<size_t>(parent_width) + static_cast<size_t>(x)];
-                        if (!kfp_inside_value(parent_raw, max_iter)) {
+                        if (!kfp_inside_value(
+                            parent_raw,
+                            max_iter,
+                            transfer_options.field_bias)) {
                             write_kfp_default_fast_pixel(
                                 parent,
                                 parent_width,
@@ -5500,7 +7163,8 @@ int fractal_atlas_colourise_kfp(
                                 max_iter,
                                 lut,
                                 lut_size,
-                                destination);
+                                destination,
+                                transfer_options.field_bias);
                         } else {
                             write_kfp_default_fast_pixel(
                                 child,
@@ -5514,7 +7178,8 @@ int fractal_atlas_colourise_kfp(
                                 max_iter,
                                 lut,
                                 lut_size,
-                                destination);
+                                destination,
+                                transfer_options.field_bias);
                         }
                         ++x;
                         continue;
@@ -5534,7 +7199,8 @@ int fractal_atlas_colourise_kfp(
                         max_iter,
                         lut,
                         lut_size,
-                        parent_rgb);
+                        parent_rgb,
+                        transfer_options.field_bias);
                     write_kfp_default_fast_pixel(
                         child,
                         child_width,
@@ -5547,7 +7213,8 @@ int fractal_atlas_colourise_kfp(
                         max_iter,
                         lut,
                         lut_size,
-                        child_rgb);
+                        child_rgb,
+                        transfer_options.field_bias);
                     destination[0] = rounded_colour_byte(
                         static_cast<double>(parent_rgb[0]) * (1.0 - alpha)
                         + static_cast<double>(child_rgb[0]) * alpha);
@@ -5596,7 +7263,10 @@ int fractal_atlas_colourise_kfp(
                 const int child_y = y - child_top;
                 const float child_raw = child[static_cast<size_t>(child_y)
                     * static_cast<size_t>(child_width) + static_cast<size_t>(child_x)];
-                const bool child_inside = kfp_inside_value(child_raw, max_iter);
+                const bool child_inside = kfp_inside_value(
+                    child_raw,
+                    max_iter,
+                    transfer_options.field_bias);
                 const float alpha = feather >= 2
                     ? std::min(
                         child_edge_x[static_cast<size_t>(child_x)],
@@ -5632,7 +7302,10 @@ int fractal_atlas_colourise_kfp(
                 if (feather < 2) {
                     const float parent_raw = parent[static_cast<size_t>(y)
                         * static_cast<size_t>(parent_width) + static_cast<size_t>(x)];
-                    if (!kfp_inside_value(parent_raw, max_iter)) {
+                    if (!kfp_inside_value(
+                        parent_raw,
+                        max_iter,
+                        transfer_options.field_bias)) {
                         write_kfp_pixel(
                             parent,
                             parent_width,
@@ -5796,6 +7469,10 @@ int fractal_crop_colourise_kfp(
         std::vector<float>& cropped = workspace.kfp_parent_field;
         cropped.resize(static_cast<size_t>(output_width)
             * static_cast<size_t>(output_height));
+        const FractalKfpOptions& transfer_options = *options;
+        if (transfer_options.field_bias > static_cast<double>(max_iter)) {
+            throw std::runtime_error("native KFP field bias exceeds iteration cap");
+        }
 #ifdef _OPENMP
         if (threads > 0) {
             omp_set_dynamic(0);
@@ -5814,20 +7491,28 @@ int fractal_crop_colourise_kfp(
                     x,
                     y,
                     max_iter,
-                    inside);
+                    inside,
+                    transfer_options.field_bias);
                 cropped[static_cast<size_t>(y) * static_cast<size_t>(output_width)
                     + static_cast<size_t>(x)] = inside
-                    ? static_cast<float>(max_iter)
-                    : smooth;
+                    ? encode_render_iteration(max_iter, transfer_options.field_bias)
+                    : encode_render_value(
+                        static_cast<long double>(smooth),
+                        transfer_options.field_bias);
             }
         }
 
-        const FractalKfpOptions& transfer_options = *options;
         const KfpSlopeDirection slope_direction = kfp_slope_direction(transfer_options);
         const KfpTransferBounds bounds = transfer_options.color_method == 4
-            ? kfp_transfer_bounds(cropped.data(), output_width, output_height, max_iter)
+            ? kfp_transfer_bounds(
+                cropped.data(),
+                output_width,
+                output_height,
+                max_iter,
+                transfer_options.field_bias)
             : KfpTransferBounds{};
-        const bool fast_default = kfp_is_default_fast_options(transfer_options);
+        const bool fast_default = kfp_is_default_fast_options(transfer_options)
+            && !kfp_force_precise;
         if (fast_default) {
             colourise_kfp_default_fast_field(
                 cropped.data(),
@@ -5837,7 +7522,8 @@ int fractal_crop_colourise_kfp(
                 lut,
                 lut_size,
                 output,
-                threads);
+                threads,
+                transfer_options.field_bias);
         } else {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -5890,6 +7576,7 @@ int fractal_atlas_colourise_kfp_raw(
     int output_height,
     double parent_zoom,
     double child_fraction,
+    double child_zoom,
     int max_iter,
     double phase,
     double vocal,
@@ -5910,11 +7597,13 @@ int fractal_atlas_colourise_kfp_raw(
             || !std::isfinite(parent_zoom) || parent_zoom <= 0.0
             || !std::isfinite(child_fraction)
             || child_fraction < 0.0 || child_fraction > 1.0
+            || !std::isfinite(child_zoom) || child_zoom <= 0.0
             || !valid_colour_controls(phase, vocal, instrumental, pitch)
             || !lut || !valid_kfp_options(options, lut_size)) {
             throw std::runtime_error("invalid native raw KFP atlas dimensions or controls");
         }
         parent_zoom = std::max(parent_zoom, 1.0);
+        child_zoom = std::max(child_zoom, 1.0);
         const bool use_child = child != nullptr && child_fraction > 0.0;
         if (use_child && (!valid_pixel_dimensions(child_width, child_height)
                           || !valid_iteration_count(child_max_iter))) {
@@ -5926,6 +7615,19 @@ int fractal_atlas_colourise_kfp_raw(
         if (!use_child && (child_width != 0 || child_height != 0 || child_max_iter != 0)) {
             throw std::runtime_error("invalid native raw KFP atlas child absence");
         }
+        const FractalKfpOptions& transfer_options = *options;
+        if (transfer_options.field_bias > static_cast<double>(max_iter)) {
+            throw std::runtime_error("native KFP field bias exceeds iteration cap");
+        }
+        // A non-zero output bias denotes the centered atlas encoding used by
+        // the production renderer. Each source tile was encoded relative to
+        // its own cap, so decode parent/child samples with their individual
+        // caps before converting both into the target frame representation.
+        const bool centered_input = transfer_options.field_bias > 0.0;
+        const double parent_field_bias = centered_input
+            ? static_cast<double>(parent_max_iter) : 0.0;
+        const double child_field_bias = centered_input
+            ? static_cast<double>(child_max_iter) : 0.0;
 
         const int visible_child_width = use_child
             ? std::max(1, static_cast<int>(std::lround(
@@ -5958,29 +7660,15 @@ int fractal_atlas_colourise_kfp_raw(
         const int sampled_child_height = use_child
             ? visible_child_height + 2 * halo
             : 0;
-        const int visible_child_min = use_child
-            ? std::min(visible_child_width, visible_child_height)
-            : 0;
-        // A narrow KFP feather still produces a bright one-pixel contour
-        // when the parent and child differ by one interior classification.
-        // Widen the scalar transition once the child has enough pixels to
-        // support it; keep the small-frame behaviour unchanged so previews
-        // do not lose their useful detail.
-        const int proportional_feather = visible_child_min >= 64
-            ? visible_child_min / 3
-            : 0;
-        const int visible_feather = use_child
-            ? std::min(64, std::max(
-                visible_child_min / 8,
-                proportional_feather))
-            : 0;
-        const int feather = use_child
-            ? std::min(
-                sampled_child_width,
-                std::min(
-                    sampled_child_height,
-                    std::max(2, visible_feather + halo)))
-            : 0;
+        // The halo is sampling support, not visible atlas content. Only the
+        // nominal child rectangle may replace the parent. Keep a tiny scalar
+        // transition inside that rectangle: it hides the unavoidable
+        // screen-space stencil seam without copying a wide halo or creating
+        // the rectangular interior fill reported for Burning Ship and
+        // Tricorn.
+        const int ownership_left = visible_child_left;
+        const int ownership_top = visible_child_top;
+        const int seam_feather = halo;
         BilinearWorkspace& workspace = bilinear_workspace;
         BilinearAxis& parent_x_axis = workspace.parent_x_axis;
         BilinearAxis& parent_y_axis = workspace.parent_y_axis;
@@ -6008,11 +7696,14 @@ int fractal_atlas_colourise_kfp_raw(
                     x,
                     y,
                     parent_max_iter,
-                    inside);
+                    inside,
+                    parent_field_bias);
                 parent_view[static_cast<size_t>(y) * static_cast<size_t>(output_width)
                     + static_cast<size_t>(x)] = inside
-                    ? static_cast<float>(max_iter)
-                    : smooth;
+                    ? encode_render_iteration(max_iter, transfer_options.field_bias)
+                    : encode_render_value(
+                        static_cast<long double>(smooth),
+                        transfer_options.field_bias);
             }
         }
 
@@ -6025,13 +7716,15 @@ int fractal_atlas_colourise_kfp_raw(
                 child_width,
                 sampled_child_width,
                 -static_cast<double>(halo),
-                static_cast<double>(visible_child_width));
+                static_cast<double>(visible_child_width),
+                child_zoom);
             fill_bilinear_axis_window(
                 child_y_axis,
                 child_height,
                 sampled_child_height,
                 -static_cast<double>(halo),
-                static_cast<double>(visible_child_height));
+                static_cast<double>(visible_child_height),
+                child_zoom);
             child_view.resize(static_cast<size_t>(sampled_child_width)
                 * static_cast<size_t>(sampled_child_height));
 #ifdef _OPENMP
@@ -6048,12 +7741,15 @@ int fractal_atlas_colourise_kfp_raw(
                         x,
                         y,
                         child_max_iter,
-                        inside);
+                        inside,
+                        child_field_bias);
                     child_view[static_cast<size_t>(y)
                         * static_cast<size_t>(sampled_child_width)
                         + static_cast<size_t>(x)] = inside
-                        ? static_cast<float>(max_iter)
-                        : smooth;
+                        ? encode_render_iteration(max_iter, transfer_options.field_bias)
+                        : encode_render_value(
+                            static_cast<long double>(smooth),
+                            transfer_options.field_bias);
                 }
             }
         } else {
@@ -6073,11 +7769,11 @@ int fractal_atlas_colourise_kfp_raw(
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-            for (int y = child_top;
-                 y < child_top + sampled_child_height;
+            for (int y = ownership_top;
+                 y < ownership_top + visible_child_height;
                  ++y) {
-                for (int x = child_left;
-                     x < child_left + sampled_child_width;
+                for (int x = ownership_left;
+                     x < ownership_left + visible_child_width;
                      ++x) {
                     const int child_x = x - child_left;
                     const int child_y = y - child_top;
@@ -6088,14 +7784,20 @@ int fractal_atlas_colourise_kfp_raw(
                         static_cast<size_t>(child_y)
                         * static_cast<size_t>(sampled_child_width)
                         + static_cast<size_t>(child_x)];
+                    // The child owns the visible region. Its source halo is
+                    // used only to make edge samples well-defined; a fixed
+                    // two-pixel scalar blend keeps an interior sentinel from
+                    // becoming a hard rectangular RGB patch.
                     float alpha = 1.0F;
-                    if (feather >= 2) {
+                    if (seam_feather >= 2) {
+                        const int visible_x = x - ownership_left;
+                        const int visible_y = y - ownership_top;
                         const int edge_distance = std::min(
-                            std::min(child_x, sampled_child_width - 1 - child_x),
-                            std::min(child_y, sampled_child_height - 1 - child_y));
+                            std::min(visible_x, visible_child_width - 1 - visible_x),
+                            std::min(visible_y, visible_child_height - 1 - visible_y));
                         const float linear = std::clamp(
                             static_cast<float>(edge_distance)
-                                / static_cast<float>(feather),
+                                / static_cast<float>(seam_feather),
                             0.0F,
                             1.0F);
                         alpha = linear * linear * (3.0F - 2.0F * linear);
@@ -6104,11 +7806,6 @@ int fractal_atlas_colourise_kfp_raw(
                         parent_view[output_index] = child_value;
                     } else {
                         const float parent_value = parent_view[output_index];
-                        // The interior cap is a valid scalar only when it is
-                        // the final owner of a pixel. Blending it in the
-                        // feather is intentional: it keeps the transition
-                        // smooth, while alpha=1 restores an exact interior
-                        // sentinel for the shared colour pass.
                         parent_view[output_index] = parent_value * (1.0F - alpha)
                             + child_value * alpha;
                     }
@@ -6130,7 +7827,7 @@ int fractal_atlas_colourise_kfp_raw(
             vocal,
             instrumental,
             pitch,
-            options,
+            &transfer_options,
             lut,
             lut_size,
             threads);
@@ -6141,6 +7838,120 @@ int fractal_atlas_colourise_kfp_raw(
         set_error("native raw KFP atlas colourizer failed with an unknown exception");
         return 1;
     }
+}
+
+// Additive exact wrappers for diagnostics and pixel-for-pixel comparisons.
+// Production rendering uses the default AVX2/native kernel; these symbols keep
+// the slower reference implementation available without changing its ABI or
+// the atlas cache format.
+int fractal_colourise_kfp_precise(
+    const float* field,
+    std::uint8_t* output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    KfpPreciseGuard guard;
+    return fractal_colourise_kfp(
+        field, output, width, height, max_iter, phase, vocal,
+        instrumental, pitch, options, lut, lut_size, threads);
+}
+
+int fractal_crop_colourise_kfp_precise(
+    const float* source,
+    int source_width,
+    int source_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    KfpPreciseGuard guard;
+    return fractal_crop_colourise_kfp(
+        source, source_width, source_height, output, output_width,
+        output_height, zoom_factor, max_iter, phase, vocal,
+        instrumental, pitch, options, lut, lut_size, threads);
+}
+
+int fractal_atlas_colourise_kfp_precise(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    const float* child,
+    int child_width,
+    int child_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    int max_iter,
+    int child_left,
+    int child_top,
+    int feather,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    KfpPreciseGuard guard;
+    return fractal_atlas_colourise_kfp(
+        parent, parent_width, parent_height, child, child_width,
+        child_height, output, output_width, output_height, max_iter,
+        child_left, child_top, feather, phase, vocal, instrumental,
+        pitch, options, lut, lut_size, threads);
+}
+
+int fractal_atlas_colourise_kfp_raw_precise(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    KfpPreciseGuard guard;
+    return fractal_atlas_colourise_kfp_raw(
+        parent, parent_width, parent_height, parent_max_iter, child,
+        child_width, child_height, child_max_iter, output, output_width,
+        output_height, parent_zoom, child_fraction, child_zoom, max_iter, phase,
+        vocal, instrumental, pitch, options, lut, lut_size, threads);
 }
 
 int fractal_crop_rgb(
@@ -7131,6 +8942,41 @@ void* fractal_create_reference_reusable(
     }
 }
 
+void* fractal_create_reference_ex(
+    const char* x_center,
+    const char* y_center,
+    const char* viewport_zoom,
+    int max_iter,
+    int precision_bits,
+    int series_order,
+    int formula,
+    const char* julia_real,
+    const char* julia_imag
+) {
+    try {
+        if (!x_center || !y_center || !viewport_zoom
+            || !julia_real || !julia_imag
+            || !valid_iteration_count(max_iter)
+            || !valid_precision_bits(precision_bits)
+            || !valid_series_parameters(series_order, 2)
+            || !valid_formula(formula)) {
+            throw std::runtime_error("invalid formula-aware reference configuration");
+        }
+        auto context = create_reference_context(
+            x_center, y_center, viewport_zoom, max_iter, precision_bits,
+            series_order, formula != FRACTAL_FORMULA_MANDELBROT,
+            formula, julia_real, julia_imag);
+        set_error("");
+        return register_reference(std::move(context));
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return nullptr;
+    } catch (...) {
+        set_error("formula-aware reference creation failed with an unknown exception");
+        return nullptr;
+    }
+}
+
 void* fractal_clone_reference(void* source_handle, const char* viewport_zoom) {
     try {
         if (!source_handle || !viewport_zoom) {
@@ -7211,7 +9057,7 @@ int fractal_get_reference_stats(
     }
 }
 
-int fractal_render_mandelbrot_reference_ex(
+int fractal_render_reference_ex(
     float* output,
     int width,
     int height,
@@ -7253,7 +9099,28 @@ int fractal_render_mandelbrot_reference_ex(
         const long double zoom = parse_zoom(zoom_text);
         zoom_log10 = std::log10(zoom);
 #endif
-        if (zoom_log10 >= 6.0L) {
+        if (zoom_log10 >= 6.0L && context->formula != FRACTAL_FORMULA_MANDELBROT) {
+#ifdef FRACTAL_HAVE_MPFR
+            if (options.backend == 2) {
+                throw std::runtime_error(
+                    "OpenCL backend is only valid for direct renders; alternate deep "
+                    "formulas use the native scaled CPU path");
+            }
+            RenderStats stats;
+            if (render_stats_enabled.load(std::memory_order_relaxed)) {
+                render_alternate_reference_impl(
+                    output, width, height, zoom_text, *context, max_iter,
+                    threads, options, &stats);
+                publish_render_stats(stats);
+            } else {
+                render_alternate_reference_impl(
+                    output, width, height, zoom_text, *context, max_iter,
+                    threads, options, nullptr);
+            }
+#else
+            throw std::runtime_error("deep rendering requires MPFR/GMP; rebuild with make");
+#endif
+        } else if (zoom_log10 >= 6.0L) {
 #ifdef FRACTAL_HAVE_MPFR
             if (options.backend == 2) {
                 throw std::runtime_error(
@@ -7286,7 +9153,11 @@ int fractal_render_mandelbrot_reference_ex(
                 context->y_center,
                 max_iter,
                 threads,
-                options.backend);
+                options.backend,
+                context->formula,
+                context->julia_real,
+                context->julia_imag,
+                options.output_bias);
         }
         set_error("");
         return 0;
@@ -7297,6 +9168,23 @@ int fractal_render_mandelbrot_reference_ex(
         set_error("native reference render failed with an unknown exception");
         return 1;
     }
+}
+
+int fractal_render_mandelbrot_reference_ex(
+    float* output,
+    int width,
+    int height,
+    const char* zoom_text,
+    void* handle,
+    int max_iter,
+    int threads,
+    int series_order,
+    int series_block,
+    const FractalRenderOptions* supplied_options
+) {
+    return fractal_render_reference_ex(
+        output, width, height, zoom_text, handle, max_iter, threads,
+        series_order, series_block, supplied_options);
 }
 
 // Render an arbitrary list of scaled perturbations.  The Python exp-map
@@ -7366,37 +9254,68 @@ int fractal_render_points(
         };
         const FloatExp point_radius = fe_sqrt(point_radius_squared);
         RenderStats stats;
-        if (render_stats_enabled.load(std::memory_order_relaxed)) {
-            render_bla_dispatch<true>(
-                output,
-                point_count,
-                1,
-                zoom_text,
-                *context,
-                max_iter,
-                threads,
-                series_order,
-                series_block,
-                options,
-                &stats,
-                &points,
-                &point_radius);
-            publish_render_stats(stats);
+        if (context->formula != FRACTAL_FORMULA_MANDELBROT) {
+            if (render_stats_enabled.load(std::memory_order_relaxed)) {
+                render_alternate_reference_impl(
+                    output,
+                    point_count,
+                    1,
+                    zoom_text,
+                    *context,
+                    max_iter,
+                    threads,
+                    options,
+                    &stats,
+                    &points,
+                    &point_radius);
+                publish_render_stats(stats);
+            } else {
+                render_alternate_reference_impl(
+                    output,
+                    point_count,
+                    1,
+                    zoom_text,
+                    *context,
+                    max_iter,
+                    threads,
+                    options,
+                    nullptr,
+                    &points,
+                    &point_radius);
+            }
         } else {
-            render_bla_dispatch<false>(
-                output,
-                point_count,
-                1,
-                zoom_text,
-                *context,
-                max_iter,
-                threads,
-                series_order,
-                series_block,
-                options,
-                nullptr,
-                &points,
-                &point_radius);
+            if (render_stats_enabled.load(std::memory_order_relaxed)) {
+                render_bla_dispatch<true>(
+                    output,
+                    point_count,
+                    1,
+                    zoom_text,
+                    *context,
+                    max_iter,
+                    threads,
+                    series_order,
+                    series_block,
+                    options,
+                    &stats,
+                    &points,
+                    &point_radius);
+                publish_render_stats(stats);
+            } else {
+                render_bla_dispatch<false>(
+                    output,
+                    point_count,
+                    1,
+                    zoom_text,
+                    *context,
+                    max_iter,
+                    threads,
+                    series_order,
+                    series_block,
+                    options,
+                    nullptr,
+                    &points,
+                    &point_radius);
+            }
         }
         set_error("");
         return 0;
@@ -7439,9 +9358,10 @@ int render_mandelbrot_reference(
         nullptr);
 }
 
-// Versioned one-shot entry point for all supported formulas. Alternate
-// formulas use the direct scalar path; the reusable MPFR/BLA reference
-// machinery remains deliberately specific to the Mandelbrot parameter plane.
+// Versioned one-shot entry point for all supported formulas. The direct and
+// deep paths share the same scalar field contract; the formula-aware deep
+// reference keeps the alternate recurrence native instead of falling back to
+// Python at the precision boundary.
 int render_fractal_ex(
     float* output,
     int width,
@@ -7473,11 +9393,6 @@ int render_fractal_ex(
         if (options.backend != 0 && options.backend != 1 && options.backend != 2) {
             throw std::runtime_error("unknown native render backend");
         }
-        if (formula != FRACTAL_FORMULA_MANDELBROT && use_perturbation) {
-            throw std::runtime_error(
-                "native deep perturbation is currently Mandelbrot-only; "
-                "alternate formulas use the Python high-precision fallback");
-        }
         if (!use_perturbation) {
             const long double zoom = parse_zoom(zoom_text);
             render_direct(
@@ -7492,16 +9407,28 @@ int render_fractal_ex(
                 options.backend,
                 formula,
                 julia_real,
-                julia_imag);
+                julia_imag,
+                options.output_bias);
         } else {
             if (options.backend == 2) {
                 throw std::runtime_error(
                     "OpenCL backend is only valid for direct one-shot renders");
             }
-            void* context_handle = fractal_create_reference(
-                x_center, y_center, zoom_text, max_iter, precision_bits, 8);
+            char julia_real_text[64];
+            char julia_imag_text[64];
+            if (std::snprintf(
+                    julia_real_text, sizeof(julia_real_text), "%.17g", julia_real)
+                < 0
+                || std::snprintf(
+                    julia_imag_text, sizeof(julia_imag_text), "%.17g", julia_imag)
+                    < 0) {
+                throw std::runtime_error("failed to format the Julia constant");
+            }
+            void* context_handle = fractal_create_reference_ex(
+                x_center, y_center, zoom_text, max_iter, precision_bits, 8,
+                formula, julia_real_text, julia_imag_text);
             if (!context_handle) throw std::runtime_error(last_error);
-            const int status = fractal_render_mandelbrot_reference_ex(
+            const int status = fractal_render_reference_ex(
                 output,
                 width,
                 height,

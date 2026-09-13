@@ -40,6 +40,7 @@ from profiles import (
     PROFILE_DEFAULTS,
     SOURCE_MODE_CHOICES,
     SOURCE_MODE_LABELS,
+    RESAMPLE_CHOICES,
 )
 
 
@@ -362,7 +363,7 @@ if Gtk is not None:
             )
             self.codec = self._entry("auto")
             self.crf = self._entry("18")
-            self.resample = self._combo(("bilinear", "lanczos"), "bilinear")
+            self.resample = self._combo(RESAMPLE_CHOICES, "nearest")
             self.lossless = Gtk.CheckButton(label="Lossless H.264 rate control")
             self.encoder_threads = self._entry("0")
             self.cache = self._entry(str(ROOT / "cache"))
@@ -407,7 +408,7 @@ if Gtk is not None:
                 ("Video preset", self.video_preset, "FFmpeg speed / size trade-off"),
                 ("Codec", self.codec, "FFmpeg encoder name or auto"),
                 ("CRF", self.crf, "encoder quality, 0 to 51"),
-                ("Resample", self.resample, "crop filter"),
+                ("Resample", self.resample, "final output filter; atlas crop stays continuous"),
                 ("Encoder threads", self.encoder_threads, "0 lets FFmpeg choose"),
                 ("Cache limit MB", self.cache_limit_mb, "0 means unlimited"),
             ):
@@ -680,7 +681,7 @@ if Gtk is not None:
         def _live_config(self) -> object:
             """Translate the current form into bounded live-view settings."""
 
-            from live_view import LiveViewConfig
+            from live_view import LIVE_DEFAULT_HEIGHT, LIVE_DEFAULT_WIDTH, LiveViewConfig
 
             formula = self._combo_text(self.formula)
             base_zoom = self.base_zoom.get_text().strip()
@@ -725,8 +726,11 @@ if Gtk is not None:
                 julia_constant=julia_constant,
                 palette=self._combo_text(self.palette),
                 palette_file=palette_file,
-                width=int(self.width.get_text()),
-                height=int(self.height.get_text()),
+                # Live view is deliberately a bounded draft source. The
+                # window/monitor may enlarge it, but the export profile must
+                # never accidentally turn the screensaver into a 4K render.
+                width=LIVE_DEFAULT_WIDTH,
+                height=LIVE_DEFAULT_HEIGHT,
                 fps=min(60, max(1, int(self.fps.get_text()))),
                 native_threads=int(self.native_threads.get_text()),
                 loop=True,

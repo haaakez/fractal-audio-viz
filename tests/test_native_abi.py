@@ -25,6 +25,7 @@ class NativeRenderOptions(ctypes.Structure):
         ("max_linear_bla_length", ctypes.c_int32),
         ("backend", ctypes.c_int32),
         ("reserved", ctypes.c_int32 * 3),
+        ("output_bias", ctypes.c_double),
     ]
 
     @classmethod
@@ -41,13 +42,14 @@ class NativeRenderOptions(ctypes.Structure):
             max_bla_length=64,
             max_linear_bla_length=4096,
             backend=0,
+            output_bias=0.0,
         )
         values.update(overrides)
         result = cls()
         result.struct_size = ctypes.sizeof(cls)
-        result.version = 1
+        result.version = 2
         for name, value in values.items():
-            setattr(result, name, int(value))
+            setattr(result, name, float(value) if name == "output_bias" else int(value))
         return result
 
 

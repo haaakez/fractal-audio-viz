@@ -1,0 +1,80 @@
+name: package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux x86_64 tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++ make pkg-config libgmp-dev libmpfr-dev
+      - name: Build portable native renderer
+        run: make -B -j2 NATIVE_ARCH_FLAGS= mandelbrot.so
+      - name: Build archive
+        run: python3 packaging/release.py linux --native mandelbrot.so --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fractal-audio-viz-linux-x86_64
+          path: dist/*.tar.gz
+
+  windows:
+    name: Windows x86_64 zip
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python runtime and PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+      - name: Install MinGW native dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-gmp
+            mingw-w64-x86_64-mpfr
+      - name: Build portable native renderer and collect DLLs
+        shell: msys2 {0}
+        run: |
+          make -B -j2 NATIVE_ARCH_FLAGS= mandelbrot.dll
+          mkdir -p .release-runtime
+          for dependency in $(ldd mandelbrot.dll | awk '$3 ~ /^\/mingw64\/bin\// {print $3}'); do
+            cp "$dependency" .release-runtime/
+          done
+      - name: Install FFmpeg for the standalone executable
+        shell: pwsh
+        run: |
+          choco install ffmpeg --yes --no-progress
+          $ffmpeg = Get-ChildItem -Path "$env:ChocolateyInstall\lib" -Filter "ffmpeg.exe" -Recurse -File | Select-Object -First 1
+          if (-not $ffmpeg) {
+            $ffmpeg = Get-Command ffmpeg -ErrorAction Stop
+          }
+          "FFMPEG_DIR=$($ffmpeg.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build source archive
+        run: python packaging/release.py windows --native mandelbrot.dll --runtime-dir .release-runtime --output dist
+      - name: Build standalone executable archive
+        run: python packaging/build_windows_exe.py --native mandelbrot.dll --runtime-dir .release-runtime --ffmpeg-dir "$env:FFMPEG_DIR" --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fractal-audio-viz-windows-x86_64-source
+          path: dist/*-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fractal-audio-viz-windows-x86_64-exe
+          path: dist/*-windows-x86_64-exe.zip

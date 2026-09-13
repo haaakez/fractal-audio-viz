@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 import math
+import locale
 import os
 import struct
 from decimal import Decimal
@@ -180,6 +181,44 @@ class AnimationTests(unittest.TestCase):
                 max_log_zoom=1.0,
                 formula="burning-ship",
             )
+
+    def test_native_gui_centres_are_locale_independent(self):
+        """The GTK process must keep decimal coordinate strings native."""
+
+        try:
+            previous_locale = locale.setlocale(locale.LC_NUMERIC)
+            locale.setlocale(locale.LC_NUMERIC, "bg_BG.utf8")
+        except locale.Error:
+            raise unittest.SkipTest("a comma-decimal locale is unavailable")
+        try:
+            for formula in visualizer.FORMULA_CHOICES:
+                with self.subTest(formula=formula):
+                    x_center, y_center, _ = visualizer._resolve_render_point(
+                        point_spec=None,
+                        random_point=False,
+                        x_center=None,
+                        y_center=None,
+                        random_seed=None,
+                        max_log_zoom=0.0,
+                        formula=formula,
+                        julia_constant=visualizer.DEFAULT_JULIA_C,
+                    )
+                    field = visualizer.render_fractal(
+                        32,
+                        18,
+                        0.0,
+                        x_center,
+                        y_center,
+                        128,
+                        renderer="native",
+                        native_threads=1,
+                        formula=formula,
+                        julia_constant=visualizer.DEFAULT_JULIA_C,
+                    )
+                    self.assertEqual(np.asarray(field).shape, (18, 32))
+                    self.assertTrue(np.isfinite(field).all())
+        finally:
+            locale.setlocale(locale.LC_NUMERIC, previous_locale)
 
     def test_alternate_e150_catalogue_targets_are_finite_and_structured(self):
         for formula, points in visualizer.FORMULA_POINT_CATALOGUES.items():
@@ -487,7 +526,7 @@ class AnimationTests(unittest.TestCase):
             self.assertEqual(values["video_preset"], "faster")
             self.assertEqual(values["crf"], NEAR_LOSSLESS_CRF)
             self.assertFalse(values["lossless"])
-            self.assertEqual(values["resample"], "bilinear")
+            self.assertEqual(values["resample"], "nearest")
             self.assertEqual(values["source_mode"], "lossless-compressed")
             args = visualizer.build_parser(["--profile", name]).parse_args([])
             self.assertEqual((args.width, args.height, args.fps), (width, height, 60))
@@ -679,6 +718,25 @@ class AnimationTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(rgb, np.full_like(rgb, (255, 255, 255)))
 
+    def test_kfp_final_dither_matches_kalles_colour_mask(self):
+        values = np.asarray(
+            [[[12.0, 12.25, 12.5], [12.75, 13.0, 13.25]],
+             [[13.5, 13.75, 14.0], [14.25, 14.5, 14.75]]],
+            dtype=np.float64,
+        )
+        actual = visualizer._kfp_dither_rgb(values, np, 37, 19)
+        expected = np.empty_like(actual)
+        for y in range(values.shape[0]):
+            for x in range(values.shape[1]):
+                for channel in range(3):
+                    mask = (
+                        ((x + 37 + channel * 67) + (y + 19) * 236) * 119
+                    ) & 255
+                    expected[y, x, channel] = int(
+                        math.floor(values[y, x, channel] + mask / 256.0)
+                    )
+        np.testing.assert_array_equal(actual, expected)
+
     def test_dark_builtin_themes_have_white_interiors(self):
         field = np.asarray([[20.0, 100.0]], dtype=np.float32)
         for name in ("midnight", "ember-night", "terminal"):
@@ -785,6 +843,23 @@ class AnimationTests(unittest.TestCase):
             2,
         )
         difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 1)
+
+        if not hasattr(library, "fractal_colourise_kfp_precise"):
+            raise unittest.SkipTest("precise native KFP colouriser is unavailable")
+        precise = visualizer._colourise_kfp_native(
+            field,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            visualizer.KALLES_DEFAULT_KFP,
+            library,
+            2,
+            precise=True,
+        )
+        difference = np.abs(precise.astype(np.int16) - portable.astype(np.int16))
         self.assertLessEqual(int(np.max(difference)), 1)
 
         # Exercise a non-default imported transfer as well; this protects the
@@ -896,6 +971,92 @@ class AnimationTests(unittest.TestCase):
         self.assertLessEqual(int(np.max(difference)), 1)
         np.testing.assert_array_equal(cropped[3, 9], (0, 0, 0))
 
+    def test_centered_kfp_field_preserves_fast_colour_transfer(self):
+        """A high-cap field can be rebased without changing its RGB output."""
+
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_kfp"):
+            raise unittest.SkipTest("native KFP colouriser is unavailable")
+        max_iter = 50000
+        rng = np.random.default_rng(5031)
+        absolute = rng.uniform(
+            max_iter - 30.0,
+            max_iter - 0.25,
+            size=(21, 29),
+        ).astype(np.float32)
+        absolute[0, 0] = max_iter
+        absolute[10, 14] = max_iter
+        absolute[-1, -1] = max_iter
+        centered = absolute - np.float32(max_iter)
+        baseline = visualizer._colourise_kfp_native(
+            absolute,
+            max_iter,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            visualizer.KALLES_DEFAULT_KFP,
+            library,
+            2,
+        )
+        rebased = visualizer._colourise_kfp_native(
+            centered,
+            max_iter,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            visualizer.KALLES_DEFAULT_KFP,
+            library,
+            2,
+            field_bias=float(max_iter),
+        )
+        np.testing.assert_array_equal(rebased, baseline)
+
+    def test_centered_kfp_atlas_preserves_fast_colour_transfer(self):
+        """Nested KFP tiles must keep the same colours after rebasing."""
+
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_atlas_colourise_kfp"):
+            raise unittest.SkipTest("native KFP atlas colourizer is unavailable")
+        max_iter = 50000
+        rng = np.random.default_rng(819)
+        parent = rng.uniform(
+            max_iter - 30.0,
+            max_iter - 0.25,
+            size=(32, 40),
+        ).astype(np.float32)
+        child = rng.uniform(
+            max_iter - 30.0,
+            max_iter - 0.25,
+            size=(16, 20),
+        ).astype(np.float32)
+        parent[3, 4] = max_iter
+        child[7, 9] = max_iter
+        common = dict(
+            output_width=40,
+            output_height=32,
+            max_iter=max_iter,
+            child_left=10,
+            child_top=8,
+            feather=0,
+            phase=0.0,
+            vocal=0.0,
+            instrumental=0.0,
+            pitch=0.5,
+            profile=visualizer.KALLES_DEFAULT_KFP,
+            native_library=library,
+            native_threads=2,
+        )
+        baseline = visualizer._atlas_colourise_kfp_native(parent, child, **common)
+        rebased = visualizer._atlas_colourise_kfp_native(
+            parent - np.float32(max_iter),
+            child - np.float32(max_iter),
+            field_bias=float(max_iter),
+            **common,
+        )
+        np.testing.assert_array_equal(rebased, baseline)
+
     def test_native_rgb_crop_is_exact_at_unit_zoom(self):
         library = visualizer._get_native_library()
         if library is None or not hasattr(library, "fractal_crop_rgb"):
@@ -967,6 +1128,190 @@ class AnimationTests(unittest.TestCase):
         np.testing.assert_array_equal(uncropped[0, 0], parent[0, 0])
         self.assertFalse(np.array_equal(uncropped[8, 10], cropped[8, 10]))
 
+    def test_static_kfp_atlas_uses_cached_rgb_tiles(self):
+        library = visualizer._get_native_library()
+        if library is None or not all(
+            hasattr(library, name)
+            for name in (
+                "fractal_crop_colourise_kfp",
+                "fractal_crop_rgb",
+                "fractal_atlas_composite_rgb",
+            )
+        ):
+            raise unittest.SkipTest("native static KFP atlas path is unavailable")
+        palette_file = (
+            Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp"
+        )
+        parent = np.linspace(0.0, 180.0, 24 * 32, dtype=np.float32).reshape(24, 32)
+        child = np.flipud(parent[:12, :16].copy())
+        parent_rgb = visualizer._crop_colourise_kfp_native(
+            parent,
+            32,
+            24,
+            1.0,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            visualizer.KALLES_DEFAULT_KFP,
+            library,
+            2,
+        )
+        child_rgb = visualizer._crop_colourise_kfp_native(
+            child,
+            32,
+            24,
+            1.0,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            visualizer.KALLES_DEFAULT_KFP,
+            library,
+            2,
+        )
+        expected = visualizer._atlas_composite_rgb_native(
+            parent_rgb,
+            child_rgb,
+            32,
+            24,
+            1.0,
+            0.5,
+            1.0,
+            visualizer._atlas_feather(16, 12, kfp=True),
+            library,
+            2,
+        )
+        with mock.patch.object(
+            visualizer,
+            "_atlas_colourise_kfp_raw_native",
+            side_effect=AssertionError("static RGB path fell back to raw KFP"),
+        ):
+            actual = visualizer._atlas_colour_frame(
+                parent,
+                child,
+                32,
+                24,
+                1.0,
+                0.5,
+                200,
+                200,
+                0.0,
+                0.0,
+                0.0,
+                library,
+                2,
+                "bilinear",
+                "aurora",
+                0.5,
+                palette_file,
+                1.0,
+                parent_rgb,
+                child_rgb,
+            )
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_static_kfp_atlas_is_reserved_for_upscaled_mode(self):
+        library = visualizer._get_native_library()
+        if library is None or not all(
+            hasattr(library, name)
+            for name in (
+                "fractal_crop_colourise_kfp",
+                "fractal_crop_rgb",
+                "fractal_atlas_composite_rgb",
+            )
+        ):
+            raise unittest.SkipTest("native static KFP atlas path is unavailable")
+        profile = visualizer.KALLES_DEFAULT_KFP
+        self.assertFalse(
+            visualizer._use_static_kfp_atlas(
+                "lossless-compressed", profile, library, "bilinear"
+            )
+        )
+        self.assertFalse(
+            visualizer._use_static_kfp_atlas(
+                "native", profile, library, "bilinear"
+            )
+        )
+        self.assertTrue(
+            visualizer._use_static_kfp_atlas(
+                "upscaled", profile, library, "bilinear"
+            )
+        )
+        self.assertFalse(
+            visualizer._use_static_kfp_atlas(
+                "upscaled", profile, library, "lanczos"
+            )
+        )
+
+    def test_quality_kfp_atlas_reprojects_before_colourising(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(
+            library, "fractal_atlas_colourise_kfp_raw"
+        ):
+            raise unittest.SkipTest("native raw KFP atlas path is unavailable")
+        palette_file = (
+            Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp"
+        )
+        parent = np.linspace(0.0, 180.0, 24 * 32, dtype=np.float32).reshape(24, 32)
+        child = np.flipud(parent[:12, :16].copy())
+        cached_parent = np.zeros((24, 32, 3), dtype=np.uint8)
+        cached_child = np.full((24, 32, 3), 255, dtype=np.uint8)
+        with mock.patch.object(
+            visualizer,
+            "_atlas_colourise_kfp_raw_native",
+            wraps=visualizer._atlas_colourise_kfp_raw_native,
+        ) as raw, mock.patch.object(
+            visualizer,
+            "_atlas_composite_rgb_native",
+            side_effect=AssertionError("quality KFP path used cached RGB tiles"),
+        ):
+            actual = visualizer._atlas_colour_frame(
+                parent,
+                child,
+                32,
+                24,
+                1.0,
+                0.5,
+                200,
+                200,
+                0.0,
+                0.0,
+                0.0,
+                library,
+                2,
+                "bilinear",
+                "aurora",
+                0.5,
+                palette_file,
+                1.0,
+                cached_parent,
+                cached_child,
+                use_static_kfp=False,
+            )
+        raw.assert_called_once()
+        self.assertEqual(actual.shape, (24, 32, 3))
+        self.assertEqual(actual.dtype, np.uint8)
+
+    def test_kfp_smooth_offset_matches_kalles_log_smoothing(self):
+        expected = 1.0 + math.log(math.log(10000.0)) / math.log(2.0)
+        self.assertAlmostEqual(
+            visualizer._kfp_smooth_offset(visualizer.KALLES_DEFAULT_KFP),
+            expected,
+            places=14,
+        )
+        self.assertEqual(
+            visualizer._kfp_smooth_offset(
+                visualizer.KfpPalette(
+                    stops=((0, 0, 0), (255, 255, 255)),
+                    smooth_method=1,
+                )
+            ),
+            0.0,
+        )
+
     def test_kfp_final_scale_is_sharp_and_working_surface_is_dense(self):
         self.assertEqual(
             visualizer._final_video_resample(
@@ -993,12 +1338,68 @@ class AnimationTests(unittest.TestCase):
             "bilinear",
         )
         self.assertEqual(
+            visualizer._final_video_resample(
+                "nearest",
+                "aurora",
+                None,
+                1920,
+                1080,
+                3840,
+                2160,
+            ),
+            "neighbor",
+        )
+        self.assertEqual(
+            visualizer.build_parser().parse_args([]).resample,
+            "nearest",
+        )
+        self.assertEqual(
             visualizer._kfp_working_dimensions(7680, 4320, 1920, 1080),
             (3840, 2160),
         )
         self.assertEqual(
             visualizer._kfp_working_dimensions(3840, 2160, 1920, 1080),
             (3840, 2160),
+        )
+        self.assertEqual(
+            visualizer._kfp_working_dimensions(
+                3840, 2160, 960, 540, "upscaled"
+            ),
+            (960, 540),
+        )
+        # KFP's distance/slope pass samples a screen-space stencil. It must
+        # see the dense source itself, rather than a 1080p field enlarged
+        # before the stencil runs. The explicit upscaled mode remains the
+        # intentionally cheap path.
+        self.assertEqual(
+            visualizer._kfp_quality_source_dimensions(
+                3840,
+                2160,
+                1920,
+                1080,
+                "lossless-compressed",
+            ),
+            (3840, 2160),
+        )
+        self.assertEqual(
+            visualizer._kfp_quality_source_dimensions(
+                7680,
+                4320,
+                1920,
+                1080,
+                "lossless-compressed",
+            ),
+            (3840, 2160),
+        )
+        self.assertEqual(
+            visualizer._kfp_quality_source_dimensions(
+                3840,
+                2160,
+                960,
+                540,
+                "upscaled",
+            ),
+            (960, 540),
         )
 
     def test_native_kfp_atlas_colouriser_matches_portable_compositor(self):
@@ -1087,6 +1488,7 @@ class AnimationTests(unittest.TestCase):
             24,
             1.0,
             0.5,
+            1.0,
             200,
             200,
             0.0,
@@ -1098,6 +1500,87 @@ class AnimationTests(unittest.TestCase):
             2,
         )
         difference = np.abs(raw.astype(np.int16) - portable.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 1)
+
+    def test_native_raw_kfp_atlas_applies_overscan_before_stencil(self):
+        """The raw atlas path must crop the stored 1.2x child centrally."""
+
+        library = visualizer._get_native_library()
+        if library is None or not all(
+            hasattr(library, name)
+            for name in (
+                "fractal_atlas_colourise_kfp_raw",
+                "fractal_crop_field",
+            )
+        ):
+            raise unittest.SkipTest("native raw KFP atlas crop path is unavailable")
+        width, height = 64, 48
+        yy, xx = np.mgrid[:height, :width]
+        parent = (20.0 + xx * 0.18 + yy * 0.11).astype(np.float32)
+        child = (15.0 + xx * 0.27 + yy * 0.13).astype(np.float32)
+        fraction = 0.5
+        child_zoom = visualizer.ATLAS_TILE_OVERSCAN_FACTOR
+        child_width = round(width * fraction)
+        child_height = round(height * fraction)
+        child_left = (width - child_width) // 2
+        child_top = (height - child_height) // 2
+        raw = visualizer._atlas_colourise_kfp_raw_native(
+            parent,
+            child,
+            width,
+            height,
+            2.0,
+            fraction,
+            child_zoom,
+            200,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            visualizer.KALLES_DEFAULT_KFP,
+            library,
+            2,
+        )
+        parent_view = visualizer._crop_field_native(
+            parent, width, height, 2.0, library, 2
+        )
+        child_view = visualizer._crop_field_native(
+            child, child_width, child_height, child_zoom, library, 2
+        )
+        expected_field = parent_view.copy()
+        feather = visualizer._atlas_feather(child_width, child_height, kfp=True)
+        child_y, child_x = np.ogrid[:child_height, :child_width]
+        edge_distance = np.minimum(
+            np.minimum(child_x, child_y),
+            np.minimum(
+                child_width - 1 - child_x,
+                child_height - 1 - child_y,
+            ),
+        )
+        alpha = np.clip(
+            edge_distance.astype(np.float32) / float(feather),
+            0.0,
+            1.0,
+        )
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+        region = expected_field[
+            child_top:child_top + child_height,
+            child_left:child_left + child_width,
+        ]
+        region[...] = region * (1.0 - alpha) + child_view * alpha
+        expected = visualizer._colourise_kfp_native(
+            expected_field,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            visualizer.KALLES_DEFAULT_KFP,
+            library,
+            2,
+        )
+        difference = np.abs(raw.astype(np.int16) - expected.astype(np.int16))
         self.assertLessEqual(int(np.max(difference)), 1)
 
     def test_public_limits_reject_aliases_and_unbounded_inputs(self):
@@ -1510,6 +1993,18 @@ class AnimationTests(unittest.TestCase):
             level_count,
         )
 
+    def test_atlas_child_fraction_removes_storage_overscan(self):
+        factor = 4.0
+        overscan = visualizer.ATLAS_TILE_OVERSCAN_FACTOR
+        self.assertAlmostEqual(
+            visualizer._atlas_child_fraction(overscan, factor),
+            1.0 / factor,
+        )
+        self.assertAlmostEqual(
+            visualizer._atlas_child_fraction(overscan * factor, factor),
+            1.0,
+        )
+
     def test_atlas_compositor_uses_child_only_in_central_region(self):
         parent = np.zeros((8, 8), dtype=np.float32)
         child = np.ones((8, 8), dtype=np.float32)
@@ -1744,7 +2239,7 @@ class AnimationTests(unittest.TestCase):
                 0.5,
                 selected_file,
             )
-            # The child starts at y=16 and the shared four-pixel feather ends
+            # The child starts at y=16 and the shared two-pixel feather ends
             # at y=20. The first two rows must retain parent colour; only the
             # fully-owned child interior is allowed to be the interior colour.
             self.assertNotEqual(tuple(result[16, 32]), (0, 0, 0))

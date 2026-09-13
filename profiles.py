@@ -14,10 +14,13 @@ from __future__ import annotations
 # a useful compressed file. Outputs above Full HD use a native C++ field capped
 # at 1920x1080; users who need one scalar sample per output pixel can add
 # ``--quality quality --fractal-scale 1``. Exact bit-level output remains
-# available with ``--lossless``.
+# available with ``--lossless``. Imported KFP palettes are the exception to
+# the 1080p cap: the native Kalles stencil gets a dense source up to 4K so its
+# distance and slope gradients do not become enlarged blocks.
 DEFAULT_PROFILE = "4k60"
 NEAR_LOSSLESS_CRF = 10
 SOURCE_MODE_CHOICES = ("lossless-compressed", "native", "upscaled")
+RESAMPLE_CHOICES = ("nearest", "bilinear", "lanczos")
 SOURCE_MODE_LABELS = {
     "lossless-compressed": "lossless compressed",
     "native": "native",
@@ -59,10 +62,11 @@ def _native_quality_profile(
         # sensible default for a near-lossless export, especially at 8K.
         "video_preset": "faster",
         "crf": NEAR_LOSSLESS_CRF,
-        # Bilinear keeps the fused native atlas colourizer active for Aurora
-        # accents and KFP profiles; it selects the renderer's crop primitive
-        # without adding a Python image round-trip.
-        "resample": "bilinear",
+        # The lower-density lossless-compressed profiles are enlarged with
+        # nearest-neighbour sampling. This keeps the rendered detail crisp
+        # instead of smearing it across the output; the internal atlas still
+        # uses the native continuous crop path for smooth zoom motion.
+        "resample": "nearest",
         "lossless": False,
         "source_mode": "lossless-compressed",
     }
@@ -78,9 +82,10 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
     "fhd60": _native_quality_profile(
         1920, 1080, quality="balanced", fractal_scale=1.0, keyframe_factor=8.0
     ),
-    # The 1080p field cap keeps every canonical native profile on the same
-    # fast, fused C++ path.  At or below Full HD the field is output-density;
-    # larger outputs receive one final high-quality upscale.
+    # The 1080p field cap keeps ordinary palettes on the same fast, fused C++
+    # path. Imported KFP palettes automatically request a denser source for
+    # their screen-space stencil; larger outputs still receive one final
+    # high-quality upscale.
     "2k60": _native_quality_profile(
         2560,
         1440,
