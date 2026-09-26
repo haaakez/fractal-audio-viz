@@ -56,6 +56,7 @@ import os
 import operator
 import queue
 import random
+import re
 import shutil
 import signal
 import stat
@@ -68,7 +69,7 @@ import time
 import uuid
 import zipfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, localcontext
 from functools import lru_cache
 from pathlib import Path
@@ -97,11 +98,88 @@ from profiles import (
 )
 
 
+# Keep automatic native rendering from monopolising the machine. Explicit
+# ``--native-threads N`` values still take precedence, but the zero/default
+# setting leaves several logical CPUs available for the desktop, audio,
+# and FFmpeg. The cap also keeps the default sensible on larger machines.
+DEFAULT_NATIVE_THREAD_LIMIT = 6
+DEFAULT_NATIVE_CPU_RESERVE = 2
+DEFAULT_ENCODER_THREAD_LIMIT = 2
+
+
+def _available_cpu_count() -> int:
+    """Return the CPUs available to this process, respecting affinity."""
+
+    try:
+        return max(1, int(len(os.sched_getaffinity(0))))
+    except (AttributeError, OSError):
+        return max(1, int(os.cpu_count() or 1))
+
+
+def _default_native_thread_count() -> int:
+    """Return a bounded automatic native-rendering worker count."""
+
+    available = _available_cpu_count()
+    if available <= 1:
+        return 1
+    return max(
+        1,
+        min(DEFAULT_NATIVE_THREAD_LIMIT, available - DEFAULT_NATIVE_CPU_RESERVE),
+    )
+
+
+def _default_encoder_thread_count(native_threads: int = 0) -> int:
+    """Return a small encoder count that leaves CPU headroom for rendering."""
+
+    available = _available_cpu_count()
+    active_native = (
+        int(native_threads)
+        if int(native_threads) > 0
+        else _default_native_thread_count()
+    )
+    remaining = available - DEFAULT_NATIVE_CPU_RESERVE - active_native
+    return max(1, min(DEFAULT_ENCODER_THREAD_LIMIT, remaining))
+
+
 # Do this before importing numerical libraries.  It helps BLAS-backed NumPy
 # without forcing an unnecessarily large number of worker threads.
-os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 3))
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "3")
-os.environ.setdefault("MKL_NUM_THREADS", "3")
+os.environ.setdefault("OMP_NUM_THREADS", str(_default_native_thread_count()))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+
+def _enable_opencl_atlas_maps(source_width: int, source_height: int) -> None:
+    """Enable the measured OpenCL atlas path for the bounded live surface.
+
+    Live view renders at 960x540 and enlarges only after the native colour
+    pass.  At that size the axis-map plus float-compositing kernels reduce the
+    repeated crop arithmetic and win on the tested GPU.  Export keeps its
+    normal driver-selectable defaults: FHD may use the same path explicitly,
+    while 4K remains on the faster arithmetic/tiled path.  Never override an
+    environment choice, so a driver-specific setting remains an escape hatch.
+    """
+
+    try:
+        pixels = int(source_width) * int(source_height)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if pixels <= 0 or pixels > 1920 * 1080:
+        return
+    os.environ.setdefault("FRACTAL_OPENCL_ATLAS_MAPS", "1")
+    os.environ.setdefault("FRACTAL_OPENCL_ATLAS_FLOAT", "1")
+
+
+def _opencl_atlas_maps_enabled() -> bool:
+    """Return whether native OpenCL atlas crop maps are active."""
+
+    setting = os.environ.get("FRACTAL_OPENCL_ATLAS_MAPS")
+    return setting is not None and setting.strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "off",
+        "no",
+    }
 
 
 DEFAULT_AUDIO = "song.mp3"
@@ -118,9 +196,9 @@ DEFAULT_Y_CENTER = _DEFAULT_MANDELBROT_POINT.y
 # Fields are expensive, so they can be cached; their cache identity must
 # change when native numerical behaviour changes.  This prevents a new
 # renderer from silently reusing an old, under-resolved .npy keyframe.
-KEYFRAME_CACHE_SCHEMA = "raw-field-series-v12-kalles-interior"
+KEYFRAME_CACHE_SCHEMA = "raw-field-series-v13-kalles-high-bailout"
 AUDIO_CACHE_SCHEMA = "audio-controls-v10-onset-sync"
-ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v18-centered-kfp-fields"
+ATLAS_CACHE_SCHEMA = "nested-raw-atlas-v20-kalles-viewport-span"
 
 FORMULA_CHOICES = (
     "mandelbrot",
@@ -137,6 +215,13 @@ VIDEO_PRESET_CHOICES = (
     "medium",
     "slow",
 )
+# Moving the MP4 metadata to the front is useful for small files, but
+# ``+faststart`` rewrites a completed file.  That second pass is needlessly
+# expensive for long lossless 1080p/4K renders, where the encoded video can be
+# tens of gigabytes.  Use a deliberately conservative raw-frame estimate so
+# short previews keep their convenient streaming layout without making a
+# finished master pay for a second full-file copy.
+FASTSTART_MAX_ESTIMATED_RAW_BYTES = 2 * 1024 * 1024 * 1024
 PALETTE_CHOICES = (
     "aurora",
     "fire",
@@ -149,6 +234,10 @@ PALETTE_CHOICES = (
     "terminal",
     "kalles-default",
 )
+# Kalles stores and reads the palette channels as COLOR14 r,g,b values.  The
+# Windows bitmap is bottom-up, but that affects row order only; it does not
+# reverse the colour channels.  Keep these stops in the same RGB order used by
+# the file parser, native renderer, and portable fallback.
 KALLES_DEFAULT_PALETTE_STOPS = (
     (255, 255, 255),
     (128, 0, 64),
@@ -159,6 +248,55 @@ KALLES_DEFAULT_PALETTE_STOPS = (
     (64, 128, 255),
     (0, 0, 255),
 )
+# Kalles' smooth escape convention uses a radius of 10000.  Keep the value
+# explicit at the scalar-render boundary: ordinary palettes retain the
+# classic radius-2 field, while a KFP render gets the same high-bailout field
+# in native, portable, atlas, and live-view paths.
+KALLES_ESCAPE_RADIUS_SQUARED = 10000.0 * 10000.0
+
+# The OpenCL RGB atlas compositor may keep immutable KFP tiles resident on
+# the device for many frames.  A NumPy data address is not a safe identity for
+# that cache: once an atlas tile is evicted, Python may reuse the same address
+# for a different tile.  Give each render a monotonically increasing
+# generation, then combine it with the logical atlas level instead.
+_ATLAS_GPU_CACHE_GENERATION = 0
+_ATLAS_GPU_CACHE_GENERATION_LOCK = threading.Lock()
+
+
+def _next_atlas_gpu_cache_generation() -> int:
+    global _ATLAS_GPU_CACHE_GENERATION
+    with _ATLAS_GPU_CACHE_GENERATION_LOCK:
+        _ATLAS_GPU_CACHE_GENERATION += 1
+        # The low 32 bits hold the atlas level.  A single Python process is
+        # not expected to render 2**32 videos, but keep the invariant explicit
+        # rather than allowing a wrapped token to alias an older render.
+        if _ATLAS_GPU_CACHE_GENERATION >= 2**32:
+            _ATLAS_GPU_CACHE_GENERATION = 1
+        return _ATLAS_GPU_CACHE_GENERATION
+
+
+def _atlas_gpu_cache_token(generation: int, level: int) -> int:
+    generation_value = int(generation)
+    level_value = int(level)
+    if not 0 < generation_value < 2**32:
+        raise ValueError("invalid atlas GPU cache generation")
+    if not 0 <= level_value < 2**32:
+        raise ValueError("invalid atlas GPU cache level")
+    return (generation_value << 32) | (level_value + 1)
+
+
+def _escape_radius_squared(escape_radius_mode: int = 0) -> float:
+    """Return the scalar bailout squared for a validated render mode."""
+
+    try:
+        mode = int(operator.index(escape_radius_mode))
+    except (TypeError, ValueError):
+        raise ValueError("escape radius mode must be classic (0) or Kalles high (1)")
+    if mode == 0:
+        return 4.0
+    if mode == 1:
+        return KALLES_ESCAPE_RADIUS_SQUARED
+    raise ValueError("escape radius mode must be classic (0) or Kalles high (1)")
 
 
 @dataclass(frozen=True)
@@ -181,10 +319,108 @@ class KfpPalette:
     power: float = 2.0
     slopes: bool = False
     slope_power: float = 50.0
-    slope_ratio: float = 20.0
+    # Kalles' runtime reset value is 50; complete bundled profiles commonly
+    # serialize 20 explicitly, but sparse .kfp files must inherit 50.
+    slope_ratio: float = 50.0
     slope_angle: float = 45.0
     differences: int = 3
     interior_color: tuple[int, int, int] = (0, 0, 0)
+    # Kalles normally renders its negative transition sentinels as the
+    # characteristic visible glitch pattern. Keep that default, but retain
+    # the serialized switch so a palette can ask the renderer to hide them.
+    show_glitches: bool = True
+    # Kalles keeps these as separate fields in modern .kfp files.  The
+    # legacy SmoothMethod field is normalized to these values when a file is
+    # imported, so the colourizer has one representation for old and new
+    # palettes.
+    bailout_radius_preset: int = 0
+    bailout_radius_custom: float = 2.0
+    bailout_norm_preset: int = 1
+    bailout_norm_custom: float = 2.0
+    # Texture/OpenGL settings are retained instead of being silently
+    # discarded.  The portable path uses texture_file; UseOpenGL/GLSL are
+    # metadata from Kalles' GPU renderer and remain CPU-rendered here.
+    texture_enabled: bool = False
+    texture_merge: float = 1.0
+    texture_power: float = 200.0
+    texture_ratio: float = 100.0
+    texture_file: str = ""
+    texture_resize: bool = True
+    use_opengl: bool = False
+    use_srgb: bool = False
+    glsl: str = ""
+
+
+@dataclass(frozen=True)
+class KfpFramePlanes:
+    """Optional per-pixel data consumed by Kalles' complete ``SetColor``.
+
+    The ordinary visualizer field is a single float image.  Kalles keeps more
+    information beside that image when the corresponding render features are
+    enabled: the integer iteration and transition, the smoothing test pair,
+    phase, and the analytic distance-estimator derivatives.  Keeping those
+    planes explicit prevents the palette stage from quietly inventing values
+    when a caller has them available (for example, when importing a KFB/KFP
+    render cache).
+
+    Every supplied plane must have the same ``(height, width)`` shape as the
+    scalar field passed to ``_colourise_kfp``.  Missing planes use the scalar
+    field's compatible fallback, exactly as Kalles does when an optional
+    feature is disabled.
+    """
+
+    # These two are the post-OutputIterationData values handed to SetColor:
+    # nPixels and nTrans. They are deliberately not recomputed from the
+    # scalar field when supplied.
+    iteration: Optional[Any] = None
+    transition: Optional[Any] = None
+    phase: Optional[Any] = None
+    de_x: Optional[Any] = None
+    de_y: Optional[Any] = None
+    test1: Optional[Any] = None
+    test2: Optional[Any] = None
+    # Optional pre-smoothing orbit data. When present with test1/test2, the
+    # colourizer performs Kalles' OutputIterationData smoothing and stores the
+    # resulting nPixels/nTrans before entering SetColor.
+    orbit_iteration: Optional[Any] = None
+    bailout: Optional[Any] = None
+    # Optional top-down RGB texture for Kalles' SetTexture stage.  These
+    # fields are useful to callers importing a complete KFB/KFP render; the
+    # normal palette-file path fills them from ``TextureFile`` automatically.
+    texture_rgb: Optional[Any] = None
+    texture_width: Optional[int] = None
+    texture_height: Optional[int] = None
+    texture_stride: Optional[int] = None
+
+
+_KFP_REQUIRED_RENDER_PLANES = (
+    "orbit_iteration",
+    "phase",
+    "de_x",
+    "de_y",
+    "test1",
+    "test2",
+)
+
+
+def _kfp_render_planes_complete(
+    planes: Optional[KfpFramePlanes],
+    shape: tuple[int, int],
+) -> bool:
+    """Return whether a native KFP metadata bundle is safe to colourise."""
+
+    if planes is None:
+        return False
+    np = _require_numpy()
+    for name in _KFP_REQUIRED_RENDER_PLANES:
+        try:
+            value = getattr(planes, name)
+            array = np.asarray(value)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if array.shape != shape or not np.isfinite(array).all():
+            return False
+    return True
 
 
 # These are the settings written by Kalles Fraktaler's own default palette.
@@ -378,6 +614,18 @@ ATLAS_LOCAL_REFERENCE_MAX_BUDGET_MS = 4000
 ATLAS_LOCAL_REFERENCE_MS_PER_PIXEL = 0.05
 ATLAS_LOCAL_REFERENCE_FINAL_BUDGET_MS = 750
 ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS = 30_000
+# A retargeted tier renders the complete requested rectangle. That is a
+# useful shortcut for small atlas tiles, but at 1080p it can replay millions
+# of hard pixels before the point renderer gets a chance to repair the actual
+# glitch regions. Large frames use the bounded shared pass plus connected
+# local references instead.
+ATLAS_LOCAL_REFERENCE_MAX_RETARGET_PIXELS = 256 * 256
+# Keep point-render repair requests bounded, but make the cells large enough
+# for a 1080p tile to amortize native reference creation. The old 2048-pixel
+# cap forced pathological deep tiles into roughly 1,000 tiny references;
+# 8192 still bounds each request while reducing setup and Python scheduling
+# overhead by about four times.
+ATLAS_LOCAL_REFERENCE_MAX_POINT_CELL_PIXELS = 8192
 # Arbitrary-precision direct recovery is intentionally a small escape hatch.
 # A single deep pixel can take hundreds of milliseconds, so a large mask must
 # continue through the native subdivision path rather than serialising a whole
@@ -402,8 +650,9 @@ ATLAS_NEAR_FULL_CHILD_FRACTION = 0.98
 ATLAS_TILE_OVERSCAN_FACTOR = 1.2
 # KFP's relief transfer needs enough pixels to preserve its fine gradients,
 # but colouring an 8K atlas tile for every level is needlessly expensive.  A
-# 4K working surface is the useful quality/performance ceiling: 4K exports are
-# fully dense and 8K exports receive one high-quality final upscale.
+# 4K is the current dense working-surface ceiling for imported KFP profiles.
+# Normal quality profiles still render at their requested output density; only
+# the explicitly named ``upscaled`` source mode enlarges a smaller source.
 KFP_ATLAS_MAX_WORKING_DIMENSION = 3840
 
 
@@ -501,6 +750,14 @@ FFMPEG_STDIN_STALL_TIMEOUT_SECONDS = 5.0 * 60.0
 # launcher consumes these lines for its determinate progress bar.
 RENDER_PROGRESS_INTERVAL_SECONDS = 5.0
 
+# ``Decimal`` deliberately accepts a wider spelling set than the native C++
+# stream parser (for example digit separators and Unicode decimal digits).
+# Keep ordinary high-precision strings byte-for-byte unchanged, but
+# canonicalize those otherwise-valid spellings before they cross the C ABI.
+_NATIVE_DECIMAL_TEXT_RE = re.compile(
+    r"[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?)|(?:\.[0-9]+))(?:[eE][+-]?[0-9]+)?\Z"
+)
+
 # These are the original visualizer's liquid-gradient constants.  Keep the
 # numerical field independent from them: the atlas stores raw iteration data,
 # so the same expensive deep render can be recoloured without being rebuilt.
@@ -574,7 +831,9 @@ class NativeRenderOptions(ctypes.Structure):
         ("max_bla_length", ctypes.c_int32),
         ("max_linear_bla_length", ctypes.c_int32),
         ("backend", ctypes.c_int32),
-        ("reserved", ctypes.c_int32 * 3),
+        ("escape_radius_mode", ctypes.c_int32),
+        ("coordinate_mode", ctypes.c_int32),
+        ("reserved", ctypes.c_int32 * 1),
         ("output_bias", ctypes.c_double),
     ]
 
@@ -592,6 +851,9 @@ class NativeRenderOptions(ctypes.Structure):
         max_bla_length: int = 256,
         max_linear_bla_length: int = 4096,
         backend: int = 0,
+        escape_radius_mode: int = 0,
+        coordinate_mode: Optional[int] = None,
+        plane_flags: int = 0,
         output_bias: float = 0.0,
     ) -> None:
         super().__init__()
@@ -602,6 +864,8 @@ class NativeRenderOptions(ctypes.Structure):
             "maximum BLA length": max_bla_length,
             "maximum linear BLA length": max_linear_bla_length,
             "backend": backend,
+            "escape radius mode": escape_radius_mode,
+            "plane flags": plane_flags,
         }
         checked_values: dict[str, int] = {}
         for label, value in integer_values.items():
@@ -623,6 +887,19 @@ class NativeRenderOptions(ctypes.Structure):
             raise ValueError("maximum linear BLA length must be between 1 and 4096")
         if checked_values["backend"] not in {0, 1, 2}:
             raise ValueError("backend must be scalar (0), avx2 (1), or opencl (2)")
+        if checked_values["escape radius mode"] not in {0, 1}:
+            raise ValueError("escape radius mode must be classic (0) or Kalles high (1)")
+        if not 0 <= checked_values["plane flags"] <= 3:
+            raise ValueError("plane flags are outside the supported range")
+        if coordinate_mode is None:
+            coordinate_mode_value = 1 if checked_values["escape radius mode"] == 1 else 0
+        else:
+            try:
+                coordinate_mode_value = int(operator.index(coordinate_mode))
+            except (TypeError, ValueError) as error:
+                raise ValueError("coordinate mode must be an integer") from error
+        if coordinate_mode_value not in {0, 1}:
+            raise ValueError("coordinate mode must be project (0) or Kalles (1)")
         if checked_values["time budget"] > 2_147_483_647:
             raise ValueError("time budget is too large for the native ABI")
         try:
@@ -654,7 +931,177 @@ class NativeRenderOptions(ctypes.Structure):
         self.max_bla_length = checked_values["maximum BLA length"]
         self.max_linear_bla_length = checked_values["maximum linear BLA length"]
         self.backend = checked_values["backend"]
+        self.escape_radius_mode = checked_values["escape radius mode"]
+        self.coordinate_mode = coordinate_mode_value
+        self.reserved[0] = checked_values["plane flags"]
         self.output_bias = output_bias
+
+
+def _scalar_metadata_options(
+    options: NativeRenderOptions,
+    formula: str = "mandelbrot",
+    *,
+    allow_opencl: bool = True,
+) -> NativeRenderOptions:
+    """Return safe options for a plane-aware native render.
+
+    Deep Mandelbrot plane output has a dedicated OpenCL kernel. The point
+    repair ABI still cannot return planes from OpenCL, and alternate-formula
+    plane output remains on the scalar path until its device metadata contract
+    is implemented too.
+    """
+
+    formula = _formula_name(formula)
+    backend = int(options.backend)
+    if backend == 0 or (
+        allow_opencl and backend == 2 and formula == "mandelbrot"
+    ):
+        return options
+    return NativeRenderOptions(
+        strict=bool(options.strict),
+        allow_recovery=bool(options.allow_recovery),
+        time_budget_ms=int(options.time_budget_ms),
+        disable_bla=bool(options.disable_bla),
+        disable_cycle=bool(options.disable_cycle),
+        strict_cycle=bool(options.strict_cycle),
+        series_min_terms=int(options.series_min_terms),
+        series_max_terms=int(options.series_max_terms),
+        max_bla_length=int(options.max_bla_length),
+        max_linear_bla_length=int(options.max_linear_bla_length),
+        backend=0,
+        escape_radius_mode=int(options.escape_radius_mode),
+        coordinate_mode=int(options.coordinate_mode),
+        plane_flags=int(options.reserved[0]),
+        output_bias=float(options.output_bias),
+    )
+
+
+class NativeRenderPlanes(ctypes.Structure):
+    """ctypes mirror of the native direct-render orbit metadata ABI."""
+
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("orbit_iteration", ctypes.POINTER(ctypes.c_int64)),
+        ("phase", ctypes.POINTER(ctypes.c_double)),
+        ("de_x", ctypes.POINTER(ctypes.c_double)),
+        ("de_y", ctypes.POINTER(ctypes.c_double)),
+        ("test1", ctypes.POINTER(ctypes.c_double)),
+        ("test2", ctypes.POINTER(ctypes.c_double)),
+    ]
+
+
+NATIVE_RENDER_PLANES_VERSION = 1
+
+# These values mirror FRACTAL_RENDER_HINT_* in renderer.h.  Zero deliberately
+# retains the old native behavior, which is important for callers that use
+# the metadata ABI without a KFP profile.  KFP can skip the expensive phase
+# and analytic-DE calculations when its imported recipe never reads them.
+NATIVE_RENDER_HINT_SKIP_PHASE = 1 << 0
+NATIVE_RENDER_HINT_SKIP_ANALYTIC_DE = 1 << 1
+
+
+def _native_kfp_plane_flags(profile: Optional[KfpPalette]) -> int:
+    """Return direct-render hints for the fields a KFP profile consumes."""
+
+    if profile is None:
+        return 0
+    flags = 0
+    try:
+        phase_strength = float(profile.phase_color_strength)
+    except (TypeError, ValueError, OverflowError):
+        phase_strength = 0.0
+    if not math.isfinite(phase_strength) or abs(phase_strength) <= 1.0e-12:
+        flags |= NATIVE_RENDER_HINT_SKIP_PHASE
+
+    # Kalles' analytic DE plane is used by the distance-transfer methods and
+    # by the analytic slope path.  The other difference stencils operate on
+    # the iteration plane and do not need derivative arithmetic in the orbit
+    # loop.
+    try:
+        differences = int(profile.differences)
+        color_method = int(profile.color_method)
+        slope_power = float(profile.slope_power)
+        slope_ratio = float(profile.slope_ratio)
+    except (TypeError, ValueError, OverflowError):
+        differences = 0
+        color_method = 0
+        slope_power = 0.0
+        slope_ratio = 0.0
+    needs_analytic_de = differences == 7 and (
+        color_method in {5, 6, 7, 8}
+        or (bool(profile.slopes) and slope_power > 0.0 and slope_ratio > 0.0)
+    )
+    if not needs_analytic_de:
+        flags |= NATIVE_RENDER_HINT_SKIP_ANALYTIC_DE
+    return flags
+
+
+def _compact_kfp_render_planes(
+    profile: Optional[KfpPalette],
+    planes: Optional[KfpFramePlanes],
+) -> Optional[KfpFramePlanes]:
+    """Discard native metadata that the selected KFP transfer cannot read.
+
+    The C ABI currently receives complete plane buffers so it remains
+    compatible with earlier renderers.  A live source can retain only the
+    arrays the profile consumes, however.  In particular, ordinary KFP 3D
+    slopes need the raw orbit/test planes but neither phase nor analytic-DE;
+    dropping those unused double buffers substantially lowers the memory
+    retained by a long live source ladder without changing SetColor inputs.
+    """
+
+    if profile is None or planes is None:
+        return planes
+    flags = _native_kfp_plane_flags(profile)
+    changes: dict[str, Any] = {}
+    if flags & NATIVE_RENDER_HINT_SKIP_PHASE:
+        changes["phase"] = None
+    if flags & NATIVE_RENDER_HINT_SKIP_ANALYTIC_DE:
+        changes["de_x"] = None
+        changes["de_y"] = None
+    # OutputIterationData's square-root smoothing branch is the only Kalles
+    # transfer that reads test2. The logarithmic branch uses test1 alone;
+    # discard this otherwise large double plane from retained live sources.
+    if int(profile.smooth_method) != 1:
+        changes["test2"] = None
+    return replace(planes, **changes) if changes else planes
+
+
+def _allocate_native_render_planes(
+    width: int,
+    height: int,
+) -> tuple[NativeRenderPlanes, dict[str, Any]]:
+    """Allocate the native orbit buffers and keep their ctypes owners together."""
+
+    np = _require_numpy()
+    orbit_iteration = np.empty((height, width), dtype=np.int64)
+    phase_plane = np.empty((height, width), dtype=np.float64)
+    de_x = np.empty((height, width), dtype=np.float64)
+    de_y = np.empty((height, width), dtype=np.float64)
+    test1 = np.empty((height, width), dtype=np.float64)
+    test2 = np.empty((height, width), dtype=np.float64)
+    metadata = NativeRenderPlanes()
+    metadata.struct_size = ctypes.sizeof(NativeRenderPlanes)
+    metadata.version = NATIVE_RENDER_PLANES_VERSION
+    metadata.orbit_iteration = orbit_iteration.ctypes.data_as(
+        ctypes.POINTER(ctypes.c_int64)
+    )
+    metadata.phase = phase_plane.ctypes.data_as(
+        ctypes.POINTER(ctypes.c_double)
+    )
+    metadata.de_x = de_x.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    metadata.de_y = de_y.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    metadata.test1 = test1.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    metadata.test2 = test2.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+    return metadata, {
+        "orbit_iteration": orbit_iteration,
+        "phase": phase_plane,
+        "de_x": de_x,
+        "de_y": de_y,
+        "test1": test1,
+        "test2": test2,
+    }
 
 
 NATIVE_KFP_MAX_MULTI_COLORS = 256
@@ -689,6 +1136,20 @@ class NativeKfpOptions(ctypes.Structure):
         ("differences", ctypes.c_int32),
         ("interior_color", ctypes.c_int32 * 3),
         ("field_bias", ctypes.c_double),
+        ("bailout_radius_preset", ctypes.c_int32),
+        ("bailout_radius_custom", ctypes.c_double),
+        ("bailout_norm_preset", ctypes.c_int32),
+        ("bailout_norm_custom", ctypes.c_double),
+        ("texture_enabled", ctypes.c_int32),
+        ("texture_merge", ctypes.c_double),
+        ("texture_power", ctypes.c_double),
+        ("texture_ratio", ctypes.c_double),
+        ("texture_resize", ctypes.c_int32),
+        ("use_opengl", ctypes.c_int32),
+        ("use_srgb", ctypes.c_int32),
+        # Appended to the version-3 block for ABI-compatible tail growth.
+        # Older native libraries ignore this field and keep Kalles' default.
+        ("show_glitches", ctypes.c_int32),
     ]
 
     @classmethod
@@ -701,7 +1162,7 @@ class NativeKfpOptions(ctypes.Structure):
             raise ValueError("KFP profile contains too many multi-colour waves")
         result = cls()
         result.struct_size = ctypes.sizeof(cls)
-        result.version = 2
+        result.version = 3
         try:
             field_bias = float(field_bias)
         except (TypeError, ValueError, OverflowError) as error:
@@ -732,7 +1193,60 @@ class NativeKfpOptions(ctypes.Structure):
         result.differences = profile.differences
         result.interior_color[:] = profile.interior_color
         result.field_bias = field_bias
+        result.bailout_radius_preset = profile.bailout_radius_preset
+        result.bailout_radius_custom = profile.bailout_radius_custom
+        result.bailout_norm_preset = profile.bailout_norm_preset
+        result.bailout_norm_custom = profile.bailout_norm_custom
+        result.texture_enabled = int(profile.texture_enabled)
+        result.texture_merge = profile.texture_merge
+        result.texture_power = profile.texture_power
+        result.texture_ratio = profile.texture_ratio
+        result.texture_resize = int(profile.texture_resize)
+        result.use_opengl = int(profile.use_opengl)
+        result.use_srgb = int(profile.use_srgb)
+        result.show_glitches = int(profile.show_glitches)
         return result
+
+
+class NativeAtlasColourFrame(ctypes.Structure):
+    """Controls for one frame in the native batched atlas colourizer."""
+
+    _fields_ = [
+        ("parent_zoom", ctypes.c_double),
+        ("child_fraction", ctypes.c_double),
+        ("child_zoom", ctypes.c_double),
+        ("parent_field_bias", ctypes.c_double),
+        ("child_field_bias", ctypes.c_double),
+        ("output_field_bias", ctypes.c_double),
+        ("palette_max_iter", ctypes.c_int32),
+        ("feather", ctypes.c_int32),
+        ("phase", ctypes.c_double),
+        ("vocal", ctypes.c_double),
+        ("instrumental", ctypes.c_double),
+        ("pitch", ctypes.c_double),
+    ]
+
+
+class NativeKfpPlanes(ctypes.Structure):
+    """ctypes mirror of the additive native Kalles plane ABI."""
+
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("orbit_iteration", ctypes.POINTER(ctypes.c_int64)),
+        ("bailout", ctypes.POINTER(ctypes.c_double)),
+        ("iteration", ctypes.POINTER(ctypes.c_int64)),
+        ("transition", ctypes.POINTER(ctypes.c_double)),
+        ("phase", ctypes.POINTER(ctypes.c_double)),
+        ("de_x", ctypes.POINTER(ctypes.c_double)),
+        ("de_y", ctypes.POINTER(ctypes.c_double)),
+        ("test1", ctypes.POINTER(ctypes.c_double)),
+        ("test2", ctypes.POINTER(ctypes.c_double)),
+        ("texture_rgb", ctypes.POINTER(ctypes.c_uint8)),
+        ("texture_width", ctypes.c_int32),
+        ("texture_height", ctypes.c_int32),
+        ("texture_stride", ctypes.c_int32),
+    ]
 
 
 NATIVE_BACKEND_NAMES = {
@@ -746,11 +1260,14 @@ def _native_backend_id(name: str, library: Any) -> int:
     """Resolve a user-facing backend name against the loaded ABI."""
 
     if name == "auto":
-        # AVX2 is a low-overhead CPU choice for shallow/direct frames. OpenCL
-        # is opt-in because a CPU OpenCL ICD can be slower than OpenMP and
-        # deep frames intentionally stay on the validated CPU path.
+        # Prefer a verified hardware GPU when the ABI reports one.  A generic
+        # OpenCL capability may instead describe a CPU ICD, which is commonly
+        # slower than the OpenMP/AVX2 renderer and remains explicit-only.
         if library is not None and hasattr(library, "fractal_backend_capabilities"):
-            return 1 if int(library.fractal_backend_capabilities()) & 2 else 0
+            capabilities = int(library.fractal_backend_capabilities())
+            if capabilities & 8:
+                return 2
+            return 1 if capabilities & 2 else 0
         return 0
     try:
         backend = NATIVE_BACKEND_NAMES[name]
@@ -766,6 +1283,81 @@ def _native_backend_id(name: str, library: Any) -> int:
             f"(capabilities bitmask {capabilities})"
         )
     return backend
+
+
+def _native_backend_for_workload(
+    name: str,
+    library: Any,
+    width: int,
+    height: int,
+    log10_zoom: float,
+    formula: str,
+    *,
+    live_source: bool = False,
+    kfp_planes: bool = False,
+    kfp_scalar: bool = False,
+) -> int:
+    """Choose a measured CPU/GPU field backend for one render workload.
+
+    The policy uses a verified physical GPU for sufficiently large ordinary
+    fields, scalar-KFP fields, and deep Mandelbrot KFP plane fields. Alternate
+    formula plane output remains on the scalar backend until its formula-
+    specific device metadata path is implemented. Explicit selections always
+    retain their direct meaning; only ``auto`` applies this policy.
+    """
+
+    if name != "auto":
+        return _native_backend_id(name, library)
+    try:
+        capabilities = int(library.fractal_backend_capabilities())
+    except (AttributeError, OSError, TypeError, ValueError):
+        capabilities = 0
+    fallback = 1 if capabilities & 2 else 0
+    if not capabilities & 8:
+        return fallback
+    try:
+        pixels = int(width) * int(height)
+        depth = float(log10_zoom)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    gpu_formula = formula in {"mandelbrot", "julia", "burning-ship", "tricorn"}
+    if not gpu_formula:
+        return fallback
+    if kfp_planes:
+        # The deep Mandelbrot kernel can write the complete Kalles metadata
+        # set in one pass. Alternate-formula plane output remains scalar
+        # until its formula-specific metadata is implemented on the device.
+        if formula != "mandelbrot":
+            return fallback
+        if depth >= 12.0 or pixels >= 1_000_000:
+            return 2
+        return fallback
+    # A compact 960x540 live KFP source remains on AVX2 in auto mode: the
+    # high-bailout transfer plus PCIe/driver overhead is usually slower there.
+    # Explicit ``opencl`` still means GPU, including for live view.
+    if kfp_scalar and live_source and pixels < 1_000_000:
+        return fallback
+    # The scalar KFP kernel has the same Kalles coordinate/bailout contract
+    # and its own linear-BLA device path. Keep only compact live sources on
+    # the measured CPU side of the transfer crossover above.
+    if kfp_scalar and depth >= 12.0:
+        return 2
+    # The shared scaled perturbation kernel handles all four ordinary
+    # formulas. Mandelbrot KFP plane output was handled above.
+    if depth >= 12.0:
+        return 2
+    shallow_gpu_pixels = (
+        # The high-bailout scalar KFP field still benefits from the physical
+        # GPU once the frame is at least 1080p-sized.
+        1_000_000 if kfp_scalar
+        else 500_000 if formula in {"burning-ship", "tricorn"}
+        else 1_000_000
+    )
+    if depth < 12.0 and (
+        (live_source and not kfp_scalar) or pixels >= shallow_gpu_pixels
+    ):
+        return 2
+    return fallback
 
 
 def _field_renderer_cache_identity(renderer: str) -> str:
@@ -911,6 +1503,20 @@ def _get_native_library() -> Any:
                     ctypes.c_int,
                 ]
                 library.fractal_colourise.restype = ctypes.c_int
+                if hasattr(library, "fractal_colourise_opencl"):
+                    library.fractal_colourise_opencl.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_colourise_opencl.restype = ctypes.c_int
                 if hasattr(library, "fractal_colourise_accents"):
                     library.fractal_colourise_accents.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -956,6 +1562,41 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_colourise_kfp.restype = ctypes.c_int
+                if hasattr(library, "fractal_colourise_kfp_opencl"):
+                    library.fractal_colourise_kfp_opencl.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(NativeKfpOptions),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_colourise_kfp_opencl.restype = ctypes.c_int
+                if hasattr(library, "fractal_colourise_kfp_planes"):
+                    library.fractal_colourise_kfp_planes.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(NativeKfpOptions),
+                        ctypes.POINTER(NativeKfpPlanes),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_colourise_kfp_planes.restype = ctypes.c_int
                 if hasattr(library, "fractal_crop_colourise_kfp"):
                     library.fractal_crop_colourise_kfp.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -1001,6 +1642,36 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_atlas_colourise_kfp.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_colourise_kfp_planes"):
+                    library.fractal_atlas_colourise_kfp_planes.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(NativeKfpPlanes),
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(NativeKfpPlanes),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(NativeKfpOptions),
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_colourise_kfp_planes.restype = ctypes.c_int
                 if hasattr(library, "fractal_atlas_colourise_kfp_raw"):
                     library.fractal_atlas_colourise_kfp_raw.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -1036,6 +1707,7 @@ def _get_native_library() -> Any:
                     ("fractal_crop_colourise_kfp", "fractal_crop_colourise_kfp_precise"),
                     ("fractal_atlas_colourise_kfp", "fractal_atlas_colourise_kfp_precise"),
                     ("fractal_atlas_colourise_kfp_raw", "fractal_atlas_colourise_kfp_raw_precise"),
+                    ("fractal_atlas_colourise_kfp_planes", "fractal_atlas_colourise_kfp_planes_precise"),
                 ):
                     fast_function = getattr(library, fast_name, None)
                     precise_function = getattr(library, precise_name, None)
@@ -1072,6 +1744,56 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_atlas_composite_rgb.restype = ctypes.c_int
+                if hasattr(library, "fractal_crop_rgb_opencl"):
+                    library.fractal_crop_rgb_opencl.argtypes = [
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_crop_rgb_opencl.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_composite_rgb_opencl"):
+                    library.fractal_atlas_composite_rgb_opencl.argtypes = [
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_composite_rgb_opencl.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_composite_rgb_opencl_cached"):
+                    library.fractal_atlas_composite_rgb_opencl_cached.argtypes = [
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_uint64,
+                        ctypes.c_uint64,
+                    ]
+                    library.fractal_atlas_composite_rgb_opencl_cached.restype = ctypes.c_int
                 if hasattr(library, "fractal_crop_field"):
                     library.fractal_crop_field.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -1084,6 +1806,137 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_crop_field.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_field"):
+                    library.fractal_atlas_field.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_field.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_field_ex"):
+                    library.fractal_atlas_field_ex.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_field_ex.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_colourise_opencl"):
+                    library.fractal_atlas_colourise_opencl.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_uint64,
+                        ctypes.c_uint64,
+                    ]
+                    library.fractal_atlas_colourise_opencl.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_colourise_opencl_accents"):
+                    library.fractal_atlas_colourise_opencl_accents.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.c_int,
+                        ctypes.c_uint64,
+                        ctypes.c_uint64,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_colourise_opencl_accents.restype = ctypes.c_int
+                if hasattr(library, "fractal_atlas_colourise_opencl_batch"):
+                    library.fractal_atlas_colourise_opencl_batch.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(NativeAtlasColourFrame),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_uint64,
+                        ctypes.c_uint64,
+                        ctypes.POINTER(ctypes.c_uint8),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                    ]
+                    library.fractal_atlas_colourise_opencl_batch.restype = ctypes.c_int
                 library.fractal_crop_colourise.argtypes = [
                     ctypes.POINTER(ctypes.c_float),
                     ctypes.c_int,
@@ -1236,6 +2089,17 @@ def _get_native_library() -> Any:
                         ctypes.c_int,
                     ]
                     library.fractal_create_reference_reusable.restype = ctypes.c_void_p
+                if hasattr(library, "fractal_create_reference_reusable_options"):
+                    library.fractal_create_reference_reusable_options.argtypes = [
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(NativeRenderOptions),
+                    ]
+                    library.fractal_create_reference_reusable_options.restype = ctypes.c_void_p
                 if hasattr(library, "fractal_create_reference_ex"):
                     library.fractal_create_reference_ex.argtypes = [
                         ctypes.c_char_p,
@@ -1249,6 +2113,20 @@ def _get_native_library() -> Any:
                         ctypes.c_char_p,
                     ]
                     library.fractal_create_reference_ex.restype = ctypes.c_void_p
+                if hasattr(library, "fractal_create_reference_ex_options"):
+                    library.fractal_create_reference_ex_options.argtypes = [
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.POINTER(NativeRenderOptions),
+                    ]
+                    library.fractal_create_reference_ex_options.restype = ctypes.c_void_p
                 if hasattr(library, "fractal_clone_reference"):
                     library.fractal_clone_reference.argtypes = [
                         ctypes.c_void_p,
@@ -1304,6 +2182,21 @@ def _get_native_library() -> Any:
                         ctypes.POINTER(NativeRenderOptions),
                     ]
                     library.fractal_render_reference_ex.restype = ctypes.c_int
+                if hasattr(library, "fractal_render_reference_ex_planes"):
+                    library.fractal_render_reference_ex_planes.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_char_p,
+                        ctypes.c_void_p,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(NativeRenderOptions),
+                        ctypes.POINTER(NativeRenderPlanes),
+                    ]
+                    library.fractal_render_reference_ex_planes.restype = ctypes.c_int
                 if hasattr(library, "fractal_render_points"):
                     library.fractal_render_points.argtypes = [
                         ctypes.POINTER(ctypes.c_float),
@@ -1320,6 +2213,23 @@ def _get_native_library() -> Any:
                         ctypes.POINTER(NativeRenderOptions),
                     ]
                     library.fractal_render_points.restype = ctypes.c_int
+                if hasattr(library, "fractal_render_points_ex_planes"):
+                    library.fractal_render_points_ex_planes.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_char_p,
+                        ctypes.POINTER(ctypes.c_double),
+                        ctypes.POINTER(ctypes.c_double),
+                        ctypes.POINTER(ctypes.c_int32),
+                        ctypes.c_void_p,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.POINTER(NativeRenderOptions),
+                        ctypes.POINTER(NativeRenderPlanes),
+                    ]
+                    library.fractal_render_points_ex_planes.restype = ctypes.c_int
                 library.render_mandelbrot.argtypes = [
                     ctypes.POINTER(ctypes.c_float),
                     ctypes.c_int,
@@ -1366,6 +2276,25 @@ def _get_native_library() -> Any:
                         ctypes.POINTER(NativeRenderOptions),
                     ]
                     library.render_fractal_ex.restype = ctypes.c_int
+                if hasattr(library, "render_fractal_ex_planes"):
+                    library.render_fractal_ex_planes.argtypes = [
+                        ctypes.POINTER(ctypes.c_float),
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_char_p,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_double,
+                        ctypes.c_double,
+                        ctypes.POINTER(NativeRenderOptions),
+                        ctypes.POINTER(NativeRenderPlanes),
+                    ]
+                    library.render_fractal_ex_planes.restype = ctypes.c_int
                 if hasattr(library, "fractal_set_stats_enabled"):
                     library.fractal_set_stats_enabled.argtypes = [ctypes.c_int]
                     library.fractal_set_stats_enabled.restype = None
@@ -1454,6 +2383,329 @@ def _crop_field_native(
     )
     if status != 0:
         message = library.fractal_last_error() or b"unknown native raw-field reprojection error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
+def _atlas_field_native(
+    parent: Any,
+    child: Any,
+    output_width: int,
+    output_height: int,
+    parent_zoom: float,
+    child_fraction: float,
+    parent_iter: int,
+    child_iter: Optional[int],
+    effective_iter: int,
+    library: Any,
+    threads: int,
+    child_zoom: float = 1.0,
+    parent_field_bias: float = 0.0,
+    child_field_bias: float = 0.0,
+    output_field_bias: float = 0.0,
+    feather: int = 48,
+) -> Any:
+    """Compose an interior-safe scalar atlas through the native ABI."""
+
+    np = _require_numpy()
+    compositor = getattr(library, "fractal_atlas_field_ex", None)
+    extended = compositor is not None
+    if compositor is None:
+        compositor = getattr(library, "fractal_atlas_field", None)
+    if compositor is None:
+        raise RuntimeError("native scalar atlas compositor is unavailable")
+    parent_array = np.ascontiguousarray(parent, dtype=np.float32)
+    if parent_array.ndim != 2:
+        raise ValueError("native scalar atlas parent must be two-dimensional")
+    child_array = None
+    child_width = 0
+    child_height = 0
+    child_cap = 0
+    if child is not None and child_iter is not None and float(child_fraction) > 0.0:
+        child_array = np.ascontiguousarray(child, dtype=np.float32)
+        if child_array.ndim != 2:
+            raise ValueError("native scalar atlas child must be two-dimensional")
+        child_height, child_width = child_array.shape
+        child_cap = int(child_iter)
+    output = np.empty((int(output_height), int(output_width)), dtype=np.float32)
+    child_pointer = (
+        child_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        if child_array is not None
+        else ctypes.POINTER(ctypes.c_float)()
+    )
+    arguments = [
+        parent_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(parent_array.shape[1]),
+        int(parent_array.shape[0]),
+        int(parent_iter),
+        child_pointer,
+        int(child_width),
+        int(child_height),
+        int(child_cap),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(output_width),
+        int(output_height),
+        float(parent_zoom),
+        float(child_fraction),
+    ]
+    if extended:
+        arguments.extend([
+            float(child_zoom),
+            float(parent_field_bias),
+            float(child_field_bias),
+            float(output_field_bias),
+            int(effective_iter),
+            int(feather),
+            int(threads),
+        ])
+    else:
+        arguments.extend([int(effective_iter), int(threads)])
+    status = compositor(*arguments)
+    if status != 0:
+        message = library.fractal_last_error() or b"unknown native scalar atlas error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
+def _atlas_colourise_opencl_native(
+    parent: Any,
+    child: Any,
+    output_width: int,
+    output_height: int,
+    parent_zoom: float,
+    child_fraction: float,
+    parent_iter: int,
+    child_iter: Optional[int],
+    effective_iter: int,
+    child_zoom: float,
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    pitch: float,
+    feather: int,
+    library: Any,
+    threads: int,
+    parent_cache_token: int = 0,
+    child_cache_token: int = 0,
+    parent_field_bias: float = 0.0,
+    child_field_bias: float = 0.0,
+    output_field_bias: float = 0.0,
+    accents: Optional[tuple[tuple[int, int, int], ...]] = None,
+    interior_color: tuple[int, int, int] = (0, 0, 0),
+) -> Any:
+    """Reproject and colour an ordinary atlas entirely on OpenCL.
+
+    The accent-aware ABI keeps the three-wave palette projection on the
+    device-side render path for built-in and custom ordinary palettes. Older
+    native libraries retain the Aurora-only ABI as a compatibility fallback.
+    """
+
+    np = _require_numpy()
+    accented_function = getattr(
+        library,
+        "fractal_atlas_colourise_opencl_accents",
+        None,
+    )
+    function = accented_function or getattr(
+        library,
+        "fractal_atlas_colourise_opencl",
+        None,
+    )
+    if function is None:
+        raise RuntimeError("fused OpenCL atlas colourizer is unavailable")
+    parent_array = np.ascontiguousarray(parent, dtype=np.float32)
+    if parent_array.ndim != 2:
+        raise ValueError("OpenCL atlas parent must be two-dimensional")
+    child_array = None
+    child_width = child_height = child_cap = 0
+    if child is not None and child_iter is not None and float(child_fraction) > 0.0:
+        child_array = np.ascontiguousarray(child, dtype=np.float32)
+        if child_array.ndim != 2:
+            raise ValueError("OpenCL atlas child must be two-dimensional")
+        child_height, child_width = child_array.shape
+        child_cap = int(child_iter)
+    try:
+        parent_token = int(parent_cache_token)
+        child_token = int(child_cache_token)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("OpenCL atlas cache tokens must be integers") from error
+    if parent_token < 0 or child_token < 0:
+        raise ValueError("OpenCL atlas cache tokens must be non-negative")
+    try:
+        interior = tuple(int(channel) for channel in interior_color)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("OpenCL atlas interior colour must contain integers") from error
+    if len(interior) != 3 or any(channel < 0 or channel > 255 for channel in interior):
+        raise ValueError("OpenCL atlas interior colour must be three bytes")
+    accent_pointer = ctypes.POINTER(ctypes.c_uint8)()
+    accent_values = None
+    if accented_function is not None and accents is not None:
+        try:
+            accent_values = (ctypes.c_uint8 * 9)(
+                *(int(channel) for colour in accents for channel in colour)
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("OpenCL atlas accents must contain RGB byte triples") from error
+        if len(accents) != 3 or any(len(colour) != 3 for colour in accents):
+            raise ValueError("OpenCL atlas accents must contain three RGB triples")
+        accent_pointer = ctypes.cast(
+            accent_values,
+            ctypes.POINTER(ctypes.c_uint8),
+        )
+    output = np.empty(
+        (int(output_height), int(output_width), 3),
+        dtype=np.uint8,
+    )
+    child_pointer = (
+        child_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        if child_array is not None
+        else ctypes.POINTER(ctypes.c_float)()
+    )
+    arguments = [
+        parent_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(parent_array.shape[1]),
+        int(parent_array.shape[0]),
+        int(parent_iter),
+        child_pointer,
+        int(child_width),
+        int(child_height),
+        int(child_cap),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(output_width),
+        int(output_height),
+        float(parent_zoom),
+        float(child_fraction),
+        float(child_zoom),
+        float(parent_field_bias),
+        float(child_field_bias),
+        float(output_field_bias),
+        int(effective_iter),
+        int(feather),
+        float(phase),
+        float(vocal),
+        float(instrumental),
+        float(pitch),
+        int(threads),
+        ctypes.c_uint64(parent_token),
+        ctypes.c_uint64(child_token),
+    ]
+    if accented_function is not None:
+        arguments.extend([
+            accent_pointer,
+            int(interior[0]),
+            int(interior[1]),
+            int(interior[2]),
+        ])
+    status = function(*arguments)
+    if status != 0:
+        message = library.fractal_last_error() or b"unknown OpenCL atlas colourizer error"
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
+def _atlas_colourise_opencl_batch_native(
+    parent: Any,
+    child: Any,
+    output_width: int,
+    output_height: int,
+    parent_iter: int,
+    child_iter: Optional[int],
+    frames: tuple[NativeAtlasColourFrame, ...],
+    library: Any,
+    threads: int,
+    parent_cache_token: int = 0,
+    child_cache_token: int = 0,
+    accents: Optional[tuple[tuple[int, int, int], ...]] = None,
+    interior_color: tuple[int, int, int] = (0, 0, 0),
+) -> Any:
+    """Colour several ordinary atlas frames with one OpenCL readback."""
+
+    np = _require_numpy()
+    function = getattr(library, "fractal_atlas_colourise_opencl_batch", None)
+    if function is None:
+        raise RuntimeError("batched OpenCL atlas colourizer is unavailable")
+    if not frames:
+        raise ValueError("batched OpenCL atlas colourizer needs one frame")
+    parent_array = np.ascontiguousarray(parent, dtype=np.float32)
+    if parent_array.ndim != 2:
+        raise ValueError("OpenCL atlas parent must be two-dimensional")
+    child_array = None
+    child_width = child_height = child_cap = 0
+    if child is not None and child_iter is not None and any(
+        float(frame.child_fraction) > 0.0 for frame in frames
+    ):
+        child_array = np.ascontiguousarray(child, dtype=np.float32)
+        if child_array.ndim != 2:
+            raise ValueError("OpenCL atlas child must be two-dimensional")
+        child_height, child_width = child_array.shape
+        child_cap = int(child_iter)
+    try:
+        parent_token = int(parent_cache_token)
+        child_token = int(child_cache_token)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("OpenCL atlas cache tokens must be integers") from error
+    if parent_token < 0 or child_token < 0:
+        raise ValueError("OpenCL atlas cache tokens must be non-negative")
+    try:
+        interior = tuple(int(channel) for channel in interior_color)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("OpenCL atlas interior colour must contain integers") from error
+    if len(interior) != 3 or any(channel < 0 or channel > 255 for channel in interior):
+        raise ValueError("OpenCL atlas interior colour must be three bytes")
+    accent_pointer = ctypes.POINTER(ctypes.c_uint8)()
+    accent_values = None
+    if accents is not None:
+        if len(accents) != 3 or any(len(colour) != 3 for colour in accents):
+            raise ValueError("OpenCL atlas accents must contain three RGB triples")
+        try:
+            accent_values = (ctypes.c_uint8 * 9)(
+                *(int(channel) for colour in accents for channel in colour)
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "OpenCL atlas accents must contain RGB byte triples"
+            ) from error
+        accent_pointer = ctypes.cast(
+            accent_values,
+            ctypes.POINTER(ctypes.c_uint8),
+        )
+    frame_values = (NativeAtlasColourFrame * len(frames))(*frames)
+    output = np.empty(
+        (len(frames), int(output_height), int(output_width), 3),
+        dtype=np.uint8,
+    )
+    parent_pointer = parent_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    child_pointer = (
+        child_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        if child_array is not None
+        else ctypes.POINTER(ctypes.c_float)()
+    )
+    status = function(
+        parent_pointer,
+        int(parent_array.shape[1]),
+        int(parent_array.shape[0]),
+        int(parent_iter),
+        child_pointer,
+        int(child_width),
+        int(child_height),
+        int(child_cap),
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(output_width),
+        int(output_height),
+        frame_values,
+        int(len(frames)),
+        int(threads),
+        ctypes.c_uint64(parent_token),
+        ctypes.c_uint64(child_token),
+        accent_pointer,
+        int(interior[0]),
+        int(interior[1]),
+        int(interior[2]),
+    )
+    if status != 0:
+        message = library.fractal_last_error() or (
+            b"unknown batched OpenCL atlas colourizer error"
+        )
         raise RuntimeError(message.decode("utf-8", errors="replace"))
     return output
 
@@ -1890,13 +3142,19 @@ class _FFmpegFrameWriter:
         process: Any,
         diagnostics: Optional[deque[str]],
         reader: Optional[threading.Thread],
+        input_pixel_format: str = "rgb24",
     ) -> None:
         if process.stdin is None:
             raise RuntimeError("FFmpeg did not provide a video input pipe")
+        if input_pixel_format not in {"rgb24", "rgb0", "rgba"}:
+            raise ValueError(
+                "FFmpeg raw input pixel format must be rgb24, rgb0, or rgba"
+            )
         self.process = process
         self.diagnostics = diagnostics
         self.reader = reader
         self.stream = process.stdin
+        self.input_pixel_format = input_pixel_format
         self.queue: queue.Queue[Any] = queue.Queue(maxsize=3)
         self.errors: list[BaseException] = []
         self.finished = threading.Event()
@@ -1956,13 +3214,37 @@ class _FFmpegFrameWriter:
         return_code = self.process.poll()
         if return_code is not None:
             raise self._failure("ffmpeg exited before the frame queue drained")
-        if time.monotonic() - self.progress > FFMPEG_STDIN_STALL_TIMEOUT_SECONDS:
+        # A deep native tile can legitimately take minutes to calculate
+        # before the producer has another frame to enqueue.  During that
+        # interval FFmpeg is idle because there is *nothing to drain*, not
+        # because its stdin pipe is stuck.  Only apply the writer timeout
+        # while queued/actively-written frames remain outstanding.
+        pending_frames = self.queue.unfinished_tasks
+        if (
+            pending_frames > 0
+            and time.monotonic() - self.progress
+                > FFMPEG_STDIN_STALL_TIMEOUT_SECONDS
+        ):
             _terminate_subprocess(self.process)
             raise self._failure("FFmpeg stopped draining video input for too long")
 
     def write(self, frame: Any) -> None:
         np = _require_numpy()
         contiguous = np.ascontiguousarray(frame, dtype=np.uint8)
+        if self.input_pixel_format in {"rgb0", "rgba"}:
+            if contiguous.ndim != 3 or contiguous.shape[2] != 3:
+                raise ValueError(
+                    "packed RGB FFmpeg input requires an HxWx3 frame"
+                )
+            packed = np.empty(
+                (contiguous.shape[0], contiguous.shape[1], 4),
+                dtype=np.uint8,
+            )
+            packed[..., :3] = contiguous
+            # ``rgb0`` ignores the fourth byte. ``rgba`` needs opaque alpha
+            # so both formats are safe when this writer is used independently.
+            packed[..., 3] = 255 if self.input_pixel_format == "rgba" else 0
+            contiguous = packed
         while True:
             self.check_health()
             try:
@@ -3453,6 +4735,19 @@ def _validate_center_text(value: str, label: str) -> str:
         raise ValueError(f"invalid {label} coordinate: {value}") from error
     if not parsed.is_finite():
         raise ValueError(f"{label} coordinate must be finite")
+    if _NATIVE_DECIMAL_TEXT_RE.fullmatch(text) is None:
+        # The native path intentionally keeps locale-independent parsing and
+        # therefore accepts the portable ASCII decimal grammar only. Decimal
+        # has already validated the value, so formatting it with ``g`` here
+        # removes separators/Unicode digits without rounding away supplied
+        # precision. This keeps GUI pastes on the native path instead of
+        # silently dropping them into the shallow Python renderer.
+        text = format(parsed, "g")
+        if not text or len(text) > MAX_COORDINATE_TEXT_LENGTH:
+            raise ValueError(
+                f"{label} coordinate must contain between 1 and "
+                f"{MAX_COORDINATE_TEXT_LENGTH:,} characters"
+            )
     return text
 
 
@@ -3778,13 +5073,15 @@ def _reference_orbit(
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
     *,
     include_margins: bool = False,
+    escape_radius_mode: int = 0,
 ) -> tuple[Any, Any] | tuple[Any, Any, Any]:
     """Return a high-precision reference orbit for an alternate formula.
 
     ``real`` and ``imag`` are float projections used by the vectorised
     perturbation recurrence.  When requested, ``margins`` retains the
-    high-precision value ``|z|² - 4`` for every reference sample.  Comparing
-    the projected float orbit directly with ``4`` loses sub-ulp escape bands
+    high-precision value ``|z|² - bailout²`` for every reference sample.
+    Comparing the projected float orbit directly with the bailout loses
+    sub-ulp escape bands
     at deep zooms (notably the Tricorn and Burning Ship tips), so the margin
     lets the alternate renderer make the escape decision without rounding
     away the very quantity it is trying to detect.
@@ -3792,6 +5089,7 @@ def _reference_orbit(
 
     np = _require_numpy()
     formula = _formula_name(formula)
+    escape_radius_squared = _escape_radius_squared(escape_radius_mode)
     precision = _decimal_precision(x_center, y_center, log10_zoom)
     real = np.empty(max_iter + 1, dtype=np.float64)
     imag = np.empty(max_iter + 1, dtype=np.float64)
@@ -3802,7 +5100,7 @@ def _reference_orbit(
         imag[index] = float(zi)
         if margins is not None:
             try:
-                margin = float(zr * zr + zi * zi - 4)
+                margin = float(zr * zr + zi * zi - escape_radius_squared)
             except (OverflowError, ValueError):
                 margin = math.inf
             margins[index] = margin
@@ -3862,7 +5160,13 @@ def _reference_orbit(
                 real.fill(float(fixed_real))
                 imag.fill(float(fixed_imag))
                 if margins is not None:
-                    margins.fill(float(fixed_real * fixed_real + fixed_imag * fixed_imag - 4))
+                    margins.fill(
+                        float(
+                            fixed_real * fixed_real
+                            + fixed_imag * fixed_imag
+                            - escape_radius_squared
+                        )
+                    )
             else:
                 for index in range(max_iter + 1):
                     if abs(zr) > float_limit or abs(zi) > float_limit:
@@ -3943,7 +5247,11 @@ def _reference_orbit(
                 real.fill(float(fixed_real))
                 imag.fill(float(fixed_imag))
                 if margins is not None:
-                    margins.fill(fixed_real * fixed_real + fixed_imag * fixed_imag - Decimal(4))
+                    margins.fill(
+                        fixed_real * fixed_real
+                        + fixed_imag * fixed_imag
+                        - Decimal(str(escape_radius_squared))
+                    )
             else:
                 for index in range(max_iter + 1):
                     if abs(zr) > decimal_limit or abs(zi) > decimal_limit:
@@ -3970,6 +5278,7 @@ def _stabilize_alternate_reference_cycle(
     reference_real: Any,
     reference_imag: Any,
     reference_margin: Any,
+    escape_radius_mode: int = 0,
 ) -> Optional[int]:
     """Hold a detected bounded cycle instead of amplifying decimal roundoff.
 
@@ -3983,6 +5292,7 @@ def _stabilize_alternate_reference_cycle(
     """
 
     np = _require_numpy()
+    escape_radius_squared = _escape_radius_squared(escape_radius_mode)
     real = np.asarray(reference_real)
     imag = np.asarray(reference_imag)
     margins = np.asarray(reference_margin)
@@ -4019,7 +5329,10 @@ def _stabilize_alternate_reference_cycle(
             following_real = real[following]
             following_imag = imag[following]
             radius_squared = cycle_real * cycle_real + cycle_imag * cycle_imag
-            if not np.isfinite(radius_squared).all() or float(np.max(radius_squared)) >= 4.0:
+            if (
+                not np.isfinite(radius_squared).all()
+                or float(np.max(radius_squared)) >= escape_radius_squared
+            ):
                 continue
             difference = np.hypot(
                 current_real - cycle_real,
@@ -4085,10 +5398,12 @@ def _alternate_critical_orbit(
     x_center: str,
     y_center: str,
     julia_constant: tuple[str, str],
+    escape_radius_mode: int = 0,
 ) -> Any:
     """Return a small float critical orbit used for interior acceleration."""
 
     np = _require_numpy()
+    escape_radius_squared = _escape_radius_squared(escape_radius_mode)
     if formula == "julia":
         parameter_real = _finite_float_coordinate(julia_constant[0], "Julia real")
         parameter_imag = _finite_float_coordinate(julia_constant[1], "Julia imaginary")
@@ -4103,7 +5418,10 @@ def _alternate_critical_orbit(
             formula, zr, zi, parameter_real, parameter_imag
         )
         magnitude_squared = zr * zr + zi * zi
-        if not math.isfinite(magnitude_squared) or magnitude_squared > 4.0:
+        if (
+            not math.isfinite(magnitude_squared)
+            or magnitude_squared > escape_radius_squared
+        ):
             break
         values.append(complex(zr, zi))
     return np.asarray(values, dtype=np.complex128)
@@ -4177,6 +5495,7 @@ def _alternate_cycle_period(
     x_center: str,
     y_center: str,
     julia_constant: tuple[str, str],
+    escape_radius_mode: int = 0,
 ) -> Optional[int]:
     """Choose a conservative period for skipping converged interior pixels."""
 
@@ -4185,7 +5504,11 @@ def _alternate_cycle_period(
         # point, so its period is not the attracting cycle that bounds the
         # filled interior. Probe the critical orbit instead.
         values = _alternate_critical_orbit(
-            formula, x_center, y_center, julia_constant
+            formula,
+            x_center,
+            y_center,
+            julia_constant,
+            escape_radius_mode,
         )
         parameter_real = _finite_float_coordinate(julia_constant[0], "Julia real")
         parameter_imag = _finite_float_coordinate(julia_constant[1], "Julia imaginary")
@@ -4201,24 +5524,49 @@ def _alternate_cycle_period(
     return period
 
 
-def _view_offsets(width: int, height: int, log10_zoom: float) -> tuple[Any, Any]:
+def _view_offsets(
+    width: int,
+    height: int,
+    log10_zoom: float,
+    coordinate_mode: int = 0,
+) -> tuple[Any, Any]:
     np = _require_numpy()
     width, height = _validate_dimensions(width, height, "fractal")
     log10_zoom = _validate_log10_zoom(log10_zoom)
+    coordinate_mode = _index_value(coordinate_mode, "coordinate mode")
+    if coordinate_mode not in {0, 1}:
+        raise ValueError("coordinate mode must be project (0) or Kalles (1)")
     if log10_zoom > 300.0:
         raise RuntimeError("Python rendering cannot represent zooms beyond 10^300; use the native renderer")
     zoom = 10.0 ** log10_zoom
-    view_height = 2.8 / zoom
+    # Kalles serializes Zoom as 2 / m_ZoomRadius and uses
+    # (m_ZoomRadius * 2) / height for pixel spacing, so its complete vertical
+    # view spans 4 / zoom. Keep the historical project span for ordinary
+    # palettes and Python callers.
+    view_height = (4.0 if coordinate_mode == 1 else 2.8) / zoom
     view_width = view_height * width / height
     if not math.isfinite(view_height) or not math.isfinite(view_width):
         raise ValueError("zoom and frame dimensions produce an unrepresentable viewport")
-    x = (np.arange(width, dtype=np.float64) - (width - 1) / 2.0) * view_width / width
-    y = ((height - 1) / 2.0 - np.arange(height, dtype=np.float64)) * view_height / height
+    if coordinate_mode == 1:
+        x_origin = float(width // 2)
+        y_origin = float(height // 2)
+    else:
+        x_origin = (width - 1) / 2.0
+        y_origin = (height - 1) / 2.0
+    x = (np.arange(width, dtype=np.float64) - x_origin) * view_width / width
+    y = (y_origin - np.arange(height, dtype=np.float64)) * view_height / height
     return np.meshgrid(x, y)
 
 
-def _smooth_escape(iteration: int, magnitude_squared: Any, power: int = 2) -> Any:
+def _smooth_escape(
+    iteration: int,
+    magnitude_squared: Any,
+    power: int = 2,
+    escape_radius_mode: int = 0,
+) -> Any:
     np = _require_numpy()
+    escape_radius_squared = _escape_radius_squared(escape_radius_mode)
+    safe_escape_squared = escape_radius_squared + 1.0e-7
     # Orbit arithmetic can overflow after a pixel has escaped, especially in
     # the exploratory alternate-formula path. Keep the smooth colour finite
     # instead of turning an otherwise valid frame into -inf/NaN values.
@@ -4226,9 +5574,9 @@ def _smooth_escape(iteration: int, magnitude_squared: Any, power: int = 2) -> An
         np.asarray(magnitude_squared),
         nan=np.finfo(np.float64).max,
         posinf=np.finfo(np.float64).max,
-        neginf=4.0000001,
+        neginf=safe_escape_squared,
     )
-    magnitude = np.sqrt(np.maximum(safe_squared, 4.0000001))
+    magnitude = np.sqrt(np.maximum(safe_squared, safe_escape_squared))
     return iteration - np.log(np.log(magnitude)) / math.log(float(power))
 
 
@@ -4241,6 +5589,8 @@ def _render_direct(
     max_iter: int,
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
+    escape_radius_mode: int = 0,
+    coordinate_mode: int = 0,
 ) -> Any:
     """Vectorised float64 renderer for shallow Mandelbrot-family views."""
 
@@ -4256,7 +5606,10 @@ def _render_direct(
         _validate_center_text(julia_constant[1], "Julia imaginary"),
     )
     formula = _formula_name(formula)
-    x_offset, y_offset = _view_offsets(width, height, log10_zoom)
+    escape_radius_squared = _escape_radius_squared(escape_radius_mode)
+    x_offset, y_offset = _view_offsets(
+        width, height, log10_zoom, coordinate_mode
+    )
     # Float conversion is safe here because this path is used before a deep
     # zoom, where the pixel spacing is still much larger than float64 ulps.
     real = (_finite_float_coordinate(x_center, "real") + x_offset).ravel()
@@ -4317,10 +5670,16 @@ def _render_direct(
             )
             next_imag = 2.0 * active_real * active_imag + active_parameter_imag
         magnitude_squared = next_real * next_real + next_imag * next_imag
-        newly_escaped = (magnitude_squared > 4.0) | ~np.isfinite(magnitude_squared)
+        newly_escaped = (
+            (magnitude_squared > escape_radius_squared)
+            | ~np.isfinite(magnitude_squared)
+        )
         escaped_indices = active_indices[newly_escaped]
         smooth[escaped_indices] = _smooth_escape(
-            iteration, magnitude_squared[newly_escaped], _formula_power(formula)
+            iteration,
+            magnitude_squared[newly_escaped],
+            _formula_power(formula),
+            escape_radius_mode,
         )
         z_real[active_indices] = next_real
         z_imag[active_indices] = next_imag
@@ -4338,6 +5697,8 @@ def _render_perturbed(
     max_iter: int,
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
+    escape_radius_mode: int = 0,
+    coordinate_mode: int = 0,
 ) -> Any:
     """Render using a high-precision centre orbit and pixel perturbations."""
 
@@ -4353,11 +5714,20 @@ def _render_perturbed(
             max_iter,
             formula,
             julia_constant,
+            escape_radius_mode,
+            coordinate_mode,
         )
-    x_offset, y_offset = _view_offsets(width, height, log10_zoom)
-    reference_real, reference_imag = _reference_orbit(
-        x_center, y_center, max_iter, log10_zoom
+    x_offset, y_offset = _view_offsets(
+        width, height, log10_zoom, coordinate_mode
     )
+    reference_real, reference_imag = _reference_orbit(
+        x_center,
+        y_center,
+        max_iter,
+        log10_zoom,
+        escape_radius_mode=escape_radius_mode,
+    )
+    escape_radius_squared = _escape_radius_squared(escape_radius_mode)
 
     x_offset = x_offset.ravel()
     y_offset = y_offset.ravel()
@@ -4395,10 +5765,15 @@ def _render_perturbed(
         next_real = reference_real[iteration + 1] + next_delta_real
         next_imag = reference_imag[iteration + 1] + next_delta_imag
         magnitude_squared = next_real * next_real + next_imag * next_imag
-        newly_escaped = (magnitude_squared > 4.0) | ~np.isfinite(magnitude_squared)
+        newly_escaped = (
+            (magnitude_squared > escape_radius_squared)
+            | ~np.isfinite(magnitude_squared)
+        )
         escaped_indices = active_indices[newly_escaped]
         smooth[escaped_indices] = _smooth_escape(
-            iteration + 1, magnitude_squared[newly_escaped]
+            iteration + 1,
+            magnitude_squared[newly_escaped],
+            escape_radius_mode=escape_radius_mode,
         )
         escaped[escaped_indices] = True
 
@@ -4419,6 +5794,8 @@ def _render_perturbed_alternate(
     max_iter: int,
     formula: str,
     julia_constant: tuple[str, str],
+    escape_radius_mode: int = 0,
+    coordinate_mode: int = 0,
 ) -> Any:
     """High-precision-reference perturbation fallback for alternate formulas.
 
@@ -4436,13 +5813,16 @@ def _render_perturbed_alternate(
     log10_zoom = _validate_log10_zoom(log10_zoom)
     x_center = _validate_center_text(x_center, "real")
     y_center = _validate_center_text(y_center, "imaginary")
+    escape_radius_squared = _escape_radius_squared(escape_radius_mode)
     if len(julia_constant) != 2:
         raise ValueError("Julia constant must contain real and imaginary coordinates")
     julia_constant = (
         _validate_center_text(julia_constant[0], "Julia real"),
         _validate_center_text(julia_constant[1], "Julia imaginary"),
     )
-    x_offset, y_offset = _view_offsets(width, height, log10_zoom)
+    x_offset, y_offset = _view_offsets(
+        width, height, log10_zoom, coordinate_mode
+    )
     reference_real, reference_imag, reference_margin = _reference_orbit(
         x_center,
         y_center,
@@ -4451,11 +5831,13 @@ def _render_perturbed_alternate(
         formula,
         julia_constant,
         include_margins=True,
+        escape_radius_mode=escape_radius_mode,
     )
     _stabilize_alternate_reference_cycle(
         reference_real,
         reference_imag,
         reference_margin,
+        escape_radius_mode,
     )
     offset = x_offset.ravel() + 1j * y_offset.ravel()
     reference = np.full(reference_real.shape, np.inf + 0j, dtype=np.complex128)
@@ -4478,6 +5860,7 @@ def _render_perturbed_alternate(
         x_center,
         y_center,
         julia_constant,
+        escape_radius_mode,
     )
     cycle_start_iteration = max(
         256,
@@ -4602,12 +5985,16 @@ def _render_perturbed_alternate(
                 + delta_imag_next * delta_imag_next
             )
             newly_escaped = (margin > 0.0) | ~np.isfinite(margin)
-            magnitude_squared = np.maximum(4.0000001, 4.0 + margin)
+            magnitude_squared = np.maximum(
+                escape_radius_squared + 1.0e-7,
+                escape_radius_squared + margin,
+            )
             escaped_indices = active_indices[newly_escaped]
             smooth[escaped_indices] = _smooth_escape(
                 iteration + 1,
                 magnitude_squared[newly_escaped],
                 power,
+                escape_radius_mode,
             )
             escaped[escaped_indices] = True
             delta[active_indices] = next_delta
@@ -4681,6 +6068,7 @@ def _render_native(
     render_options: Optional[NativeRenderOptions] = None,
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
+    return_planes: bool = False,
 ) -> Any:
     np = _require_numpy()
     formula = _formula_name(formula)
@@ -4694,8 +6082,35 @@ def _render_native(
     use_perturbation = int(log10_zoom >= 12.0)
     options = render_options or NativeRenderOptions()
     formula_renderer = getattr(library, "render_fractal_ex", None)
+    metadata_renderer = getattr(library, "render_fractal_ex_planes", None)
     ex_renderer = getattr(library, "render_mandelbrot_ex", None)
-    if formula_renderer is not None:
+    metadata = None
+    metadata_buffers = None
+    if return_planes:
+        options = _scalar_metadata_options(options, formula)
+        if metadata_renderer is None:
+            raise RuntimeError(
+                "the native library does not expose render_fractal_ex_planes; rebuild with make"
+            )
+        metadata, metadata_buffers = _allocate_native_render_planes(width, height)
+        status = metadata_renderer(
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            width,
+            height,
+            zoom_text,
+            x_center.encode("ascii"),
+            y_center.encode("ascii"),
+            max_iter,
+            precision_bits,
+            use_perturbation,
+            native_threads,
+            FORMULA_IDS[formula],
+            _finite_float_coordinate(julia_constant[0], "Julia real"),
+            _finite_float_coordinate(julia_constant[1], "Julia imaginary"),
+            ctypes.byref(options),
+            ctypes.byref(metadata),
+        )
+    elif formula_renderer is not None:
         status = formula_renderer(
             output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             width,
@@ -4746,6 +6161,19 @@ def _render_native(
     if status != 0:
         message = library.fractal_last_error() or b"unknown native renderer error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
+    if return_planes:
+        return output, KfpFramePlanes(
+            orbit_iteration=metadata_buffers["orbit_iteration"],
+            phase=metadata_buffers["phase"],
+            # Both direct and deep Mandelbrot paths now export Kalles' DE
+            # planes.  Keeping them attached is what lets Differences=7 and
+            # the analytic slope path use the same SetColor inputs at deep
+            # zoom instead of silently reverting to a screen stencil.
+            de_x=metadata_buffers["de_x"],
+            de_y=metadata_buffers["de_y"],
+            test1=metadata_buffers["test1"],
+            test2=metadata_buffers["test2"],
+        )
     return output
 
 
@@ -4758,6 +6186,8 @@ def _create_native_reference(
     bla_log10_zoom: Optional[float] = None,
     image_series_order: int = 32,
     reusable: bool = False,
+    escape_radius_mode: int = 0,
+    coordinate_mode: Optional[int] = None,
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
 ) -> tuple[Any, Any]:
@@ -4788,17 +6218,29 @@ def _create_native_reference(
         raise ValueError("series order must be between 1 and 32")
     if not 8 <= image_series_order <= 32:
         raise ValueError("image series order must be between 8 and 32")
+    escape_radius_mode = _index_value(escape_radius_mode, "escape radius mode")
+    if escape_radius_mode not in {0, 1}:
+        raise ValueError("escape radius mode must be classic (0) or Kalles high (1)")
     library = _get_native_library()
     if library is None:
         raise RuntimeError("native renderer is unavailable; run `make` inside `nix-shell`")
     precision_bits = _native_precision_bits(x_center, y_center, log10_zoom)
+    reference_options = NativeRenderOptions(
+        escape_radius_mode=escape_radius_mode,
+        coordinate_mode=coordinate_mode,
+    )
+    use_option_aware_creator = bool(escape_radius_mode or coordinate_mode == 1)
     if formula != "mandelbrot":
-        creator = getattr(library, "fractal_create_reference_ex", None)
+        creator = (
+            getattr(library, "fractal_create_reference_ex_options", None)
+            if use_option_aware_creator
+            else getattr(library, "fractal_create_reference_ex", None)
+        )
         if creator is None:
             raise RuntimeError(
                 "the native library does not expose formula-aware references; rebuild with make"
             )
-        handle = creator(
+        arguments = (
             x_center.encode("ascii"),
             y_center.encode("ascii"),
             _zoom_text(log10_zoom if bla_log10_zoom is None else bla_log10_zoom),
@@ -4809,20 +6251,45 @@ def _create_native_reference(
             julia_constant[0].encode("ascii"),
             julia_constant[1].encode("ascii"),
         )
-    else:
-        creator = (
-            getattr(library, "fractal_create_reference_reusable", None)
-            if reusable
-            else None
-        ) or library.fractal_create_reference
-        handle = creator(
-            x_center.encode("ascii"),
-            y_center.encode("ascii"),
-            _zoom_text(log10_zoom if bla_log10_zoom is None else bla_log10_zoom),
-            max_iter,
-            precision_bits,
-            image_series_order,
+        handle = (
+            creator(*arguments, ctypes.byref(reference_options))
+            if use_option_aware_creator
+            else creator(*arguments)
         )
+    else:
+        if use_option_aware_creator:
+            creator = getattr(
+                library,
+                "fractal_create_reference_reusable_options",
+                None,
+            )
+            if creator is None:
+                raise RuntimeError(
+                    "the native library does not expose Kalles bailout references; rebuild with make"
+                )
+            arguments = (
+                x_center.encode("ascii"),
+                y_center.encode("ascii"),
+                _zoom_text(log10_zoom if bla_log10_zoom is None else bla_log10_zoom),
+                max_iter,
+                precision_bits,
+                image_series_order,
+            )
+            handle = creator(*arguments, ctypes.byref(reference_options))
+        else:
+            creator = (
+                getattr(library, "fractal_create_reference_reusable", None)
+                if reusable
+                else None
+            ) or library.fractal_create_reference
+            handle = creator(
+                x_center.encode("ascii"),
+                y_center.encode("ascii"),
+                _zoom_text(log10_zoom if bla_log10_zoom is None else bla_log10_zoom),
+                max_iter,
+                precision_bits,
+                image_series_order,
+            )
     if not handle:
         message = library.fractal_last_error() or b"unknown native reference error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
@@ -4892,7 +6359,12 @@ def _native_reference_tier_logs(
     if not math.isfinite(maximum) or maximum < 12.0:
         return []
     starts = [12.0]
-    if maximum <= 32.0:
+    # The original e12 table is sufficient through the normal e24 GUI range,
+    # but its broad input-radius maps become unreliable just beyond that
+    # boundary. Prepare a final radius-matched tier for the smaller deep
+    # ranges too; otherwise a max-zoom of e30 would silently render every
+    # source with the e12 table and could turn the whole frame unresolved.
+    if maximum <= 24.0:
         return starts
     # The first reusable e12 table is intentionally conservative.  Leaving a
     # 28-decade gap before the next tier makes the e20--e40 atlas levels reuse
@@ -4992,6 +6464,7 @@ def _render_native_reference(
     render_options: Optional[NativeRenderOptions] = None,
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
+    return_planes: bool = False,
 ) -> Any:
     np = _require_numpy()
     library = _get_native_library()
@@ -5002,9 +6475,21 @@ def _render_native_reference(
     zoom_text = _zoom_text(log10_zoom)
     options = render_options or NativeRenderOptions()
     formula = _formula_name(formula)
-    reference_renderer = getattr(library, "fractal_render_reference_ex", None)
-    if reference_renderer is not None:
-        status = reference_renderer(
+    metadata = None
+    metadata_buffers = None
+    if return_planes:
+        options = _scalar_metadata_options(options, formula)
+        reference_planes_renderer = getattr(
+            library,
+            "fractal_render_reference_ex_planes",
+            None,
+        )
+        if reference_planes_renderer is None:
+            raise RuntimeError(
+                "the native library does not expose reusable-reference orbit metadata; rebuild with make"
+            )
+        metadata, metadata_buffers = _allocate_native_render_planes(width, height)
+        status = reference_planes_renderer(
             output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             width,
             height,
@@ -5015,11 +6500,12 @@ def _render_native_reference(
             series_order,
             series_block,
             ctypes.byref(options),
+            ctypes.byref(metadata),
         )
-    elif formula == "mandelbrot":
-        ex_renderer = getattr(library, "fractal_render_mandelbrot_reference_ex", None)
-        if ex_renderer is not None:
-            status = ex_renderer(
+    else:
+        reference_renderer = getattr(library, "fractal_render_reference_ex", None)
+        if reference_renderer is not None:
+            status = reference_renderer(
                 output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 width,
                 height,
@@ -5031,25 +6517,49 @@ def _render_native_reference(
                 series_block,
                 ctypes.byref(options),
             )
+        elif formula == "mandelbrot":
+            ex_renderer = getattr(library, "fractal_render_mandelbrot_reference_ex", None)
+            if ex_renderer is not None:
+                status = ex_renderer(
+                    output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    width,
+                    height,
+                    zoom_text,
+                    native_reference,
+                    max_iter,
+                    native_threads,
+                    series_order,
+                    series_block,
+                    ctypes.byref(options),
+                )
+            else:
+                status = library.render_mandelbrot_reference(
+                    output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                    width,
+                    height,
+                    zoom_text,
+                    native_reference,
+                    max_iter,
+                    native_threads,
+                    series_order,
+                    series_block,
+                )
         else:
-            status = library.render_mandelbrot_reference(
-                output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                width,
-                height,
-                zoom_text,
-                native_reference,
-                max_iter,
-                native_threads,
-                series_order,
-                series_block,
+            raise RuntimeError(
+                "the native library does not expose formula-aware reference rendering; rebuild with make"
             )
-    else:
-        raise RuntimeError(
-            "the native library does not expose formula-aware reference rendering; rebuild with make"
-        )
     if status != 0:
         message = library.fractal_last_error() or b"unknown native renderer error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
+    if return_planes:
+        return output, KfpFramePlanes(
+            orbit_iteration=metadata_buffers["orbit_iteration"],
+            phase=metadata_buffers["phase"],
+            de_x=metadata_buffers["de_x"],
+            de_y=metadata_buffers["de_y"],
+            test1=metadata_buffers["test1"],
+            test2=metadata_buffers["test2"],
+        )
     return output
 
 
@@ -5103,6 +6613,9 @@ def _render_native_reference_points(
     series_order: int,
     series_block: int,
     render_options: NativeRenderOptions,
+    coordinate_mode: Optional[int] = None,
+    formula: str = "mandelbrot",
+    return_planes: bool = False,
 ) -> Any:
     """Render exact global pixels around a probe-centred secondary reference.
 
@@ -5113,14 +6626,26 @@ def _render_native_reference_points(
     """
 
     np = _require_numpy()
-    if not hasattr(native_library, "fractal_render_points"):
+    if coordinate_mode is None:
+        coordinate_mode = int(render_options.coordinate_mode)
+    coordinate_mode = _index_value(coordinate_mode, "coordinate mode")
+    if coordinate_mode not in {0, 1}:
+        raise ValueError("coordinate mode must be project (0) or Kalles (1)")
+    point_renderer = (
+        getattr(native_library, "fractal_render_points_ex_planes", None)
+        if return_planes else getattr(native_library, "fractal_render_points", None)
+    )
+    if point_renderer is None:
         raise RuntimeError("native point renderer is unavailable")
     x0, x1, y0, y1 = cell
     probe_x, probe_y = probe
     if not (0 <= x0 < x1 <= render_width and 0 <= y0 < y1 <= render_height):
         raise ValueError("invalid point-render cell")
-    if not (x0 <= probe_x < x1 and y0 <= probe_y < y1):
-        raise ValueError("point-render probe is outside its cell")
+    if not (
+        0 <= probe_x < render_width
+        and 0 <= probe_y < render_height
+    ):
+        raise ValueError("point-render probe is outside the render")
 
     precision = max(
         96,
@@ -5133,7 +6658,7 @@ def _render_native_reference_points(
         fractional_exponent = log10_zoom - exponent
         zoom_mantissa = Decimal(str(10.0 ** fractional_exponent))
         inverse_zoom = Decimal(1).scaleb(-exponent) / zoom_mantissa
-        view_height = Decimal("2.8") * inverse_zoom
+        view_height = (Decimal("4.0") if coordinate_mode == 1 else Decimal("2.8")) * inverse_zoom
         view_width = view_height * Decimal(render_width) / Decimal(render_height)
         step_x = view_width / Decimal(render_width)
         step_y = view_height / Decimal(render_height)
@@ -5166,18 +6691,33 @@ def _render_native_reference_points(
         imag_exponent.astype(np.int64) - common_exponent.astype(np.int64),
     )
     output = np.empty((height, width), dtype=np.float32)
+    metadata = None
+    metadata_buffers = None
+    if return_planes:
+        metadata, metadata_buffers = _allocate_native_render_planes(width, height)
     options = render_options
-    status = native_library.fractal_render_points(
+    if return_planes:
+        # OpenCL point rendering currently has no plane-output arguments;
+        # secondary glitch repairs therefore remain on the scalar ABI.
+        options = _scalar_metadata_options(
+            options,
+            formula,
+            allow_opencl=False,
+        )
+    real_mantissa = np.ascontiguousarray(real_mantissa, dtype=np.float64).ravel()
+    imag_mantissa = np.ascontiguousarray(imag_mantissa, dtype=np.float64).ravel()
+    common_exponent = np.ascontiguousarray(common_exponent, dtype=np.int32).ravel()
+    arguments = (
         output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         width * height,
         _zoom_text(log10_zoom),
-        np.ascontiguousarray(real_mantissa, dtype=np.float64).ravel().ctypes.data_as(
+        real_mantissa.ctypes.data_as(
             ctypes.POINTER(ctypes.c_double)
         ),
-        np.ascontiguousarray(imag_mantissa, dtype=np.float64).ravel().ctypes.data_as(
+        imag_mantissa.ctypes.data_as(
             ctypes.POINTER(ctypes.c_double)
         ),
-        np.ascontiguousarray(common_exponent, dtype=np.int32).ravel().ctypes.data_as(
+        common_exponent.ctypes.data_as(
             ctypes.POINTER(ctypes.c_int32)
         ),
         native_reference,
@@ -5187,9 +6727,21 @@ def _render_native_reference_points(
         series_block,
         ctypes.byref(options),
     )
+    if return_planes:
+        arguments += (ctypes.byref(metadata),)
+    status = point_renderer(*arguments)
     if status != 0:
         message = native_library.fractal_last_error() or b"unknown native point renderer error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
+    if return_planes:
+        return output, KfpFramePlanes(
+            orbit_iteration=metadata_buffers["orbit_iteration"],
+            phase=metadata_buffers["phase"],
+            de_x=metadata_buffers["de_x"],
+            de_y=metadata_buffers["de_y"],
+            test1=metadata_buffers["test1"],
+            test2=metadata_buffers["test2"],
+        )
     return output
 
 
@@ -5208,6 +6760,7 @@ def render_fractal(
     render_options: Optional[NativeRenderOptions] = None,
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
+    return_planes: bool = False,
 ) -> Any:
     """Render with the C-ABI backend, falling back to the Python backend."""
 
@@ -5233,6 +6786,29 @@ def render_fractal(
     formula = _formula_name(formula)
     if renderer not in {"auto", "native", "python"}:
         raise ValueError(f"unknown renderer: {renderer}")
+    try:
+        escape_radius_mode = int(
+            operator.index(getattr(render_options, "escape_radius_mode", 0))
+        )
+    except (TypeError, ValueError):
+        raise ValueError(
+            "escape radius mode must be classic (0) or Kalles high (1)"
+        )
+    _escape_radius_squared(escape_radius_mode)
+    try:
+        coordinate_mode = int(
+            operator.index(
+                getattr(
+                    render_options,
+                    "coordinate_mode",
+                    1 if escape_radius_mode == 1 else 0,
+                )
+            )
+        )
+    except (TypeError, ValueError):
+        raise ValueError("coordinate mode must be project (0) or Kalles (1)")
+    if coordinate_mode not in {0, 1}:
+        raise ValueError("coordinate mode must be project (0) or Kalles (1)")
     if renderer != "python":
         try:
             # Long-double direct iteration remains accurate while the pixel
@@ -5252,6 +6828,7 @@ def render_fractal(
                     render_options,
                     formula,
                     julia_constant,
+                    return_planes,
                 )
             return _render_native(
                 width,
@@ -5264,6 +6841,7 @@ def render_fractal(
                 render_options,
                 formula,
                 julia_constant,
+                return_planes,
             )
         except RuntimeError as error:
             if renderer == "native" or log10_zoom >= 12.0:
@@ -5273,19 +6851,31 @@ def render_fractal(
                 _native_notice_printed = True
 
     if log10_zoom > 300.0:
+        if return_planes:
+            raise RuntimeError(
+                "orbit metadata is unavailable in the Python deep renderer"
+            )
         raise RuntimeError("zoom beyond 10^300 requires the native MPFR renderer")
 
     # Once the pixel spacing is below about 1e-7, adding it to a normal
     # float64 centre starts to lose visible detail.  Perturbation keeps the
     # centre separate from the small per-pixel offsets.
     if log10_zoom < 7.0:
+        if return_planes:
+            raise RuntimeError(
+                "orbit metadata requires the native renderer; Python fallback has no plane ABI"
+            )
         return _render_direct(
             width, height, log10_zoom, x_center, y_center, max_iter,
-            formula, julia_constant,
+            formula, julia_constant, escape_radius_mode, coordinate_mode,
+        )
+    if return_planes:
+        raise RuntimeError(
+            "orbit metadata requires the native direct renderer for this frame"
         )
     return _render_perturbed(
         width, height, log10_zoom, x_center, y_center, max_iter,
-        formula, julia_constant,
+        formula, julia_constant, escape_radius_mode, coordinate_mode,
     )
 
 
@@ -5456,9 +7046,11 @@ def _crop_and_resize(
     top = (source_height - crop_height) * 0.5
     image = Image.fromarray(np.asarray(field, dtype=np.float32), mode="F")
     resampling = {
-        # Bicubic is the highest-quality Pillow filter supported for a
-        # floating-point crop box.
-        "lanczos": Image.Resampling.BICUBIC,
+        # Kalles' final bitmap scaler is a Lanczos3 separable convolution.
+        # Pillow's Lanczos kernel is the closest portable equivalent for the
+        # floating-point crop surface; using bicubic here left high-contrast
+        # KFP relief a little too soft.
+        "lanczos": Image.Resampling.LANCZOS,
         "bilinear": Image.Resampling.BILINEAR,
         "nearest": Image.Resampling.NEAREST,
     }[resample]
@@ -5478,11 +7070,12 @@ def _crop_and_resize(
 def _atlas_resample_mode(resample: str) -> str:
     """Map the public output filter to the internal atlas crop filter.
 
-    ``nearest`` is intentionally an output-upscale choice.  The atlas still
+    ``nearest`` is intentionally an output-upscale choice. The atlas still
     needs a continuous crop while the camera moves between absolute zoom
     sources; using nearest for that crop would make every live/export frame
     snap between source pixels and would also disable the fused native
-    colourisers.  The final video/display enlargement remains nearest.
+    colourisers. The final video/display enlargement is selected separately
+    (KFP uses a smooth filter; ordinary profiles may use nearest).
     """
 
     if resample not in RESAMPLE_CHOICES:
@@ -5624,6 +7217,295 @@ def _crop_and_resize_preserving_interior(
         dtype=np.float32,
     )
     return resized, inside
+
+
+_KFP_DISCRETE_PLANES = frozenset(("orbit_iteration", "iteration"))
+_KFP_FLOAT_PLANES = (
+    "transition",
+    "phase",
+    "de_x",
+    "de_y",
+    "test1",
+    "test2",
+    "bailout",
+)
+
+
+def _kfp_texture_bundle(
+    planes: Optional[KfpFramePlanes],
+    np: Any,
+) -> dict[str, Any]:
+    """Carry one complete Kalles texture beside cropped orbit planes.
+
+    Texture coordinates are evaluated in destination screen space, so the
+    RGB image is not cropped with the scalar/orbit planes. It must still stay
+    attached to the metadata bundle when an atlas tile is cropped or merged;
+    otherwise an embedded texture with no ``TextureFile`` fallback disappears
+    at the atlas boundary.
+    """
+
+    if planes is None or getattr(planes, "texture_rgb", None) is None:
+        return {}
+    texture = np.asarray(planes.texture_rgb)
+    if texture.ndim != 3 or texture.shape[-1] != 3:
+        raise ValueError("KFP texture plane must have shape (height, width, 3)")
+    values: dict[str, Any] = {"texture_rgb": texture}
+    for name in ("texture_width", "texture_height", "texture_stride"):
+        value = getattr(planes, name, None)
+        if value is not None:
+            try:
+                values[name] = int(value)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(f"KFP {name} must be an integer") from error
+    if values.get("texture_width") not in (None, texture.shape[1]):
+        raise ValueError("KFP texture plane width does not match texture_width")
+    if values.get("texture_height") not in (None, texture.shape[0]):
+        raise ValueError("KFP texture plane height does not match texture_height")
+    return values
+
+
+def _crop_resize_kfp_plane(
+    value: Any,
+    output_width: int,
+    output_height: int,
+    zoom_factor: float,
+    resample: str,
+    *,
+    discrete: bool,
+    preserve_negative: bool = False,
+) -> Any:
+    """Crop one Kalles metadata plane with the same camera mapping as a field.
+
+    Orbit counters are categorical and must use nearest-neighbour sampling.
+    Test values, phase, derivatives, and transitions are continuous and use
+    the same bilinear/bicubic camera interpolation as the scalar source.  The
+    final colourizer then sees one coherent screen-space set of planes.
+
+    Kalles also uses negative transition values as glitch sentinels.  Those
+    values are categorical metadata, not samples on the transition curve, so
+    preserve their nearest source value instead of allowing a bilinear crop
+    to smear a sentinel into neighbouring pixels.
+    """
+
+    np = _require_numpy()
+    array = np.asarray(value)
+    if array.ndim != 2:
+        raise ValueError("KFP metadata planes must be two-dimensional")
+    if not np.isfinite(array).all():
+        raise ValueError("KFP metadata planes contain non-finite samples")
+    mode = "nearest" if discrete else resample
+    source = np.asarray(array, dtype=np.float32)
+    if preserve_negative and np.any(source < 0.0):
+        # Interpolate ordinary transitions independently.  A nearest mask
+        # then restores the exact Kalles sentinel selected by the same source
+        # pixel that owns the categorical glitch flag.
+        glitch = source < 0.0
+        ordinary = np.where(glitch, 0.0, source)
+        resized = _crop_and_resize(
+            ordinary,
+            int(output_width),
+            int(output_height),
+            float(zoom_factor),
+            resample,
+        )
+        glitch_mask = _crop_and_resize(
+            np.asarray(glitch, dtype=np.float32),
+            int(output_width),
+            int(output_height),
+            float(zoom_factor),
+            "nearest",
+        ) >= 0.5
+        nearest_glitch = _crop_and_resize(
+            source,
+            int(output_width),
+            int(output_height),
+            float(zoom_factor),
+            "nearest",
+        )
+        resized = np.array(resized, dtype=np.float32, copy=True)
+        resized[glitch_mask] = nearest_glitch[glitch_mask]
+    else:
+        resized = _crop_and_resize(
+            source,
+            int(output_width),
+            int(output_height),
+            float(zoom_factor),
+            mode,
+        )
+    if discrete:
+        return np.ascontiguousarray(np.rint(resized), dtype=np.int64)
+    return np.ascontiguousarray(resized, dtype=np.float64)
+
+
+def _crop_kfp_planes(
+    planes: Optional[KfpFramePlanes],
+    source_shape: tuple[int, int],
+    output_width: int,
+    output_height: int,
+    zoom_factor: float,
+    resample: str,
+    *,
+    inside: Optional[Any] = None,
+    output_max_iter: Optional[int] = None,
+) -> Optional[KfpFramePlanes]:
+    """Crop all available Kalles orbit planes as one metadata bundle."""
+
+    if planes is None:
+        return None
+    np = _require_numpy()
+    source_shape = (int(source_shape[0]), int(source_shape[1]))
+    output_width, output_height = _validate_dimensions(
+        output_width,
+        output_height,
+        "KFP metadata crop",
+    )
+    if inside is not None:
+        inside = np.asarray(inside, dtype=bool)
+        if inside.shape != (output_height, output_width):
+            raise ValueError(
+                f"KFP metadata interior mask has shape {inside.shape}, expected "
+                f"{(output_height, output_width)}"
+            )
+    target_iter = None if output_max_iter is None else _validate_iteration_count(
+        output_max_iter,
+        "KFP metadata iteration cap",
+    )
+    values: dict[str, Any] = {}
+    for name in (
+        "iteration",
+        "transition",
+        "phase",
+        "de_x",
+        "de_y",
+        "test1",
+        "test2",
+        "orbit_iteration",
+        "bailout",
+    ):
+        value = getattr(planes, name, None)
+        if value is None:
+            continue
+        array = np.asarray(value)
+        if array.shape != source_shape:
+            raise ValueError(
+                f"KFP {name} plane has shape {array.shape}, expected {source_shape}"
+            )
+        cropped = _crop_resize_kfp_plane(
+            array,
+            output_width,
+            output_height,
+            zoom_factor,
+            resample,
+            discrete=name in _KFP_DISCRETE_PLANES,
+            preserve_negative=name == "transition",
+        )
+        if inside is not None and target_iter is not None:
+            if name in _KFP_DISCRETE_PLANES:
+                cropped[inside] = int(target_iter)
+            elif name in {"transition", "phase", "de_x", "de_y", "test1", "test2"}:
+                cropped[inside] = 0.0
+        values[name] = cropped
+    # Unlike a per-pixel plane, the texture is a single top-down image shared
+    # by the whole Kalles colour pass. Keep it untouched and let SetTexture
+    # apply its integer warp in the final screen coordinates.
+    values.update(_kfp_texture_bundle(planes, np))
+    if not values:
+        return None
+    return KfpFramePlanes(**values)
+
+
+def _merge_kfp_plane_views(
+    parent: Optional[KfpFramePlanes],
+    child: Optional[KfpFramePlanes],
+    output_shape: tuple[int, int],
+    child_left: int,
+    child_top: int,
+    child_width: int,
+    child_height: int,
+    alpha: Any,
+) -> Optional[KfpFramePlanes]:
+    """Splice two cropped Kalles metadata bundles in screen coordinates."""
+
+    if parent is None and child is None:
+        return None
+    np = _require_numpy()
+    output_height, output_width = int(output_shape[0]), int(output_shape[1])
+    alpha = np.asarray(alpha, dtype=np.float64)
+    if alpha.shape != (child_height, child_width):
+        raise ValueError("KFP atlas metadata seam has an invalid alpha shape")
+    discrete = _KFP_DISCRETE_PLANES
+    names = (
+        "iteration",
+        "transition",
+        "phase",
+        "de_x",
+        "de_y",
+        "test1",
+        "test2",
+        "orbit_iteration",
+        "bailout",
+    )
+    output_values: dict[str, Any] = {}
+    for name in names:
+        parent_value = None if parent is None else getattr(parent, name, None)
+        child_value = None if child is None else getattr(child, name, None)
+        if parent_value is None and child_value is None:
+            continue
+        if parent_value is not None:
+            parent_array = np.asarray(parent_value)
+            if parent_array.shape != (output_height, output_width):
+                raise ValueError(f"KFP parent {name} plane has an invalid shape")
+            merged = np.array(parent_array, copy=True)
+        else:
+            dtype = np.int64 if name in discrete else np.float64
+            merged = np.zeros((output_height, output_width), dtype=dtype)
+        if child_value is not None:
+            child_array = np.asarray(child_value)
+            if child_array.shape != (child_height, child_width):
+                raise ValueError(f"KFP child {name} plane has an invalid shape")
+            region = merged[
+                child_top:child_top + child_height,
+                child_left:child_left + child_width,
+            ]
+            if parent_value is None or name in discrete:
+                # Discrete counters cannot be averaged.  The same smoothstep
+                # ownership used for the scalar seam selects the child once
+                # it owns more than half of the boundary pixel.
+                region[...] = child_array
+            elif name == "transition" and np.any(
+                (region < 0.0) | (child_array < 0.0)
+            ):
+                # Negative transitions are Kalles' categorical glitch
+                # sentinels.  Keep the ordinary seam continuous, but let the
+                # same half-owned source decide whether a sentinel survives;
+                # averaging it with a normal transition would turn the
+                # encoded glitch into an unrelated shading value.
+                parent_region = np.array(region, copy=True)
+                blended = (
+                    parent_region.astype(np.float64, copy=False)
+                    * (1.0 - alpha)
+                    + child_array.astype(np.float64, copy=False) * alpha
+                )
+                child_owned = alpha >= 0.5
+                selected = np.where(child_owned, child_array, parent_region)
+                region[...] = np.where(selected < 0.0, selected, blended)
+            else:
+                region[...] = (
+                    region.astype(np.float64, copy=False) * (1.0 - alpha)
+                    + child_array.astype(np.float64, copy=False) * alpha
+                )
+        output_values[name] = np.ascontiguousarray(merged)
+    # Parent and child atlas views normally share the same texture from the
+    # selected KFP profile. Prefer the parent when both carry one; choosing a
+    # single image keeps the metadata deterministic and avoids copying an
+    # image into every seam operation.
+    texture_values = _kfp_texture_bundle(parent, np)
+    if not texture_values:
+        texture_values = _kfp_texture_bundle(child, np)
+    output_values.update(texture_values)
+    if not output_values:
+        return None
+    return KfpFramePlanes(**output_values)
 
 
 def _zoom_chunks(zooms: Any, keyframe_factor: float) -> Any:
@@ -5832,6 +7714,43 @@ def _atlas_tile_path(
     return cache_dir / f"atlas-tile-{cache_key}.npy"
 
 
+def _atlas_tile_planes_path(
+    cache_dir: Optional[Path],
+    cache_identity: str,
+    render_width: int,
+    render_height: int,
+    level: int,
+    log_zoom: float,
+    x_center: str,
+    y_center: str,
+    max_iter: int,
+    series_order: int,
+    series_block: int,
+) -> Optional[Path]:
+    """Return the companion cache path for a complete KFP tile.
+
+    Plane-bearing tiles use a separate suffix so an older scalar ``.npy``
+    entry can never be mistaken for a complete Kalles metadata bundle.
+    Keep the key construction identical to ``_atlas_tile_path`` so both
+    representations are invalidated by the same atlas identity.
+    """
+
+    scalar_path = _atlas_tile_path(
+        cache_dir,
+        cache_identity,
+        render_width,
+        render_height,
+        level,
+        log_zoom,
+        x_center,
+        y_center,
+        max_iter,
+        series_order,
+        series_block,
+    )
+    return None if scalar_path is None else scalar_path.with_suffix(".npz")
+
+
 def _atlas_local_reference_centres(
     render_width: int,
     render_height: int,
@@ -5839,16 +7758,16 @@ def _atlas_local_reference_centres(
     x_center: str,
     y_center: str,
     divisions: int = 2,
+    coordinate_mode: int = 0,
 ) -> list[tuple[int, int, int, int, str, str]]:
     """Return exact Decimal centres for a regular tile subdivision.
 
-    The native viewport maps pixel centres as
-    ``(pixel - (size - 1) / 2) / size``.  Computing the quadrant centre with
-    integer numerators preserves that mapping when a parent tile is replaced
-    by equal-ish views at their corresponding per-cell zoom. Binary floats
-    cannot express the offsets once the zoom passes roughly 1e308, so only
-    the small geometry fractions are floats; the scale and centre arithmetic
-    stay in Decimal at a precision derived from the requested depth.
+    Computing the quadrant centre with integer numerators preserves the
+    selected viewport mapping when a parent tile is replaced by equal-ish
+    views at their corresponding per-cell zoom. Binary floats cannot express
+    the offsets once the zoom passes roughly 1e308, so only the small geometry
+    fractions are floats; the scale and centre arithmetic stay in Decimal at a
+    precision derived from the requested depth.
     """
 
     if divisions < 2:
@@ -5857,6 +7776,9 @@ def _atlas_local_reference_centres(
         raise ValueError("local-reference tile is too small for its subdivision")
     if not math.isfinite(log10_zoom):
         raise ValueError("tile zoom must be finite")
+    coordinate_mode = _index_value(coordinate_mode, "coordinate mode")
+    if coordinate_mode not in {0, 1}:
+        raise ValueError("coordinate mode must be project (0) or Kalles (1)")
 
     precision = max(
         96,
@@ -5878,24 +7800,26 @@ def _atlas_local_reference_centres(
         # remains safe even when the integer exponent is several thousand.
         zoom_mantissa = Decimal(str(10.0 ** fractional_exponent))
         inverse_zoom = Decimal(1).scaleb(-exponent) / zoom_mantissa
-        view_height = Decimal("2.8") * inverse_zoom
+        view_height = (Decimal("4.0") if coordinate_mode == 1 else Decimal("2.8")) * inverse_zoom
         view_width = view_height * Decimal(render_width) / Decimal(render_height)
         base_x = Decimal(x_center)
         base_y = Decimal(y_center)
         denominator_x = Decimal(2 * render_width)
         denominator_y = Decimal(2 * render_height)
+        origin_x = Decimal(render_width if coordinate_mode else render_width - 1)
+        origin_y = Decimal(render_height if coordinate_mode else render_height - 1)
         result: list[tuple[int, int, int, int, str, str]] = []
         for y0, y1 in y_splits:
             centre_y_numerator = y0 + y1 - 1
             y_fraction = (
-                Decimal(render_height - 1 - centre_y_numerator)
+                Decimal(origin_y - centre_y_numerator)
                 / denominator_y
             )
             local_y = base_y + view_height * y_fraction
             for x0, x1 in x_splits:
                 centre_x_numerator = x0 + x1 - 1
                 x_fraction = (
-                    Decimal(centre_x_numerator - (render_width - 1))
+                    (Decimal(centre_x_numerator) - origin_x)
                     / denominator_x
                 )
                 local_x = base_x + view_width * x_fraction
@@ -5911,12 +7835,16 @@ def _atlas_local_reference_cell(
     y_center: str,
     cell: tuple[int, int, int, int],
     probe: Optional[tuple[int, int]] = None,
+    coordinate_mode: int = 0,
 ) -> tuple[int, int, int, int, str, str, float]:
     """Compute one exact local view for an arbitrary glitch-cell rectangle."""
 
     x0, x1, y0, y1 = cell
     if not (0 <= x0 < x1 <= render_width and 0 <= y0 < y1 <= render_height):
         raise ValueError("invalid local-reference cell")
+    coordinate_mode = _index_value(coordinate_mode, "coordinate mode")
+    if coordinate_mode not in {0, 1}:
+        raise ValueError("coordinate mode must be project (0) or Kalles (1)")
     precision = max(96, _decimal_precision(x_center, y_center, log10_zoom) + 48)
     with localcontext() as context:
         context.prec = precision
@@ -5924,22 +7852,29 @@ def _atlas_local_reference_cell(
         fractional_exponent = log10_zoom - exponent
         zoom_mantissa = Decimal(str(10.0 ** fractional_exponent))
         inverse_zoom = Decimal(1).scaleb(-exponent) / zoom_mantissa
-        view_height = Decimal("2.8") * inverse_zoom
+        view_height = (Decimal("4.0") if coordinate_mode == 1 else Decimal("2.8")) * inverse_zoom
         view_width = view_height * Decimal(render_width) / Decimal(render_height)
         base_x = Decimal(x_center)
         base_y = Decimal(y_center)
+        origin_x = Decimal(render_width if coordinate_mode else render_width - 1)
+        origin_y = Decimal(render_height if coordinate_mode else render_height - 1)
         if probe is None:
-            x_numerator = Decimal(x0 + x1 - 1) - Decimal(render_width - 1)
-            y_numerator = Decimal(render_height - 1 - (y0 + y1 - 1))
+            x_numerator = Decimal(x0 + x1 - 1) - origin_x
+            y_numerator = origin_y - Decimal(y0 + y1 - 1)
         else:
             probe_x, probe_y = probe
-            if not (x0 <= probe_x < x1 and y0 <= probe_y < y1):
-                raise ValueError("glitch probe is outside its reference cell")
+            if not (
+                0 <= probe_x < render_width
+                and 0 <= probe_y < render_height
+            ):
+                raise ValueError("glitch probe is outside the render")
             # Keep the local view scale based on the failed region, while
             # placing the high-precision reference on an actual failed pixel
-            # rather than on the centre of a sparse bounding box.
-            x_numerator = Decimal(2 * probe_x) - Decimal(render_width - 1)
-            y_numerator = Decimal(render_height - 1) - Decimal(2 * probe_y)
+            # or on a nearby finite halo pixel. A stable neighbouring orbit
+            # can be a much better reference than every pixel inside a thin
+            # boundary cell.
+            x_numerator = Decimal(2 * probe_x) - origin_x
+            y_numerator = origin_y - Decimal(2 * probe_y)
         x_fraction = x_numerator / (Decimal(2) * Decimal(render_width))
         y_fraction = y_numerator / (Decimal(2) * Decimal(render_height))
         local_x = base_x + view_width * x_fraction
@@ -6083,6 +8018,7 @@ def _render_exact_formula_pixel(
     log10_zoom: float,
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
+    escape_radius_mode: int = 0,
 ) -> float:
     """Render one deep pixel with arbitrary-precision formula arithmetic.
 
@@ -6106,6 +8042,7 @@ def _render_exact_formula_pixel(
         ) from error
 
     formula = _formula_name(formula)
+    escape_radius_squared = _escape_radius_squared(escape_radius_mode)
     if len(julia_constant) != 2:
         raise ValueError("Julia constant must contain real and imaginary coordinates")
     julia_constant = (
@@ -6172,7 +8109,7 @@ def _render_exact_formula_pixel(
                 value_real * value_real
                 + value_imag * value_imag
             )
-            if magnitude_squared > 4:
+            if magnitude_squared > escape_radius_squared:
                 magnitude = mp.sqrt(magnitude_squared)
                 smooth = (
                     iteration
@@ -6222,6 +8159,11 @@ def _atlas_glitch_reference_field(
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
     field_bias: float = 0.0,
+    escape_radius_mode: int = 0,
+    coordinate_mode: int = 0,
+    plane_flags: int = 0,
+    return_planes: bool = False,
+    initial_field: Optional[Any] = None,
 ) -> Any:
     """Render a tile, refining only pixels that the shared reference cannot solve.
 
@@ -6235,6 +8177,7 @@ def _atlas_glitch_reference_field(
 
     np = _require_numpy()
     formula = _formula_name(formula)
+    _escape_radius_squared(escape_radius_mode)
     if len(julia_constant) != 2:
         raise ValueError("Julia constant must contain real and imaginary coordinates")
     julia_constant = (
@@ -6242,6 +8185,17 @@ def _atlas_glitch_reference_field(
         _validate_center_text(julia_constant[1], "Julia imaginary"),
     )
     field = np.full((render_height, render_width), np.nan, dtype=np.float32)
+    if initial_field is not None:
+        # A direct GPU pass can solve almost the entire deep tile and leave
+        # only a tiny cancellation mask. Keep those already-valid samples:
+        # rerunning the complete tile merely to discover the same mask wastes
+        # the most expensive part of the render. The unresolved samples still
+        # go through the exact reference/repair path below.
+        initial_array = np.asarray(initial_field, dtype=np.float32)
+        if initial_array.shape != field.shape:
+            raise ValueError("initial atlas field has an invalid shape")
+        initial_finite = np.isfinite(initial_array)
+        field[initial_finite] = initial_array[initial_finite]
     fallback_array = None
     if fallback_field is not None:
         fallback_array = np.asarray(fallback_field, dtype=np.float32)
@@ -6299,10 +8253,19 @@ def _atlas_glitch_reference_field(
         # regions. ``whole_tile`` remains an explicit argument to make that
         # policy visible at the call site and for future budget tiers.
         floor = ATLAS_LOCAL_REFERENCE_MIN_BUDGET_MS
+        # The initial whole-tile pass gets the larger work-queue budget. A
+        # secondary reference is deliberately short: if its probe is bad,
+        # the caller should split that connected region rather than waiting
+        # through another frame-sized timeout.
+        budget_limit = (
+            ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS
+            if whole_tile
+            else ATLAS_LOCAL_REFERENCE_MAX_BUDGET_MS
+        )
         return max(
             floor,
             min(
-                ATLAS_LOCAL_REFERENCE_TILE_BUDGET_MS,
+                budget_limit,
                 max(estimate, floor),
             ),
         )
@@ -6328,6 +8291,9 @@ def _atlas_glitch_reference_field(
             strict_cycle=True,
             backend=native_backend,
             output_bias=field_bias,
+            escape_radius_mode=escape_radius_mode,
+            coordinate_mode=coordinate_mode,
+            plane_flags=plane_flags,
         )
         return np.asarray(
             render_fractal(
@@ -6371,34 +8337,46 @@ def _atlas_glitch_reference_field(
             strict_cycle=True,
             backend=native_backend,
             output_bias=field_bias,
+            escape_radius_mode=escape_radius_mode,
+            coordinate_mode=coordinate_mode,
+            plane_flags=plane_flags,
         )
-        return np.asarray(
-            _render_native_reference_points(
-                render_width=render_width,
-                render_height=render_height,
-                log10_zoom=log10_zoom,
-                cell=cell,
-                probe=probe,
-                x_center=x_center,
-                y_center=y_center,
-                reference_x=local_x,
-                reference_y=local_y,
-                max_iter=max_iter,
-                native_threads=native_threads,
-                native_library=native_library,
-                native_reference=reference,
-                series_order=series_order,
-                series_block=series_block,
-                render_options=options,
-            ),
-            dtype=np.float32,
+        rendered = _render_native_reference_points(
+            render_width=render_width,
+            render_height=render_height,
+            log10_zoom=log10_zoom,
+            cell=cell,
+            probe=probe,
+            x_center=x_center,
+            y_center=y_center,
+            reference_x=local_x,
+            reference_y=local_y,
+            max_iter=max_iter,
+            native_threads=native_threads,
+            native_library=native_library,
+            native_reference=reference,
+            series_order=series_order,
+            series_block=series_block,
+            render_options=options,
+            coordinate_mode=coordinate_mode,
+            formula=formula,
+            return_planes=return_planes,
         )
+        if return_planes:
+            local_field, local_planes = rendered
+            return np.asarray(local_field, dtype=np.float32), local_planes
+        return np.asarray(rendered, dtype=np.float32)
 
     def recover(cell: tuple[int, int, int, int], local_field: Any) -> None:
+        nonlocal plane_recovery_approximate
         if not allow_recovery:
+            unresolved_count = int((~np.isfinite(local_field)).sum())
+            x0, x1, y0, y1 = cell
             raise RuntimeError(
                 "strict atlas render encountered unresolved pixels in a "
-                "glitch-driven secondary reference"
+                "glitch-driven secondary reference "
+                f"at cell ({x0}:{x1}, {y0}:{y1}) "
+                f"with {unresolved_count} unresolved pixel(s)"
             )
         x0, x1, y0, y1 = cell
         local = np.asarray(local_field, dtype=np.float32).copy()
@@ -6408,6 +8386,12 @@ def _atlas_glitch_reference_field(
             fallback = existing if np.isfinite(existing).any() else None
         local, _ = _spatial_recover_field(local, fallback)
         field[y0:y1, x0:x1] = local
+        if return_planes:
+            # Spatial recovery has no corresponding Kalles orbit/DE data. It
+            # is acceptable for a draft field, but must force the caller onto
+            # the scalar compatibility colour path instead of pairing
+            # invented values with stale metadata.
+            plane_recovery_approximate = True
 
     def exact_pixel_recovery(
         mask: Any,
@@ -6420,6 +8404,7 @@ def _atlas_glitch_reference_field(
         if (
             unresolved_pixels.size == 0
             or allow_recovery
+            or return_planes
             or len(unresolved_pixels) > ATLAS_LOCAL_REFERENCE_MAX_EXACT_PIXELS
         ):
             return 0
@@ -6441,6 +8426,7 @@ def _atlas_glitch_reference_field(
                 y_center,
                 pixel_cell,
                 (pixel_x, pixel_y),
+                coordinate_mode,
             )
             _, _, _, _, pixel_x_center, pixel_y_center, _ = pixel_geometry
             exact_value = _render_exact_formula_pixel(
@@ -6450,6 +8436,7 @@ def _atlas_glitch_reference_field(
                 log10_zoom,
                 formula,
                 julia_constant,
+                escape_radius_mode=escape_radius_mode,
             )
             field[pixel_y, pixel_x] = np.float32(
                 exact_value - field_bias
@@ -6473,29 +8460,82 @@ def _atlas_glitch_reference_field(
         strict_cycle=True,
         backend=native_backend,
         output_bias=field_bias,
+        escape_radius_mode=escape_radius_mode,
+        coordinate_mode=coordinate_mode,
+        plane_flags=plane_flags,
     )
-    shared_field = np.asarray(
-        render_fractal(
-            render_width,
-            render_height,
-            log10_zoom,
-            x_center,
-            y_center,
-            max_iter,
-            "native",
-            native_threads,
-            native_reference,
-            series_order,
-            series_block,
-            shared_options,
-            formula,
-            julia_constant,
-        ),
-        dtype=np.float32,
-    )
-    finite = np.isfinite(shared_field)
-    field[finite] = shared_field[finite]
-    unresolved = ~finite
+    shared_planes = None
+    if initial_field is None:
+        shared_rendered = render_fractal(
+                render_width,
+                render_height,
+                log10_zoom,
+                x_center,
+                y_center,
+                max_iter,
+                "native",
+                native_threads,
+                native_reference,
+                series_order,
+                series_block,
+                shared_options,
+                formula,
+                julia_constant,
+                return_planes=return_planes,
+        )
+        if return_planes:
+            shared_rendered, shared_planes = shared_rendered
+        shared_field = np.asarray(shared_rendered, dtype=np.float32)
+        finite = np.isfinite(shared_field)
+        field[finite] = shared_field[finite]
+    unresolved = ~np.isfinite(field)
+    plane_names = _KFP_REQUIRED_RENDER_PLANES
+    plane_buffers: Optional[dict[str, Any]] = None
+    if return_planes and shared_planes is not None:
+        candidate_planes: dict[str, Any] = {}
+        for plane_name in plane_names:
+            candidate = getattr(shared_planes, plane_name, None)
+            if candidate is None:
+                candidate_planes = {}
+                break
+            candidate = np.asarray(candidate)
+            if candidate.shape != field.shape or not np.isfinite(candidate).all():
+                candidate_planes = {}
+                break
+            candidate_planes[plane_name] = np.array(candidate, copy=True)
+        if len(candidate_planes) == len(plane_names):
+            plane_buffers = candidate_planes
+    plane_recovery_approximate = False
+
+    def merge_planes(
+        cell: tuple[int, int, int, int],
+        local_planes: Optional[KfpFramePlanes],
+        valid: Any,
+    ) -> None:
+        """Copy metadata only for pixels solved by the same local render."""
+
+        nonlocal plane_buffers
+        valid = np.asarray(valid, dtype=bool)
+        if (
+            not return_planes
+            or local_planes is None
+            or plane_buffers is None
+            or not valid.any()
+        ):
+            return
+        x0, x1, y0, y1 = cell
+        for plane_name in plane_names:
+            source = getattr(local_planes, plane_name, None)
+            if source is None:
+                plane_buffers = None
+                return
+            source = np.asarray(source)
+            if source.shape != valid.shape:
+                plane_buffers = None
+                return
+            target = plane_buffers[plane_name][y0:y1, x0:x1]
+            target[valid] = source[valid]
+
     if diagnostics is not None:
         diagnostics.update({
             "initial_unresolved_pixels": int(unresolved.sum()),
@@ -6507,30 +8547,68 @@ def _atlas_glitch_reference_field(
             "final_unresolved_pixels": 0,
         })
     if not unresolved.any():
-        return field
+        if not return_planes:
+            return field
+        # Never pair a finished scalar field with incomplete or non-finite
+        # orbit metadata: KFP colour and 3D passes would interpret that as
+        # real orbit data and turn it into a convincing-looking artifact.
+        if not _kfp_render_planes_complete(shared_planes, field.shape):
+            return field, None
+        return field, shared_planes
+
+    # The direct device pass is already the authoritative renderer for every
+    # finite sample it returned. On that path, a small NaN tail should go
+    # straight to exact pixel recovery before trying any alternate full-tile
+    # BLA tiers. This is the common case for deep 4K GPU tiles; the wider
+    # retarget/region machinery below remains available for larger masks.
+    if initial_field is not None and not allow_recovery and not return_planes:
+        exact_recovered = exact_pixel_recovery(unresolved)
+        unresolved = ~np.isfinite(field)
+        if exact_recovered:
+            print(
+                f"  Exact arbitrary-precision retry repaired {exact_recovered} "
+                "deep pixels without rerendering the tile.",
+                flush=True,
+            )
+        if not unresolved.any():
+            return field
 
     # A decade-spaced tier can be mathematically valid yet land on an
     # unfortunate BLA map boundary for this particular tile. Before building
-    # a tree of small secondary references, retarget one clone of the reusable
-    # root just inside the current viewport. This reuses the already-built
-    # MPFR orbit, adds no approximation to the strict output, and is usually
-    # enough to turn a large timeout mask into a handful of exact pixels.
+    # a tree of small secondary references, try a few clones of the reusable
+    # root at progressively safer radii inside the current viewport. The
+    # closest clone is not always the best one: at extreme zooms its BLA
+    # boundary can line up with the tile's slow orbit and leave a large,
+    # coherent hole, while a slightly shallower clone resolves the whole
+    # image quickly. These renders reuse the already-built MPFR orbit and add
+    # no approximation to the strict output.
     clone = getattr(native_library, "fractal_clone_reference", None)
     if (
         native_reference_root is not None
         and clone is not None
         and log10_zoom >= 12.0
+        and render_width * render_height <= ATLAS_LOCAL_REFERENCE_MAX_RETARGET_PIXELS
     ):
-        retarget_log = max(12.0, float(log10_zoom) - 0.1)
-        retargeted_reference = None
-        try:
-            retargeted_reference = _clone_native_reference(
-                native_library,
-                native_reference_root,
-                retarget_log,
-            )
-            retargeted = np.asarray(
-                render_fractal(
+        # The first value is deliberately not the nearest possible radius.
+        # A margin of roughly a third of a decade is a useful compromise for
+        # the BLA lookup at the tile sizes used by the atlas. Wider fallbacks
+        # handle pathological orbit boundaries without making the normal
+        # secondary-reference queue pay for them.
+        retarget_offsets = (0.35, 0.75, 1.25, 2.0)
+        retarget_logs: list[float] = []
+        for offset in retarget_offsets:
+            candidate = max(12.0, float(log10_zoom) - offset)
+            if not retarget_logs or candidate < retarget_logs[-1] - 1.0e-9:
+                retarget_logs.append(candidate)
+        for retarget_log in retarget_logs:
+            retargeted_reference = None
+            try:
+                retargeted_reference = _clone_native_reference(
+                    native_library,
+                    native_reference_root,
+                    retarget_log,
+                )
+                retargeted_rendered = render_fractal(
                     render_width,
                     render_height,
                     log10_zoom,
@@ -6549,36 +8627,77 @@ def _atlas_glitch_reference_field(
                         strict_cycle=True,
                         backend=native_backend,
                         output_bias=field_bias,
+                        escape_radius_mode=escape_radius_mode,
+                        coordinate_mode=coordinate_mode,
+                        plane_flags=plane_flags,
                     ),
                     formula,
                     julia_constant,
-                ),
-                dtype=np.float32,
-            )
-            retargeted_finite = np.isfinite(retargeted)
-            repaired = unresolved & retargeted_finite
-            if repaired.any():
-                field[repaired] = retargeted[repaired]
-                print(
-                    f"  Retargeted BLA tier repaired {int(repaired.sum())} "
-                    "deep pixels before local refinement.",
-                    flush=True,
+                    return_planes=return_planes,
                 )
-            unresolved = ~np.isfinite(field)
-            if not unresolved.any():
-                return field
-        except (RuntimeError, ValueError):
-            # A retargeted tier is an optimization, not a correctness
-            # dependency. Keep the existing connected-region repair path as
-            # the fallback if clone support or the candidate radius is not
-            # available for a particular build.
-            pass
-        finally:
-            if retargeted_reference is not None:
-                try:
-                    native_library.fractal_destroy_reference(retargeted_reference)
-                except Exception:
-                    pass
+                retargeted_planes = None
+                if return_planes:
+                    retargeted_rendered, retargeted_planes = retargeted_rendered
+                retargeted = np.asarray(retargeted_rendered, dtype=np.float32)
+                retargeted_finite = np.isfinite(retargeted)
+
+                # Never splice planes from two references. If a complete
+                # alternate render is available, it is the only valid source
+                # for both the scalar field and Kalles' per-pixel metadata.
+                planes_complete = True
+                if return_planes:
+                    planes_complete = retargeted_planes is not None
+                    if planes_complete:
+                        for plane_name in (
+                            "orbit_iteration",
+                            "phase",
+                            "de_x",
+                            "de_y",
+                            "test1",
+                            "test2",
+                        ):
+                            plane = getattr(retargeted_planes, plane_name, None)
+                            if plane is None or not np.isfinite(plane).all():
+                                planes_complete = False
+                                break
+                if retargeted_finite.all() and planes_complete:
+                    print(
+                        f"  Retargeted BLA tier at {_zoom_label(retarget_log)} "
+                        "resolved the complete deep tile.",
+                        flush=True,
+                    )
+                    return (
+                        (retargeted, retargeted_planes)
+                        if return_planes else retargeted
+                    )
+
+                # Scalar recovery may still benefit from a partial candidate.
+                # In plane mode this merge is intentionally forbidden: the
+                # candidate metadata only describes its own finite samples.
+                if not return_planes:
+                    repaired = unresolved & retargeted_finite
+                    if repaired.any():
+                        field[repaired] = retargeted[repaired]
+                        print(
+                            f"  Retargeted BLA tier repaired {int(repaired.sum())} "
+                            "deep pixels before local refinement.",
+                            flush=True,
+                        )
+                    unresolved = ~np.isfinite(field)
+                    if not unresolved.any():
+                        return field
+            except (RuntimeError, ValueError):
+                # A retargeted tier is an optimization, not a correctness
+                # dependency. Keep trying safer radii and then fall through
+                # to the connected-region repair path if clone support or a
+                # candidate radius is unavailable for this build.
+                pass
+            finally:
+                if retargeted_reference is not None:
+                    try:
+                        native_library.fractal_destroy_reference(retargeted_reference)
+                    except Exception:
+                        pass
 
     if not allow_recovery:
         exact_recovered = exact_pixel_recovery(unresolved)
@@ -6590,7 +8709,7 @@ def _atlas_glitch_reference_field(
                 flush=True,
             )
         if not unresolved.any():
-            return field
+            return (field, None) if return_planes else field
 
     regions = _unresolved_regions(unresolved)
     if diagnostics is not None:
@@ -6622,6 +8741,43 @@ def _atlas_glitch_reference_field(
             recovered_pixels += (x1 - x0) * (y1 - y0)
             continue
 
+        # The native point ABI is intentionally exact only for bounded cells.
+        # Split a large connected mask before creating its secondary
+        # reference; otherwise a frame-sized request can spend its entire
+        # budget walking pixels that will be split away immediately after the
+        # call returns.
+        cell_pixels = (x1 - x0) * (y1 - y0)
+        if (
+            cell_pixels > ATLAS_LOCAL_REFERENCE_MAX_POINT_CELL_PIXELS
+            and depth < max_depth
+        ):
+            refined_regions += 1
+            if diagnostics is not None:
+                diagnostics["refined_regions"] = refined_regions
+            x_mid = x0 + (x1 - x0) // 2
+            y_mid = y0 + (y1 - y0) // 2
+            subdivisions = (
+                (x0, x_mid, y0, y_mid),
+                (x_mid, x1, y0, y_mid),
+                (x0, x_mid, y_mid, y1),
+                (x_mid, x1, y_mid, y1),
+            )
+            for sub_x0, sub_x1, sub_y0, sub_y1 in reversed(subdivisions):
+                if sub_x1 <= sub_x0 or sub_y1 <= sub_y0:
+                    continue
+                pending.append(
+                    (
+                        (sub_x0, sub_x1, sub_y0, sub_y1),
+                        depth + 1,
+                        cell_pixels,
+                        (
+                            sub_x0 + (sub_x1 - sub_x0) // 2,
+                            sub_y0 + (sub_y1 - sub_y0) // 2,
+                        ),
+                    )
+                )
+            continue
+
         geometry = _atlas_local_reference_cell(
             render_width,
             render_height,
@@ -6630,23 +8786,35 @@ def _atlas_glitch_reference_field(
             y_center,
             cell,
             probe,
+            coordinate_mode,
         )
         _, _, _, _, local_x, local_y, local_log_zoom = geometry
+        # The point ABI renders only the small failed cell, not the whole
+        # local viewport.  Give its secondary reference a wider BLA radius
+        # than the cell's nominal zoom.  At extreme zooms the exact
+        # local-radius boundary can coincide with a tiny central filament and
+        # mark every pixel in the cell as a cancellation glitch.  A full
+        # decade of headroom keeps the BLA map on the stable side of that
+        # boundary while retaining the high-precision local orbit.  The extra
+        # map work is limited to genuinely unresolved cells.
+        local_bla_log_zoom = max(12.0, log10_zoom - 1.0)
         local_library, local_reference = _create_native_reference(
             local_x,
             local_y,
             max_iter,
             local_log_zoom,
             series_order,
-            local_log_zoom,
+            local_bla_log_zoom,
             formula=formula,
             julia_constant=julia_constant,
+            escape_radius_mode=escape_radius_mode,
+            coordinate_mode=coordinate_mode,
         )
         secondary_references += 1
         if diagnostics is not None:
             diagnostics["secondary_references"] = secondary_references
         try:
-            local_field = render_points_with_reference(
+            local_rendered = render_points_with_reference(
                 cell,
                 probe,
                 local_x,
@@ -6654,11 +8822,217 @@ def _atlas_glitch_reference_field(
                 local_log_zoom,
                 local_reference,
             )
+            local_planes = None
+            if return_planes:
+                local_field, local_planes = local_rendered
+            else:
+                local_field = local_rendered
             local_finite = np.isfinite(local_field)
             local_view = field[y0:y1, x0:x1]
             local_view[local_finite] = local_field[local_finite]
+            merge_planes(cell, local_planes, local_finite)
             if local_finite.all():
                 continue
+
+            # A tiny unresolved cell can be centred on a numerically bad
+            # orbit even though one of its finite halo pixels is an excellent
+            # reference.  Try a few finite pixels around the current probe
+            # before subdividing/falling back to the final retry.  This is
+            # deliberately limited to the smallest cells: large connected
+            # regions still use the normal largest-first refinement queue.
+            if max(x1 - x0, y1 - y0) <= minimum_cell:
+                finite_positions = np.argwhere(np.isfinite(local_view))
+                alternate_probes = []
+                for local_y_index, local_x_index in sorted(
+                    finite_positions.tolist(),
+                    key=lambda position: (
+                        (x0 + int(position[1]) - probe[0]) ** 2
+                        + (y0 + int(position[0]) - probe[1]) ** 2,
+                        int(position[0]),
+                        int(position[1]),
+                    ),
+                ):
+                    alternate_probe = (
+                        x0 + int(local_x_index),
+                        y0 + int(local_y_index),
+                    )
+                    if alternate_probe == probe:
+                        continue
+                    if alternate_probe not in alternate_probes:
+                        alternate_probes.append(alternate_probe)
+                    if len(alternate_probes) >= 8:
+                        break
+                if len(alternate_probes) < 8:
+                    # A completely unresolved small cell has no finite halo
+                    # sample to borrow. Try deterministic edge/corner probes
+                    # as well; one of them usually moves the reference off a
+                    # slow central filament. Keep this bounded because each
+                    # candidate builds a real native reference.
+                    edge_probes = (
+                        (x0, y0),
+                        (x1 - 1, y0),
+                        (x0, y1 - 1),
+                        (x1 - 1, y1 - 1),
+                        ((x0 + x1 - 1) // 2, y0),
+                        ((x0 + x1 - 1) // 2, y1 - 1),
+                        (x0, (y0 + y1 - 1) // 2),
+                        (x1 - 1, (y0 + y1 - 1) // 2),
+                    )
+                    for alternate_probe in edge_probes:
+                        if alternate_probe == probe:
+                            continue
+                        if alternate_probe not in alternate_probes:
+                            alternate_probes.append(alternate_probe)
+                        if len(alternate_probes) >= 8:
+                            break
+                # A failed cell can sit directly beside a finite region from
+                # the shared pass (or an earlier repaired cell). Prefer those
+                # halo samples as secondary-reference probes. The old
+                # inside-cell restriction forced every thin boundary cell to
+                # keep retrying its own unstable orbit, even when a stable
+                # neighbour was one pixel away. Keep the search local and
+                # bounded: this is a repair probe list, not another full
+                # image scan.
+                neighbour_probes = []
+                neighbour_radius = 16
+                search_x0 = max(0, x0 - neighbour_radius)
+                search_x1 = min(render_width, x1 + neighbour_radius)
+                search_y0 = max(0, y0 - neighbour_radius)
+                search_y1 = min(render_height, y1 + neighbour_radius)
+                finite_neighbour_mask = np.isfinite(
+                    field[search_y0:search_y1, search_x0:search_x1]
+                )
+
+                def add_neighbour_probe(candidate: tuple[int, int]) -> None:
+                    candidate_x, candidate_y = candidate
+                    if not (
+                        search_x0 <= candidate_x < search_x1
+                        and search_y0 <= candidate_y < search_y1
+                    ):
+                        return
+                    if x0 <= candidate_x < x1 and y0 <= candidate_y < y1:
+                        return
+                    if not finite_neighbour_mask[
+                        candidate_y - search_y0,
+                        candidate_x - search_x0,
+                    ]:
+                        return
+                    if candidate not in neighbour_probes:
+                        neighbour_probes.append(candidate)
+
+                # Walk out along the four cardinal rays before considering
+                # the complete perimeter. A bad BLA boundary can surround a
+                # cell for several pixels; a farther sample on the same ray
+                # is often stable while the geometrically nearest ring is
+                # not. The ray order also keeps the search bounded and
+                # deterministic.
+                for distance in range(1, neighbour_radius + 1):
+                    add_neighbour_probe((x0 - distance, y0))
+                    add_neighbour_probe((x1 - 1 + distance, y0))
+                    add_neighbour_probe((x0, y0 - distance))
+                    add_neighbour_probe((x0, y1 - 1 + distance))
+                    if len(neighbour_probes) >= 64:
+                        break
+
+                finite_neighbours = np.argwhere(finite_neighbour_mask)
+                neighbour_positions = []
+                for relative_y, relative_x in finite_neighbours.tolist():
+                    neighbour_x = search_x0 + int(relative_x)
+                    neighbour_y = search_y0 + int(relative_y)
+                    if x0 <= neighbour_x < x1 and y0 <= neighbour_y < y1:
+                        continue
+                    distance_x = (
+                        x0 - neighbour_x
+                        if neighbour_x < x0
+                        else neighbour_x - (x1 - 1)
+                        if neighbour_x >= x1
+                        else 0
+                    )
+                    distance_y = (
+                        y0 - neighbour_y
+                        if neighbour_y < y0
+                        else neighbour_y - (y1 - 1)
+                        if neighbour_y >= y1
+                        else 0
+                    )
+                    neighbour_positions.append(
+                        (
+                            1,
+                            max(distance_x, distance_y),
+                            distance_x * distance_x + distance_y * distance_y,
+                            abs(neighbour_x - probe[0])
+                            + abs(neighbour_y - probe[1]),
+                            neighbour_y,
+                            neighbour_x,
+                        )
+                    )
+                for _, _, _, _, neighbour_y, neighbour_x in sorted(neighbour_positions):
+                    neighbour_probe = (neighbour_x, neighbour_y)
+                    add_neighbour_probe(neighbour_probe)
+                    if len(neighbour_probes) >= 64:
+                        break
+                for alternate_probe in neighbour_probes + alternate_probes:
+                    alternate_geometry = _atlas_local_reference_cell(
+                        render_width,
+                        render_height,
+                        log10_zoom,
+                        x_center,
+                        y_center,
+                        cell,
+                        alternate_probe,
+                        coordinate_mode,
+                    )
+                    (
+                        _,
+                        _,
+                        _,
+                        _,
+                        alternate_x,
+                        alternate_y,
+                        alternate_log_zoom,
+                    ) = alternate_geometry
+                    alternate_library, alternate_reference = _create_native_reference(
+                        alternate_x,
+                        alternate_y,
+                        max_iter,
+                        alternate_log_zoom,
+                        series_order,
+                        local_bla_log_zoom,
+                        formula=formula,
+                        julia_constant=julia_constant,
+                        escape_radius_mode=escape_radius_mode,
+                        coordinate_mode=coordinate_mode,
+                    )
+                    secondary_references += 1
+                    if diagnostics is not None:
+                        diagnostics["secondary_references"] = secondary_references
+                    try:
+                        alternate_rendered = render_points_with_reference(
+                            cell,
+                            alternate_probe,
+                            alternate_x,
+                            alternate_y,
+                            alternate_log_zoom,
+                            alternate_reference,
+                        )
+                        alternate_planes = None
+                        if return_planes:
+                            alternate_field, alternate_planes = alternate_rendered
+                        else:
+                            alternate_field = alternate_rendered
+                        alternate_finite = np.isfinite(alternate_field)
+                        repair_mask = ~np.isfinite(local_view) & alternate_finite
+                        local_view[repair_mask] = alternate_field[repair_mask]
+                        merge_planes(cell, alternate_planes, repair_mask)
+                        if np.isfinite(local_view).all():
+                            break
+                    finally:
+                        alternate_library.fractal_destroy_reference(
+                            alternate_reference
+                        )
+                if np.isfinite(local_view).all():
+                    continue
+                local_finite = np.isfinite(local_view)
 
             local_regions = _unresolved_regions(~local_finite)
             can_split = (
@@ -6672,10 +9046,55 @@ def _atlas_glitch_reference_field(
                 next_pending = []
                 for lx0, lx1, ly0, ly1, count, probe_x, probe_y in local_regions:
                     global_region = (x0 + lx0, x0 + lx1, y0 + ly0, y0 + ly1)
-                    global_probe = (x0 + probe_x, y0 + probe_y)
-                    next_pending.append(
-                        (global_region, depth + 1, count, global_probe)
-                    )
+                    if global_region == cell:
+                        # The point ABI returns only the requested box.  If
+                        # its whole box is unresolved, asking it to refine
+                        # that same box merely recreates the same reference
+                        # and can loop until ``max_depth``. Split the box
+                        # explicitly so each child gets a different
+                        # high-precision probe orbit. This is especially
+                        # important when the unresolved region is centred on
+                        # a slow filament: the central probe can be the one
+                        # bad orbit while all four neighbouring quadrants
+                        # are perfectly renderable.
+                        x_mid = x0 + (x1 - x0) // 2
+                        y_mid = y0 + (y1 - y0) // 2
+                        subdivisions = (
+                            (x0, x_mid, y0, y_mid),
+                            (x_mid, x1, y0, y_mid),
+                            (x0, x_mid, y_mid, y1),
+                            (x_mid, x1, y_mid, y1),
+                        )
+                        for sub_x0, sub_x1, sub_y0, sub_y1 in subdivisions:
+                            if sub_x1 <= sub_x0 or sub_y1 <= sub_y0:
+                                continue
+                            sub_mask = ~local_finite[
+                                sub_y0 - y0 : sub_y1 - y0,
+                                sub_x0 - x0 : sub_x1 - x0,
+                            ]
+                            if not sub_mask.any():
+                                continue
+                            sub_positions = np.argwhere(sub_mask)
+                            sub_probe_y, sub_probe_x = sub_positions[
+                                len(sub_positions) // 2
+                            ]
+                            sub_cell = (sub_x0, sub_x1, sub_y0, sub_y1)
+                            next_pending.append(
+                                (
+                                    sub_cell,
+                                    depth + 1,
+                                    int(sub_mask.sum()),
+                                    (
+                                        sub_x0 + int(sub_probe_x),
+                                        sub_y0 + int(sub_probe_y),
+                                    ),
+                                )
+                            )
+                    else:
+                        global_probe = (x0 + probe_x, y0 + probe_y)
+                        next_pending.append(
+                            (global_region, depth + 1, count, global_probe)
+                        )
                 # `_unresolved_regions` is largest-first; the stack pops the
                 # last item, so reverse it to process the largest glitch first
                 # and keep the queue bounded by actual components.
@@ -6685,7 +9104,7 @@ def _atlas_glitch_reference_field(
             # One exact scaled retry is the final quality-preserving recovery.
             # It still returns NaN on a deadline; strict modes then fail rather
             # than turning the unresolved tail into a flat rectangle.
-            local_retry = render_points_with_reference(
+            local_retry_rendered = render_points_with_reference(
                 cell,
                 probe,
                 local_x,
@@ -6694,8 +9113,14 @@ def _atlas_glitch_reference_field(
                 local_reference,
                 final_retry=True,
             )
+            local_retry_planes = None
+            if return_planes:
+                local_retry, local_retry_planes = local_retry_rendered
+            else:
+                local_retry = local_retry_rendered
             retry_finite = np.isfinite(local_retry)
             local_view[retry_finite] = local_retry[retry_finite]
+            merge_planes(cell, local_retry_planes, retry_finite)
             if not retry_finite.all():
                 unresolved_local = ~np.isfinite(local_view)
                 exact_recovered = exact_pixel_recovery(
@@ -6718,6 +9143,8 @@ def _atlas_glitch_reference_field(
         if allow_recovery and parent_fallback is not None:
             field, recovered = _spatial_recover_field(field, parent_fallback)
             recovered_pixels += recovered
+            if return_planes and recovered:
+                plane_recovery_approximate = True
         else:
             unresolved_count = int((~np.isfinite(field)).sum())
             raise RuntimeError(
@@ -6734,6 +9161,17 @@ def _atlas_glitch_reference_field(
         + ".",
         flush=True,
     )
+    if return_planes:
+        if plane_recovery_approximate:
+            return field, None
+        if plane_buffers is None or any(
+            not np.isfinite(plane).all() for plane in plane_buffers.values()
+        ):
+            raise RuntimeError(
+                "strict atlas render completed the field without complete "
+                "Kalles orbit metadata"
+            )
+        return field, KfpFramePlanes(**plane_buffers)
     return field
 
 
@@ -6761,6 +9199,8 @@ def _atlas_local_reference_field(
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
     field_bias: float = 0.0,
+    escape_radius_mode: int = 0,
+    coordinate_mode: int = 0,
 ) -> Optional[Any]:
     """Render a deep tile with an adaptive secondary-reference grid.
 
@@ -6809,6 +9249,8 @@ def _atlas_local_reference_field(
             formula=formula,
             julia_constant=julia_constant,
             field_bias=field_bias,
+            escape_radius_mode=escape_radius_mode,
+            coordinate_mode=coordinate_mode,
         )
     if (
         render_width < ATLAS_LOCAL_REFERENCE_MIN_DIMENSION
@@ -6830,6 +9272,7 @@ def _atlas_local_reference_field(
         x_center,
         y_center,
         initial_divisions,
+        coordinate_mode,
     )
     centres_by_divisions = {initial_divisions: initial_cells}
     field = np.full((render_height, render_width), np.nan, dtype=np.float32)
@@ -6870,6 +9313,7 @@ def _atlas_local_reference_field(
                 x_center,
                 y_center,
                 next_divisions,
+                coordinate_mode,
             )
             centres_by_divisions[next_divisions] = all_children
         return [
@@ -6899,6 +9343,8 @@ def _atlas_local_reference_field(
             local_log_zoom,
             formula=formula,
             julia_constant=julia_constant,
+            escape_radius_mode=escape_radius_mode,
+            coordinate_mode=coordinate_mode,
         )
         try:
             render_options = NativeRenderOptions(
@@ -6913,6 +9359,8 @@ def _atlas_local_reference_field(
                 strict_cycle=True,
                 backend=native_backend,
                 output_bias=field_bias,
+                escape_radius_mode=escape_radius_mode,
+                coordinate_mode=coordinate_mode,
             )
             return np.asarray(
                 render_fractal(
@@ -7109,10 +9557,15 @@ def _atlas_tile_field(
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
     native_reference_root: Any = None,
     field_bias: float = 0.0,
+    escape_radius_mode: int = 0,
+    coordinate_mode: int = 0,
+    plane_flags: int = 0,
+    return_planes: bool = False,
 ) -> Any:
     """Load or render one reusable tile in the fixed zoom atlas."""
 
     np = _require_numpy()
+    _escape_radius_squared(escape_radius_mode)
     cache_path = _atlas_tile_path(
         cache_dir,
         cache_identity,
@@ -7126,7 +9579,59 @@ def _atlas_tile_field(
         series_order,
         series_block,
     )
-    if cache_path is not None:
+    plane_cache_path = _atlas_tile_planes_path(
+        cache_dir,
+        cache_identity,
+        render_width,
+        render_height,
+        level,
+        log_zoom,
+        x_center,
+        y_center,
+        max_iter,
+        series_order,
+        series_block,
+    ) if return_planes else None
+    if plane_cache_path is not None:
+        try:
+            with _safe_cache_load(plane_cache_path) as cached:
+                if cached is None or not hasattr(cached, "files"):
+                    raise ValueError("unsafe KFP plane cache")
+                required = {"field", *_KFP_REQUIRED_RENDER_PLANES}
+                if not required.issubset(set(cached.files)):
+                    raise ValueError("incomplete KFP plane cache")
+                shape = (render_height, render_width)
+                arrays: dict[str, Any] = {}
+                field_value = np.asarray(cached["field"], dtype=np.float32)
+                if not _valid_field_array(field_value, shape):
+                    raise ValueError("invalid cached KFP field")
+                for name in _KFP_REQUIRED_RENDER_PLANES:
+                    value = np.asarray(cached[name])
+                    if value.shape != shape or not np.isfinite(value).all():
+                        raise ValueError(f"invalid cached KFP plane: {name}")
+                    arrays[name] = np.array(value, copy=True)
+                if cache_evictor is not None:
+                    cache_evictor.touch(plane_cache_path)
+                print(
+                    f"Using cached KFP atlas tile {level} "
+                    f"({plane_cache_path.name}).",
+                    flush=True,
+                )
+                return (
+                    field_value.copy(),
+                    KfpFramePlanes(**arrays),
+                )
+        except (
+            EOFError,
+            KeyError,
+            MemoryError,
+            OSError,
+            TypeError,
+            ValueError,
+            zipfile.BadZipFile,
+        ):
+            pass
+    if cache_path is not None and not return_planes:
         try:
             with _safe_cache_load(cache_path) as cached:
                 if cached is None:
@@ -7156,6 +9661,16 @@ def _atlas_tile_field(
         f"iterations {max_iter}",
         flush=True,
     )
+    use_gpu_direct_deep = (
+        native_backend == 2
+        and native_reference is not None
+        and log_zoom >= 12.0
+    )
+    watchdog_reason = (
+        "OpenCL deep field pass is still running"
+        if use_gpu_direct_deep
+        else "strict native deep reference/repair is still running"
+    )
     tile_started = time.monotonic()
     watchdog_stop = threading.Event()
 
@@ -7165,7 +9680,7 @@ def _atlas_tile_field(
             print(
                 f"  Still rendering atlas tile {level} "
                 f"({_zoom_label(log_zoom)}); {elapsed:.0f}s elapsed "
-                "(native deep reference work is active).",
+                f"({watchdog_reason}).",
                 flush=True,
             )
 
@@ -7177,10 +9692,15 @@ def _atlas_tile_field(
     watchdog.start()
     try:
         field = None
+        planes = None
         # Adaptive local references are formula-aware: the native handle owns
         # the orbit and perturbation rules for Mandelbrot, Julia, Tricorn, and
-        # Burning Ship. Keep the same strict atlas repair path for all of them.
-        if native_library is not None:
+        # Burning Ship. They are useful on the CPU path, but constructing
+        # secondary MPFR references is exactly the work the GPU path is meant
+        # to avoid. Let a device render use its complete shared-reference
+        # pass first; if it returns unresolved samples, the strict repair
+        # queue below is still available as a correctness fallback.
+        if native_library is not None and not return_planes and not use_gpu_direct_deep:
             try:
                 field = _atlas_local_reference_field(
                     render_width=render_width,
@@ -7204,6 +9724,8 @@ def _atlas_tile_field(
                     formula=formula,
                     julia_constant=julia_constant,
                     field_bias=field_bias,
+                    escape_radius_mode=escape_radius_mode,
+                    coordinate_mode=coordinate_mode,
                 )
             except RuntimeError as error:
                 if not allow_recovery:
@@ -7218,7 +9740,7 @@ def _atlas_tile_field(
                     flush=True,
                 )
         if field is None:
-            field = render_fractal(
+            rendered = render_fractal(
                 render_width,
                 render_height,
                 log_zoom,
@@ -7233,10 +9755,18 @@ def _atlas_tile_field(
                 NativeRenderOptions(
                     backend=native_backend,
                     output_bias=field_bias,
+                    escape_radius_mode=escape_radius_mode,
+                    coordinate_mode=coordinate_mode,
+                    plane_flags=plane_flags,
                 ),
                 formula,
                 julia_constant,
+                return_planes=return_planes,
             )
+            if return_planes:
+                field, planes = rendered
+            else:
+                field = rendered
             if (
                 not _valid_field_array(field, (render_height, render_width))
                 and native_library is not None
@@ -7254,7 +9784,7 @@ def _atlas_tile_field(
                     "strict glitch repair.",
                     flush=True,
                 )
-                field = _atlas_glitch_reference_field(
+                repaired = _atlas_glitch_reference_field(
                     render_width=render_width,
                     render_height=render_height,
                     log10_zoom=log_zoom,
@@ -7275,7 +9805,16 @@ def _atlas_tile_field(
                     formula=formula,
                     julia_constant=julia_constant,
                     field_bias=field_bias,
+                    escape_radius_mode=escape_radius_mode,
+                    coordinate_mode=coordinate_mode,
+                    plane_flags=plane_flags,
+                    return_planes=return_planes,
+                    initial_field=(None if return_planes else field),
                 )
+                if return_planes:
+                    field, planes = repaired
+                else:
+                    field = repaired
     finally:
         watchdog_stop.set()
         watchdog.join(timeout=1.0)
@@ -7285,7 +9824,7 @@ def _atlas_tile_field(
         flush=True,
     )
     field = _validated_field(field, (render_height, render_width), "atlas tile")
-    if cache_path is not None:
+    if cache_path is not None and not return_planes:
         _atomic_save_field(cache_path, field, durable=durable_cache)
         if cache_evictor is not None:
             cache_evictor.observe(cache_path)
@@ -7293,7 +9832,18 @@ def _atlas_tile_field(
         # used by cache hits. Reopening and copying a freshly written 4K tile
         # only doubles its disk traffic and peak memory; the next render will
         # validate the on-disk entry when it actually consumes it.
-    return field
+    if plane_cache_path is not None and _kfp_render_planes_complete(
+        planes, (render_height, render_width)
+    ):
+        _atomic_save_kfp_planes(
+            plane_cache_path,
+            field,
+            planes,
+            durable=durable_cache,
+        )
+        if cache_evictor is not None:
+            cache_evictor.observe(plane_cache_path)
+    return (field, planes) if return_planes else field
 
 
 def _atlas_colourise_native(
@@ -7514,14 +10064,384 @@ def _use_static_kfp_atlas(
     # bilinear/native crop as the existing fast path.
     resample = _atlas_resample_mode(resample)
     return (
-        source_mode == "upscaled"
+        source_mode in {"lossless-compressed", "upscaled"}
         and profile is not None
+        and not _kfp_has_texture(profile)
         and native_library is not None
         and hasattr(native_library, "fractal_crop_colourise_kfp")
         and hasattr(native_library, "fractal_crop_rgb")
         and hasattr(native_library, "fractal_atlas_composite_rgb")
         and resample == "bilinear"
     )
+
+
+def _kfp_frame_is_audio_invariant(profile: Optional[KfpPalette]) -> bool:
+    """Return whether an unchanged KFP camera produces identical RGB.
+
+    KFP's CPU ``SetColor`` does not consume this project's vocal,
+    instrumental, or pitch features. Its only animation input is the optional
+    phase-colour offset. A static camera using a profile without that offset
+    can therefore safely reuse its complete screen-space KFP surface.
+    """
+
+    if profile is None:
+        return False
+    try:
+        phase_strength = float(profile.phase_color_strength)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(phase_strength) and abs(phase_strength) <= 1.0e-12
+
+
+def _atlas_colourise_kfp_planes_native(
+    parent: Any,
+    child: Any,
+    parent_planes: KfpFramePlanes,
+    child_planes: Optional[KfpFramePlanes],
+    output_width: int,
+    output_height: int,
+    parent_zoom: float,
+    child_fraction: float,
+    parent_iter: int,
+    child_iter: Optional[int],
+    child_zoom: float,
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    pitch: float,
+    profile: KfpPalette,
+    native_library: Any,
+    native_threads: int,
+    field_bias: float,
+    precise: bool = True,
+) -> Optional[Any]:
+    """Reproject a complete KFP atlas in the native plane-aware compositor.
+
+    The Python implementation remains below as a compatibility fallback for
+    older shared libraries and for non-bilinear experimental crops.  The
+    normal 4K/live path uses this entry point so Pillow does not allocate and
+    resize six full-resolution metadata planes for every video frame.
+    """
+
+    if native_library is None:
+        return None
+    function_name = (
+        "fractal_atlas_colourise_kfp_planes_precise"
+        if precise else "fractal_atlas_colourise_kfp_planes"
+    )
+    function = getattr(native_library, function_name, None)
+    if function is None and precise:
+        function = getattr(native_library, "fractal_atlas_colourise_kfp_planes", None)
+    if function is None:
+        return None
+    np = _require_numpy()
+    parent_array = np.ascontiguousarray(parent, dtype=np.float32)
+    if parent_array.ndim != 2:
+        raise ValueError("native plane-aware KFP atlas parent must be two-dimensional")
+    parent_native, parent_references = _native_kfp_planes(
+        parent_planes,
+        (int(parent_array.shape[0]), int(parent_array.shape[1])),
+        profile,
+    )
+    use_child = (
+        child is not None
+        and child_iter is not None
+        and float(child_fraction) > 0.0
+    )
+    if use_child:
+        if child_planes is None:
+            raise ValueError("native plane-aware KFP atlas child metadata is missing")
+        child_array = np.ascontiguousarray(child, dtype=np.float32)
+        if child_array.ndim != 2:
+            raise ValueError("native plane-aware KFP atlas child must be two-dimensional")
+        child_native, child_references = _native_kfp_planes(
+            child_planes,
+            (int(child_array.shape[0]), int(child_array.shape[1])),
+            profile,
+        )
+        child_pointer = child_array.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_float)
+        )
+        child_native_pointer = ctypes.byref(child_native)
+        child_width, child_height = (
+            int(child_array.shape[1]),
+            int(child_array.shape[0]),
+        )
+        child_max_iter = int(child_iter)
+    else:
+        child_array = np.empty((0, 0), dtype=np.float32)
+        child_references = []
+        child_pointer = ctypes.POINTER(ctypes.c_float)()
+        child_native_pointer = ctypes.POINTER(NativeKfpPlanes)()
+        child_width = child_height = child_max_iter = 0
+    output = np.empty((int(output_height), int(output_width), 3), dtype=np.uint8)
+    lut = np.ascontiguousarray(_kfp_palette_lut(profile), dtype=np.uint8)
+    # Source centering is decoded by the native compositor. SetColor sees the
+    # same zero-bias screen-space field as the existing Python path.
+    options = _native_kfp_options(profile, 0.0)
+    # Keep every marshalled NumPy owner alive until the native function returns.
+    _ = parent_references, child_references, child_array
+    status = function(
+        parent_array.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        int(parent_array.shape[1]),
+        int(parent_array.shape[0]),
+        int(parent_iter),
+        ctypes.byref(parent_native),
+        child_pointer,
+        int(child_width),
+        int(child_height),
+        int(child_max_iter),
+        child_native_pointer,
+        output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(output_width),
+        int(output_height),
+        float(parent_zoom),
+        float(child_fraction) if use_child else 0.0,
+        float(child_zoom),
+        int(max(int(parent_iter), int(child_iter or parent_iter))),
+        int(float(field_bias) > 0.0),
+        float(phase),
+        float(vocal),
+        float(instrumental),
+        float(pitch),
+        ctypes.byref(options),
+        lut.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(lut.shape[0]),
+        int(native_threads),
+    )
+    if status != 0:
+        message = native_library.fractal_last_error() or (
+            b"unknown native plane-aware KFP atlas colourizer error"
+        )
+        raise RuntimeError(message.decode("utf-8", errors="replace"))
+    return output
+
+
+def _colourise_kfp_atlas_planes(
+    parent: Any,
+    child: Any,
+    parent_planes: Optional[KfpFramePlanes],
+    child_planes: Optional[KfpFramePlanes],
+    output_width: int,
+    output_height: int,
+    parent_zoom: float,
+    child_fraction: float,
+    parent_iter: int,
+    child_iter: Optional[int],
+    child_zoom: float,
+    phase: float,
+    vocal: float,
+    instrumental: float,
+    pitch: float,
+    profile: KfpPalette,
+    native_library: Any,
+    native_threads: int,
+    resample: str,
+    field_bias: float = 0.0,
+) -> Any:
+    """Run one complete Kalles palette pass over a reprojected atlas.
+
+    This is the metadata counterpart to ``_atlas_colourise_kfp_raw_native``.
+    The latter is intentionally scalar-only and is retained for deep BLA
+    tiles.  When direct-render orbit planes are available, this function
+    reprojects the scalar field and every Kalles input plane together, then
+    invokes the plane-aware SetColor implementation once over the final
+    screen-space surface.
+    """
+
+    np = _require_numpy()
+    output_width, output_height = _validate_dimensions(
+        output_width,
+        output_height,
+        "KFP plane atlas output",
+    )
+    parent_array = np.asarray(parent)
+    if parent_array.ndim != 2:
+        raise ValueError("KFP plane atlas parent must be two-dimensional")
+    effective_iter = max(int(parent_iter), int(child_iter or parent_iter))
+    centered = float(field_bias) > 0.0
+
+    # The native fused path performs the same scalar/metadata crop and seam
+    # merge in one bounded OpenMP pass, then calls the source-faithful Kalles
+    # SetColor implementation. It removes the per-frame Pillow work that was
+    # dominating dense KFP exports. Lanczos remains on the reference Python
+    # path until a matching native kernel is added; normal profiles map their
+    # final ``nearest`` choice to this bilinear atlas crop.
+    if resample == "bilinear":
+        native_output = _atlas_colourise_kfp_planes_native(
+            parent,
+            child,
+            parent_planes,
+            child_planes,
+            output_width,
+            output_height,
+            parent_zoom,
+            child_fraction,
+            parent_iter,
+            child_iter,
+            child_zoom,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            profile,
+            native_library,
+            native_threads,
+            field_bias,
+            precise=True,
+        )
+        if native_output is not None:
+            return native_output
+
+    parent_source_bias = float(parent_iter) if centered else 0.0
+    parent_view, parent_inside = _crop_and_resize_preserving_interior(
+        parent_array,
+        output_width,
+        output_height,
+        max(float(parent_zoom), 1.0),
+        int(parent_iter),
+        resample,
+        field_bias=parent_source_bias,
+        output_max_iter=effective_iter,
+        output_field_bias=0.0,
+    )
+    parent_view = np.asarray(parent_view, dtype=np.float32)
+    parent_view_planes = _crop_kfp_planes(
+        parent_planes,
+        parent_array.shape,
+        output_width,
+        output_height,
+        max(float(parent_zoom), 1.0),
+        resample,
+        inside=parent_inside,
+        output_max_iter=effective_iter,
+    )
+
+    def colour(view: Any, view_planes: Optional[KfpFramePlanes], cap: int) -> Any:
+        if native_library is not None:
+            return _colourise_kfp_native(
+                view,
+                int(cap),
+                phase,
+                vocal,
+                instrumental,
+                pitch,
+                profile,
+                native_library,
+                native_threads,
+                precise=True,
+                field_bias=0.0,
+                planes=view_planes,
+            )
+        return _colourise_kfp(
+            view,
+            int(cap),
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            profile,
+            spatial_width=output_width,
+            field_bias=0.0,
+            planes=view_planes,
+        )
+
+    if (
+        child is None
+        or child_iter is None
+        or child_planes is None
+        or float(child_fraction) <= 0.0
+    ):
+        return colour(parent_view, parent_view_planes, effective_iter)
+
+    child_fraction = min(max(float(child_fraction), 0.0), 1.0)
+    if child_fraction >= 0.999999:
+        child_array = np.asarray(child)
+        child_view, child_inside = _crop_and_resize_preserving_interior(
+            child_array,
+            output_width,
+            output_height,
+            max(float(child_zoom), 1.0),
+            int(child_iter),
+            resample,
+            field_bias=float(child_iter) if centered else 0.0,
+            output_max_iter=int(child_iter),
+            output_field_bias=0.0,
+        )
+        child_view = np.asarray(child_view, dtype=np.float32)
+        child_view_planes = _crop_kfp_planes(
+            child_planes,
+            child_array.shape,
+            output_width,
+            output_height,
+            max(float(child_zoom), 1.0),
+            resample,
+            inside=child_inside,
+            output_max_iter=int(child_iter),
+        )
+        return colour(child_view, child_view_planes, int(child_iter))
+
+    child_array = np.asarray(child)
+    child_width = max(1, int(round(output_width * child_fraction)))
+    child_height = max(1, int(round(output_height * child_fraction)))
+    child_view, child_inside = _crop_and_resize_preserving_interior(
+        child_array,
+        child_width,
+        child_height,
+        max(float(child_zoom), 1.0),
+        int(child_iter),
+        resample,
+        field_bias=float(child_iter) if centered else 0.0,
+        output_max_iter=effective_iter,
+        output_field_bias=0.0,
+    )
+    child_view = np.asarray(child_view, dtype=np.float32)
+    child_view_planes = _crop_kfp_planes(
+        child_planes,
+        child_array.shape,
+        child_width,
+        child_height,
+        max(float(child_zoom), 1.0),
+        resample,
+        inside=child_inside,
+        output_max_iter=effective_iter,
+    )
+    left = (output_width - child_width) // 2
+    top = (output_height - child_height) // 2
+    right = left + child_width
+    bottom = top + child_height
+    # Use the same narrow seam policy as the scalar atlas path. The scalar
+    # surface and continuous planes share one smoothstep, while categorical
+    # iteration counters use child ownership at the same boundary.
+    feather = _atlas_feather(child_width, child_height, kfp=True)
+    if feather < 2:
+        alpha = np.ones((child_height, child_width), dtype=np.float64)
+    else:
+        yy, xx = np.ogrid[:child_height, :child_width]
+        edge_distance = np.minimum(
+            np.minimum(xx, yy),
+            np.minimum(child_width - 1 - xx, child_height - 1 - yy),
+        )
+        alpha = np.clip(
+            edge_distance.astype(np.float64) / float(feather), 0.0, 1.0
+        )
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+    parent_region = parent_view[top:bottom, left:right]
+    parent_region[...] = (
+        parent_region * (1.0 - alpha.astype(np.float32))
+        + child_view * alpha.astype(np.float32)
+    )
+    merged_planes = _merge_kfp_plane_views(
+        parent_view_planes,
+        child_view_planes,
+        (output_height, output_width),
+        left,
+        top,
+        child_width,
+        child_height,
+        alpha,
+    )
+    return colour(parent_view, merged_planes, effective_iter)
 
 
 def _atlas_colour_frame(
@@ -7547,6 +10467,15 @@ def _atlas_colour_frame(
     kfp_child_rgb: Any = None,
     use_static_kfp: bool = True,
     kfp_field_bias: float = 0.0,
+    kfp_profile_override: Optional[KfpPalette] = None,
+    parent_planes: Optional[KfpFramePlanes] = None,
+    child_planes: Optional[KfpFramePlanes] = None,
+    kfp_gpu: bool = False,
+    ordinary_gpu: bool = False,
+    kfp_parent_cache_token: int = 0,
+    kfp_child_cache_token: int = 0,
+    ordinary_parent_cache_token: int = 0,
+    ordinary_child_cache_token: int = 0,
 ) -> Any:
     """Compose a frame from a parent tile and its central child tile.
 
@@ -7585,7 +10514,36 @@ def _atlas_colour_frame(
         child = None
         child_iter = None
         child_fraction = 0.0
-    kfp_profile = _kfp_profile_for_selection(palette_name, palette_file)
+    kfp_profile = (
+        kfp_profile_override
+        if kfp_profile_override is not None
+        else _kfp_profile_for_selection(palette_name, palette_file)
+    )
+    ordinary_accents = None
+    ordinary_interior_color = (0, 0, 0)
+    if kfp_profile is None:
+        ordinary_accents = (
+            None
+            if palette_name == "aurora" and palette_file is None
+            else _aurora_accents_for_selection(palette_name, palette_file)
+        )
+        ordinary_interior_color = _ordinary_interior_color(
+            palette_name,
+            palette_file,
+        )
+    kfp_colour_kwargs = (
+        {
+            "kfp_profile_override": kfp_profile,
+            "kfp_gpu": bool(kfp_gpu),
+        }
+        if kfp_profile is not None
+        else {}
+    )
+    # Keep the optional keyword out of the ordinary CPU path.  Apart from
+    # avoiding needless argument plumbing, this preserves compatibility with
+    # lightweight colouriser adapters used by callers and tests; the keyword
+    # only matters when the OpenCL Aurora path is actually selected.
+    ordinary_colour_kwargs = {"ordinary_gpu": True} if ordinary_gpu else {}
     centered_kfp = kfp_profile is not None and float(kfp_field_bias) > 0.0
     effective_iter = max(int(parent_iter), int(child_iter or parent_iter))
     target_kfp_bias = float(effective_iter) if centered_kfp else 0.0
@@ -7624,10 +10582,55 @@ def _atlas_colour_frame(
             kfp_child_rgb=None,
             use_static_kfp=use_static_kfp,
             kfp_field_bias=target_kfp_bias,
+            kfp_profile_override=kfp_profile,
+            parent_planes=child_planes,
+            child_planes=None,
+            kfp_gpu=kfp_gpu,
+            ordinary_gpu=ordinary_gpu,
+            kfp_parent_cache_token=kfp_child_cache_token,
+            kfp_child_cache_token=0,
+            ordinary_parent_cache_token=ordinary_child_cache_token,
+            ordinary_child_cache_token=0,
+        )
+    if (
+        kfp_profile is not None
+        and parent_planes is not None
+        and (
+            child is None
+            or child_iter is None
+            or child_planes is not None
+        )
+    ):
+        # Do not let a scalar atlas fast path discard the raw orbit data. A
+        # shallow direct tile can carry Kalles' complete SetColor inputs all
+        # the way to this screen-space compositor; deep BLA tiles simply leave
+        # this branch unavailable and retain the validated scalar fallback.
+        return _colourise_kfp_atlas_planes(
+            parent,
+            child,
+            parent_planes,
+            child_planes,
+            output_width,
+            output_height,
+            parent_zoom,
+            child_fraction,
+            parent_iter,
+            child_iter,
+            child_crop_zoom,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            kfp_profile,
+            native_library,
+            native_threads,
+            resample,
+            target_kfp_bias,
         )
     if (
         use_static_kfp
         and kfp_profile is not None
+        and not _kfp_has_texture(kfp_profile)
         and kfp_parent_rgb is not None
         and native_library is not None
         and hasattr(native_library, "fractal_crop_rgb")
@@ -7648,6 +10651,7 @@ def _atlas_colour_frame(
                 parent_zoom,
                 native_library,
                 native_threads,
+                use_opencl=kfp_gpu,
             )
         if float(child_fraction) >= 0.999999 and kfp_child_rgb is not None:
             return _crop_rgb_native(
@@ -7657,6 +10661,7 @@ def _atlas_colour_frame(
                 child_crop_zoom,
                 native_library,
                 native_threads,
+                use_opencl=kfp_gpu,
             )
         if kfp_child_rgb is not None:
             child_width = max(1, int(round(output_width * float(child_fraction))))
@@ -7672,12 +10677,71 @@ def _atlas_colour_frame(
                 _atlas_feather(child_width, child_height, kfp=True),
                 native_library,
                 native_threads,
+                use_opencl=kfp_gpu,
+                parent_cache_token=kfp_parent_cache_token,
+                child_cache_token=kfp_child_cache_token,
             )
+    if (
+        kfp_gpu
+        and kfp_profile is not None
+        and not _kfp_has_texture(kfp_profile)
+        and parent_planes is None
+        and child_planes is None
+        and native_library is not None
+        and hasattr(native_library, "fractal_atlas_field_ex")
+        and resample == "bilinear"
+    ):
+        # The OpenCL KFP colourizer still needs one continuous screen-space
+        # scalar field. Keep the complete parent/child crop, deep-tile
+        # overscan, source bias conversion, and narrow seam in the native
+        # compositor; the former fallback did two Pillow resizes plus a
+        # NumPy blend for every frame, which made deep KFP exports spend
+        # minutes on otherwise trivial atlas updates.
+        child_width = max(1, int(round(output_width * float(child_fraction))))
+        child_height = max(1, int(round(output_height * float(child_fraction))))
+        composed_field = _atlas_field_native(
+            parent,
+            child,
+            output_width,
+            output_height,
+            parent_zoom,
+            child_fraction,
+            parent_iter,
+            child_iter,
+            effective_iter,
+            native_library,
+            native_threads,
+            child_zoom=child_crop_zoom,
+            parent_field_bias=(float(parent_iter) if centered_kfp else 0.0),
+            child_field_bias=(
+                float(child_iter)
+                if centered_kfp and child_iter is not None
+                else 0.0
+            ),
+            output_field_bias=target_kfp_bias,
+            feather=_atlas_feather(child_width, child_height, kfp=True),
+        )
+        return _colourise_kfp_native(
+            composed_field,
+            effective_iter,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            kfp_profile,
+            native_library,
+            native_threads,
+            precise=False,
+            field_bias=target_kfp_bias,
+            use_opencl=True,
+        )
     if (
         kfp_profile is not None
         and child is not None
         and child_iter is not None
         and float(child_fraction) >= 0.999999
+        and not _kfp_has_texture(kfp_profile)
+        and not kfp_gpu
         and native_library is not None
         and hasattr(native_library, "fractal_crop_colourise_kfp")
         and resample == "bilinear"
@@ -7711,6 +10775,7 @@ def _atlas_colour_frame(
         and child_iter is not None
         and float(child_fraction) >= 0.999999
         and kfp_profile is None
+        and not ordinary_gpu
         and native_library is not None
         and hasattr(native_library, "fractal_crop_colourise")
         and resample == "bilinear"
@@ -7741,6 +10806,8 @@ def _atlas_colour_frame(
         )
     if (
         kfp_profile is not None
+        and not _kfp_has_texture(kfp_profile)
+        and not kfp_gpu
         and native_library is not None
         and hasattr(native_library, "fractal_atlas_colourise_kfp_raw")
         and resample == "bilinear"
@@ -7772,6 +10839,7 @@ def _atlas_colour_frame(
     if (
         native_library is not None
         and hasattr(native_library, "fractal_atlas_colourise")
+        and not ordinary_gpu
         and resample == "bilinear"
     ):
         if palette_name == "aurora" and palette_file is None:
@@ -7791,7 +10859,7 @@ def _atlas_colour_frame(
                 native_library,
                 pitch,
             )
-        if _kfp_profile_for_selection(palette_name, palette_file) is None:
+        if kfp_profile is None:
             interior_color = _ordinary_interior_color(palette_name, palette_file)
             return _atlas_colourise_native(
                 parent,
@@ -7811,6 +10879,49 @@ def _atlas_colour_frame(
                 interior_color if interior_color != (0, 0, 0) else None,
                 _aurora_accents_for_selection(palette_name, palette_file),
             )
+    if (
+        ordinary_gpu
+        and kfp_profile is None
+        and native_library is not None
+        and child_crop_zoom == 1.0
+        and (
+            hasattr(native_library, "fractal_atlas_colourise_opencl_accents")
+            or hasattr(native_library, "fractal_atlas_colourise_opencl")
+        )
+    ):
+        # Keep the scalar tiles on the device. The fused kernel avoids both
+        # the CPU 1080p atlas compose and the upload/readback of a complete
+        # float surface on every frame. If an older/restricted OpenCL driver
+        # rejects the optional kernel, retain the validated native fallback.
+        child_width = max(1, int(round(output_width * float(child_fraction))))
+        child_height = max(1, int(round(output_height * float(child_fraction))))
+        try:
+            return _atlas_colourise_opencl_native(
+                parent,
+                child,
+                output_width,
+                output_height,
+                parent_zoom,
+                child_fraction,
+                parent_iter,
+                child_iter,
+                effective_iter,
+                child_crop_zoom,
+                phase,
+                vocal,
+                instrumental,
+                pitch,
+                _atlas_feather(child_width, child_height),
+                native_library,
+                native_threads,
+                parent_cache_token=ordinary_parent_cache_token,
+                child_cache_token=ordinary_child_cache_token,
+                accents=ordinary_accents,
+                interior_color=ordinary_interior_color,
+            )
+        except RuntimeError:
+            pass
+
     parent_crop_options = (
         {
             "field_bias": float(parent_iter),
@@ -7842,6 +10953,8 @@ def _atlas_colour_frame(
             pitch,
             palette_file,
             target_kfp_bias,
+            **kfp_colour_kwargs,
+            **ordinary_colour_kwargs,
         )
     child_fraction = min(float(child_fraction), 1.0)
     if child_fraction >= 0.999999:
@@ -7875,6 +10988,8 @@ def _atlas_colour_frame(
             pitch,
             palette_file,
             (int(child_iter) if centered_kfp else 0.0),
+            **kfp_colour_kwargs,
+            **ordinary_colour_kwargs,
         )
 
     child_width = max(1, int(round(output_width * child_fraction)))
@@ -7916,6 +11031,8 @@ def _atlas_colour_frame(
         feather = _atlas_feather(child_width, child_height, kfp=True)
         if (
             native_library is not None
+            and not _kfp_has_texture(kfp_profile)
+            and not kfp_gpu
             and hasattr(native_library, "fractal_atlas_colourise_kfp")
             and resample == "bilinear"
         ):
@@ -7964,6 +11081,21 @@ def _atlas_colour_frame(
                 region * (1.0 - alpha)
                 + child_view * alpha
             )
+        if kfp_gpu and native_library is not None:
+            return _colourise_kfp_native(
+                parent_view,
+                effective_iter,
+                phase,
+                vocal,
+                instrumental,
+                pitch,
+                kfp_profile,
+                native_library,
+                native_threads,
+                precise=False,
+                field_bias=target_kfp_bias,
+                use_opencl=True,
+            )
         return _colourise_kfp(
             parent_view,
             effective_iter,
@@ -7974,6 +11106,25 @@ def _atlas_colour_frame(
             kfp_profile,
             spatial_width=output_width,
             field_bias=target_kfp_bias,
+        )
+    if ordinary_gpu:
+        # The OpenCL Aurora ABI consumes one complete scalar surface. Compose
+        # the parent/child crop in scalar space first, then colourise once on
+        # the device; colouring the two tiles independently would make the
+        # palette lookup disagree at the atlas boundary.
+        return _colourise_view(
+            parent_view,
+            effective_iter,
+            phase,
+            vocal,
+            instrumental,
+            native_library,
+            native_threads,
+            palette_name,
+            pitch,
+            palette_file,
+            0.0,
+            ordinary_gpu=True,
         )
     feather = _atlas_feather(child_width, child_height)
     if feather < 2:
@@ -7990,6 +11141,8 @@ def _atlas_colour_frame(
             palette_name,
             pitch,
             palette_file,
+            **kfp_colour_kwargs,
+            **ordinary_colour_kwargs,
         )
 
     yy, xx = np.ogrid[:child_height, :child_width]
@@ -8017,6 +11170,8 @@ def _atlas_colour_frame(
         palette_name,
         pitch,
         palette_file,
+        **kfp_colour_kwargs,
+        **ordinary_colour_kwargs,
     )
     child_rgb = _colourise_view(
         child_view,
@@ -8029,6 +11184,8 @@ def _atlas_colour_frame(
         palette_name,
         pitch,
         palette_file,
+        **kfp_colour_kwargs,
+        **ordinary_colour_kwargs,
     )
     region_rgb = parent_rgb[top:bottom, left:right]
     blended = (
@@ -8105,6 +11262,10 @@ def _render_video_atlas(
     glow: float = 0.0,
     motion_blur: float = 0.0,
     source_mode: str = "lossless-compressed",
+    kfp_profile_override: Optional[KfpPalette] = None,
+    kfp_colour_opencl: Optional[bool] = None,
+    ordinary_colour_opencl: bool = False,
+    ffmpeg_input_pixel_format: str = "rgb24",
 ) -> dict[str, Any]:
     """Render a song through a fixed nested tile atlas.
 
@@ -8129,7 +11290,23 @@ def _render_video_atlas(
     )
     origin, step, level_count = _atlas_geometry(zooms, keyframe_factor)
     factor = 10.0 ** step
-    kfp_profile = _kfp_profile_for_selection(palette, palette_file)
+    kfp_profile = (
+        kfp_profile_override
+        if kfp_profile_override is not None
+        else _kfp_profile_for_selection(palette, palette_file)
+    )
+    kfp_plane_enabled = bool(
+        kfp_profile is not None
+        and _kfp_requires_render_planes(kfp_profile)
+        and native_library is not None
+        and active_renderer in {"auto", "native"}
+        and hasattr(native_library, "render_fractal_ex_planes")
+    )
+    kfp_plane_flags = _native_kfp_plane_flags(kfp_profile)
+    kfp_escape_radius_mode = (
+        _kfp_escape_radius_mode(kfp_profile)
+        if kfp_profile is not None else 0
+    )
     tile_overscan = _atlas_storage_overscan(palette, palette_file)
     tile_overscan_log = math.log10(tile_overscan)
     maximum_log = float(max(float(value) for value in zooms))
@@ -8141,6 +11318,7 @@ def _render_video_atlas(
     )
 
     tile_cache: dict[int, Any] = {}
+    tile_planes_cache: dict[int, Optional[KfpFramePlanes]] = {}
     tile_iterations: dict[int, int] = {}
     kfp_centered_fields = (
         kfp_profile is not None
@@ -8170,7 +11348,46 @@ def _render_video_atlas(
         native_library,
         resample,
     )
+    # Field OpenCL and KFP colour OpenCL are separate stages. Keep this
+    # explicit so selecting the GPU backend actually moves the expensive
+    # finite-difference/LUT pass too, while plane/textured profiles retain
+    # their complete CPU SetColor implementation.
+    kfp_gpu_enabled = bool(
+        (native_backend == 2 if kfp_colour_opencl is None else kfp_colour_opencl)
+        and native_library is not None
+        and hasattr(native_library, "fractal_colourise_kfp_opencl")
+        and _kfp_gpu_supported(kfp_profile)
+        and not kfp_plane_enabled
+    )
+    ordinary_gpu_enabled = bool(
+        ordinary_colour_opencl
+        and kfp_profile is None
+        and native_library is not None
+        and native_backend == 2
+        and (
+            hasattr(native_library, "fractal_atlas_colourise_opencl_accents")
+            or hasattr(native_library, "fractal_atlas_colourise_opencl")
+        )
+    )
+    ordinary_atlas_cache_enabled = bool(
+        ordinary_gpu_enabled
+        and (
+            hasattr(native_library, "fractal_atlas_colourise_opencl_accents")
+            or hasattr(native_library, "fractal_atlas_colourise_opencl")
+        )
+    )
+    atlas_gpu_cache_enabled = bool(kfp_static_enabled and kfp_gpu_enabled)
     kfp_colour_cache: dict[int, Any] = {}
+    # Keep the token beside the in-memory RGB tile, not merely beside its
+    # logical level.  The bounded atlas cache can evict a level and later
+    # recreate it; that new NumPy tile must force a fresh device upload even
+    # though it represents the same zoom level.
+    kfp_colour_tokens: dict[int, int] = {}
+    # The fused ordinary Aurora kernel keeps scalar atlas tiles resident in
+    # the same way as the static KFP RGB compositor.  Tokens are logical
+    # identities, not NumPy addresses, so an evicted/recreated tile cannot
+    # accidentally reuse a stale device allocation.
+    tile_field_tokens: dict[int, int] = {}
     cache_evictor = _CacheEvictor(cache_dir, cache_limit_mb)
     tile_seconds = 0.0
     kfp_colour_seconds = 0.0
@@ -8191,15 +11408,41 @@ def _render_video_atlas(
     # double wall time on small machines. Hardware encoding does not make the
     # CPU field renderer cheaper: NVENC still leaves the foreground native
     # team competing with the speculative worker for the same cores. Keep the
-    # deep path on the old single-team schedule; shallow previews still benefit
-    # from one-tile look-ahead.
-    deep_native_export = native_library is not None and maximum_log >= 12.0
+    # CPU deep path on the old single-team schedule; a physical OpenCL path can
+    # use the same bounded look-ahead because the device work is not competing
+    # for the host OpenMP team. The OpenCL runtime mutex still serializes device
+    # submissions safely.
+    deep_native_export = (
+        native_library is not None
+        and maximum_log >= 12.0
+        and native_backend != 2
+    )
+    prefetch_setting = os.environ.get("FRACTAL_OPENCL_PREFETCH")
+    prefetch_enabled = prefetch_setting is None or prefetch_setting.strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+    # A tile prefetch and the frame compositor share one OpenCL context and
+    # runtime lock.  On a physical GPU that makes the speculative field pass
+    # queue behind (and sometimes evict working state from) the much hotter
+    # per-frame compositor.  Keep the old overlap available for driver
+    # experiments, but let a GPU export run the two stages in a predictable
+    # sequence by default.
     prefetch_executor = (
         ThreadPoolExecutor(max_workers=1, thread_name_prefix="fractal-field")
-        if cache_limit_mb <= 0.0 and not deep_native_export
+        if cache_limit_mb <= 0.0
+        and not deep_native_export
+        and (native_backend != 2 or prefetch_enabled)
         else None
     )
-    prefetch_native_threads = native_threads
+    # A shallow atlas, or a GPU-backed deep atlas, may render a look-ahead tile
+    # while the foreground thread colourises the current one. Give a CPU
+    # background call a bounded share of the team so the all-CPU default does
+    # not create two full OpenMP teams competing for the same cores.
+    prefetch_native_threads = max(1, native_threads // 2)
 
     def tile_display_log(level: int) -> float:
         """Nominal camera boundary represented by an atlas level."""
@@ -8245,7 +11488,19 @@ def _render_video_atlas(
                 if parent_field is not None
                 else None
             )
-        field = _atlas_tile_field(
+        # The native reference ABI now emits the same iteration/test/phase
+        # planes for every supported formula.  Keep KFP metadata enabled at
+        # deep zoom too; restricting it to Mandelbrot here silently sent
+        # Julia, Tricorn, and Burning Ship tiles through the old scalar
+        # colour approximation.
+        want_planes = kfp_plane_enabled
+        plane_gpu = (
+            want_planes
+            and formula == "mandelbrot"
+            and native_backend == 2
+        )
+        tile_backend = native_backend if (not want_planes or plane_gpu) else 0
+        rendered = _atlas_tile_field(
             cache_dir=cache_dir,
             cache_identity=tile_cache_identity,
             render_width=render_width,
@@ -8275,7 +11530,7 @@ def _render_video_atlas(
                 else tile_native_threads
             ),
             native_library=native_library,
-            native_backend=native_backend,
+            native_backend=tile_backend,
             native_reference_root=native_reference_root,
             fallback_field=parent_field,
             fallback_zoom_factor=factor,
@@ -8286,8 +11541,16 @@ def _render_video_atlas(
             formula=formula,
             julia_constant=julia_constant,
             field_bias=(float(tile_iter(level)) if kfp_centered_fields else 0.0),
+            escape_radius_mode=kfp_escape_radius_mode,
+            coordinate_mode=1 if kfp_profile is not None else 0,
+            plane_flags=kfp_plane_flags,
+            return_planes=want_planes,
         )
-        return field
+        if want_planes:
+            field, planes = rendered
+        else:
+            field, planes = rendered, None
+        return field, planes
 
     def get_tile(level: int) -> Any:
         nonlocal tile_seconds
@@ -8300,7 +11563,11 @@ def _render_video_atlas(
             started_waiting = time.monotonic()
             while True:
                 try:
-                    field = future.result(timeout=ATLAS_PROGRESS_INTERVAL_SECONDS)
+                    rendered = future.result(timeout=ATLAS_PROGRESS_INTERVAL_SECONDS)
+                    if isinstance(rendered, tuple) and len(rendered) == 2:
+                        field, planes = rendered
+                    else:
+                        field, planes = rendered, None
                     break
                 except FutureTimeout:
                     waited = time.monotonic() - started_waiting
@@ -8313,9 +11580,15 @@ def _render_video_atlas(
             tile_seconds += time.perf_counter() - started
         else:
             started = time.perf_counter()
-            field = render_tile(level)
+            field, planes = render_tile(level)
             tile_seconds += time.perf_counter() - started
         tile_cache[level] = field
+        tile_planes_cache[level] = planes
+        if ordinary_atlas_cache_enabled:
+            tile_field_tokens[level] = _atlas_gpu_cache_token(
+                _next_atlas_gpu_cache_generation(),
+                level,
+            )
         protected_paths: set[Path] = set()
         if active_level is not None and cache_dir is not None:
             for protected_level in range(active_level - 1, active_level + 2):
@@ -8344,6 +11617,11 @@ def _render_video_atlas(
         nonlocal kfp_colour_seconds
         if not kfp_static_enabled or level < 0 or level > level_count:
             return None
+        if tile_planes_cache.get(level) is not None:
+            # A plane-aware tile must be colourised after the atlas is
+            # reprojected. An independently coloured RGB tile would discard
+            # the orbit metadata and reintroduce the scalar approximation.
+            return None
         cached = kfp_colour_cache.get(level)
         if cached is not None:
             return cached
@@ -8361,6 +11639,7 @@ def _render_video_atlas(
                 native_library,
                 native_threads,
                 field_bias=(float(tile_iter(level)) if kfp_centered_fields else 0.0),
+                use_opencl=kfp_gpu_enabled,
             )
         else:
             # The scalar source may be 1080p for a lossless-compressed 4K/8K
@@ -8380,9 +11659,15 @@ def _render_video_atlas(
                 native_library,
                 native_threads,
                 field_bias=(float(tile_iter(level)) if kfp_centered_fields else 0.0),
+                use_opencl=kfp_gpu_enabled,
             )
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
         kfp_colour_cache[level] = rgb
+        if atlas_gpu_cache_enabled:
+            kfp_colour_tokens[level] = _atlas_gpu_cache_token(
+                _next_atlas_gpu_cache_generation(),
+                level,
+            )
         kfp_colour_seconds += time.perf_counter() - started
         return rgb
 
@@ -8410,6 +11695,66 @@ def _render_video_atlas(
     frame_seconds = 0.0
     encoder_seconds = 0.0
     previous_rgb = None
+    colour_executor = (
+        ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="fractal-colour",
+        )
+        if float(glow) == 0.0 and float(motion_blur) == 0.0 and total_frames > 1
+        else None
+    )
+    ordinary_batch_size = 2
+    ordinary_batch_request = os.environ.get("FRACTAL_OPENCL_ATLAS_BATCH")
+    if ordinary_batch_request is None and ordinary_gpu_enabled:
+        # Four frames also win at 4K on the tested RTX path: the larger
+        # device readback amortises queue setup without the pressure seen at
+        # eight. An explicit environment override remains available for other
+        # drivers.
+        ordinary_batch_request = (
+            "4"
+            if max(int(frame_width), int(frame_height)) <= 1920
+            else "4"
+        )
+    try:
+        requested_batch_size = int(ordinary_batch_request or "2")
+        ordinary_batch_size = max(1, min(16, requested_batch_size))
+    except (TypeError, ValueError):
+        pass
+    ordinary_batch_enabled = bool(
+        ordinary_batch_request
+        and ordinary_gpu_enabled
+        and not kfp_static_enabled
+        and colour_executor is not None
+        and hasattr(native_library, "fractal_atlas_colourise_opencl_batch")
+    )
+    ordinary_batch_accents = None
+    ordinary_batch_interior = (0, 0, 0)
+    if ordinary_batch_enabled:
+        ordinary_batch_accents = (
+            None
+            if palette == "aurora" and palette_file is None
+            else _aurora_accents_for_selection(palette, palette_file)
+        )
+        ordinary_batch_interior = _ordinary_interior_color(
+            palette,
+            palette_file,
+        )
+    ordinary_batch_requests: list[dict[str, Any]] = []
+    ordinary_batch_signature: Optional[tuple[Any, ...]] = None
+    pending_ordinary_batch_future: Optional[Future[Any]] = None
+    pending_colour_future: Optional[Future[Any]] = None
+    pending_colour_key: Optional[tuple[Any, ...]] = None
+    # A still KFP camera without phase animation has no audio-dependent
+    # colour input. Hold on to the last unmodified surface so an intro hold
+    # or a static smoke export does not run the full plane/stencil colour pass
+    # once per encoded frame.
+    reusable_kfp_frame_key: Optional[tuple[Any, ...]] = None
+    reusable_kfp_frame = None
+    reuse_kfp_frame = (
+        _kfp_frame_is_audio_invariant(kfp_profile)
+        and float(glow) == 0.0
+        and float(motion_blur) == 0.0
+    )
     render_started = time.perf_counter()
     last_progress_report = render_started
     active_level = None
@@ -8419,17 +11764,67 @@ def _render_video_atlas(
             process,
             ffmpeg_diagnostics,
             ffmpeg_reader,
+            ffmpeg_input_pixel_format,
         )
 
         def enqueue_frame(frame: Any) -> None:
             assert frame_writer is not None
             frame_writer.write(frame)
 
+        def drain_ordinary_batch() -> None:
+            nonlocal frame_seconds, pending_ordinary_batch_future
+            if pending_ordinary_batch_future is None:
+                return
+            started = time.perf_counter()
+            batch = pending_ordinary_batch_future.result()
+            for frame in batch:
+                enqueue_frame(frame)
+            frame_seconds += time.perf_counter() - started
+            pending_ordinary_batch_future = None
+
+        def submit_ordinary_batch() -> None:
+            nonlocal ordinary_batch_signature, pending_ordinary_batch_future
+            if not ordinary_batch_requests:
+                return
+            assert colour_executor is not None
+            # Keep at most one completed-but-not-written batch in flight. It
+            # overlaps the main thread's tile selection without allowing an
+            # unbounded queue of 4K RGB surfaces to accumulate.
+            drain_ordinary_batch()
+            first = ordinary_batch_requests[0]
+            frames = tuple(
+                request["controls"] for request in ordinary_batch_requests
+            )
+            pending_ordinary_batch_future = colour_executor.submit(
+                _atlas_colourise_opencl_batch_native,
+                first["parent"],
+                first["child"],
+                frame_width,
+                frame_height,
+                first["parent_iter"],
+                first["child_iter"],
+                frames,
+                native_library,
+                native_threads,
+                parent_cache_token=first["parent_token"],
+                child_cache_token=first["child_token"],
+                accents=ordinary_batch_accents,
+                interior_color=ordinary_batch_interior,
+            )
+            ordinary_batch_requests.clear()
+            ordinary_batch_signature = None
+
+        def flush_ordinary_batch() -> None:
+            submit_ordinary_batch()
+            drain_ordinary_batch()
+
         for frame_index in range(total_frames):
             frame_started = time.perf_counter()
             frame_log_zoom = float(zooms[frame_index])
             level = _atlas_level_for_zoom(frame_log_zoom, origin, step, level_count)
             if level != active_level:
+                if ordinary_batch_enabled:
+                    flush_ordinary_batch()
                 active_level = level
                 print(
                     f"Entering atlas level {level}/{level_count} at "
@@ -8444,7 +11839,14 @@ def _render_video_atlas(
                     get_tile(level + 1)
                 prefetch_tile(level + 2)
                 _trim_atlas_memory_cache(tile_cache, level)
+                _trim_atlas_memory_cache(tile_planes_cache, level)
                 _trim_atlas_memory_cache(kfp_colour_cache, level)
+                for old_level in tuple(kfp_colour_tokens):
+                    if abs(old_level - level) > 1:
+                        del kfp_colour_tokens[old_level]
+                for old_level in tuple(tile_field_tokens):
+                    if abs(old_level - level) > 1:
+                        del tile_field_tokens[old_level]
 
             parent_log = tile_log(level)
             parent = get_tile(level)
@@ -8466,6 +11868,33 @@ def _render_video_atlas(
                 float(max(parent_max_iter, int(child_max_iter or parent_max_iter)))
                 if kfp_centered_fields else 0.0
             )
+            kfp_parent_cache_token = (
+                kfp_colour_tokens.get(level, 0)
+                if atlas_gpu_cache_enabled and kfp_parent_rgb is not None
+                else 0
+            )
+            kfp_child_cache_token = (
+                kfp_colour_tokens.get(level + 1, 0)
+                if (
+                    atlas_gpu_cache_enabled
+                    and child is not None
+                    and kfp_child_rgb is not None
+                )
+                else 0
+            )
+            ordinary_parent_cache_token = (
+                tile_field_tokens.get(level, 0)
+                if ordinary_atlas_cache_enabled and parent is not None
+                else 0
+            )
+            ordinary_child_cache_token = (
+                tile_field_tokens.get(level + 1, 0)
+                if (
+                    ordinary_atlas_cache_enabled
+                    and child is not None
+                )
+                else 0
+            )
             # KFP tiles are rendered with a fixed overscan. The child crop
             # removes that storage margin, so the visible child fraction is
             # computed with the selected tile margin above. Non-KFP tiles use
@@ -8475,34 +11904,237 @@ def _render_video_atlas(
             gradient = float(features.gradient[frame_index])
             instrumental = float(features.instrumental[frame_index])
             pitch = float(features.pitch[frame_index])
-            rgb = _atlas_colour_frame(
-                parent,
-                child,
-                frame_width,
-                frame_height,
-                parent_zoom,
-                child_fraction,
+            ordinary_batch_eligible = False
+            ordinary_batch_child = child
+            ordinary_batch_child_iter = child_max_iter
+            ordinary_batch_fraction = float(child_fraction)
+            if ordinary_batch_enabled:
+                near_full_child = (
+                    ordinary_batch_child is not None
+                    and ordinary_batch_child_iter is not None
+                    and ordinary_batch_fraction
+                        >= ATLAS_NEAR_FULL_CHILD_FRACTION
+                    and ordinary_batch_fraction < 0.999999
+                )
+                if (
+                    ordinary_batch_child is None
+                    or ordinary_batch_child_iter is None
+                    or ordinary_batch_fraction <= 0.0
+                ):
+                    ordinary_batch_child = None
+                    ordinary_batch_child_iter = None
+                    ordinary_batch_fraction = 0.0
+                elif (
+                    min(int(frame_width), int(frame_height))
+                    * ordinary_batch_fraction
+                    < ATLAS_MIN_CHILD_PIXELS
+                ):
+                    # Match _atlas_colour_frame's tiny-child suppression
+                    # before constructing the native batch controls.
+                    ordinary_batch_child = None
+                    ordinary_batch_child_iter = None
+                    ordinary_batch_fraction = 0.0
+                ordinary_batch_eligible = not near_full_child
+                if ordinary_batch_eligible:
+                    ordinary_child_width = max(
+                        1,
+                        int(round(frame_width * ordinary_batch_fraction)),
+                    )
+                    ordinary_child_height = max(
+                        1,
+                        int(round(frame_height * ordinary_batch_fraction)),
+                    )
+                    ordinary_effective_iter = max(
+                        int(parent_max_iter),
+                        int(ordinary_batch_child_iter or parent_max_iter),
+                    )
+                    ordinary_signature = (
+                        id(parent),
+                        id(ordinary_batch_child),
+                        int(parent_max_iter),
+                        int(ordinary_batch_child_iter or 0),
+                        int(ordinary_parent_cache_token),
+                        int(
+                            ordinary_child_cache_token
+                            if ordinary_batch_child is not None else 0
+                        ),
+                    )
+                    if (
+                        ordinary_batch_requests
+                        and ordinary_signature != ordinary_batch_signature
+                    ):
+                        submit_ordinary_batch()
+                    ordinary_batch_signature = ordinary_signature
+                    ordinary_batch_requests.append({
+                        "parent": parent,
+                        "child": ordinary_batch_child,
+                        "parent_iter": int(parent_max_iter),
+                        "child_iter": ordinary_batch_child_iter,
+                        "parent_token": int(ordinary_parent_cache_token),
+                        "child_token": int(
+                            ordinary_child_cache_token
+                            if ordinary_batch_child is not None else 0
+                        ),
+                        "controls": NativeAtlasColourFrame(
+                            parent_zoom=float(parent_zoom),
+                            child_fraction=float(ordinary_batch_fraction),
+                            child_zoom=1.0,
+                            parent_field_bias=0.0,
+                            child_field_bias=0.0,
+                            output_field_bias=0.0,
+                            palette_max_iter=ordinary_effective_iter,
+                            feather=(
+                                _atlas_feather(
+                                    ordinary_child_width,
+                                    ordinary_child_height,
+                                )
+                                if ordinary_batch_child is not None
+                                else 0
+                            ),
+                            phase=phase,
+                            vocal=gradient,
+                            instrumental=instrumental,
+                            pitch=pitch,
+                        ),
+                    })
+                    if len(ordinary_batch_requests) >= ordinary_batch_size:
+                        submit_ordinary_batch()
+                    progress_now = time.perf_counter()
+                    if (
+                        frame_index == 0
+                        or frame_index + 1 == total_frames
+                        or progress_now - last_progress_report
+                            >= RENDER_PROGRESS_INTERVAL_SECONDS
+                    ):
+                        print(
+                            f"  frame {frame_index + 1}/{total_frames} "
+                            f"({100.0 * (frame_index + 1) / total_frames:5.1f}%) "
+                            f"· atlas level {level}/{level_count}",
+                            flush=True,
+                        )
+                        last_progress_report = progress_now
+                    continue
+            kfp_frame_key = (
+                level,
                 parent_max_iter,
                 child_max_iter,
-                phase,
-                gradient,
-                instrumental,
-                native_library,
-                native_threads,
-                resample,
-                palette,
-                pitch,
-                palette_file,
+                parent_zoom,
+                child_fraction,
                 child_zoom,
-                kfp_parent_rgb,
-                kfp_child_rgb,
-                use_static_kfp=kfp_static_enabled,
-                kfp_field_bias=kfp_field_bias,
-            )
-            rgb = _apply_frame_effects(rgb, glow, motion_blur, previous_rgb)
-            previous_rgb = rgb
-            enqueue_frame(rgb)
-            frame_seconds += time.perf_counter() - frame_started
+                kfp_field_bias,
+            ) if reuse_kfp_frame else None
+            frame_colour_future = None
+            if (
+                kfp_frame_key is not None
+                and kfp_frame_key == reusable_kfp_frame_key
+            ):
+                rgb = reusable_kfp_frame
+            else:
+                colour_arguments = (
+                    parent,
+                    child,
+                    frame_width,
+                    frame_height,
+                    parent_zoom,
+                    child_fraction,
+                    parent_max_iter,
+                    child_max_iter,
+                    phase,
+                    gradient,
+                    instrumental,
+                    native_library,
+                    native_threads,
+                    resample,
+                    palette,
+                    pitch,
+                    palette_file,
+                    child_zoom,
+                    kfp_parent_rgb,
+                    kfp_child_rgb,
+                )
+                colour_keywords = {
+                    "use_static_kfp": kfp_static_enabled,
+                    "kfp_field_bias": kfp_field_bias,
+                    "kfp_profile_override": kfp_profile,
+                    "parent_planes": tile_planes_cache.get(level),
+                    "child_planes": (
+                        tile_planes_cache.get(level + 1)
+                        if child is not None else None
+                    ),
+                    "kfp_gpu": kfp_gpu_enabled,
+                    "ordinary_gpu": ordinary_gpu_enabled,
+                    "kfp_parent_cache_token": kfp_parent_cache_token,
+                    "kfp_child_cache_token": kfp_child_cache_token,
+                    "ordinary_parent_cache_token": ordinary_parent_cache_token,
+                    "ordinary_child_cache_token": ordinary_child_cache_token,
+                }
+                if ordinary_batch_enabled and not ordinary_batch_eligible:
+                    # The near-full promotion is intentionally kept on the
+                    # exact single-frame path: it changes the parent/child
+                    # topology for one or two boundary frames. Drain any
+                    # earlier batch first so output order remains strict.
+                    flush_ordinary_batch()
+                    rgb = _atlas_colour_frame(
+                        *colour_arguments,
+                        **colour_keywords,
+                    )
+                    enqueue_frame(rgb)
+                    frame_seconds += time.perf_counter() - frame_started
+                    progress_now = time.perf_counter()
+                    if (
+                        frame_index == 0
+                        or frame_index + 1 == total_frames
+                        or progress_now - last_progress_report
+                            >= RENDER_PROGRESS_INTERVAL_SECONDS
+                    ):
+                        print(
+                            f"  frame {frame_index + 1}/{total_frames} "
+                            f"({100.0 * (frame_index + 1) / total_frames:5.1f}%) "
+                            f"· atlas level {level}/{level_count}",
+                            flush=True,
+                        )
+                        last_progress_report = progress_now
+                    continue
+                if colour_executor is not None:
+                    frame_colour_future = colour_executor.submit(
+                        _atlas_colour_frame,
+                        *colour_arguments,
+                        **colour_keywords,
+                    )
+                else:
+                    rgb = _atlas_colour_frame(
+                        *colour_arguments,
+                        **colour_keywords,
+                    )
+                if reuse_kfp_frame and colour_executor is None:
+                    reusable_kfp_frame_key = kfp_frame_key
+                    reusable_kfp_frame = rgb
+
+            if colour_executor is not None:
+                # Submit the current frame before resolving the previous one.
+                # Once the previous future completes, the worker starts this
+                # frame while the main thread is blocked writing the previous
+                # RGB buffer to FFmpeg.
+                if pending_colour_future is not None:
+                    rgb = pending_colour_future.result()
+                    pending_colour_future = None
+                    if reuse_kfp_frame:
+                        reusable_kfp_frame_key = pending_colour_key
+                        reusable_kfp_frame = rgb
+                    pending_colour_key = None
+                    enqueue_frame(rgb)
+                    frame_seconds += time.perf_counter() - frame_started
+                if frame_colour_future is None:
+                    enqueue_frame(rgb)
+                    frame_seconds += time.perf_counter() - frame_started
+                else:
+                    pending_colour_future = frame_colour_future
+                    pending_colour_key = kfp_frame_key
+            else:
+                rgb = _apply_frame_effects(rgb, glow, motion_blur, previous_rgb)
+                previous_rgb = rgb
+                enqueue_frame(rgb)
+                frame_seconds += time.perf_counter() - frame_started
             progress_now = time.perf_counter()
             if (
                 frame_index == 0
@@ -8517,6 +12149,23 @@ def _render_video_atlas(
                     flush=True,
                 )
                 last_progress_report = progress_now
+
+        if ordinary_batch_enabled:
+            # Submit and drain the tail block before FFmpeg is allowed to
+            # finish. This also covers a final atlas interval shorter than
+            # the normal batch size.
+            flush_ordinary_batch()
+
+        if pending_colour_future is not None:
+            # Flush the final colour future before asking FFmpeg to drain.
+            # There is no later frame write to provide the overlap window.
+            rgb = pending_colour_future.result()
+            pending_colour_future = None
+            if reuse_kfp_frame:
+                reusable_kfp_frame_key = pending_colour_key
+                reusable_kfp_frame = rgb
+            pending_colour_key = None
+            enqueue_frame(rgb)
 
         encoder_started = time.perf_counter()
         assert frame_writer is not None
@@ -8574,6 +12223,11 @@ def _render_video_atlas(
             # references are released; the native time budgets keep this
             # wait finite even for a pathological tile.
             prefetch_executor.shutdown(
+                wait=True,
+                cancel_futures=True,
+            )
+        if colour_executor is not None:
+            colour_executor.shutdown(
                 wait=True,
                 cancel_futures=True,
             )
@@ -8761,6 +12415,15 @@ def _hardware_encoder_usable(
     # and fail when the first real frame arrives.
     if encoder == "h264_nvenc" and (width % 2 or height % 2):
         preserve_chroma = True
+    output_pixel_format = (
+        "yuv444p"
+        if preserve_chroma and encoder == "h264_nvenc"
+        else "yuv420p"
+    )
+    input_pixel_format, rgb_arguments = _ffmpeg_raw_rgb_input(
+        encoder,
+        output_pixel_format,
+    )
     command = [
         ffmpeg,
         "-nostdin",
@@ -8773,7 +12436,7 @@ def _hardware_encoder_usable(
         # Use the real input dimensions. A tiny probe can pass even when the
         # selected hardware rejects an 8K frame, causing the first real frame
         # to fail after expensive atlas preparation has already started.
-        f"color=black:s={width}x{height}:r={fps}:d=0.05,format=rgb24",
+        f"color=black:s={width}x{height}:r={fps}:d=0.05,format={input_pixel_format}",
         "-r",
         str(fps),
         "-frames:v",
@@ -8788,15 +12451,11 @@ def _hardware_encoder_usable(
         )
     except ValueError:
         return False
-    output_pixel_format = (
-        "yuv444p"
-        if preserve_chroma and encoder == "h264_nvenc"
-        else "yuv420p"
-    )
     command.extend([
         "-c:v",
         encoder,
         *rate_control,
+        *rgb_arguments,
         "-pix_fmt",
         output_pixel_format,
         "-f",
@@ -9146,6 +12805,35 @@ def _video_pixel_format(
     return "yuv420p"
 
 
+def _ffmpeg_raw_rgb_input(
+    codec: str,
+    output_pixel_format: str,
+) -> tuple[str, list[str]]:
+    """Choose the raw RGB format sent to FFmpeg's encoder.
+
+    NVENC can consume packed RGB itself. Sending ``rgb0`` avoids FFmpeg's
+    software ``rgb24`` conversion before the frame reaches the GPU. The
+    escape hatch is useful with older FFmpeg/NVENC combinations that do not
+    expose packed RGB input.
+    """
+
+    if codec != "h264_nvenc":
+        return "rgb24", []
+    # It is intentionally opt-in: on the current RTX/NVENC stack the extra
+    # byte per pixel makes the pipe slower even though the decoded image is
+    # identical. Other FFmpeg builds can still benchmark the direct path.
+    setting = os.environ.get("FRACTAL_FFMPEG_PACKED_RGB", "0").strip().lower()
+    if setting in {"0", "false", "off", "no", "never"}:
+        return "rgb24", []
+    if output_pixel_format == "yuv444p":
+        return "rgb0", ["-rgb_mode", "yuv444"]
+    if output_pixel_format == "yuv420p":
+        return "rgb0", ["-rgb_mode", "yuv420"]
+    # Keep an unknown future output format on the well-tested path rather
+    # than asking NVENC to guess a conversion mode.
+    return "rgb24", []
+
+
 def _final_video_resample(
     resample: str,
     palette: str,
@@ -9154,8 +12842,17 @@ def _final_video_resample(
     source_height: int,
     output_width: int,
     output_height: int,
+    source_mode: str = "lossless-compressed",
 ) -> str:
-    """Select the final RGB scale filter without weakening KFP detail."""
+    """Select the final RGB scale filter without weakening KFP detail.
+
+    Kalles keeps its internal OpenGL/CPU image planes on exact texel samples,
+    but its finished bitmap/display surface uses a Lanczos3-style scale.
+    ``nearest`` remains useful for ordinary palettes, but it is the wrong
+    final filter for any KFP surface, including the deliberately small
+    ``upscaled`` preview mode, because it turns the palette's fine relief into
+    visible noisy pixels.
+    """
 
     if resample not in RESAMPLE_CHOICES:
         raise ValueError(f"unknown output resample mode: {resample}")
@@ -9168,14 +12865,17 @@ def _final_video_resample(
         int(output_height),
     ):
         return ffmpeg_resample
+    kfp_profile = _kfp_profile_for_selection(palette, palette_file)
+    if kfp_profile is not None:
+        # This deliberately comes before the public nearest choice.  The
+        # public default remains nearest for ordinary lossless-compressed
+        # profiles, while every resized KFP export follows Kalles' actual
+        # Lanczos3 bitmap scaler and keeps the fine relief/highlight detail
+        # continuous. Kalles applies this scaler to small previews too; the
+        # old FHD-only and upscaled exceptions made KFP output visibly noisy.
+        return "lanczos"
     if resample == "nearest":
         return ffmpeg_resample
-    if _kfp_profile_for_selection(palette, palette_file) is not None:
-        # KFP is already sampled in RGB at the dense working surface. A
-        # bilinear final scale turns its fine relief into the square/mushy
-        # look seen in old 4K exports; Lanczos keeps the Kalles gradient edges
-        # crisp while retaining a continuous transition between pixels.
-        return "lanczos"
     return ffmpeg_resample
 
 
@@ -9370,6 +13070,9 @@ def _parse_kfp_stops(palette_text: str, path: Path) -> list[tuple[int, int, int]
         )
     stops = []
     for index in range(0, len(values), 3):
+        # Parameter.cpp writes m_cKeys as r,g,b and SetColor reads the same
+        # values directly.  The Windows DIB is bottom-up, but that affects
+        # image rows, not the serialized palette channel order.
         channels = tuple(values[index:index + 3])
         if not all(0 <= channel <= 255 for channel in channels):
             raise ValueError(f"KFP RGB values must be between 0 and 255: {path}")
@@ -9427,21 +13130,43 @@ def _parse_kfp_int(
     return result
 
 
+def _parse_kfp_atoi(
+    fields: dict[str, str],
+    key: str,
+    default: int,
+    path: Path,
+    *,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    """Parse an integer using the legacy C ``atoi`` convention Kalles uses."""
+
+    value = fields.get(key.casefold())
+    if value is None or not value.strip():
+        return int(default)
+    match = re.match(r"^[\t ]*([+-]?\d+)", value)
+    if match is None:
+        raise ValueError(f"invalid KFP {key} field: {path}")
+    result = int(match.group(1), 10)
+    if minimum is not None and result < minimum:
+        raise ValueError(f"KFP {key} is below its supported range: {path}")
+    if maximum is not None and result > maximum:
+        raise ValueError(f"KFP {key} is above its supported range: {path}")
+    return result
+
+
 def _parse_kfp_bool(
     fields: dict[str, str],
     key: str,
     default: bool,
     path: Path,
 ) -> bool:
+    """Read Kalles' numeric boolean fields with the source ``atoi`` rules."""
+
     value = fields.get(key.casefold())
     if value is None or not value.strip():
         return bool(default)
-    token = value.strip().casefold()
-    if token in {"1", "true", "yes", "on"}:
-        return True
-    if token in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"invalid KFP {key} field: {path}")
+    return bool(_parse_kfp_atoi(fields, key, int(default), path))
 
 
 def _parse_kfp_multi_colors(
@@ -9480,32 +13205,62 @@ def _parse_kfp_multi_colors(
     return tuple(triples)
 
 
+def _parse_kfp_text_value(
+    fields: dict[str, str],
+    key: str,
+    default: str,
+) -> str:
+    """Return a string field while preserving spaces in Kalles paths/GLSL."""
+
+    value = fields.get(key.casefold())
+    if value is None:
+        return default
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    return value
+
+
 def _parse_kfp_profile(palette_text: str, path: Path) -> KfpPalette:
-    """Read a KFP gradient and the transfer settings that give it its look."""
+    """Read the settings Kalles applies when a ``.kfp`` palette is loaded.
+
+    Kalles opens palette files with ``bNoLocation=TRUE``.  Consequently a
+    KFP's saved camera/formula fields (including ``Power`` and all bailout
+    controls) must *not* change the selected scene or its smoothing contract.
+    Only the colour-pipeline settings below are imported.
+    """
 
     fields = _parse_kfp_fields(palette_text)
     stops = tuple(_parse_kfp_stops(palette_text, path))
     interior_text = fields.get("interiorcolor", "0,0,0").rstrip(" ,;")
     try:
-        interior_color = _parse_palette_colour(interior_text)
+        raw_interior_color = _parse_palette_colour(interior_text)
+        # Kalles' Parameter.cpp also stores InteriorColor in RGB order.
+        interior_color = raw_interior_color
     except ValueError as error:
         raise ValueError(f"invalid KFP InteriorColor field: {path}") from error
+    raw_color_offset = _parse_kfp_int(
+        fields,
+        "ColorOffset",
+        0,
+        path,
+        minimum=-10**12,
+        maximum=10**12,
+    )
+    # OpenString does not wrap malformed offsets. It resets values outside
+    # the 0..1023 lookup-table range to zero before SetColor sees them.
+    color_offset = raw_color_offset if 0 <= raw_color_offset <= 1023 else 0
     return KfpPalette(
         stops=stops,
         iter_div=_parse_kfp_float(
             fields, "IterDiv", 1.0, path, minimum=1.0e-12, maximum=1.0e12
         ),
-        color_offset=_parse_kfp_float(
-            fields, "ColorOffset", 0.0, path, minimum=-1.0e12, maximum=1.0e12
-        ),
+        color_offset=float(color_offset),
         ratio=_parse_kfp_float(
             fields, "Ratio", 360.0, path, minimum=0.0, maximum=1.0e6
         ),
         color_method=_parse_kfp_int(
             fields, "ColorMethod", 0, path, minimum=0, maximum=11
-        ),
-        smooth_method=_parse_kfp_int(
-            fields, "SmoothMethod", 0, path, minimum=0, maximum=2
         ),
         smooth=_parse_kfp_bool(fields, "Smooth", True, path),
         flat=_parse_kfp_bool(fields, "Flat", False, path),
@@ -9513,26 +13268,60 @@ def _parse_kfp_profile(palette_text: str, path: Path) -> KfpPalette:
             fields, "InverseTransition", False, path
         ),
         phase_color_strength=_parse_kfp_float(
-            fields, "ColorPhaseStrength", 0.0, path, minimum=0.0, maximum=100.0
+            # Kalles reads this directly with atof. Negative strengths are
+            # valid and reverse the phase-colour travel, so do not clamp the
+            # serialized recipe to the GUI's usual positive-range control.
+            fields, "ColorPhaseStrength", 0.0, path,
+            minimum=-1.0e12, maximum=1.0e12,
         ),
         multi_color=_parse_kfp_bool(fields, "MultiColor", False, path),
         blend_multi_color=_parse_kfp_bool(fields, "BlendMC", False, path),
         multi_colors=_parse_kfp_multi_colors(fields.get("multicolors", ""), path),
-        power=_parse_kfp_float(fields, "Power", 2.0, path, minimum=1.0e-6, maximum=64.0),
         slopes=_parse_kfp_bool(fields, "Slopes", False, path),
-        slope_power=_parse_kfp_float(
-            fields, "SlopePower", 50.0, path, minimum=0.0, maximum=1.0e4
-        ),
-        slope_ratio=_parse_kfp_float(
-            fields, "SlopeRatio", 20.0, path, minimum=0.0, maximum=1.0e4
-        ),
-        slope_angle=_parse_kfp_float(
-            fields, "SlopeAngle", 45.0, path, minimum=-360.0, maximum=360.0
-        ),
+        slope_power=float(_parse_kfp_atoi(
+            fields, "SlopePower", 50, path, minimum=1, maximum=10_000
+        )),
+        slope_ratio=float(_parse_kfp_atoi(
+            fields, "SlopeRatio", 50, path, minimum=0, maximum=10_000
+        )),
+        slope_angle=float(_parse_kfp_atoi(
+            fields, "SlopeAngle", 45, path, minimum=-360, maximum=360
+        )),
         differences=_parse_kfp_int(
-            fields, "Differences", 3, path, minimum=0, maximum=7
+            # OpenString resets parameters before reading a palette. Its
+            # reset value is the traditional stencil (0); the bundled Kalles
+            # profile explicitly writes Differences: 3, so complete files
+            # keep that setting while older/minimal files retain Kalles'
+            # actual missing-field behaviour.
+            fields, "Differences", 0, path, minimum=0, maximum=7
         ),
         interior_color=interior_color,
+        show_glitches=_parse_kfp_bool(fields, "ShowGlitches", True, path),
+        texture_enabled=_parse_kfp_bool(
+            fields, "TextureEnabled", False, path
+        ),
+        texture_merge=_parse_kfp_float(
+            fields, "TextureMerge", 1.0, path, minimum=-1.0e6, maximum=1.0e6
+        ),
+        texture_power=_parse_kfp_float(
+            fields, "TexturePower", 200.0, path, minimum=-1.0e6, maximum=1.0e6
+        ),
+        texture_ratio=float(_parse_kfp_atoi(
+            fields, "TextureRatio", 100, path,
+            minimum=-1_000_000, maximum=1_000_000,
+        )),
+        texture_file=(
+            str((path.parent / texture_file).resolve())
+            if (texture_file := _parse_kfp_text_value(fields, "TextureFile", ""))
+            and not Path(texture_file).is_absolute()
+            else texture_file
+        ),
+        texture_resize=_parse_kfp_bool(
+            fields, "TextureResize", True, path
+        ),
+        use_opengl=_parse_kfp_bool(fields, "UseOpenGL", False, path),
+        use_srgb=_parse_kfp_bool(fields, "UseSRGB", False, path),
+        glsl=_parse_kfp_text_value(fields, "GLSL", ""),
     )
 
 
@@ -9624,8 +13413,8 @@ def _palette_file_palette(path_text: str, mtime_ns: int, size: int = 4096) -> An
     path = Path(path_text)
     palette_text = _read_palette_text(path)
     if path.suffix.casefold() == ".kfp":
-        stops = _parse_kfp_stops(palette_text, path)
-        return _interpolate_palette_stops(stops, size, np)
+        profile = _parse_kfp_profile(palette_text, path)
+        return _kfp_palette_lut(profile, size)
 
     stops = []
     for line in palette_text.splitlines():
@@ -9669,6 +13458,118 @@ def _kfp_profile_for_selection(
     if palette_name == "kalles-default":
         return KALLES_DEFAULT_KFP
     return None
+
+
+def _kfp_profile_with_3d(
+    profile: Optional[KfpPalette],
+    enabled: Optional[bool],
+) -> Optional[KfpPalette]:
+    """Apply the explicit Kalles slope/3D override when one was requested."""
+
+    if profile is None or enabled is None:
+        return profile
+    return replace(profile, slopes=bool(enabled))
+
+
+def _kfp_profile_with_glitches(
+    profile: Optional[KfpPalette],
+    enabled: Optional[bool],
+) -> Optional[KfpPalette]:
+    """Apply an explicit Kalles glitch/highlight visibility override."""
+
+    if profile is None or enabled is None:
+        return profile
+    return replace(profile, show_glitches=bool(enabled))
+
+
+def _kfp_has_texture(profile: Optional[KfpPalette]) -> bool:
+    """Return whether a KFP profile needs the texture-aware transfer path.
+
+    Direct native coloring can now marshal a profile's TextureFile as an
+    additive texture plane.  The flag remains useful for atlas/crop callers:
+    those native entry points do not carry texture pixels, so they must keep
+    the complete portable SetColor path instead of silently dropping the
+    texture stage.
+    """
+
+    return bool(
+        profile is not None
+        and profile.texture_enabled
+        and str(profile.texture_file).strip()
+    )
+
+
+def _kfp_gpu_supported(profile: Optional[KfpPalette]) -> bool:
+    """Return whether the scalar OpenCL KFP colour pass is source-safe.
+
+    The GPU kernel receives only the float iteration field and palette LUT.
+    It therefore supports Kalles' scalar finite-difference/stencil features,
+    but not features whose values live in orbit/texture planes or in the
+    multi-colour wave list. Unsupported profiles stay on the complete CPU
+    SetColor path.
+    """
+
+    if profile is None:
+        return False
+    try:
+        phase_strength = float(profile.phase_color_strength)
+        return (
+            int(profile.smooth_method) == 0
+            and not int(profile.multi_color)
+            and not int(profile.texture_enabled)
+            and not _kfp_has_texture(profile)
+            and not _kfp_requires_render_planes(profile)
+            and math.isfinite(phase_strength)
+            and abs(phase_strength) <= 1.0e-12
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _kfp_requires_render_planes(profile: Optional[KfpPalette]) -> bool:
+    """Return whether a KFP source needs orbit metadata for its colour pass.
+
+    The native scalar field already contains Kalles' smooth iteration value.
+    Finite-difference distance and slope operators can therefore run directly
+    on that field. Allocating and filling six extra per-pixel planes for those
+    profiles only made live view and atlas preparation slower. Keep the
+    orbit-aware path for features whose result cannot be reconstructed from a
+    scalar field, while retaining the complete Kalles path for them.
+    """
+
+    if profile is None:
+        return False
+    try:
+        smooth_method = int(profile.smooth_method)
+        color_method = int(profile.color_method)
+        differences = int(profile.differences)
+        phase_strength = float(profile.phase_color_strength)
+        slope_power = float(profile.slope_power)
+        slope_ratio = float(profile.slope_ratio)
+    except (TypeError, ValueError, OverflowError):
+        # Imported profiles are validated before reaching this point. If a
+        # caller constructs an unusual profile directly, prefer the slower
+        # metadata path over silently dropping a feature.
+        return True
+
+    if smooth_method != 0:
+        return True
+    if not math.isfinite(phase_strength) or abs(phase_strength) > 1.0e-12:
+        return True
+    if _kfp_has_texture(profile):
+        return True
+    # Finite-difference relief reads the same smooth scalar samples that
+    # Kalles reconstructs from nPixels/nTrans. Only analytic relief needs the
+    # derivative planes; retaining orbit metadata for the common Differences
+    # 0..6 slope path needlessly makes every frame pay for six large arrays.
+    if (
+        profile.slopes
+        and slope_power > 0.0
+        and slope_ratio > 0.0
+        and differences == 7
+    ):
+        return True
+    return differences == 7 and color_method in {5, 6, 7, 8}
 
 
 @lru_cache(maxsize=16)
@@ -9838,6 +13739,179 @@ def _kfp_slope_gradient(field: Any, np: Any) -> tuple[Any, Any]:
     return dx, dy
 
 
+def _kfp_texture_dimensions(
+    width: int,
+    height: int,
+    profile: KfpPalette,
+) -> tuple[int, int]:
+    """Return Kalles' resized texture dimensions for one output surface."""
+
+    if not profile.texture_resize:
+        return max(1, int(width)), max(1, int(height))
+    try:
+        power = float(profile.texture_power)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("KFP texture power must be numeric") from error
+    if not math.isfinite(power):
+        raise ValueError("KFP texture power must be finite")
+    # Kalles computes nImgOffs as an integer division and then adds the
+    # integer truncation of (power + nImgOffs) / 64 to the render dimensions.
+    # int() has the same truncation-toward-zero behavior as the C++ cast for
+    # the finite values accepted by the profile parser.
+    image_offset = int(power / 64.0)
+    extra = int((power + image_offset) / 64.0)
+    return max(1, int(width) + extra), max(1, int(height) + extra)
+
+
+@lru_cache(maxsize=32)
+def _kfp_texture_image(
+    path_text: str,
+    mtime_ns: int,
+    width: int,
+    height: int,
+    resize: bool,
+) -> Any:
+    """Load one KFP texture, retaining Kalles' integer pixel sampling."""
+
+    del mtime_ns  # The timestamp is part of the cache key, not the decoder.
+    np = _require_numpy()
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError("Pillow is required for textured KFP palettes") from exc
+    with Image.open(path_text) as source:
+        image = source.convert("RGB")
+        if resize:
+            target = (max(1, int(width)), max(1, int(height)))
+            if image.size != target:
+                # Kalles uses GDI's HALFTONE StretchBlt for this preparatory
+                # shrink. Pillow's high-quality bilinear filter is the closest
+                # portable equivalent and, crucially, the later SetTexture
+                # lookup remains nearest/integer just like Kalles' CPU path.
+                image = image.resize(target, Image.Resampling.BILINEAR)
+        return np.ascontiguousarray(np.asarray(image, dtype=np.float64))
+
+
+def _kfp_apply_texture(
+    rgb: Any,
+    field: Any,
+    profile: KfpPalette,
+    np: Any,
+    texture_rgb: Any = None,
+    texture_width: Optional[int] = None,
+    texture_height: Optional[int] = None,
+) -> tuple[Any, bool]:
+    """Apply Kalles' CPU texture warp and blend before slopes/dithering."""
+
+    if not profile.texture_enabled:
+        return rgb, False
+    height, width = field.shape
+    if texture_rgb is not None:
+        # A complete Kalles frame can carry the already loaded texture beside
+        # its orbit planes. Keep this path independent of TextureFile so an
+        # imported cache remains usable when its source image is unavailable.
+        texture = np.asarray(texture_rgb)
+        if texture.ndim != 3 or texture.shape[-1] != 3:
+            raise ValueError("KFP texture plane must have shape (height, width, 3)")
+        if not np.issubdtype(texture.dtype, np.number) or np.issubdtype(
+            texture.dtype, np.complexfloating
+        ):
+            raise ValueError("KFP texture plane must contain real numeric samples")
+        if not np.isfinite(texture).all():
+            raise ValueError("KFP texture plane contains non-finite samples")
+        texture = np.asarray(texture, dtype=np.float64)
+        if np.any(texture < 0.0) or np.any(texture > 255.0):
+            raise ValueError("KFP texture plane samples must be in the 0..255 range")
+        if texture_width is not None and int(texture_width) != texture.shape[1]:
+            raise ValueError("KFP texture plane width does not match texture_width")
+        if texture_height is not None and int(texture_height) != texture.shape[0]:
+            raise ValueError("KFP texture plane height does not match texture_height")
+    else:
+        if not str(profile.texture_file).strip():
+            return rgb, False
+        path = Path(profile.texture_file).expanduser()
+        try:
+            path = path.resolve()
+            stat = path.stat()
+        except OSError:
+            # LoadTexture leaves Kalles' texture pointer null when the image
+            # is unavailable. SetColor consequently keeps the ordinary/interior
+            # colour path, rather than producing a partially initialized frame.
+            return rgb, False
+        texture_width, texture_height = _kfp_texture_dimensions(width, height, profile)
+        texture = _kfp_texture_image(
+            str(path),
+            int(stat.st_mtime_ns),
+            texture_width,
+            texture_height,
+            bool(profile.texture_resize),
+        )
+        if texture.ndim != 3 or texture.shape[-1] != 3:
+            raise ValueError("KFP texture must decode as an RGB image")
+
+    # SetTexture uses the same one-sided stencil as Kalles' slope pass, but it
+    # always uses the configured slope direction, even when Slopes is off.
+    dx, dy = _kfp_slope_gradient(np.asarray(field, dtype=np.float64), np)
+    warped_x = 1.0 + dx
+    warped_y = 1.0 + dy
+    try:
+        power = float(profile.texture_power)
+        ratio = float(profile.texture_ratio)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("KFP texture controls must be numeric") from error
+    if not math.isfinite(power) or not math.isfinite(ratio):
+        raise ValueError("KFP texture controls must be finite")
+
+    def texture_offset(value: Any) -> Any:
+        # This is the source's `if (diff > 1) diff else diff = 1/diff`
+        # followed by atan around pi/4.  Do not clamp the signed gradient:
+        # Kalles intentionally lets unusual texture powers produce their
+        # corresponding reverse/expanded mapping.
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            powered = np.power(value, power)
+            reciprocal = 1.0 / powered
+            selected = np.where(powered > 1.0, powered, reciprocal)
+            result = (
+                (np.arctan(selected) - math.pi / 4.0)
+                / (math.pi / 4.0)
+                * (ratio / 100.0)
+            )
+            # SetTexture adds the warp for the >1 branch and subtracts it
+            # for the reciprocal branch.  Keeping the sign is important for
+            # the characteristic Kalles texture displacement.
+            result = np.where(powered > 1.0, power * result, -power * result)
+        return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+
+    mapped_x = texture_offset(warped_x)
+    mapped_y = texture_offset(warped_y)
+    image_offset = int(power / 64.0)
+    # Kalles' C++ integer conversion truncates toward zero. Keeping the
+    # conversion explicit avoids floor() changing negative texture offsets.
+    grid_x = np.arange(width, dtype=np.float64)[None, :]
+    grid_y = np.arange(height, dtype=np.float64)[:, None]
+    with np.errstate(over="ignore", invalid="ignore"):
+        sample_x = np.trunc(grid_x + image_offset + mapped_x).astype(np.int64)
+        sample_y = np.trunc(grid_y + image_offset + mapped_y).astype(np.int64)
+    sample_x = np.clip(sample_x, 0, texture.shape[1] - 1)
+    sample_y = np.clip(sample_y, 0, texture.shape[0] - 1)
+    # Kalles reads a bottom-up DIB. PIL exposes the same image top-down, so
+    # invert only the row index; the public RGB array remains display order.
+    sampled = np.asarray(
+        texture[texture.shape[0] - 1 - sample_y, sample_x],
+        dtype=np.float32,
+    ) / np.float32(255.0)
+    merge = float(profile.texture_merge)
+    # SetTexture assigns the double expression back into Kalles' float srgb
+    # fields. Keep that assignment boundary instead of retaining a byte-scale
+    # float64 image between the texture and slope stages.
+    output = np.asarray(
+        np.asarray(rgb, dtype=np.float32) * np.float32(1.0 - merge)
+        + sampled * np.float32(merge),
+        dtype=np.float32,
+    )
+    return output, True
+
+
 def _kfp_difference_magnitude(field: Any, differences: int, np: Any) -> Any:
     """Apply Kalles' selectable 3x3 difference operators.
 
@@ -9906,9 +13980,10 @@ def _kfp_difference_magnitude(field: Any, differences: int, np: Any) -> Any:
     diagonal_distance_squared = 2.0
     inv_sqrt_two = 1.0 / math.sqrt(2.0)
     if differences == 0:  # Traditional, as in CFraktalSFT::SetColor.
+        axis_scale = 1.414
         return (
-            np.abs(left - centre) * math.sqrt(2.0)
-            + np.abs(up - centre) * math.sqrt(2.0)
+            np.abs(left - centre) * axis_scale
+            + np.abs(up - centre) * axis_scale
             # Kalles multiplies every delta by sqrt(2) before dividing by
             # its geometric neighbour distance. Diagonal neighbours are
             # already sqrt(2) pixels away, so their net coefficient is one.
@@ -9946,11 +14021,18 @@ def _kfp_difference_magnitude(field: Any, differences: int, np: Any) -> Any:
         # least-squares slopes reduce to these two four-sample contrasts.
         dx = ((up - top_left) + (centre - left)) * 0.5
         dy = ((left - top_left) + (centre - up)) * 0.5
-        return np.hypot(dx, dy) * 2.8284271247461903
+        # Kalles' gradient.cpp names this hypot1 but implements it as the
+        # literal sqrt(x*x+y*y). Match that arithmetic instead of NumPy's
+        # range-stable hypot, which can round differently at a LUT boundary.
+        with np.errstate(over="ignore", invalid="ignore"):
+            norm = np.sqrt(dx * dx + dy * dy)
+        return norm * 2.8284271247461903
     if differences == 5:  # Least-squares 3x3.
         dx = (right + top_right + bottom_right - left - top_left - bottom_left) / 6.0
         dy = (down + bottom_left + bottom_right - up - top_left - top_right) / 6.0
-        return np.hypot(dx, dy) * 2.8284271247461903
+        with np.errstate(over="ignore", invalid="ignore"):
+            norm = np.sqrt(dx * dx + dy * dy)
+        return norm * 2.8284271247461903
     if differences == 6:  # Laplacian 3x3.
         laplacian = (
             top_left + 4.0 * up + top_right
@@ -9958,39 +14040,56 @@ def _kfp_difference_magnitude(field: Any, differences: int, np: Any) -> Any:
             + bottom_left + 4.0 * down + bottom_right
         )
         return np.sqrt(np.abs(laplacian / 6.0 * 1.4426950408889634)) * 2.8284271247461903
-    # Analytic (7) is not available from a scalar field. Central differences
-    # are the least surprising fallback for imported profiles using it.
-    return np.sqrt(
-        np.maximum(
-            0.0,
-            (right - left) ** 2 / 4.0 + (down - up) ** 2 / 4.0,
-        )
-    ) * 2.8284271247461903
+    # Analytic (7) is not available from a scalar field. Kalles sets the
+    # distance transfer to zero when its optional DE plane is absent; using a
+    # made-up central gradient here creates a different palette, especially
+    # for the common ``DistanceLog`` method.
+    return np.zeros_like(values, dtype=np.float64)
 
 
 def _hsv_to_rgb(hue: Any, saturation: Any, value: Any, np: Any) -> Any:
-    """Vectorised HSV conversion matching Kalles' 0..1 colour coordinates."""
+    """Vectorised copy of Kalles' ``colour.h::hsv2rgb``."""
 
-    hue = np.mod(hue, 1.0)
-    saturation = np.clip(saturation, 0.0, 1.0)
-    value = np.clip(value, 0.0, 1.0)
-    scaled_hue = hue * 6.0
+    # Kalles does not normalize these values inside hsv2rgb.  Its wave
+    # encoder supplies the intended range, and hue==1 intentionally lands in
+    # sector 6.  Keeping that behavior matters for serialized negative-period
+    # waves and avoids silently changing a KFP recipe during import.
+    # Kalles' hsv/srgb structs are float, even though SetColor accumulates
+    # the wave values in double.  Use float32 for the colour conversion so
+    # the native and portable .kfp paths make the same narrowing at exactly
+    # the same point.
+    hue_array = np.asarray(hue, dtype=np.float32)
+    saturation_array = np.asarray(saturation, dtype=np.float32)
+    value_array = np.asarray(value, dtype=np.float32)
+    scaled_hue = hue_array * np.float32(6.0)
     sector = np.floor(scaled_hue).astype(np.intp)
-    fraction = scaled_hue - np.floor(scaled_hue)
-    fraction = np.where((sector & 1) == 0, 1.0 - fraction, fraction)
-    minimum = value * (1.0 - saturation)
-    transition = value * (1.0 - saturation * fraction)
-    choices = (
-        np.stack((minimum, transition, value), axis=-1),
-        np.stack((minimum, value, transition), axis=-1),
-        np.stack((transition, value, minimum), axis=-1),
-        np.stack((value, transition, minimum), axis=-1),
-        np.stack((value, minimum, transition), axis=-1),
-        np.stack((transition, minimum, value), axis=-1),
+    fraction = scaled_hue - sector
+    fraction = np.where(
+        (sector & 1) == 0,
+        np.float32(1.0) - fraction,
+        fraction,
+    ).astype(np.float32)
+    minimum = value_array * (np.float32(1.0) - saturation_array)
+    transition = value_array * (
+        np.float32(1.0) - saturation_array * fraction
     )
-    output = np.empty(hue.shape + (3,), dtype=np.float64)
+    choices = (
+        np.stack((minimum, transition, value_array), axis=-1),
+        np.stack((minimum, value_array, transition), axis=-1),
+        np.stack((transition, value_array, minimum), axis=-1),
+        np.stack((value_array, transition, minimum), axis=-1),
+        np.stack((value_array, minimum, transition), axis=-1),
+        np.stack((transition, minimum, value_array), axis=-1),
+    )
+    output = np.zeros(hue_array.shape + (3,), dtype=np.float32)
     for index, choice in enumerate(choices):
-        output[sector == index] = choice[sector == index]
+        mask = sector == index
+        output[mask] = choice[mask]
+    # Kalles has an explicit case 6, which is the hue==1 endpoint of sector
+    # 0.  Keep invalid sectors black rather than indexing an arbitrary hue;
+    # valid KFP wave values are unaffected.
+    endpoint = sector == 6
+    output[endpoint] = choices[0][endpoint]
     return output
 
 
@@ -10032,24 +14131,134 @@ def _kfp_dither_rgb(
     return output
 
 
-def _kfp_smooth_offset(profile: KfpPalette) -> float:
-    """Return the bailout term Kalles adds to its smooth iteration value."""
+def _kfp_dither_srgb(
+    rgb: Any,
+    np: Any,
+    x_offset: int = 0,
+    y_offset: int = 0,
+) -> Any:
+    """Dither Kalles' normalized float sRGB values into RGB8."""
 
-    # The native scalar field stores the compact smooth value without the
-    # fixed bailout term. Kalles' default logarithmic smoothing reconstructs
-    # it as nIter + 1 - log(log(|z|) / log(10000)) / log(power), so the
-    # omitted part is constant for one formula/palette. The alternate Kalles
-    # smoothing modes need the actual bailout test value, which is not present
-    # in a scalar iteration field; leave those modes on the existing fallback.
+    values = np.asarray(rgb, dtype=np.float32)
+    if values.ndim != 3 or values.shape[-1] != 3:
+        raise ValueError("KFP normalized dither input must have shape (height, width, 3)")
+    height, width, _ = values.shape
+    x = np.arange(width, dtype=np.uint32)[None, :]
+    y = np.arange(height, dtype=np.uint32)[:, None]
+    with np.errstate(over="ignore"):
+        x = x + np.uint32(max(0, int(x_offset)))
+        y = y + np.uint32(max(0, int(y_offset)))
+    output = np.empty(values.shape, dtype=np.uint8)
+    for channel in range(3):
+        mask = (
+            ((x + np.uint32(channel) * np.uint32(67) + y * np.uint32(236))
+                * np.uint32(119))
+            & np.uint32(255)
+        ).astype(np.float32) / np.float32(256.0)
+        channel_values = np.nan_to_num(
+            values[..., channel], nan=0.0, posinf=1.0, neginf=0.0
+        )
+        quantized = np.floor(np.float32(255.0) * channel_values + mask)
+        output[..., channel] = np.asarray(
+            np.clip(quantized, 0.0, 255.0), dtype=np.uint8
+        )
+    return output
+
+
+def _kfp_bailout_radius(profile: KfpPalette) -> float:
+    """Return Kalles' selected bailout radius for one transfer profile."""
+
+    power = float(profile.power)
+    if not math.isfinite(power) or power <= 1.0:
+        raise ValueError("KFP power must be finite and greater than one")
+    preset = int(profile.bailout_radius_preset)
+    if preset == 0:  # BailoutRadius_High
+        radius = 10000.0
+    elif preset == 1:  # BailoutRadius_2
+        radius = 2.0
+    elif preset == 2:  # BailoutRadius_Low
+        radius = 2.0 ** (1.0 / (power - 1.0))
+    elif preset == 3:  # BailoutRadius_Custom
+        radius = float(profile.bailout_radius_custom)
+    else:
+        raise ValueError("KFP bailout radius preset must be between zero and three")
+    if not math.isfinite(radius) or radius <= 1.0:
+        raise ValueError("KFP bailout radius must be finite and greater than one")
+    return radius
+
+
+def _kfp_bailout_norm(profile: KfpPalette) -> float:
+    """Return Kalles' selected bailout norm, including infinity."""
+
+    preset = int(profile.bailout_norm_preset)
+    if preset == 0:  # BailoutNorm_1
+        return 1.0
+    if preset == 1:  # BailoutNorm_2
+        return 2.0
+    if preset == 2:  # BailoutNorm_Infinity
+        return math.inf
+    if preset == 3:  # BailoutNorm_Custom
+        value = float(profile.bailout_norm_custom)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("KFP custom bailout norm must be finite and positive")
+        return value
+    raise ValueError("KFP bailout norm preset must be between zero and three")
+
+
+def _kfp_plane(
+    planes: Optional[KfpFramePlanes],
+    name: str,
+    shape: tuple[int, int],
+    np: Any,
+    dtype: Any,
+) -> Optional[Any]:
+    """Validate and normalize one optional Kalles per-pixel plane."""
+
+    if planes is None:
+        return None
+    value = getattr(planes, name)
+    if value is None:
+        return None
+    array = np.asarray(value, dtype=dtype)
+    if array.shape != shape:
+        raise ValueError(
+            f"KFP {name} plane has shape {array.shape}, expected {shape}"
+        )
+    if not np.isfinite(array).all():
+        raise ValueError(f"KFP {name} plane contains non-finite samples")
+    return array
+
+
+def _kfp_smooth_offset(profile: KfpPalette) -> float:
+    """Return the scalar-field offset used by Kalles' log smoothing."""
+
+    # The native scalar field already stores nIter + 1 - log(log(|z|))/log(p),
+    # while Kalles' SetColor uses nIter + 1 -
+    # log(log(|z|)/log(radius))/log(p). Only the selected bailout's
+    # log(log(radius))/log(p) term belongs in this compatibility offset. This
+    # is only a fallback for fields without Kalles' test1/test2 planes; a
+    # complete KFP frame uses those planes directly in _colourise_kfp.
     if int(profile.smooth_method) != 0:
         return 0.0
     try:
+        radius = _kfp_bailout_radius(profile)
         power = float(profile.power)
-    except (TypeError, ValueError, OverflowError):
+        return math.log(math.log(radius)) / math.log(power)
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
         return 0.0
-    if not math.isfinite(power) or power <= 0.0 or abs(power - 1.0) < 1.0e-12:
-        return 0.0
-    return 1.0 + math.log(math.log(10000.0)) / math.log(power)
+
+
+def _kfp_escape_radius_mode(profile: KfpPalette) -> int:
+    """Map KFP's two fixed native bailout fields to the render ABI.
+
+    The current scalar ABI has explicit radius-2 and radius-10000 modes.
+    Low/custom KFP radii are still preserved in the transfer profile and use
+    the portable scalar fallback until a future field ABI carries an
+    arbitrary radius; silently treating those files as high-bailout fields
+    would change their set membership.
+    """
+
+    return 1 if int(profile.bailout_radius_preset) == 0 else 0
 
 
 def _colourise_kfp(
@@ -10064,16 +14273,29 @@ def _colourise_kfp(
     dither_x: int = 0,
     dither_y: int = 0,
     field_bias: float = 0.0,
+    planes: Optional[KfpFramePlanes] = None,
 ) -> Any:
-    """Apply the portable Kalles transfer, multi-colour, and slope stages."""
+    """Apply Kalles' complete CPU colour stage to one scalar frame.
 
-    # A KFP is a complete colour recipe.  Kalles applies the imported colours
-    # and slope pass directly; the visualizer's audio/pitch colour transforms
-    # belong to the ordinary Aurora palettes and would otherwise make the
-    # bundled Kalles defaults drift into a different palette while rendering.
-    del phase, vocal, instrumental, pitch
+    ``field`` is retained as a convenient compatibility input for the normal
+    renderer.  When ``planes`` is supplied, this function uses the same
+    ``nPixels``/``nTrans``/``test1``/``test2``/``phase``/DE data that Kalles'
+    ``SetColor`` receives, including its alternate smoothing and analytic
+    distance paths.  If ``orbit_iteration`` is also supplied, the two
+    ``test`` planes are first passed through Kalles' ``OutputIterationData``
+    formulas. That distinction matters: a single already-smoothed float
+    cannot reproduce those optional Kalles planes by itself.
+    """
+
+    # A KFP is a complete colour recipe.  The visualizer's audio/pitch colour
+    # transforms belong to ordinary Aurora palettes. Kalles' phase input is a
+    # per-pixel plane, represented by ``planes.phase`` below, rather than the
+    # audio phase argument used by the ordinary palette path.
+    del vocal, instrumental, pitch
     np = _require_numpy()
     field = np.asarray(field, dtype=np.float32)
+    if field.ndim != 2:
+        raise ValueError("KFP colour input must be two-dimensional")
     try:
         field_bias = float(field_bias)
     except (TypeError, ValueError, OverflowError) as error:
@@ -10098,8 +14320,166 @@ def _colourise_kfp(
         neginf=0.0,
     )
     safe = np.clip(safe, 0.0, float(max_iter))
-    smooth_iter = np.maximum(0.0, safe + _kfp_smooth_offset(profile))
-    colour_iter = np.floor(smooth_iter) if profile.flat else smooth_iter
+
+    shape = field.shape
+    smooth_offset = _kfp_smooth_offset(profile)
+    fallback_smooth = np.maximum(0.0, safe + smooth_offset)
+    fallback_iteration = np.floor(fallback_smooth).astype(np.int64)
+    fallback_transition = 1.0 - (fallback_smooth - fallback_iteration)
+    fallback_iteration[inside] = int(max_iter)
+    fallback_transition[inside] = 0.0
+
+    plane_iteration = _kfp_plane(
+        planes, "iteration", shape, np, np.int64
+    )
+    plane_transition = _kfp_plane(
+        planes, "transition", shape, np, np.float64
+    )
+    plane_phase = _kfp_plane(planes, "phase", shape, np, np.float64)
+    plane_de_x = _kfp_plane(planes, "de_x", shape, np, np.float64)
+    plane_de_y = _kfp_plane(planes, "de_y", shape, np, np.float64)
+    plane_test1 = _kfp_plane(planes, "test1", shape, np, np.float64)
+    plane_test2 = _kfp_plane(planes, "test2", shape, np, np.float64)
+    plane_orbit_iteration = _kfp_plane(
+        planes, "orbit_iteration", shape, np, np.int64
+    )
+    plane_bailout = _kfp_plane(planes, "bailout", shape, np, np.float64)
+    glitch_mask = (
+        np.asarray(plane_transition, dtype=np.float64) < 0.0
+        if plane_transition is not None
+        else np.zeros(shape, dtype=bool)
+    )
+    has_planes = planes is not None and any(
+        value is not None
+        for value in (
+            plane_iteration,
+            plane_transition,
+            plane_phase,
+            plane_de_x,
+            plane_de_y,
+            plane_test1,
+            plane_test2,
+            plane_orbit_iteration,
+            plane_bailout,
+        )
+    )
+
+    if not has_planes:
+        # The compatibility scalar stores Kalles' nIter+smooth value. Decode
+        # it into the exact nPixels/nTrans representation used by SetColor so
+        # all subsequent stages share one source-faithful implementation.
+        iteration = fallback_iteration
+        transition = fallback_transition
+        smooth_iter = fallback_smooth
+    else:
+        # A caller may provide only the planes relevant to its profile. Fill
+        # the rest from the scalar field without replacing explicitly supplied
+        # Kalles data. ``iteration`` and ``transition`` are the values already
+        # handed to SetColor (nPixels and nTrans), not raw orbit counters.
+        if plane_iteration is None:
+            iteration = fallback_iteration.copy()
+        else:
+            iteration = np.clip(plane_iteration, 0, int(max_iter))
+        if plane_transition is None:
+            transition = fallback_transition.copy()
+        else:
+            # Kalles encodes a detected perturbation glitch as a negative
+            # transition (SET_TRANS_GLITCH).  It is intentionally outside
+            # the ordinary 0..1 transition range so SetColor can preserve the
+            # optional visible glitch pattern; clipping it here silently
+            # turned those pixels into ordinary palette samples.
+            transition = np.asarray(plane_transition, dtype=np.float64).copy()
+        if plane_iteration is not None:
+            inside = iteration >= int(max_iter)
+        else:
+            inside = inside | (iteration >= int(max_iter))
+        smooth_iter = iteration.astype(np.float64) + 1.0 - transition
+
+        # This is CFraktalSFT::OutputIterationData's exact pair of smoothing
+        # formulas. The render field itself does not contain test1/test2. A
+        # complete orbit caller therefore supplies ``orbit_iteration`` (the
+        # pre-smoothing antal counter) as well as the test values; otherwise
+        # the already materialized nPixels/nTrans pair above is authoritative.
+        if plane_orbit_iteration is not None:
+            smooth_part = np.zeros(shape, dtype=np.float64)
+            try:
+                radius = _kfp_bailout_radius(profile)
+                bailout = (
+                    plane_bailout
+                    if plane_bailout is not None
+                    else np.full(shape, radius, dtype=np.float64)
+                )
+                if (
+                    plane_test1 is not None
+                    and int(profile.smooth_method) == 0
+                ):
+                    power = float(profile.power)
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        smooth_part = (
+                            1.0
+                            - np.log(
+                                np.log(np.sqrt(plane_test1))
+                                / np.log(bailout)
+                            ) / math.log(power)
+                        )
+                elif (
+                    plane_test1 is not None
+                    and plane_test2 is not None
+                    and int(profile.smooth_method) == 1
+                ):
+                    norm = _kfp_bailout_norm(profile)
+                    # Kalles changes an infinite norm to one for this formula.
+                    exponent = 1.0 if math.isinf(norm) else 1.0 / norm
+                    with np.errstate(
+                        divide="ignore", invalid="ignore", over="ignore"
+                    ):
+                        root1 = np.power(plane_test1, exponent)
+                        root2 = np.power(plane_test2, exponent)
+                        denominator = root1 - root2
+                        smooth_part = np.where(
+                            denominator != 0.0,
+                            1.0 - (root1 - bailout) / denominator,
+                            0.0,
+                        )
+                # Kalles resets invalid smoothing values before storing the
+                # transition. Keep the same behavior for each pixel.
+                smooth_part = np.nan_to_num(
+                    smooth_part, nan=0.0, posinf=0.0, neginf=0.0
+                )
+            except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+                # Match Kalles' invalid smoothing result, which is reset to
+                # zero before OutputIterationData stores the transition.
+                smooth_part = np.zeros(shape, dtype=np.float64)
+
+            raw_iteration = np.maximum(
+                0, np.asarray(plane_orbit_iteration, dtype=np.int64)
+            )
+            raw_smooth = raw_iteration.astype(np.float64) + smooth_part
+            stored_iteration = np.floor(raw_smooth).astype(np.int64)
+            stored_inside = (
+                (raw_iteration >= int(max_iter))
+                | (stored_iteration >= int(max_iter))
+            )
+            iteration = np.clip(stored_iteration, 0, int(max_iter))
+            transition = 1.0 - (raw_smooth - stored_iteration)
+            iteration[stored_inside] = int(max_iter)
+            transition[stored_inside] = 0.0
+            inside = stored_inside
+            # SetColor reconstructs max_iter+1 for interior stencil/color
+            # calculations after OutputIterationData stores max_iter,0.
+            smooth_iter = np.where(
+                inside, float(max_iter) + 1.0, raw_smooth
+            )
+
+    # Kalles stores interior samples as (max_iter, transition=0). A stencil
+    # reconstructs those samples as max_iter+1, while the centre is restored
+    # to the exact interior colour at the end of SetColor.
+    stencil_iter = np.where(inside, float(max_iter) + 1.0, smooth_iter)
+    colour_iter = (
+        iteration.astype(np.float64)
+        if profile.flat
+        else smooth_iter
+    )
     method = int(profile.color_method)
     needs_difference = method in {5, 6, 7, 8}
     needs_slopes = bool(
@@ -10107,13 +14487,30 @@ def _colourise_kfp(
         and profile.slope_power > 0.0
         and profile.slope_ratio > 0.0
     )
-    # Kalles represents an interior sample as (max_iter, transition=0), which
-    # reconstructs to max_iter + 1 when that sample is used by a neighbour
-    # stencil. Keep the centre colour marker at max_iter, but retain the
-    # reconstructed value for the distance and slope passes so boundaries do
-    # not turn into a flat rectangular fill.
-    stencil_iter = np.where(inside, float(max_iter) + 1.0, smooth_iter)
-    if needs_difference:
+    # Atlas children are rendered into a smaller rectangle, but their pixels
+    # represent the same final-screen density as the parent crop. Use the
+    # output width for Kalles' resolution-dependent distance/slope scale so a
+    # child does not suddenly change palette contrast at its rectangular edge.
+    width = max(1, int(spatial_width or field.shape[1]))
+    # Analytic Kalles profiles use 1/|DE|. The scalar compatibility path has
+    # no DE plane and therefore follows Kalles' zero-value behavior for
+    # Differences_Analytic instead of manufacturing a finite-difference DE.
+    if needs_difference and int(profile.differences) == 7:
+        if plane_de_x is not None and plane_de_y is not None:
+            # Kalles stores m_nDEx/m_nDEy as float before SetColor reads them
+            # back. Reproduce that narrowing and its float arithmetic instead
+            # of silently turning the analytic branch into a double-precision
+            # renderer that only happens to use the same formula.
+            de_x = np.asarray(plane_de_x, dtype=np.float32)
+            de_y = np.asarray(plane_de_y, dtype=np.float32)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                de_squared = de_x * de_x + de_y * de_y
+                gradient = (
+                    np.float32(1.0) / np.sqrt(de_squared)
+                ).astype(np.float64)
+        else:
+            gradient = np.zeros_like(smooth_iter, dtype=np.float64)
+    elif needs_difference:
         gradient = _kfp_difference_magnitude(stencil_iter, profile.differences, np)
     else:
         gradient = np.zeros_like(smooth_iter, dtype=np.float64)
@@ -10121,30 +14518,31 @@ def _colourise_kfp(
         slope_dx, slope_dy = _kfp_slope_gradient(stencil_iter, np)
     else:
         slope_dx = slope_dy = None
-    # Atlas children are rendered into a smaller rectangle, but their pixels
-    # represent the same final-screen density as the parent crop. Use the
-    # output width for Kalles' resolution-dependent distance/slope scale so a
-    # child does not suddenly change palette contrast at its rectangular edge.
-    width = max(1, int(spatial_width or field.shape[1]))
-    # A scalar iteration field does not carry Kalles' analytic DE derivatives.
-    # Its selected finite-difference magnitude is the closest portable local
-    # distance proxy and, unlike normalising by max_iter, retains detail at any
-    # absolute zoom depth.
-    # The individual Kalles difference operators return their own native
-    # scale (some include the historical 2*sqrt(2) factor); only the image
-    # width normalization belongs here.
+    # The individual Kalles difference operators return their native scale;
+    # only the image-width normalization belongs here.
+    # Kalles limits the post-transfer distance to 1024.  Do not cap the raw
+    # DE before DistanceLog takes its logarithm: large finite values still
+    # affect the palette phase.  Keep positive infinity for the same
+    # method-specific clamp, while mapping invalid/negative values to zero.
     distance = gradient * width / 640.0
-    distance = np.nan_to_num(distance, nan=0.0, posinf=1.0e12, neginf=0.0)
+    distance = np.where(np.isnan(distance), 0.0, distance)
+    distance = np.maximum(distance, 0.0)
     if method == 1:
         transfer = np.sqrt(colour_iter)
     elif method == 2:
-        transfer = np.cbrt(colour_iter)
+        # Kalles evaluates pow(fmax(0, iter), 1/3), not cbrt(). The two
+        # formulas are mathematically equivalent but not always bitwise
+        # equivalent at the palette boundary.
+        transfer = np.power(np.maximum(0.0, colour_iter), 1.0 / 3.0)
     elif method == 3:
         transfer = np.log(np.maximum(1.0, colour_iter))
     elif method == 4:
         # Kalles' GetIterations() range is based on integer nIter0 values,
-        # not the fractional transition used for the final pixel colour.
-        escaped = np.floor(smooth_iter[~inside])
+        # not the fractional transition used for the final pixel colour. It
+        # also excludes the last possible escaped band (nPixels >= max-1),
+        # which Kalles reserves for max-iteration/interior handling.
+        eligible = (~inside) & (iteration < int(max_iter) - 1)
+        escaped = iteration[eligible].astype(np.float64)
         minimum = float(np.min(escaped)) if escaped.size else 0.0
         maximum = float(np.max(escaped)) if escaped.size else minimum + 1.0
         transfer = 1024.0 * (colour_iter - minimum) / max(maximum - minimum, 1.0e-12)
@@ -10170,40 +14568,68 @@ def _colourise_kfp(
     elif method == 8:
         transfer = np.sqrt(np.maximum(0.0, distance))
     elif method == 9:
-        transfer = np.log1p(np.log1p(colour_iter))
+        # Keep Kalles' literal log(1 + log(1 + iter)) expression.
+        transfer = np.log(
+            1.0 + np.log(1.0 + np.maximum(0.0, colour_iter))
+        )
     elif method == 10:
         transfer = np.arctan(colour_iter)
     elif method == 11:
-        transfer = np.power(colour_iter, 0.25)
+        # Kalles uses sqrt(sqrt(fmax(0, iter))).
+        transfer = np.sqrt(np.sqrt(np.maximum(0.0, colour_iter)))
     else:
         transfer = colour_iter
-    transfer = np.nan_to_num(
-        transfer,
-        nan=0.0,
-        posinf=float(max(max_iter, 1024)),
-        neginf=0.0,
-    )
+    # Preserve positive infinity until the distance branches clamp it to the
+    # Kalles limit.  Replacing it with max_iter would make an analytic DE
+    # singularity depend on the iteration cap instead of the palette stage.
+    transfer = np.where(np.isnan(transfer), 0.0, transfer)
+    transfer = np.where(transfer < 0.0, 0.0, transfer)
     if method in {5, 7, 8}:
         transfer = np.clip(transfer, 0.0, 1024.0)
 
     lut = _kfp_palette_lut(profile)
-    position = np.mod(transfer / profile.iter_div + profile.color_offset, 1024.0)
-    lower = np.floor(position).astype(np.intp) % 1024
-    if profile.smooth:
-        fraction = position - np.floor(position)
-        if profile.inverse_transition:
-            fraction = 1.0 - fraction
-        upper = (lower + 1) % 1024
-        rgb = lut[lower].astype(np.float64) * (1.0 - fraction[..., None])
-        rgb += lut[upper].astype(np.float64) * fraction[..., None]
-    else:
-        rgb = lut[lower].astype(np.float64)
 
-    if profile.multi_color and profile.multi_colors:
+    def palette_rgb(position_input: Any) -> Any:
+        position = np.mod(position_input, 1024.0)
+        lower = np.floor(position).astype(np.intp) % 1024
+        if profile.smooth:
+            fraction = position - np.floor(position)
+            if profile.inverse_transition:
+                fraction = 1.0 - fraction
+            upper = (lower + 1) % 1024
+            # Kalles forms the byte interpolation in double (`offs` is a
+            # double), divides by the float literal 255.0f, and stores the
+            # result in its float srgb struct. Reproduce that exact staging
+            # instead of carrying byte-scale float64 values into the relief
+            # and dither passes.
+            inverse_fraction = 1.0 - fraction
+            result = (
+                lut[lower].astype(np.float64) * inverse_fraction[..., None]
+                + lut[upper].astype(np.float64) * fraction[..., None]
+            ) / np.float32(255.0)
+            return np.asarray(result, dtype=np.float32)
+        return np.asarray(lut[lower], dtype=np.float32) / np.float32(255.0)
+
+    # Kalles' SetColor divides by the serialized IterDiv once, after the
+    # colour-method transfer and before the palette offset. Keep this separate
+    # from the distance transfer so imported recipes retain their phase.
+    palette_value = np.asarray(transfer, dtype=np.float64)
+    if float(profile.iter_div) != 1.0:
+        palette_value = palette_value / float(profile.iter_div)
+    palette_input = palette_value + profile.color_offset
+    phase_shift = 0.0
+    if plane_phase is not None and profile.phase_color_strength:
+        phase_shift = (
+            float(profile.phase_color_strength) / 100.0
+            * 1024.0
+            * plane_phase
+        )
+
+    if profile.multi_color:
         hues: list[Any] = []
         saturations: list[Any] = []
         values: list[Any] = []
-        wave_input = transfer / profile.iter_div + profile.color_offset
+        wave_input = palette_input
         if not profile.smooth:
             wave_input = np.floor(wave_input)
         for period, _start, colour_type in profile.multi_colors:
@@ -10220,32 +14646,97 @@ def _colourise_kfp(
             else:
                 values.append(wave)
         hue = np.mean(hues, axis=0) if hues else np.zeros_like(transfer)
-        saturation = np.mean(saturations, axis=0) if saturations else np.ones_like(transfer)
-        value = np.mean(values, axis=0) if values else np.ones_like(transfer)
-        multi_rgb = _hsv_to_rgb(hue, saturation, value, np) * 255.0
-        rgb = (rgb + multi_rgb) * 0.5 if profile.blend_multi_color else multi_rgb
+        # Match CFraktalSFT::SetColor: nS/nB start at zero when the recipe
+        # does not provide those wave types.
+        saturation = np.mean(saturations, axis=0) if saturations else np.zeros_like(transfer)
+        value = np.mean(values, axis=0) if values else np.zeros_like(transfer)
+        multi_rgb = _hsv_to_rgb(hue, saturation, value, np)
+        if profile.blend_multi_color:
+            rgb = (palette_rgb(palette_input + phase_shift) + multi_rgb) * 0.5
+        else:
+            # Kalles does not apply ColorPhaseStrength to a non-blended
+            # multi-colour wave; the phase plane affects the standard half of
+            # the blended branch only.
+            rgb = multi_rgb
+    else:
+        rgb = palette_rgb(palette_input + phase_shift)
+
+    texture_plane = None
+    texture_plane_width = None
+    texture_plane_height = None
+    if planes is not None and planes.texture_rgb is not None:
+        texture_plane = planes.texture_rgb
+        texture_plane_width = planes.texture_width
+        texture_plane_height = planes.texture_height
+    texture_requested = bool(
+        profile.texture_enabled
+        and (str(profile.texture_file).strip() or texture_plane is not None)
+    )
+    if texture_requested:
+        # Kalles starts an interior pixel at the configured interior colour
+        # before applying its texture and slope stages. The final interior
+        # overwrite is intentionally skipped when texture exists.
+        rgb[inside] = (
+            np.asarray(profile.interior_color, dtype=np.float32)
+            / np.float32(255.0)
+        )
+
+    # Kalles applies a textured image after the palette/multi-colour stage,
+    # then applies relief shading, and only then performs RGB8 dithering.  A
+    # native scalar colourizer cannot do this because its ABI has no texture
+    # pixels; the caller routes textured profiles here.
+    rgb, texture_applied = _kfp_apply_texture(
+        rgb,
+        stencil_iter,
+        profile,
+        np,
+        texture_plane,
+        texture_plane_width,
+        texture_plane_height,
+    )
 
     if needs_slopes:
         assert slope_dx is not None and slope_dy is not None
+        if (
+            int(profile.differences) == 7
+            and plane_de_x is not None
+            and plane_de_y is not None
+        ):
+            # This is complex<float>(1) / complex<float>(de_x, de_y) from
+            # Kalles' slope path, written component-wise.
+            de_x = np.asarray(plane_de_x, dtype=np.float32)
+            de_y = np.asarray(plane_de_y, dtype=np.float32)
+            denominator = de_x * de_x + de_y * de_y
+            with np.errstate(divide="ignore", invalid="ignore"):
+                slope_dx = np.divide(de_x, denominator).astype(np.float64)
+                slope_dy = np.divide(-de_y, denominator).astype(np.float64)
         angle = math.radians(profile.slope_angle)
         projected = slope_dx * math.cos(angle) + slope_dy * math.sin(angle)
         projected *= profile.slope_power * width / 640.0
-        strength = np.clip(
+        # Kalles applies SlopeRatio after atan without a final clamp. The
+        # normal UI range keeps this between zero and one, but preserving the
+        # unclamped imported value is required for arbitrary .kfp files.
+        strength = (
             np.arctan(np.abs(projected)) / (math.pi / 2.0)
-            * profile.slope_ratio / 100.0,
-            0.0,
-            1.0,
+            * profile.slope_ratio / 100.0
         )[..., None]
         dark = projected >= 0.0
-        rgb = np.where(
+        rgb = np.asarray(np.where(
             dark[..., None],
             rgb * (1.0 - strength),
-            rgb * (1.0 - strength) + 255.0 * strength,
-        )
+            rgb * (1.0 - strength) + strength,
+        ), dtype=np.float32)
 
-    rgb = np.clip(rgb, 0.0, 255.0)
-    rgb = _kfp_dither_rgb(rgb, np, dither_x, dither_y)
-    rgb[inside] = np.asarray(profile.interior_color, dtype=np.uint8)
+    rgb = np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
+    rgb = _kfp_dither_srgb(rgb, np, dither_x, dither_y)
+    if not texture_applied:
+        rgb[inside] = np.asarray(profile.interior_color, dtype=np.uint8)
+    if not profile.show_glitches:
+        # Kalles returns before writing a hidden glitch pixel. A standalone
+        # NumPy result has no previous framebuffer to preserve, so black is
+        # the deterministic equivalent instead of leaking an uninitialized
+        # pixel or a stale atlas tile.
+        rgb[glitch_mask] = 0
     return rgb
 
 
@@ -10257,6 +14748,103 @@ def _native_kfp_options(
     """Build one immutable ctypes transfer block per imported KFP profile."""
 
     return NativeKfpOptions.from_profile(profile, field_bias=field_bias)
+
+
+def _native_kfp_planes(
+    planes: Optional[KfpFramePlanes],
+    field_shape: tuple[int, int],
+    profile: KfpPalette,
+) -> tuple[NativeKfpPlanes, list[Any]]:
+    """Marshal Kalles' optional planes and texture into the native ABI.
+
+    The returned reference list is intentionally kept beside the ctypes
+    structure by the caller.  ctypes stores raw pointers, so dropping one of
+    these NumPy arrays while C++ is still reading the frame would otherwise
+    turn a perfectly valid colour pass into use-after-free memory.
+    """
+
+    np = _require_numpy()
+    native = NativeKfpPlanes()
+    native.struct_size = ctypes.sizeof(NativeKfpPlanes)
+    native.version = 1
+    references: list[Any] = []
+    if planes is not None:
+        for name, dtype, pointer_type in (
+            ("orbit_iteration", np.int64, ctypes.POINTER(ctypes.c_int64)),
+            ("bailout", np.float64, ctypes.POINTER(ctypes.c_double)),
+            ("iteration", np.int64, ctypes.POINTER(ctypes.c_int64)),
+            ("transition", np.float64, ctypes.POINTER(ctypes.c_double)),
+            ("phase", np.float64, ctypes.POINTER(ctypes.c_double)),
+            ("de_x", np.float64, ctypes.POINTER(ctypes.c_double)),
+            ("de_y", np.float64, ctypes.POINTER(ctypes.c_double)),
+            ("test1", np.float64, ctypes.POINTER(ctypes.c_double)),
+            ("test2", np.float64, ctypes.POINTER(ctypes.c_double)),
+        ):
+            value = getattr(planes, name)
+            if value is None:
+                continue
+            array = np.ascontiguousarray(value, dtype=dtype)
+            if array.shape != field_shape:
+                raise ValueError(
+                    f"KFP {name} plane has shape {array.shape}, expected {field_shape}"
+                )
+            setattr(native, name, array.ctypes.data_as(pointer_type))
+            references.append(array)
+
+    texture_value = getattr(planes, "texture_rgb", None) if planes is not None else None
+    if texture_value is not None:
+        texture = np.ascontiguousarray(texture_value, dtype=np.uint8)
+        if texture.ndim != 3 or texture.shape[-1] != 3:
+            raise ValueError("KFP texture plane must have shape (height, width, 3)")
+    elif profile.texture_enabled and str(profile.texture_file).strip():
+        path = Path(profile.texture_file).expanduser()
+        try:
+            path = path.resolve()
+            stat = path.stat()
+        except OSError:
+            texture = None
+        else:
+            texture_width, texture_height = _kfp_texture_dimensions(
+                field_shape[1], field_shape[0], profile
+            )
+            texture = np.ascontiguousarray(
+                np.clip(
+                    np.rint(
+                        _kfp_texture_image(
+                            str(path),
+                            int(stat.st_mtime_ns),
+                            texture_width,
+                            texture_height,
+                            bool(profile.texture_resize),
+                        )
+                    ),
+                    0.0,
+                    255.0,
+                ),
+                dtype=np.uint8,
+            )
+    else:
+        texture = None
+
+    if texture is not None:
+        texture_height, texture_width, _ = texture.shape
+        native.texture_rgb = texture.ctypes.data_as(
+            ctypes.POINTER(ctypes.c_uint8)
+        )
+        native.texture_width = int(
+            getattr(planes, "texture_width", None) or texture_width
+        )
+        native.texture_height = int(
+            getattr(planes, "texture_height", None) or texture_height
+        )
+        # The marshalled array is packed even when the source ndarray was
+        # strided; using its actual row stride keeps the pointer arithmetic
+        # correct for both imported and palette-file textures.
+        native.texture_stride = int(texture.strides[0])
+        if native.texture_width != texture_width or native.texture_height != texture_height:
+            raise ValueError("KFP texture dimensions do not match texture data")
+        references.append(texture)
+    return native, references
 
 
 def _colourise_kfp_native(
@@ -10271,14 +14859,89 @@ def _colourise_kfp_native(
     native_threads: int,
     precise: bool = False,
     field_bias: float = 0.0,
+    planes: Optional[KfpFramePlanes] = None,
+    use_opencl: bool = False,
 ) -> Any:
-    """Apply KFP's transfer in one OpenMP-native pass over the scalar field."""
+    """Apply KFP's transfer using the native scalar or plane-aware ABI.
 
-    function_name = (
-        "fractal_colourise_kfp_precise" if precise
-        else "fractal_colourise_kfp"
-    )
-    function = getattr(native_library, function_name, None)
+    ``use_opencl`` is deliberately opt-in. The scalar CPU ABI remains the
+    reference/default path, while the OpenCL entry point is used only for a
+    profile that has no metadata or texture dependencies.
+    """
+
+    # The old ABI accepts only one scalar field.  Request the additive plane
+    # ABI whenever the caller supplied Kalles metadata, and also for textured
+    # palettes so the texture stays in the native SetColor pass instead of
+    # silently taking a separate Python renderer.
+    plane_request = planes
+    if plane_request is None and _kfp_has_texture(profile):
+        plane_request = KfpFramePlanes()
+    plane_function = getattr(native_library, "fractal_colourise_kfp_planes", None)
+    if plane_request is not None and plane_function is not None:
+        np = _require_numpy()
+        scalar = np.ascontiguousarray(field, dtype=np.float32)
+        if scalar.ndim != 2:
+            raise ValueError("KFP colour input must be two-dimensional")
+        output = np.empty(scalar.shape + (3,), dtype=np.uint8)
+        lut = np.ascontiguousarray(_kfp_palette_lut(profile), dtype=np.uint8)
+        options = _native_kfp_options(profile, float(field_bias))
+        native_planes, plane_references = _native_kfp_planes(
+            plane_request,
+            (int(scalar.shape[0]), int(scalar.shape[1])),
+            profile,
+        )
+        # Keep plane_references alive until the native call returns.  The
+        # local list is deliberately not hidden inside _native_kfp_planes:
+        # ctypes stores pointers, not ownership information.
+        status = plane_function(
+            scalar.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            int(scalar.shape[1]),
+            int(scalar.shape[0]),
+            int(max_iter),
+            float(phase),
+            float(vocal),
+            float(instrumental),
+            float(pitch),
+            ctypes.byref(options),
+            ctypes.byref(native_planes),
+            lut.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            int(lut.shape[0]),
+            int(native_threads),
+        )
+        if status != 0:
+            message = native_library.fractal_last_error() or b"unknown native KFP plane colourizer error"
+            raise RuntimeError(message.decode("utf-8", errors="replace"))
+        return output
+
+    # Older shared libraries do not know the additive plane ABI. Preserve a
+    # complete, correct fallback for them rather than throwing away metadata.
+    if plane_request is not None:
+        return _colourise_kfp(
+            field,
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            profile,
+            field_bias=field_bias,
+            # ``plane_request`` is an empty request for textured profiles on
+            # older native libraries.  Pass that request through as well so
+            # the Python fallback can still use a supplied embedded texture
+            # plane instead of silently reverting to the palette file.
+            planes=plane_request,
+        )
+
+    function = None
+    if use_opencl and _kfp_gpu_supported(profile):
+        function = getattr(native_library, "fractal_colourise_kfp_opencl", None)
+    if function is None:
+        function_name = (
+            "fractal_colourise_kfp_precise" if precise
+            else "fractal_colourise_kfp"
+        )
+        function = getattr(native_library, function_name, None)
     if function is None and precise:
         function = getattr(native_library, "fractal_colourise_kfp", None)
     if function is None:
@@ -10335,8 +14998,62 @@ def _crop_colourise_kfp_native(
     native_threads: int,
     precise: bool = False,
     field_bias: float = 0.0,
+    use_opencl: bool = False,
 ) -> Any:
     """Crop and colourise a KFP frame without a Python/Pillow round trip."""
+
+    if use_opencl and _kfp_gpu_supported(profile):
+        np = _require_numpy()
+        view, _ = _crop_and_resize_preserving_interior(
+            field,
+            int(output_width),
+            int(output_height),
+            float(zoom_factor),
+            int(max_iter),
+            "bilinear",
+            field_bias=float(field_bias),
+            output_max_iter=int(max_iter),
+            output_field_bias=float(field_bias),
+        )
+        return _colourise_kfp_native(
+            np.asarray(view, dtype=np.float32),
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            profile,
+            native_library,
+            native_threads,
+            precise=False,
+            field_bias=float(field_bias),
+            use_opencl=True,
+        )
+
+    if _kfp_has_texture(profile):
+        np = _require_numpy()
+        view, _ = _crop_and_resize_preserving_interior(
+            field,
+            int(output_width),
+            int(output_height),
+            float(zoom_factor),
+            int(max_iter),
+            "bilinear",
+            field_bias=float(field_bias),
+            output_max_iter=int(max_iter),
+            output_field_bias=float(field_bias),
+        )
+        return _colourise_kfp(
+            np.asarray(view, dtype=np.float32),
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            profile,
+            spatial_width=int(output_width),
+            field_bias=float(field_bias),
+        )
 
     function_name = (
         "fractal_crop_colourise_kfp_precise" if precise
@@ -10385,6 +15102,7 @@ def _crop_rgb_native(
     zoom_factor: float,
     native_library: Any,
     native_threads: int,
+    use_opencl: bool = False,
 ) -> Any:
     """Crop an RGB tile with the native bilinear sampler.
 
@@ -10394,7 +15112,13 @@ def _crop_rgb_native(
     sentinel or a square tile boundary.
     """
 
-    function = getattr(native_library, "fractal_crop_rgb", None)
+    function = getattr(
+        native_library,
+        "fractal_crop_rgb_opencl" if use_opencl else "fractal_crop_rgb",
+        None,
+    )
+    if function is None and use_opencl:
+        function = getattr(native_library, "fractal_crop_rgb", None)
     if function is None:
         raise RuntimeError("native RGB crop compositor is unavailable")
     np = _require_numpy()
@@ -10423,6 +15147,22 @@ def _crop_rgb_native(
         zoom,
         int(native_threads),
     )
+    if status != 0 and use_opencl:
+        # A restricted OpenCL driver may accept the field/colour kernels but
+        # reject the optional RGB sampler. Keep the export correct by falling
+        # back to the validated native CPU compositor for that device.
+        cpu_function = getattr(native_library, "fractal_crop_rgb", None)
+        if cpu_function is not None and cpu_function is not function:
+            status = cpu_function(
+                source.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                int(source.shape[1]),
+                int(source.shape[0]),
+                output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                output_width,
+                output_height,
+                zoom,
+                int(native_threads),
+            )
     if status != 0:
         message = native_library.fractal_last_error() or b"unknown native RGB crop error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
@@ -10440,10 +15180,43 @@ def _atlas_composite_rgb_native(
     feather: int,
     native_library: Any,
     native_threads: int,
+    use_opencl: bool = False,
+    parent_cache_token: int = 0,
+    child_cache_token: int = 0,
 ) -> Any:
     """Composite two already-colourised RGB atlas tiles in native code."""
 
-    function = getattr(native_library, "fractal_atlas_composite_rgb", None)
+    try:
+        parent_token = int(parent_cache_token)
+        child_token = int(child_cache_token)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("native RGB atlas cache tokens must be integers") from error
+    if parent_token < 0 or child_token < 0:
+        raise ValueError("native RGB atlas cache tokens must be non-negative")
+    cached_symbol = (
+        getattr(native_library, "fractal_atlas_composite_rgb_opencl_cached", None)
+        if use_opencl else None
+    )
+    # Only use the cached ABI when the caller supplied logical identities.
+    # Generic callers and older tests retain the conservative upload-every-call
+    # path; a pointer address is deliberately never used as a cache key.
+    cached_function = (
+        cached_symbol
+        if cached_symbol is not None
+        and parent_token > 0
+        and (child is None or child_token > 0)
+        else None
+    )
+    function = getattr(
+        native_library,
+        "fractal_atlas_composite_rgb_opencl" if use_opencl
+        else "fractal_atlas_composite_rgb",
+        None,
+    )
+    if cached_function is not None:
+        function = cached_function
+    if function is None and use_opencl:
+        function = getattr(native_library, "fractal_atlas_composite_rgb", None)
     if function is None:
         raise RuntimeError("native RGB atlas compositor is unavailable")
     np = _require_numpy()
@@ -10483,8 +15256,9 @@ def _atlas_composite_rgb_native(
         child_height, child_width = child_array.shape[:2]
         child_pointer = child_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
     output = np.empty((output_height, output_width, 3), dtype=np.uint8)
-    status = function(
-        parent_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+    parent_pointer = parent_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+    call_args = [
+        parent_pointer,
         int(parent_array.shape[1]),
         int(parent_array.shape[0]),
         child_pointer,
@@ -10498,7 +15272,35 @@ def _atlas_composite_rgb_native(
         crop_zoom,
         feather_value,
         int(native_threads),
-    )
+    ]
+    if function is cached_function and cached_function is not None:
+        # The tokens are logical per-render/per-level identities supplied by
+        # the atlas loop. Never derive them from NumPy addresses: Python can
+        # recycle an evicted tile's allocation for a different level.
+        call_args.extend([
+            ctypes.c_uint64(parent_token),
+            ctypes.c_uint64(child_token),
+        ])
+    status = function(*call_args)
+    if status != 0 and use_opencl:
+        cpu_function = getattr(native_library, "fractal_atlas_composite_rgb", None)
+        if cpu_function is not None and cpu_function is not function:
+            status = cpu_function(
+                parent_array.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                int(parent_array.shape[1]),
+                int(parent_array.shape[0]),
+                child_pointer,
+                int(child_width),
+                int(child_height),
+                output.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                output_width,
+                output_height,
+                zoom,
+                fraction,
+                crop_zoom,
+                feather_value,
+                int(native_threads),
+            )
     if status != 0:
         message = native_library.fractal_last_error() or b"unknown native RGB atlas compositor error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
@@ -10688,8 +15490,13 @@ def _colourise_custom(
     pitch: float = 0.5,
     palette_file: Optional[Path] = None,
     kfp_field_bias: float = 0.0,
+    kfp_profile_override: Optional[KfpPalette] = None,
 ) -> Any:
-    profile = _kfp_profile_for_selection(palette_name, palette_file)
+    profile = (
+        kfp_profile_override
+        if kfp_profile_override is not None
+        else _kfp_profile_for_selection(palette_name, palette_file)
+    )
     if profile is not None:
         return _colourise_kfp(
             field,
@@ -10721,14 +15528,15 @@ def _colourise_native(
     native_threads: int,
     library: Any,
     pitch: float = 0.5,
+    use_opencl: bool = False,
 ) -> Any:
-    """Colour one smooth-iteration frame through the OpenMP C ABI."""
+    """Colour one ordinary Aurora frame through the native CPU/GPU ABI."""
 
     np = _require_numpy()
     field = np.ascontiguousarray(field, dtype=np.float32)
     height, width = field.shape
     rgb = np.empty((height, width, 3), dtype=np.uint8)
-    status = library.fractal_colourise(
+    colour_args = (
         field.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         rgb.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
         width,
@@ -10740,6 +15548,11 @@ def _colourise_native(
         pitch,
         native_threads,
     )
+    function = (
+        getattr(library, "fractal_colourise_opencl", None)
+        if use_opencl else None
+    ) or library.fractal_colourise
+    status = function(*colour_args)
     if status != 0:
         message = library.fractal_last_error() or b"unknown native colourizer error"
         raise RuntimeError(message.decode("utf-8", errors="replace"))
@@ -10963,6 +15776,61 @@ def _atomic_save_field(path: Path, field: Any, *, durable: bool = False) -> None
                 pass
 
 
+def _atomic_save_kfp_planes(
+    path: Path,
+    field: Any,
+    planes: KfpFramePlanes,
+    *,
+    durable: bool = False,
+) -> None:
+    """Atomically save a complete scalar/Kalles plane tile.
+
+    ``np.savez`` is intentionally used without ZIP compression.  The orbit
+    planes are already close to incompressible, and avoiding compression keeps
+    the first deep render fast while still making subsequent renders reuse the
+    expensive reference repair.  The temporary file and replacement follow
+    the scalar cache's crash-safe protocol.
+    """
+
+    np = _require_numpy()
+    path = _absolute_path(path)
+    _reject_final_symlink(path, "KFP cache entry")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, Any] = {"field": np.asarray(field, dtype=np.float32)}
+    for name in _KFP_REQUIRED_RENDER_PLANES:
+        value = getattr(planes, name, None)
+        if value is None:
+            raise ValueError(f"cannot cache incomplete KFP plane: {name}")
+        arrays[name] = np.asarray(value)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            np.savez(handle, **arrays)
+            handle.flush()
+            if durable:
+                os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if durable and hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if temporary is not None and temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
 class _CacheEvictor:
     """Maintain a cheap incremental LRU index for generated cache files.
 
@@ -11100,12 +15968,17 @@ def _keyframe_field(
     cache_evictor: Optional[_CacheEvictor] = None,
     formula: str = "mandelbrot",
     julia_constant: tuple[str, str] = DEFAULT_JULIA_C,
+    return_planes: bool = False,
 ) -> Any:
     """Load or render one absolute-zoom field, with an atomic cache."""
 
     np = _require_numpy()
     cache_path = None
-    if cache_dir is not None:
+    # Existing scalar cache entries cannot satisfy a complete Kalles palette
+    # request: the orbit/test/DE planes were never written into ``.npy``.
+    # Re-render that source instead of silently downgrading it to the scalar
+    # compatibility colourizer.
+    if cache_dir is not None and not return_planes:
         cache_key = hashlib.sha256(
             repr((
                 KEYFRAME_CACHE_SCHEMA,
@@ -11136,7 +16009,7 @@ def _keyframe_field(
         except (OSError, EOFError, ValueError, TypeError):
             pass
 
-    field = render_fractal(
+    rendered = render_fractal(
         render_width,
         render_height,
         log_zoom,
@@ -11151,13 +16024,17 @@ def _keyframe_field(
         render_options,
         formula,
         julia_constant,
+        return_planes=return_planes,
     )
+    planes = None
+    if return_planes:
+        field, planes = rendered
     field = _validated_field(field, (render_height, render_width), "keyframe")
-    if cache_path is not None:
+    if cache_path is not None and not return_planes:
         _atomic_save_field(cache_path, field, durable=durable_cache)
         if cache_evictor is not None:
             cache_evictor.observe(cache_path)
-    return field
+    return (field, planes) if return_planes else field
 
 
 def _prune_cache(
@@ -11184,12 +16061,23 @@ def _colourise_view(
     pitch: float,
     palette_file: Optional[Path] = None,
     kfp_field_bias: float = 0.0,
+    kfp_profile_override: Optional[KfpPalette] = None,
+    kfp_gpu: bool = False,
+    ordinary_gpu: bool = False,
 ) -> Any:
     """Colour an already-resampled scalar iteration field."""
 
-    kfp_profile = _kfp_profile_for_selection(palette_name, palette_file)
+    kfp_profile = (
+        kfp_profile_override
+        if kfp_profile_override is not None
+        else _kfp_profile_for_selection(palette_name, palette_file)
+    )
     if kfp_profile is not None:
-        if native_library is not None and hasattr(native_library, "fractal_colourise_kfp"):
+        if (
+            not _kfp_has_texture(kfp_profile)
+            and native_library is not None
+            and hasattr(native_library, "fractal_colourise_kfp")
+        ):
             return _colourise_kfp_native(
                 view,
                 max_iter,
@@ -11202,6 +16090,7 @@ def _colourise_view(
                 native_threads,
                 precise=False,
                 field_bias=kfp_field_bias,
+                use_opencl=kfp_gpu,
             )
         return _colourise_custom(
             view,
@@ -11213,6 +16102,7 @@ def _colourise_view(
             pitch,
             palette_file,
             kfp_field_bias,
+            kfp_profile,
         )
     if native_library is not None and palette_name == "aurora" and palette_file is None:
         return _colourise_native(
@@ -11224,6 +16114,7 @@ def _colourise_view(
             native_threads,
             native_library,
             pitch,
+            use_opencl=ordinary_gpu,
         )
     if native_library is not None:
         accents = _aurora_accents_for_selection(palette_name, palette_file)
@@ -11281,6 +16172,7 @@ def _colourise_view(
             palette_name,
             pitch,
             palette_file,
+            kfp_profile_override=kfp_profile,
         )
     return _colourise(view, max_iter, phase, vocal, instrumental, pitch)
 
@@ -11301,7 +16193,11 @@ def _colour_frame(
     pitch: float = 0.5,
     palette_file: Optional[Path] = None,
     kfp_field_bias: float = 0.0,
+    kfp_profile_override: Optional[KfpPalette] = None,
+    planes: Optional[KfpFramePlanes] = None,
+    ordinary_gpu: bool = False,
 ) -> Any:
+    np = _require_numpy()
     # The public nearest mode is for enlarging an undersized source into the
     # encoded video. Keep animation crops bilinear so the native C++ path is
     # still used and the camera does not jump source pixel by source pixel.
@@ -11309,6 +16205,7 @@ def _colour_frame(
     if (
         palette_file is None
         and native_library is not None
+        and not ordinary_gpu
         and resample == "bilinear"
         and palette_name == "aurora"
     ):
@@ -11325,9 +16222,55 @@ def _colour_frame(
             native_library,
             pitch,
         )
-    kfp_profile = _kfp_profile_for_selection(palette_name, palette_file)
+    kfp_profile = (
+        kfp_profile_override
+        if kfp_profile_override is not None
+        else _kfp_profile_for_selection(palette_name, palette_file)
+    )
+    if planes is not None and kfp_profile is not None:
+        # A Kalles frame is more than the scalar iteration image. Crop the
+        # orbit metadata alongside the scalar surface and enter the complete
+        # plane-aware SetColor path before any scalar fast kernel can consume
+        # the frame. This branch is intentionally before the native crop ABI:
+        # that ABI has no way to carry test1/test2/DE/phase planes.
+        view, inside = _crop_and_resize_preserving_interior(
+            field,
+            output_width,
+            output_height,
+            zoom_factor,
+            max_iter,
+            resample,
+            field_bias=float(kfp_field_bias),
+            output_max_iter=int(max_iter),
+            output_field_bias=0.0,
+        )
+        view_planes = _crop_kfp_planes(
+            planes,
+            np.asarray(field).shape,
+            output_width,
+            output_height,
+            zoom_factor,
+            resample,
+            inside=inside,
+            output_max_iter=int(max_iter),
+        )
+        return _colourise_kfp_native(
+            np.asarray(view, dtype=np.float32),
+            max_iter,
+            phase,
+            vocal,
+            instrumental,
+            pitch,
+            kfp_profile,
+            native_library,
+            native_threads,
+            precise=True,
+            field_bias=0.0,
+            planes=view_planes,
+        )
     if (
         kfp_profile is not None
+        and not _kfp_has_texture(kfp_profile)
         and native_library is not None
         and hasattr(native_library, "fractal_crop_colourise_kfp")
         and resample == "bilinear"
@@ -11350,8 +16293,9 @@ def _colour_frame(
         )
     if (
         native_library is not None
+        and not ordinary_gpu
         and resample == "bilinear"
-        and _kfp_profile_for_selection(palette_name, palette_file) is None
+        and kfp_profile is None
     ):
         interior_color = _ordinary_interior_color(palette_name, palette_file)
         return _crop_and_colourise_native(
@@ -11389,6 +16333,8 @@ def _colour_frame(
         pitch,
         palette_file,
         kfp_field_bias,
+        kfp_profile,
+        ordinary_gpu=ordinary_gpu,
     )
 
 
@@ -11518,6 +16464,8 @@ def render_video(
     motion_blur: float = 0.0,
     lossless: bool = False,
     source_mode: str = "lossless-compressed",
+    kfp_3d: Optional[bool] = None,
+    kfp_glitches: Optional[bool] = None,
 ) -> dict[str, Any]:
     np = _require_numpy()
     audio_path, output_path, _, cache_dir = _validate_render_paths(
@@ -11530,9 +16478,10 @@ def render_video(
     if resample not in RESAMPLE_CHOICES:
         raise ValueError(f"unknown output resample mode: {resample}")
     # Nearest-neighbour is used for the final enlargement of the
-    # lossless-compressed profiles. Keep the internal scalar/RGB atlas on its
-    # continuous native crop path so the speed and smooth zoom behaviour do
-    # not regress just because the encoded output is enlarged crisply.
+    # ordinary lossless-compressed profiles. KFP uses Kalles' Lanczos3 final
+    # bitmap scale whenever its surface is resized; keep the
+    # internal scalar/RGB atlas on its continuous native crop path so the
+    # speed and smooth zoom behaviour do not depend on the output filter.
     atlas_resample = _atlas_resample_mode(resample)
     features = _normalise_audio_features(features)
     frame_count = features.frame_count
@@ -11592,6 +16541,10 @@ def render_video(
     lossless = bool(lossless)
     if lossless:
         crf = 0
+    if kfp_3d is not None and not isinstance(kfp_3d, bool):
+        raise ValueError("kfp 3d override must be true, false, or unset")
+    if kfp_glitches is not None and not isinstance(kfp_glitches, bool):
+        raise ValueError("kfp glitches override must be true, false, or unset")
     source_scale, transition_fraction = _quality_source_settings(
         fractal_scale,
         quality,
@@ -11605,6 +16558,10 @@ def render_video(
         render_scale * float(source_scale),
         "fractal source",
     )
+    # Crop maps remain an explicit driver-tuning switch.  On the RTX path a
+    # full-song FHD run showed that the extra global map reads are slower than
+    # the in-kernel coordinate arithmetic, so do not silently enable them for
+    # every GUI/export render.
     formula = _formula_name(formula)
     if palette_file is not None:
         palette_file = _normalise_path(palette_file)
@@ -11614,9 +16571,18 @@ def render_video(
             raise ValueError("palette file must be different from the input audio file")
         if _paths_refer_to_same_target(palette_file, output_path):
             raise ValueError("palette file must be different from the output video")
-    preserve_chroma = (
-        lossless or _kfp_profile_for_selection(palette, palette_file) is not None
+    kfp_profile = _kfp_profile_with_glitches(
+        _kfp_profile_with_3d(
+            _kfp_profile_for_selection(palette, palette_file),
+            kfp_3d,
+        ),
+        kfp_glitches,
     )
+    kfp_escape_radius_mode = (
+        _kfp_escape_radius_mode(kfp_profile)
+        if kfp_profile is not None else 0
+    )
+    preserve_chroma = lossless or kfp_profile is not None
     ffmpeg_path = _find_external_tool("ffmpeg")
     if ffmpeg_path is None:
         raise RuntimeError("ffmpeg is required to encode the video, but it was not found on PATH")
@@ -11665,9 +16631,11 @@ def render_video(
     # but cannot be part of a quality master: they are exactly the source of
     # the rectangular/deep-black artefacts seen in earlier renders.
     allow_recovery = quality == "draft"
-    cpu_count = max(2, os.cpu_count() or 2)
     if native_threads == 0:
-        native_threads = min(MAX_THREAD_COUNT, max(1, (cpu_count * 2) // 3))
+        native_threads = _default_native_thread_count()
+    if encoder_threads == 0:
+        encoder_threads = _default_encoder_thread_count(native_threads)
+    cpu_count = _default_native_thread_count()
     frame_width = int(render_width)
     frame_height = int(render_height)
     if frame_width <= 0 or frame_height <= 0:
@@ -11684,7 +16652,15 @@ def render_video(
     native_references: list[tuple[float, Any]] = []
     active_renderer = renderer
     max_log_zoom = float(np.max(zooms))
+    # A KFP file only needs the scalar-only field path when its SetColor
+    # recipe consumes orbit metadata. Plain KFP palettes still use their
+    # exact native transfer below, but their shallow field is compatible with
+    # the Kalles-coordinate OpenCL renderer.
+    kfp_planes_needed = _kfp_requires_render_planes(kfp_profile)
+    kfp_scalar_profile = kfp_profile is not None and not kfp_planes_needed
     native_backend_id = 0
+    kfp_colour_opencl_enabled = False
+    ordinary_colour_opencl_enabled = False
     native_render_options = NativeRenderOptions()
     if renderer != "python":
         native_library = _get_native_library()
@@ -11697,12 +16673,42 @@ def render_video(
                 raise RuntimeError("native renderer is unavailable; run `make` inside `nix-shell`")
             active_renderer = "python"
         else:
-            native_backend_id = _native_backend_id(native_backend, native_library)
-            native_render_options = NativeRenderOptions(backend=native_backend_id)
-            if native_backend_id == 2 and max_log_zoom >= 6.0:
-                raise RuntimeError(
-                    "--native-backend opencl currently supports only direct zooms below 1e6"
+            native_backend_id = _native_backend_for_workload(
+                native_backend,
+                native_library,
+                render_width,
+                render_height,
+                max_log_zoom,
+                formula,
+                kfp_planes=kfp_planes_needed,
+                kfp_scalar=kfp_profile is not None and not kfp_planes_needed,
+            )
+            try:
+                native_capabilities = int(native_library.fractal_backend_capabilities())
+            except (AttributeError, OSError, TypeError, ValueError):
+                native_capabilities = 0
+            kfp_colour_opencl_enabled = bool(
+                kfp_scalar_profile
+                and native_backend in {"auto", "opencl"}
+                and native_capabilities & 4
+                and hasattr(native_library, "fractal_colourise_kfp_opencl")
+                and _kfp_gpu_supported(kfp_profile)
+            )
+            ordinary_colour_opencl_enabled = bool(
+                kfp_profile is None
+                and native_backend_id == 2
+                and native_capabilities & 4
+                and (
+                    hasattr(native_library, "fractal_atlas_colourise_opencl_accents")
+                    or hasattr(native_library, "fractal_atlas_colourise_opencl")
                 )
+            )
+            native_render_options = NativeRenderOptions(
+                backend=native_backend_id,
+                escape_radius_mode=kfp_escape_radius_mode,
+                coordinate_mode=1 if kfp_profile is not None else 0,
+                plane_flags=_native_kfp_plane_flags(kfp_profile),
+            )
         if native_library is not None and float(np.max(zooms)) >= 12.0:
             reference_iter = max(
                 max_iterations(
@@ -11775,6 +16781,8 @@ def render_video(
                     series_order,
                     reference_logs[0],
                     reusable=clone_tiers,
+                    escape_radius_mode=kfp_escape_radius_mode,
+                    coordinate_mode=1 if kfp_profile is not None else 0,
                     formula=formula,
                     julia_constant=julia_constant,
                 )
@@ -11830,6 +16838,8 @@ def render_video(
                                 max_log_zoom,
                                 series_order,
                                 bla_start_log,
+                                escape_radius_mode=kfp_escape_radius_mode,
+                                coordinate_mode=1 if kfp_profile is not None else 0,
                                 formula=formula,
                                 julia_constant=julia_constant,
                             )
@@ -11848,6 +16858,8 @@ def render_video(
                             max_log_zoom,
                             series_order,
                             bla_start_log,
+                            escape_radius_mode=kfp_escape_radius_mode,
+                            coordinate_mode=1 if kfp_profile is not None else 0,
                             formula=formula,
                             julia_constant=julia_constant,
                         )
@@ -11869,12 +16881,11 @@ def render_video(
                 _destroy_native_references(native_library, native_references)
                 raise
 
-    kfp_profile = _kfp_profile_for_selection(palette, palette_file)
     if (
         kfp_profile is not None
         and quality != "draft"
         and source_mode != "upscaled"
-        and atlas_resample == "bilinear"
+        and atlas_resample in {"bilinear", "lanczos"}
         and native_library is not None
         and hasattr(native_library, "fractal_colourise_kfp")
     ):
@@ -11896,7 +16907,7 @@ def render_video(
     if (
         keyframe_mode == "atlas"
         and quality != "draft"
-        and atlas_resample == "bilinear"
+        and atlas_resample in {"bilinear", "lanczos"}
         and kfp_profile is not None
         and native_library is not None
         and hasattr(native_library, "fractal_crop_colourise_kfp")
@@ -11916,24 +16927,69 @@ def render_video(
                 flush=True,
             )
 
+    # Mandelbrot plane-aware tiles can use the OpenCL metadata kernel. Other
+    # formulas still use scalar metadata, so keep their cache namespace tied
+    # to the actual backend used by the tile loop.
+    effective_field_backend_id = (
+        native_backend_id
+        if not kfp_planes_needed
+        or (formula == "mandelbrot" and native_backend_id == 2)
+        else 0
+    )
     cache_identity = _field_renderer_cache_identity(active_renderer)
     cache_identity = (
         f"{cache_identity}-formula-{formula}"
         + (f"-julia-{julia_constant[0]}-{julia_constant[1]}" if formula == "julia" else "")
-        + f"-backend-{native_backend_id}"
+        + f"-backend-{effective_field_backend_id}"
     )
-    colourizer_backend = (
-        f"native-{('scalar', 'avx2', 'opencl')[native_backend_id]}"
-        if native_library is not None and 0 <= native_backend_id <= 2
+    # The OpenCL deep scalar kernel can use the fast mixed mantissa/exponent
+    # recurrence by default on a physical GPU. Keep strict-double A/B runs
+    # and experimental relaxed-math runs out of that cache namespace: their
+    # fields are intentionally not byte-identical, even though they share the
+    # same native library build.
+    if effective_field_backend_id == 2:
+        strict_opencl = (
+            os.environ.get("FRACTAL_OPENCL_STRICT_DOUBLE", "") not in {"", "0"}
+            or os.environ.get("FRACTAL_OPENCL_MIXED_PRECISION") == "0"
+        )
+        cache_identity += "-opencl-strict" if strict_opencl else "-opencl-mixed"
+        if os.environ.get("FRACTAL_OPENCL_FAST_MATH"):
+            cache_identity += "-fast-math"
+    if kfp_profile is not None:
+        # The scalar tile is rendered with Kalles' coordinate and bailout
+        # rules, not merely coloured with them. Keep profiles using different
+        # escape-radius contracts in separate namespaces so a tile produced
+        # by classic-radius rendering can never be reused by high-bailout KFP
+        # rendering (or vice versa).
+        cache_identity += (
+            f"-kfp-radius-{kfp_escape_radius_mode}-coord-1"
+        )
+    field_backend = (
+        f"native-{('scalar', 'avx2', 'opencl')[effective_field_backend_id]}"
+        if native_library is not None and 0 <= effective_field_backend_id <= 2
         else "python"
     )
+    colourizer_engine = "native CPU" if native_library is not None else "python"
+    if ordinary_colour_opencl_enabled and native_library is not None:
+        colourizer_engine = "native OpenCL fused ordinary palette"
+    elif (
+        kfp_profile is not None
+        and native_library is not None
+        and kfp_colour_opencl_enabled
+        and not kfp_planes_needed
+        and hasattr(native_library, "fractal_colourise_kfp_opencl")
+        and _kfp_gpu_supported(kfp_profile)
+    ):
+        colourizer_engine = "native OpenCL KFP"
+    elif kfp_profile is not None and native_library is not None:
+        colourizer_engine = "native CPU KFP"
     print(
         f"Keyframe source: {render_width}x{render_height} ({quality}, {source_mode}); "
         f"planned keyframes: "
         f"{_keyframe_count(zooms, keyframe_factor) if keyframe_mode == 'legacy' else _atlas_geometry(zooms, keyframe_factor)[2] + 1}; "
         f"mode: {keyframe_mode}; "
         f"field renderer: {active_renderer}; "
-        f"colourizer: {colourizer_backend}; "
+        f"field backend: {field_backend}; colourizer: {colourizer_engine}; "
         f"native threads: {native_threads}; encoder: {selected_codec}; "
         f"encoder threads: {encoder_threads if encoder_threads > 0 else 'auto'}",
         flush=True,
@@ -11952,6 +17008,10 @@ def render_video(
             width=width,
             height=height,
         )
+        ffmpeg_input_pixel_format, ffmpeg_rgb_arguments = _ffmpeg_raw_rgb_input(
+            selected_codec,
+            video_pixel_format,
+        )
         preset_arguments = ["-preset", selected_preset] if selected_preset else []
         video_filters: list[str] = []
         if (frame_width, frame_height) != (int(width), int(height)):
@@ -11963,6 +17023,7 @@ def render_video(
                 frame_height,
                 width,
                 height,
+                source_mode,
             )
             video_filters.append(
                 f"scale={int(width)}:{int(height)}:flags={final_resample}"
@@ -11970,6 +17031,17 @@ def render_video(
         if using_vaapi:
             video_filters.extend(["format=nv12", "hwupload"])
         filter_arguments = ["-vf", ",".join(video_filters)] if video_filters else []
+        estimated_raw_bytes = (
+            int(width)
+            * int(height)
+            * (4 if ffmpeg_input_pixel_format in {"rgb0", "rgba"} else 3)
+            * int(features.frame_count)
+        )
+        mux_flags = (
+            ["-movflags", "+faststart"]
+            if estimated_raw_bytes < FASTSTART_MAX_ESTIMATED_RAW_BYTES
+            else []
+        )
         command = [
             ffmpeg_path,
             "-y",
@@ -11984,7 +17056,7 @@ def render_video(
             "-s",
             f"{frame_width}x{frame_height}",
             "-pix_fmt",
-            "rgb24",
+            ffmpeg_input_pixel_format,
             "-r",
             str(fps),
             "-i",
@@ -12001,6 +17073,7 @@ def render_video(
             *preset_arguments,
             *(["-threads", str(encoder_threads)] if not using_vaapi and encoder_threads > 0 else []),
             *rate_control,
+            *ffmpeg_rgb_arguments,
             *([] if using_vaapi else ["-pix_fmt", video_pixel_format]),
             "-c:a",
             "aac",
@@ -12011,8 +17084,7 @@ def render_video(
             "apad",
             "-t",
             f"{features.frame_count / max(float(fps), 1.0):.9f}",
-            "-movflags",
-            "+faststart",
+            *mux_flags,
             str(temporary_output),
         ]
     except BaseException:
@@ -12024,6 +17096,14 @@ def render_video(
                 pass
         raise
     assert temporary_output is not None
+
+    kfp_plane_enabled = bool(
+        kfp_profile is not None
+        and _kfp_requires_render_planes(kfp_profile)
+        and native_library is not None
+        and active_renderer in {"auto", "native"}
+        and hasattr(native_library, "render_fractal_ex_planes")
+    )
 
     if keyframe_mode == "atlas":
         atlas_result = None
@@ -12067,6 +17147,10 @@ def render_video(
                 glow=glow,
                 motion_blur=motion_blur,
                 source_mode=source_mode,
+                kfp_profile_override=kfp_profile,
+                kfp_colour_opencl=kfp_colour_opencl_enabled,
+                ordinary_colour_opencl=ordinary_colour_opencl_enabled,
+                ffmpeg_input_pixel_format=ffmpeg_input_pixel_format,
             )
         finally:
             _destroy_native_references(native_library, native_references)
@@ -12103,9 +17187,11 @@ def render_video(
             process,
             ffmpeg_diagnostics,
             ffmpeg_reader,
+            ffmpeg_input_pixel_format,
         )
         chunk_index = 0
         field = None
+        field_planes = None
         field_source_zoom = None
         field_max_zoom = None
         field_iter = None
@@ -12128,7 +17214,7 @@ def render_video(
             )
             keyframe_started = time.perf_counter()
             if field is None:
-                field = _keyframe_field(
+                rendered_field = _keyframe_field(
                     cache_dir=cache_dir,
                     cache_identity=cache_identity,
                     renderer=active_renderer,
@@ -12150,7 +17236,14 @@ def render_video(
                     cache_evictor=cache_evictor,
                     formula=formula,
                     julia_constant=julia_constant,
+                    return_planes=(
+                        kfp_plane_enabled
+                    ),
                 )
+                if kfp_plane_enabled:
+                    field, field_planes = rendered_field
+                else:
+                    field, field_planes = rendered_field, None
                 field_source_zoom = chunk_log_zoom
                 field_max_zoom = chunk_max_zoom
                 field_iter = current_iter
@@ -12168,6 +17261,7 @@ def render_video(
                 print("Using prefetched next keyframe.", flush=True)
 
             next_field = None
+            next_field_planes = None
             next_log_zoom = None
             next_max_zoom = None
             next_iter = None
@@ -12185,7 +17279,7 @@ def render_video(
                         iterations_per_decade,
                         iteration_cap,
                     )
-                    next_field = _keyframe_field(
+                    rendered_next = _keyframe_field(
                         cache_dir=cache_dir,
                         cache_identity=cache_identity,
                         renderer=active_renderer,
@@ -12207,7 +17301,14 @@ def render_video(
                         cache_evictor=cache_evictor,
                         formula=formula,
                         julia_constant=julia_constant,
+                        return_planes=(
+                            kfp_plane_enabled
+                        ),
                     )
+                    if kfp_plane_enabled:
+                        next_field, next_field_planes = rendered_next
+                    else:
+                        next_field, next_field_planes = rendered_next, None
                     _prune_cache(cache_dir, cache_limit_mb, cache_evictor)
                 else:
                     next_log_zoom = None
@@ -12237,6 +17338,9 @@ def render_video(
                     palette,
                     pitch,
                     palette_file,
+                    kfp_profile_override=kfp_profile,
+                    planes=field_planes,
+                    ordinary_gpu=ordinary_colour_opencl_enabled,
                 )
                 if next_field is not None and next_log_zoom is not None and next_iter is not None:
                     progress = (frame_index - chunk_start) / max(
@@ -12269,6 +17373,9 @@ def render_video(
                             palette,
                             pitch,
                             palette_file,
+                            kfp_profile_override=kfp_profile,
+                            planes=next_field_planes,
+                            ordinary_gpu=ordinary_colour_opencl_enabled,
                         )
                         rgb = np.asarray(
                             np.rint(
@@ -12301,6 +17408,7 @@ def render_video(
             if next_field is None:
                 del field
                 field = None
+                field_planes = None
                 field_source_zoom = None
                 field_max_zoom = None
                 field_iter = None
@@ -12308,6 +17416,7 @@ def render_video(
                 # Critical rolling-keyframe reuse: this field becomes the
                 # current field for the next chunk without another render.
                 field = next_field
+                field_planes = next_field_planes
                 field_source_zoom = next_log_zoom
                 field_max_zoom = next_max_zoom
                 field_iter = next_iter
@@ -12738,15 +17847,19 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
         "--native-threads",
         type=int,
         default=0,
-        help="OpenMP threads for the native renderer; 0 uses the runtime default",
+        help=(
+            "OpenMP threads for the native renderer; 0 uses the bounded default "
+            f"(up to {DEFAULT_NATIVE_THREAD_LIMIT}, reserving "
+            f"{DEFAULT_NATIVE_CPU_RESERVE})"
+        ),
     )
     parser.add_argument(
         "--native-backend",
         choices=("auto", "scalar", "avx2", "opencl"),
         default="auto",
         help=(
-            "native field backend: auto selects AVX2 when available; opencl is "
-            "an opt-in direct/shallow preview backend"
+            "native field backend: auto selects the measured AVX2/OpenCL path "
+            "for the workload; opencl forces the OpenCL device explicitly"
         ),
     )
     parser.add_argument(
@@ -12782,8 +17895,9 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
         choices=RESAMPLE_CHOICES,
         default="nearest",
         help=(
-            "final output resize filter; nearest keeps lossless-compressed "
-            "profiles crisp while the internal atlas remains continuous"
+            "final output resize filter; ordinary lossless-compressed profiles "
+            "default to nearest, while resized KFP output follows Kalles with "
+            "Lanczos and the internal atlas remains continuous"
         ),
     )
     parser.add_argument(
@@ -12796,8 +17910,39 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
         "--palette-file",
         type=Path,
         default=None,
-        help="optional .txt or KFP colour-stop file, interpolated per frame",
+        help="optional .txt or KFP colour-stop file",
     )
+    kfp_3d_group = parser.add_mutually_exclusive_group()
+    kfp_3d_group.add_argument(
+        "--kfp-3d",
+        dest="kfp_3d",
+        action="store_true",
+        help=(
+            "enable Kalles' slope/3D relief pass for a KFP palette, "
+            "including its bright/white relief highlights"
+        ),
+    )
+    kfp_3d_group.add_argument(
+        "--no-kfp-3d",
+        dest="kfp_3d",
+        action="store_false",
+        help="disable Kalles' relief/highlight pass and keep a flat KFP palette",
+    )
+    parser.set_defaults(kfp_3d=None)
+    kfp_glitches_group = parser.add_mutually_exclusive_group()
+    kfp_glitches_group.add_argument(
+        "--kfp-glitches",
+        dest="kfp_glitches",
+        action="store_true",
+        help="show Kalles' glitch/bright transition artefacts for a KFP palette",
+    )
+    kfp_glitches_group.add_argument(
+        "--no-kfp-glitches",
+        dest="kfp_glitches",
+        action="store_false",
+        help="suppress Kalles' glitch/bright transition artefacts for a KFP palette",
+    )
+    parser.set_defaults(kfp_glitches=None)
     parser.add_argument(
         "--glow",
         type=float,
@@ -12814,7 +17959,10 @@ def build_parser(argv: Optional[list[str]] = None) -> argparse.ArgumentParser:
         "--encoder-threads",
         type=int,
         default=0,
-        help="FFmpeg encoder threads; 0 lets FFmpeg choose, lower values reduce CPU contention",
+        help=(
+            "FFmpeg encoder threads; 0 uses the bounded default (at most "
+            f"{DEFAULT_ENCODER_THREAD_LIMIT}) and leaves CPU headroom"
+        ),
     )
     parser.add_argument(
         "--cache-dir",
@@ -13146,6 +18294,8 @@ def _main_impl() -> None:
             args.motion_blur,
             args.lossless,
             args.source_mode,
+            args.kfp_3d,
+            args.kfp_glitches,
         )
     except Exception as error:
         if manifest_path is not None:

@@ -29,19 +29,20 @@ import visualizer
 
 LIVE_AUDIO_SAMPLE_RATE = 8_000
 # The live window may be enlarged to the monitor, but its working source is a
-# real widescreen 480p frame.  This is deliberately separate from export
-# resolution: Cairo performs the final nearest-neighbour enlargement once.
-LIVE_DEFAULT_WIDTH = 854
-LIVE_DEFAULT_HEIGHT = 480
+# real widescreen 540p frame. This is deliberately separate from export
+# resolution: ordinary palettes use a crisp nearest-neighbour enlargement,
+# while KFP palettes use Cairo's smooth best-quality filter.
+LIVE_DEFAULT_WIDTH = 960
+LIVE_DEFAULT_HEIGHT = 540
 LIVE_DEFAULT_FPS = 30
 LIVE_MAX_FPS = 60
-# Live view renders one bounded 854x480 source surface and only enlarges that
+# Live view renders one bounded 960x540 source surface and only enlarges that
 # surface in GTK/Cairo. Keep the same source dimensions for every native
 # formula; a hidden 144p Burning Ship exception was one reason the preview
 # looked like a postage stamp at deep zoom. The Python fallback keeps the same
 # geometry too, although native is strongly preferred for deep previews.
-LIVE_NATIVE_MAX_WIDTH = 854
-LIVE_NATIVE_MAX_HEIGHT = 480
+LIVE_NATIVE_MAX_WIDTH = 960
+LIVE_NATIVE_MAX_HEIGHT = 540
 LIVE_NATIVE_ALTERNATE_MAX_WIDTH = LIVE_NATIVE_MAX_WIDTH
 LIVE_NATIVE_ALTERNATE_MAX_HEIGHT = LIVE_NATIVE_MAX_HEIGHT
 LIVE_PYTHON_MAX_WIDTH = LIVE_NATIVE_MAX_WIDTH
@@ -52,7 +53,7 @@ LIVE_DEFAULT_MAX_ZOOM = "1e4"
 # alternate-formula path is deliberately not made a blocking screensaver.
 LIVE_MAX_PREVIEW_LOG_ZOOM = 300.0
 # Keep live view's atlas at about 0.60 decades per replacement: that gives it
-# enough intermediate coverage to hide tile changes without making the 480p
+# enough intermediate coverage to hide tile changes without making the 540p
 # source handoff obvious.
 # The first fields are prepared before audio playback starts. Once the camera
 # has coverage for this fraction of the song, the remaining source ladder is
@@ -67,7 +68,7 @@ LIVE_INITIAL_SOURCE_COUNT = 3
 # Playback starts only after source coverage reaches this fraction of the
 # first loop. This is based on the highest zoom actually visited in the prefix,
 # not merely on a source-count percentage, so audio-driven pullbacks are safe.
-LIVE_PRERENDER_FRACTION = 0.75
+LIVE_PRERENDER_FRACTION = 0.60
 # Keep the old name as the minimum for callers/tests that used the original
 # fixed-budget preview.  Deep alternate formulas need a larger budget: a
 # fixed 192-iteration cap classifies an e150 boundary tile as entirely
@@ -96,32 +97,66 @@ def _find_live_tool(name: str) -> Optional[str]:
 
 
 def _live_available_cpu_count() -> int:
-    """Return the number of CPUs available to this live-view process."""
+    """Return the bounded automatic CPU count for this live-view process."""
 
-    try:
-        return max(1, len(os.sched_getaffinity(0)))
-    except (AttributeError, OSError):
-        return max(1, os.cpu_count() or 1)
+    return visualizer._default_native_thread_count()
 
 
-# Pass the full available team size into every native live call. The export
-# pipeline deliberately interprets zero as a conservative host default, but a
-# screensaver should use all CPUs unless the GUI/CLI supplies an explicit
-# positive limit. This also overrides a stale OMP_NUM_THREADS inherited from a
-# shell or an already-running GUI process.
-LIVE_DEFAULT_NATIVE_THREADS = min(
-    visualizer.MAX_THREAD_COUNT,
-    _live_available_cpu_count(),
-)
+def _live_escape_radius_mode(config: LiveViewConfig) -> int:
+    """Use the same escape contract as export for the selected palette.
+
+    KFP profiles use Kalles' high bailout radius. Keeping this decision in
+    one helper is important: live sources, repair passes, and Python's
+    compatibility path must not silently disagree about what counts as an
+    escaped point.
+    """
+
+    profile = _live_kfp_profile(config)
+    return (
+        visualizer._kfp_escape_radius_mode(profile)
+        if profile is not None else 0
+    )
+
+
+def _live_coordinate_mode(config: LiveViewConfig) -> int:
+    """Use Kalles' pixel origin and four-unit viewport for every KFP file.
+
+    The bailout radius is a palette setting, not the coordinate convention.
+    A custom KFP can request the classic radius-2 field and still uses
+    FraktalSFT's ``i - width / 2`` / ``j - height / 2`` geometry.  Keeping
+    this decision separate prevents those palettes from silently switching
+    back to the project's 2.8-unit viewport in live mode.
+    """
+
+    profile = _live_kfp_profile(config)
+    return 1 if profile is not None else 0
+
+
+# Use the same bounded default as export. Both export and live view still
+# accept an explicit positive limit, while zero leaves CPU headroom for audio,
+# the desktop, and the player.
+LIVE_DEFAULT_NATIVE_THREADS = _live_available_cpu_count()
 # Source fields are prepared in the background. When playback catches the
 # builder, let the latest field carry the camera only to the next requested
 # source boundary, and approach that boundary at a bounded rate. Without
 # this, the camera freezes at the last completed field and then jumps when the
 # worker appends the next one, which looks like an atlas-tile slideshow.
 LIVE_MAX_ZOOM_RATE = 2.5
-# Cairo's public enum value for FILTER_NEAREST. Keeping this local avoids
-# importing cairo just to select the final display filter.
+# Cairo's public enum values. Keeping these local avoids importing cairo just
+# to select the final display filter.
 LIVE_CAIRO_FILTER_NEAREST = 3
+LIVE_CAIRO_FILTER_BEST = 2
+
+
+def _live_display_filter(config: LiveViewConfig) -> int:
+    """Choose a display filter that matches the palette's source detail."""
+
+    if config.palette == "kalles-default":
+        return LIVE_CAIRO_FILTER_BEST
+    palette_file = config.palette_file
+    if palette_file is not None and palette_file.suffix.casefold() == ".kfp":
+        return LIVE_CAIRO_FILTER_BEST
+    return LIVE_CAIRO_FILTER_NEAREST
 
 
 class _LiveCancelled(Exception):
@@ -139,6 +174,8 @@ class LiveViewConfig:
     julia_constant: tuple[str, str] = visualizer.DEFAULT_JULIA_C
     palette: str = "aurora"
     palette_file: Optional[Path] = None
+    kfp_3d: Optional[bool] = None
+    kfp_glitches: Optional[bool] = None
     width: int = LIVE_DEFAULT_WIDTH
     height: int = LIVE_DEFAULT_HEIGHT
     fps: int = LIVE_DEFAULT_FPS
@@ -147,6 +184,7 @@ class LiveViewConfig:
     fullscreen: bool = True
     base_zoom: str = "1.0"
     max_zoom: str = LIVE_DEFAULT_MAX_ZOOM
+    native_backend: str = "auto"
 
     def __post_init__(self) -> None:
         audio_path = Path(self.audio_path).expanduser()
@@ -185,6 +223,10 @@ class LiveViewConfig:
         object.__setattr__(self, "julia_constant", julia_constant)
         if self.palette not in visualizer.PALETTE_CHOICES:
             raise ValueError(f"unknown palette: {self.palette}")
+        if self.kfp_3d is not None and not isinstance(self.kfp_3d, bool):
+            raise ValueError("live KFP 3D override must be true, false, or unset")
+        if self.kfp_glitches is not None and not isinstance(self.kfp_glitches, bool):
+            raise ValueError("live KFP glitches override must be true, false, or unset")
         if self.palette_file is not None:
             palette_file = Path(self.palette_file).expanduser()
             if not palette_file.is_file():
@@ -219,6 +261,10 @@ class LiveViewConfig:
                 f"live native threads must be at most {visualizer.MAX_THREAD_COUNT}"
             )
         object.__setattr__(self, "native_threads", native_threads)
+        native_backend = str(self.native_backend).strip().lower()
+        if native_backend != "auto" and native_backend not in visualizer.NATIVE_BACKEND_NAMES:
+            raise ValueError(f"unknown native backend: {native_backend}")
+        object.__setattr__(self, "native_backend", native_backend)
 
     @property
     def base_log_zoom(self) -> float:
@@ -235,6 +281,21 @@ class LiveViewConfig:
     @property
     def preview_zoom_is_capped(self) -> bool:
         return self.preview_max_log_zoom < self.max_log_zoom - 1.0e-9
+
+
+def _live_kfp_profile(config: LiveViewConfig) -> Any:
+    """Resolve the selected KFP recipe with every live-only override applied."""
+
+    return visualizer._kfp_profile_with_glitches(
+        visualizer._kfp_profile_with_3d(
+            visualizer._kfp_profile_for_selection(
+                config.palette,
+                config.palette_file,
+            ),
+            config.kfp_3d,
+        ),
+        config.kfp_glitches,
+    )
 
 
 @dataclass(frozen=True)
@@ -256,12 +317,13 @@ class LiveAudioTrack:
 
 @dataclass(frozen=True)
 class LiveZoomSources:
-    """Absolute-zoom scalar fields used by the live parent/child compositor."""
+    """Absolute-zoom fields and optional Kalles orbit planes."""
 
     log_zooms: Any
     fields: tuple[Any, ...]
     iteration_caps: tuple[int, ...] = ()
     capped: bool = False
+    planes: tuple[Optional[visualizer.KfpFramePlanes], ...] = ()
 
 
 @dataclass
@@ -272,6 +334,11 @@ class LiveZoomSourceStore:
     _log_zooms: list[float] = field(default_factory=list, init=False, repr=False)
     _fields: list[Any] = field(default_factory=list, init=False, repr=False)
     _iteration_caps: list[int] = field(default_factory=list, init=False, repr=False)
+    _planes: list[Optional[visualizer.KfpFramePlanes]] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
     _capped: bool = field(default=False, init=False, repr=False)
     _finished: bool = field(default=False, init=False, repr=False)
     _error: Optional[BaseException] = field(default=None, init=False, repr=False)
@@ -301,11 +368,18 @@ class LiveZoomSourceStore:
         with self._condition:
             return self._error
 
-    def append(self, log_zoom: float, field_value: Any, iteration_cap: int) -> None:
+    def append(
+        self,
+        log_zoom: float,
+        field_value: Any,
+        iteration_cap: int,
+        planes_value: Optional[visualizer.KfpFramePlanes] = None,
+    ) -> None:
         with self._condition:
             self._log_zooms.append(float(log_zoom))
             self._fields.append(field_value)
             self._iteration_caps.append(int(iteration_cap))
+            self._planes.append(planes_value)
             self._snapshot_cache = None
             self._condition.notify_all()
 
@@ -381,6 +455,7 @@ class LiveZoomSourceStore:
                     tuple(self._fields),
                     tuple(self._iteration_caps),
                     self._capped,
+                    tuple(self._planes),
                 )
             return self._snapshot_cache
 
@@ -395,9 +470,9 @@ def live_dimensions(
     """Return a bounded 16:9-ish source size that the live view can upscale.
 
     The requested dimensions describe the window/aspect ratio. Native and
-    Python live sources are capped at a real 854x480 480p working frame; the
-    display may enlarge that frame to fullscreen with nearest-neighbour
-    sampling.
+    Python live sources are capped at a real 960x540 540p working frame; the
+    display enlarges that frame to fullscreen with a palette-appropriate
+    filter (smooth for KFP, crisp for ordinary palettes).
     """
 
     try:
@@ -535,6 +610,18 @@ def live_iteration_cap(formula: str, log_zoom: float) -> int:
         # preperiod than the Mandelbrot reference path.
         base, per_decade = 256.0, 5.0
     requested = max(LIVE_MIN_ITERATIONS, int(math.ceil(base + per_decade * log_zoom)))
+    # The logarithmic estimate is enough for the first few sources, but it is
+    # not enough to resolve a deep Kalles reference.  At e96 the 2,048/4,096
+    # pass can still classify every pixel as bounded; at e150 the first
+    # structured pass is around 12k iterations.  Use stable bands rather than
+    # a per-tile staircase so adjacent live tiles have comparable detail and
+    # the worker does not keep retrying a source after playback starts.
+    if log_zoom >= 112.0:
+        requested = max(requested, 16_384)
+    elif log_zoom >= 64.0:
+        requested = max(requested, 8_192)
+    elif log_zoom >= 32.0:
+        requested = max(requested, 4_096)
     quantised = int(
         math.ceil(requested / LIVE_ITERATION_QUANTUM) * LIVE_ITERATION_QUANTUM
     )
@@ -777,10 +864,13 @@ def _render_live_source(
     max_iter: int = LIVE_ITERATIONS,
     native_references: Optional[list[tuple[float, Any]]] = None,
     native_threads_override: Optional[int] = None,
+    return_planes: bool = False,
 ) -> Any:
     """Render one absolute-zoom source with the cheapest valid backend."""
 
     max_iter = visualizer._validate_iteration_count(max_iter, "live iteration cap")
+    live_escape_radius_mode = _live_escape_radius_mode(config)
+    live_coordinate_mode = _live_coordinate_mode(config)
     if native_threads_override is None:
         render_threads = (
             config.native_threads
@@ -792,21 +882,72 @@ def _render_live_source(
             native_threads_override,
             "live source native thread count",
         )
-    render_options = None
+    # A scalar-only KFP recipe keeps its exact CPU SetColor transfer and has
+    # a different field crossover because Kalles uses a high bailout. Work
+    # this out before choosing the live source backend so the direct-GPU
+    # shortcut below cannot override the measured policy.
+    kfp_profile = _live_kfp_profile(config)
+    kfp_scalar = kfp_profile is not None and not return_planes
+    native_backend = 0
     if native_library is not None:
         try:
-            render_options = visualizer.NativeRenderOptions(
-                strict=False,
-                allow_recovery=True,
-                backend=visualizer._native_backend_id("auto", native_library),
+            native_backend = visualizer._native_backend_for_workload(
+                config.native_backend,
+                native_library,
+                source_width,
+                source_height,
+                log_zoom,
+                config.formula,
+                live_source=True,
+                kfp_planes=return_planes,
+                kfp_scalar=kfp_scalar,
             )
         except (OSError, RuntimeError, ValueError):
-            render_options = visualizer.NativeRenderOptions(
-                strict=False,
-                allow_recovery=True,
-            )
+            native_backend = 0
+        # At the fixed 960x540 live source, the direct OpenCL kernels are
+        # cheaper than re-running an ordinary field on the CPU. Every
+        # supported non-KFP formula also shares the scaled perturbation GPU
+        # path at deep zoom. Mandelbrot KFP plane sources use the same device
+        # metadata kernel at deep zoom; alternate-formula planes stay scalar.
+        shallow_gpu_formula = config.formula in {
+            "mandelbrot", "julia", "burning-ship", "tricorn"
+        }
+        deep_gpu_formula = shallow_gpu_formula
+        if config.native_backend == "auto" and not return_planes and not kfp_scalar and (
+            (log_zoom < 12.0 and shallow_gpu_formula)
+            or (log_zoom >= 12.0 and deep_gpu_formula)
+        ):
+            try:
+                native_backend = visualizer._native_backend_id("opencl", native_library)
+            except (OSError, RuntimeError, ValueError):
+                pass
+    if return_planes and not (
+        config.formula == "mandelbrot" and native_backend == 2
+    ):
+        # Point-based repair and alternate-formula plane output still use the
+        # scalar ABI. Do not force deep Mandelbrot sources off the dedicated
+        # OpenCL metadata kernel.
+        native_backend = 0
+    # Also pass the options object to the explicit Python compatibility path;
+    # native and fallback live sources must agree on the bailout contract.
+    render_options = visualizer.NativeRenderOptions(
+        # Let the validator see perturbation failures as NaNs.  Native
+        # recovery can turn a numerically bad deep pixel into a finite value
+        # before the validator gets a chance to retarget the BLA reference,
+        # which is how a live tile could appear as a black/noisy rectangle
+        # even though the adaptive repair path was available.
+        strict=True,
+        allow_recovery=False,
+        backend=native_backend,
+        escape_radius_mode=live_escape_radius_mode,
+        coordinate_mode=live_coordinate_mode,
+        plane_flags=visualizer._native_kfp_plane_flags(kfp_profile),
+    )
 
     np = visualizer._require_numpy()
+
+    def pack(field_value: Any, planes_value: Any = None) -> Any:
+        return (field_value, planes_value) if return_planes else field_value
 
     def validated_native_result(
         result: Any,
@@ -815,9 +956,21 @@ def _render_live_source(
     ) -> Any:
         """Repair a rare strict-BLA NaN mask before it reaches the GUI."""
 
+        result_planes = None
+        if return_planes:
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise RuntimeError("native live source did not return Kalles orbit planes")
+            result, result_planes = result
         array = np.asarray(result, dtype=np.float32)
-        if np.isfinite(array).all():
-            return array
+        planes_complete = (
+            not return_planes
+            or visualizer._kfp_render_planes_complete(result_planes, array.shape)
+        )
+        if np.isfinite(array).all() and planes_complete:
+            return pack(
+                array,
+                visualizer._compact_kfp_render_planes(kfp_profile, result_planes),
+            )
         if native_library is not None and reference is not None:
             backend = int(getattr(render_options, "backend", 0))
             try:
@@ -835,16 +988,37 @@ def _render_live_source(
                     native_backend=backend,
                     native_reference=reference,
                     native_reference_root=reference_root,
+                    escape_radius_mode=live_escape_radius_mode,
+                    coordinate_mode=live_coordinate_mode,
                     fallback_field=None,
                     fallback_zoom_factor=1.0,
                     fallback_max_iter=None,
                     allow_recovery=False,
                     formula=config.formula,
                     julia_constant=config.julia_constant,
+                    return_planes=return_planes,
                 )
+                repaired_planes = None
+                if return_planes:
+                    repaired, repaired_planes = repaired
                 repaired = np.asarray(repaired, dtype=np.float32)
-                if np.isfinite(repaired).all():
-                    return repaired
+                repaired_planes_complete = (
+                    not return_planes
+                    or visualizer._kfp_render_planes_complete(
+                        repaired_planes, repaired.shape
+                    )
+                )
+                if np.isfinite(repaired).all() and repaired_planes_complete:
+                    # A repaired deep/reference path has no matching orbit
+                    # metadata. Keep it scalar rather than pairing planes
+                    # from a different field with the repaired image.
+                    return pack(
+                        repaired,
+                        visualizer._compact_kfp_render_planes(
+                            kfp_profile,
+                            repaired_planes,
+                        ),
+                    )
             except (RuntimeError, ValueError):
                 pass
         # This path is exceptional and only runs when the native strict pass
@@ -852,7 +1026,7 @@ def _render_live_source(
         # partially initialized buffer, which presents as black noise or a
         # rectangular fill artifact.
         if log_zoom <= 300.0:
-            return np.asarray(
+            return pack(np.asarray(
                 visualizer.render_fractal(
                     source_width,
                     source_height,
@@ -862,12 +1036,13 @@ def _render_live_source(
                     max_iter,
                     renderer="python",
                     native_threads=render_threads,
+                    render_options=render_options,
                     formula=config.formula,
                     julia_constant=config.julia_constant,
                 ),
                 dtype=np.float32,
-            )
-        return array
+            ))
+        return pack(array)
 
     # Reuse the same depth-safe references for every live source. Rebuilding a
     # reference orbit once per ladder entry was the main reason a deep live
@@ -899,6 +1074,7 @@ def _render_live_source(
                         render_options=render_options,
                         formula=config.formula,
                         julia_constant=config.julia_constant,
+                        return_planes=return_planes,
                     ),
                     shared_reference,
                     native_references[0][1] if native_references else None,
@@ -909,18 +1085,22 @@ def _render_live_source(
                 # bounded Python fallback preserves the exact decimal centre.
                 if log_zoom > 300.0:
                     raise
-                return visualizer.render_fractal(
-                    source_width,
-                    source_height,
-                    log_zoom,
-                    config.x_center,
-                    config.y_center,
-                    max_iter,
-                    renderer="python",
-                    native_threads=render_threads,
-                    formula=config.formula,
-                    julia_constant=config.julia_constant,
-                )
+                return pack(np.asarray(
+                    visualizer.render_fractal(
+                        source_width,
+                        source_height,
+                        log_zoom,
+                        config.x_center,
+                        config.y_center,
+                        max_iter,
+                        renderer="python",
+                        native_threads=render_threads,
+                        render_options=render_options,
+                        formula=config.formula,
+                        julia_constant=config.julia_constant,
+                    ),
+                    dtype=np.float32,
+                ))
         reference_library: Any = None
         reference: Any = None
         try:
@@ -932,6 +1112,8 @@ def _render_live_source(
                 3,
                 log_zoom,
                 image_series_order=16,
+                escape_radius_mode=live_escape_radius_mode,
+                coordinate_mode=live_coordinate_mode,
                 formula=config.formula,
                 julia_constant=config.julia_constant,
             )
@@ -951,6 +1133,7 @@ def _render_live_source(
                     render_options=render_options,
                     formula=config.formula,
                     julia_constant=config.julia_constant,
+                    return_planes=return_planes,
                 ),
                 reference,
             )
@@ -962,18 +1145,22 @@ def _render_live_source(
             # their stricter native error instead of hiding it.
             if log_zoom > 300.0:
                 raise
-            return visualizer.render_fractal(
-                source_width,
-                source_height,
-                log_zoom,
-                config.x_center,
-                config.y_center,
-                max_iter,
-                renderer="python",
-                native_threads=render_threads,
-                formula=config.formula,
-                julia_constant=config.julia_constant,
-            )
+            return pack(np.asarray(
+                visualizer.render_fractal(
+                    source_width,
+                    source_height,
+                    log_zoom,
+                    config.x_center,
+                    config.y_center,
+                    max_iter,
+                    renderer="python",
+                    native_threads=render_threads,
+                    render_options=render_options,
+                    formula=config.formula,
+                    julia_constant=config.julia_constant,
+                ),
+                dtype=np.float32,
+            ))
         finally:
             if reference_library is not None and reference is not None:
                 reference_library.fractal_destroy_reference(reference)
@@ -997,6 +1184,7 @@ def _render_live_source(
             render_options=render_options,
             formula=config.formula,
             julia_constant=config.julia_constant,
+            return_planes=return_planes,
         )
     except RuntimeError:
         # A reference can be rejected when a user supplied centre has fewer
@@ -1004,7 +1192,7 @@ def _render_live_source(
         # be useful; its explicit Python fallback is preferable to a stale or
         # synthetic black field. Final export validation remains strict.
         if renderer != "python" and log_zoom <= 300.0:
-            return visualizer.render_fractal(
+            return pack(visualizer.render_fractal(
                 source_width,
                 source_height,
                 log_zoom,
@@ -1013,9 +1201,10 @@ def _render_live_source(
                 max_iter,
                 renderer="python",
                 native_threads=render_threads,
+                render_options=render_options,
                 formula=config.formula,
                 julia_constant=config.julia_constant,
-            )
+            ))
         raise
 
 
@@ -1025,6 +1214,8 @@ def _prepare_live_native_references(
 ) -> list[tuple[float, Any]]:
     """Prepare one reusable reference ladder for all deep live sources."""
 
+    live_escape_radius_mode = _live_escape_radius_mode(config)
+    live_coordinate_mode = _live_coordinate_mode(config)
     if native_library is None or config.preview_max_log_zoom < 12.0:
         return []
     np = visualizer._require_numpy()
@@ -1051,15 +1242,24 @@ def _prepare_live_native_references(
         LIVE_MAX_ITERATIONS,
         live_iteration_cap(config.formula, config.preview_max_log_zoom),
     )
+    if config.formula == "mandelbrot":
+        tier_creator_available = hasattr(
+            native_library,
+            "fractal_create_reference_reusable_options"
+            if live_escape_radius_mode
+            else "fractal_create_reference_reusable",
+        )
+    else:
+        tier_creator_available = hasattr(
+            native_library,
+            "fractal_create_reference_ex_options"
+            if live_escape_radius_mode
+            else "fractal_create_reference_ex",
+        )
     clone_tiers = (
         len(reference_logs) > 1
         and hasattr(native_library, "fractal_clone_reference")
-        and (
-            config.formula == "mandelbrot"
-            and hasattr(native_library, "fractal_create_reference_reusable")
-            or config.formula != "mandelbrot"
-            and hasattr(native_library, "fractal_create_reference_ex")
-        )
+        and tier_creator_available
     )
     try:
         _, root_reference = visualizer._create_native_reference(
@@ -1071,6 +1271,8 @@ def _prepare_live_native_references(
             reference_logs[0],
             image_series_order=16,
             reusable=clone_tiers,
+            escape_radius_mode=live_escape_radius_mode,
+            coordinate_mode=live_coordinate_mode,
             formula=config.formula,
             julia_constant=config.julia_constant,
         )
@@ -1095,6 +1297,8 @@ def _prepare_live_native_references(
                     3,
                     start_log,
                     image_series_order=16,
+                    escape_radius_mode=live_escape_radius_mode,
+                    coordinate_mode=live_coordinate_mode,
                     formula=config.formula,
                     julia_constant=config.julia_constant,
                 )
@@ -1142,6 +1346,23 @@ def build_live_zoom_sources(
             raise ValueError("live source limit must be an integer") from error
         if max_sources <= 0:
             raise ValueError("live source limit must be positive")
+    kfp_profile = _live_kfp_profile(config)
+    # Alternate recurrences do not share Mandelbrot's scalar bailout
+    # interpretation at deep zoom. Keep their orbit metadata available to the
+    # Kalles colour pass even when the palette itself only asks for ordinary
+    # finite-difference relief. The scalar-only shortcut remains enabled for
+    # the common Mandelbrot live path, where it is both equivalent and much
+    # cheaper.
+    alternate_formula = str(config.formula).strip().lower() != "mandelbrot"
+    kfp_plane_enabled = bool(
+        kfp_profile is not None
+        and (
+            visualizer._kfp_requires_render_planes(kfp_profile)
+            or alternate_formula
+        )
+        and native_library is not None
+        and hasattr(native_library, "render_fractal_ex_planes")
+    )
     truncated_for_budget = False
     start_index = store.count
     try:
@@ -1163,19 +1384,28 @@ def build_live_zoom_sources(
             # Retry only that pathological case, and only as far as the bounded
             # live budget allows; ordinary sources still pay for one render.
             field = None
+            planes = None
             final_iter = source_iter
+            # The native plane ABI carries formula-specific derivatives as
+            # well as Mandelbrot orbit data.  Keep the Kalles colouriser on
+            # the Julia, Tricorn, and Burning Ship live paths too; limiting
+            # planes to shallow alternate-formula tiles silently switched
+            # deep live sources back to the scalar/Python colouriser.
+            want_planes = kfp_plane_enabled
+            plane_kwargs = {"return_planes": True} if want_planes else {}
             while True:
                 if native_references is None and source_native_threads is None:
-                    field = _render_live_source(
+                    rendered = _render_live_source(
                         config,
                         source_width,
                         source_height,
                         source_log_zoom,
                         native_library,
                         final_iter,
+                        **plane_kwargs,
                     )
                 elif source_native_threads is None:
-                    field = _render_live_source(
+                    rendered = _render_live_source(
                         config,
                         source_width,
                         source_height,
@@ -1183,9 +1413,10 @@ def build_live_zoom_sources(
                         native_library,
                         final_iter,
                         native_references,
+                        **plane_kwargs,
                     )
                 else:
-                    field = _render_live_source(
+                    rendered = _render_live_source(
                         config,
                         source_width,
                         source_height,
@@ -1194,7 +1425,12 @@ def build_live_zoom_sources(
                         final_iter,
                         native_references,
                         source_native_threads,
+                        **plane_kwargs,
                     )
+                if want_planes:
+                    field, planes = rendered
+                else:
+                    field, planes = rendered, None
                 field = visualizer._validated_field(
                     field,
                     (source_height, source_width),
@@ -1244,7 +1480,7 @@ def build_live_zoom_sources(
                         f"{final_iter} iterations"
                     )
                 break
-            store.append(source_log_zoom, field, final_iter)
+            store.append(source_log_zoom, field, final_iter, planes)
         is_complete = store.count >= len(requested_logs) or truncated_for_budget
         if max_sources is None or is_complete:
             store.finish(
@@ -1304,11 +1540,13 @@ def _live_kfp_static_profile(
         "fractal_atlas_composite_rgb",
     ):
         return None
-    profile = visualizer._kfp_profile_for_selection(
-        config.palette,
-        config.palette_file,
-    )
+    profile = _live_kfp_profile(config)
     if profile is None:
+        return None
+    if visualizer._kfp_has_texture(profile):
+        # The cached-RGB live shortcut has no texture pixel buffer. Keep the
+        # full Kalles texture warp/blend on visualizer's portable path so a
+        # textured profile cannot silently degrade into the scalar palette.
         return None
     try:
         phase_strength = float(profile.phase_color_strength)
@@ -1325,6 +1563,7 @@ def _live_kfp_colour_tile(
     profile: Any,
     native_library: Any,
     native_threads: int,
+    use_opencl: bool = False,
 ) -> Any:
     """Colour one live KFP source once, keeping the hot path crop-only."""
 
@@ -1340,6 +1579,7 @@ def _live_kfp_colour_tile(
         native_library,
         int(native_threads),
         precise=False,
+        use_opencl=bool(use_opencl),
     )
     rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
     expected_shape = np.asarray(field).shape + (3,)
@@ -1349,6 +1589,45 @@ def _live_kfp_colour_tile(
             f"{rgb.shape}, expected {expected_shape}"
         )
     return rgb
+
+
+def _live_opencl_atlas_available(
+    config: LiveViewConfig,
+    native_library: Any,
+    source_width: int,
+    source_height: int,
+    log_zoom: float,
+) -> bool:
+    """Return whether this live ordinary field was selected for OpenCL.
+
+    Live source construction and live RGB composition must make the same
+    backend decision.  Checking only for ``native_backend == "opencl"``
+    leaves the normal GUI ``auto`` mode rendering fields on OpenCL and then
+    needlessly colourising them on the CPU.
+    """
+
+    if native_library is None:
+        return False
+    if not (
+        hasattr(native_library, "fractal_atlas_colourise_opencl_accents")
+        or hasattr(native_library, "fractal_atlas_colourise_opencl")
+    ):
+        return False
+    try:
+        backend = visualizer._native_backend_for_workload(
+            config.native_backend,
+            native_library,
+            int(source_width),
+            int(source_height),
+            float(log_zoom),
+            config.formula,
+            live_source=True,
+            kfp_planes=False,
+            kfp_scalar=False,
+        )
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return False
+    return int(backend) == 2
 
 
 def _live_colour_frame(
@@ -1362,6 +1641,7 @@ def _live_colour_frame(
     config: LiveViewConfig,
     kfp_colour_cache: Optional[dict[int, Any]] = None,
     kfp_profile: Any = None,
+    ordinary_field_cache_tokens: Optional[dict[int, int]] = None,
 ) -> Any:
     """Compose one continuous frame from the absolute live source ladder."""
 
@@ -1386,6 +1666,12 @@ def _live_colour_frame(
     index = int(np.searchsorted(logs, bounded_log_zoom, side="right") - 1)
     index = max(0, min(index, len(sources.fields) - 1))
     parent = sources.fields[index]
+    source_planes = getattr(sources, "planes", ())
+    parent_planes = (
+        source_planes[index]
+        if len(source_planes) == len(sources.fields)
+        else None
+    )
     parent_log_zoom = float(logs[index])
     caps = sources.iteration_caps
     if len(caps) != len(sources.fields):
@@ -1399,21 +1685,84 @@ def _live_colour_frame(
     child_fraction = 0.0
     if index + 1 < len(sources.fields):
         child = sources.fields[index + 1]
+        child_planes = (
+            source_planes[index + 1]
+            if len(source_planes) == len(sources.fields)
+            else None
+        )
         child_log_zoom = float(logs[index + 1])
         child_interval_factor = _live_zoom_factor(child_log_zoom, parent_log_zoom)
         child_fraction = min(1.0, parent_zoom / child_interval_factor)
         child_iter = int(caps[index + 1])
+    else:
+        child_planes = None
     colour_threads = (
         config.native_threads
         if config.native_threads > 0
         else LIVE_DEFAULT_NATIVE_THREADS
     )
-    static_kfp_profile = (
+    selected_kfp_profile = (
         kfp_profile
         if kfp_profile is not None
-        else _live_kfp_static_profile(config, native_library)
-        if kfp_colour_cache is not None
+        else _live_kfp_profile(config)
+    )
+    static_profile_candidate = _live_kfp_static_profile(
+        config,
+        native_library,
+    )
+    if parent_planes is not None or child_planes is not None:
+        # Preserve the complete Kalles metadata until after the parent/child
+        # crop. A cached RGB tile would permanently discard phase, DE, and
+        # test-pair data before the displayed-pixel SetColor pass.
+        static_profile_candidate = None
+    static_kfp_profile = (
+        selected_kfp_profile
+        if (
+            kfp_colour_cache is not None
+            and selected_kfp_profile is not None
+            and static_profile_candidate is not None
+        )
         else None
+    )
+    kfp_gpu = bool(
+        config.native_backend == "opencl"
+        and native_library is not None
+        and hasattr(native_library, "fractal_colourise_kfp_opencl")
+        and visualizer._kfp_gpu_supported(selected_kfp_profile)
+        and parent_planes is None
+        and child_planes is None
+    )
+    ordinary_gpu = bool(
+        selected_kfp_profile is None
+        and _live_opencl_atlas_available(
+            config,
+            native_library,
+            parent.shape[1],
+            parent.shape[0],
+            bounded_log_zoom,
+        )
+    )
+
+    def ordinary_cache_token(source_index: int) -> int:
+        """Return a stable device-cache token for one immutable live field."""
+
+        if not ordinary_gpu or ordinary_field_cache_tokens is None:
+            return 0
+        source_index = int(source_index)
+        token = ordinary_field_cache_tokens.get(source_index)
+        if token is None:
+            token = visualizer._atlas_gpu_cache_token(
+                visualizer._next_atlas_gpu_cache_generation(),
+                source_index,
+            )
+            ordinary_field_cache_tokens[source_index] = token
+        return int(token)
+
+    ordinary_parent_cache_token = ordinary_cache_token(index)
+    ordinary_child_cache_token = (
+        ordinary_cache_token(index + 1)
+        if child is not None
+        else 0
     )
     kfp_parent_rgb = None
     kfp_child_rgb = None
@@ -1425,6 +1774,7 @@ def _live_colour_frame(
                 static_kfp_profile,
                 native_library,
                 colour_threads,
+                use_opencl=kfp_gpu,
             )
         kfp_parent_rgb = kfp_colour_cache[index]
         # Do not pre-colour the child. Its independently computed relief
@@ -1442,6 +1792,21 @@ def _live_colour_frame(
             "kfp_child_rgb": kfp_child_rgb,
             "use_static_kfp": True,
         }
+    if selected_kfp_profile is not None:
+        atlas_optional_kwargs["kfp_profile_override"] = selected_kfp_profile
+    if parent_planes is not None or child_planes is not None:
+        atlas_optional_kwargs["parent_planes"] = parent_planes
+        atlas_optional_kwargs["child_planes"] = child_planes
+    if kfp_gpu:
+        atlas_optional_kwargs["kfp_gpu"] = True
+    if ordinary_gpu:
+        atlas_optional_kwargs["ordinary_gpu"] = True
+        atlas_optional_kwargs["ordinary_parent_cache_token"] = (
+            ordinary_parent_cache_token
+        )
+        atlas_optional_kwargs["ordinary_child_cache_token"] = (
+            ordinary_child_cache_token
+        )
     return visualizer._atlas_colour_frame(
         parent,
         child,
@@ -1539,6 +1904,7 @@ if Gtk is not None:
             self._pixbuf: Any = None
             self._status_visible = True
             self._dismiss_status_on_frame = True
+            self._display_filter = _live_display_filter(config)
 
             if transient_for is not None:
                 self.set_transient_for(transient_for)
@@ -1696,7 +2062,7 @@ if Gtk is not None:
             context.translate(left, top)
             context.scale(scale, scale)
             Gdk.cairo_set_source_pixbuf(context, self._pixbuf, 0.0, 0.0)
-            context.get_source().set_filter(LIVE_CAIRO_FILTER_NEAREST)
+            context.get_source().set_filter(self._display_filter)
             context.paint()
             context.restore()
             return False
@@ -1735,6 +2101,13 @@ if Gtk is not None:
             source_builder_done = threading.Event()
             native_library: Any = None
             native_references: list[tuple[float, Any]] = []
+            live_atlas_environment = {
+                name: os.environ.get(name)
+                for name in (
+                    "FRACTAL_OPENCL_ATLAS_MAPS",
+                    "FRACTAL_OPENCL_ATLAS_FLOAT",
+                )
+            }
             try:
                 self._post_status("analysing audio…")
                 try:
@@ -1777,6 +2150,20 @@ if Gtk is not None:
                     return
 
                 self._post_status("preparing live zoom ladder…")
+                # Work out the bounded source size before loading the native
+                # library so the live-only OpenCL atlas defaults are selected
+                # from the actual 540p surface, not from a fullscreen window
+                # size supplied by a command-line caller.
+                source_width, source_height = live_dimensions(
+                    self.config.width,
+                    self.config.height,
+                    native_available=True,
+                    formula=self.config.formula,
+                )
+                visualizer._enable_opencl_atlas_maps(
+                    source_width,
+                    source_height,
+                )
                 try:
                     native_library = visualizer._get_native_library()
                 except (OSError, RuntimeError):
@@ -1882,7 +2269,7 @@ if Gtk is not None:
 
                 # Do not start the audio clock against a source ladder that
                 # only covers the first few preview tiles. Wait until the
-                # highest zoom visited in the first 75% of the song has a
+                # highest zoom visited in the first 60% of the song has a
                 # completed source. The rest of the ladder can then continue
                 # rendering concurrently with playback.
                 prerender_ready = source_store.count >= prerender_source_count
@@ -1958,6 +2345,16 @@ if Gtk is not None:
                             visualizer._terminate_subprocess(player)
                     except (AttributeError, OSError):
                         pass
+                # The live compositor selects its GPU kernel through process
+                # environment variables because the OpenCL program is built
+                # lazily. Restore the caller's environment when the window
+                # closes so a later GUI export is not accidentally forced
+                # onto the live-only FHD map/float variant.
+                for name, value in live_atlas_environment.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
 
         def _run_frames(
             self,
@@ -1978,15 +2375,26 @@ if Gtk is not None:
             if len(source_shape) != 2:
                 raise RuntimeError("live zoom source has invalid dimensions")
             # Keep the expensive KFP/Aurora colour pass at the bounded source
-            # density. The DrawingArea applies one nearest-neighbour upscale
-            # to the window; rendering a larger RGB frame here would do the
-            # same resize twice and make the GUI the dominant bottleneck.
+            # density. The DrawingArea applies the one final palette-specific
+            # upscale to the window; rendering a larger RGB frame here would
+            # do the same resize twice and make the GUI the bottleneck.
             source_height, source_width = int(source_shape[0]), int(source_shape[1])
             kfp_profile = _live_kfp_static_profile(
                 self.config,
                 native_library,
             )
             kfp_colour_cache = {} if kfp_profile is not None else None
+            ordinary_field_cache_tokens = (
+                {}
+                if (
+                    native_library is not None
+                    and (
+                        hasattr(native_library, "fractal_atlas_colourise_opencl_accents")
+                        or hasattr(native_library, "fractal_atlas_colourise_opencl")
+                    )
+                )
+                else None
+            )
             frame_interval = 1.0 / float(track.fps)
             started = time.monotonic()
             next_deadline = started
@@ -2069,10 +2477,11 @@ if Gtk is not None:
                     phase,
                     energy,
                     native_library,
-                    self.config,
-                    kfp_colour_cache,
-                    kfp_profile,
-                )
+            self.config,
+            kfp_colour_cache,
+            kfp_profile,
+            ordinary_field_cache_tokens,
+        )
                 self._publish_frame(np.asarray(rgb, dtype=np.uint8))
                 next_deadline += frame_interval
                 now = time.monotonic()
@@ -2111,10 +2520,13 @@ def _resolve_cli_config(args: argparse.Namespace) -> LiveViewConfig:
         julia_constant=julia_constant,
         palette=args.palette,
         palette_file=palette_file,
+        kfp_3d=args.kfp_3d,
+        kfp_glitches=args.kfp_glitches,
         width=args.width,
         height=args.height,
         fps=args.fps,
         native_threads=args.native_threads,
+        native_backend=args.native_backend,
         loop=args.loop,
         fullscreen=args.fullscreen,
         base_zoom=args.base_zoom,
@@ -2137,12 +2549,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--palette", choices=visualizer.PALETTE_CHOICES, default="aurora")
     parser.add_argument("--palette-file", type=Path, default=None)
+    kfp_3d_group = parser.add_mutually_exclusive_group()
+    kfp_3d_group.add_argument(
+        "--kfp-3d",
+        dest="kfp_3d",
+        action="store_true",
+        help=(
+            "enable Kalles' slope/3D relief pass for a KFP palette, "
+            "including its bright/white relief highlights"
+        ),
+    )
+    kfp_3d_group.add_argument(
+        "--no-kfp-3d",
+        dest="kfp_3d",
+        action="store_false",
+        help="disable Kalles' relief/highlight pass and keep a flat KFP palette",
+    )
+    parser.set_defaults(kfp_3d=None)
+    kfp_glitches_group = parser.add_mutually_exclusive_group()
+    kfp_glitches_group.add_argument(
+        "--kfp-glitches",
+        dest="kfp_glitches",
+        action="store_true",
+        help="show Kalles' glitch/bright transition artefacts for a KFP palette",
+    )
+    kfp_glitches_group.add_argument(
+        "--no-kfp-glitches",
+        dest="kfp_glitches",
+        action="store_false",
+        help="suppress Kalles' glitch/bright transition artefacts for a KFP palette",
+    )
+    parser.set_defaults(kfp_glitches=None)
     parser.add_argument("--base-zoom", default="1.0")
     parser.add_argument("--max-zoom", default=LIVE_DEFAULT_MAX_ZOOM)
     parser.add_argument("--width", type=int, default=LIVE_DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=LIVE_DEFAULT_HEIGHT)
     parser.add_argument("--fps", type=int, default=LIVE_DEFAULT_FPS)
     parser.add_argument("--native-threads", type=int, default=0)
+    parser.add_argument(
+        "--native-backend",
+        choices=("auto", "scalar", "avx2", "opencl"),
+        default="auto",
+        help="field and supported KFP colour backend (opencl enables the GPU path)",
+    )
     parser.add_argument("--no-loop", dest="loop", action="store_false")
     parser.set_defaults(loop=True)
     parser.add_argument("--windowed", dest="fullscreen", action="store_false")

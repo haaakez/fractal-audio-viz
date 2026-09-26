@@ -14,6 +14,16 @@ import visualizer
 
 
 class LiveViewHelperTests(unittest.TestCase):
+    def test_live_cli_preserves_kfp_glitch_override(self):
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            args = live_view.build_parser().parse_args(
+                [str(audio), "--no-kfp-glitches"]
+            )
+            config = live_view._resolve_cli_config(args)
+            self.assertFalse(config.kfp_glitches)
+
     def test_live_source_snapshots_are_cached_and_refresh_on_updates(self):
         store = live_view.LiveZoomSourceStore(np.asarray([0.0, 1.0]))
         store.append(0.0, np.zeros((4, 8), dtype=np.float32), 192)
@@ -141,18 +151,48 @@ class LiveViewHelperTests(unittest.TestCase):
     def test_live_dimensions_cap_the_source_but_keep_aspect(self):
         self.assertEqual(
             (live_view.LIVE_DEFAULT_WIDTH, live_view.LIVE_DEFAULT_HEIGHT),
-            (854, 480),
+            (960, 540),
         )
-        self.assertEqual(live_view.live_dimensions(3840, 2160), (853, 480))
+        self.assertEqual(live_view.live_dimensions(3840, 2160), (960, 540))
         self.assertEqual(
             live_view.live_dimensions(3840, 2160, formula="burning-ship"),
-            (853, 480),
+            (960, 540),
         )
         self.assertEqual(
             live_view.live_dimensions(3840, 2160, native_available=False),
-            (853, 480),
+            (960, 540),
         )
         self.assertEqual(live_view.live_dimensions(400, 200), (400, 200))
+
+    def test_kfp_live_display_uses_a_smooth_filter(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "song.mp3"
+            audio.write_bytes(b"audio")
+            kfp = root / "palette.kfp"
+            kfp.write_text("Colors: 0,0,0,255,255,255\n", encoding="utf-8")
+
+            ordinary = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="mandelbrot",
+                x_center="0.0",
+                y_center="0.0",
+            )
+            imported = replace(ordinary, palette_file=kfp)
+            builtin = replace(ordinary, palette="kalles-default")
+
+            self.assertEqual(
+                live_view._live_display_filter(ordinary),
+                live_view.LIVE_CAIRO_FILTER_NEAREST,
+            )
+            self.assertEqual(
+                live_view._live_display_filter(imported),
+                live_view.LIVE_CAIRO_FILTER_BEST,
+            )
+            self.assertEqual(
+                live_view._live_display_filter(builtin),
+                live_view.LIVE_CAIRO_FILTER_BEST,
+            )
 
     def test_live_dimensions_reject_invalid_values(self):
         with self.assertRaises(ValueError):
@@ -233,6 +273,8 @@ class LiveViewHelperTests(unittest.TestCase):
 
     def test_deep_formula_live_budgets_are_not_fixed_at_192(self):
         self.assertEqual(live_view.live_iteration_cap("mandelbrot", 0.0), 192)
+        self.assertGreaterEqual(live_view.live_iteration_cap("mandelbrot", 96.0), 8192)
+        self.assertEqual(live_view.live_iteration_cap("mandelbrot", 150.0), 16384)
         self.assertGreaterEqual(live_view.live_iteration_cap("burning-ship", 150.0), 700)
         self.assertGreaterEqual(live_view.live_iteration_cap("tricorn", 150.0), 900)
         self.assertGreaterEqual(live_view.live_iteration_cap("julia", 300.0), 1500)
@@ -250,7 +292,7 @@ class LiveViewHelperTests(unittest.TestCase):
                 formula="tricorn",
                 x_center="-1.00000000000000000000",
                 y_center="0.10000000000000000000",
-                max_zoom="1e4",
+                max_zoom="1e1",
             )
             calls = []
 
@@ -384,6 +426,126 @@ class LiveViewHelperTests(unittest.TestCase):
             self.assertEqual(result.shape, (4, 8))
             self.assertIs(render.call_args.kwargs["native_reference"], reference)
 
+    def test_kfp_live_source_uses_the_kalles_bailout_mode(self):
+        """Live KFP fields must use the same high bailout as export fields."""
+
+        palette_file = Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp"
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="mandelbrot",
+                x_center="-0.743643887037151000000000000000000000000000",
+                y_center="0.131825904205330000000000000000000000000000",
+                palette_file=palette_file,
+                max_zoom="1e12",
+            )
+            reference = object()
+            native_library = type(
+                "CapabilityLibrary",
+                (),
+                {"fractal_backend_capabilities": lambda self: 2 | 4 | 8},
+            )()
+            with mock.patch.object(
+                live_view.visualizer,
+                "_select_native_reference",
+                return_value=reference,
+            ), mock.patch.object(
+                live_view.visualizer,
+                "render_fractal",
+                return_value=np.ones((4, 8), dtype=np.float32),
+            ) as render:
+                result = live_view._render_live_source(
+                    config,
+                    8,
+                    4,
+                    12.0,
+                    native_library,
+                    192,
+                    [(12.0, reference)],
+                )
+
+            self.assertEqual(result.shape, (4, 8))
+            self.assertEqual(live_view._live_escape_radius_mode(config), 1)
+            self.assertEqual(
+                render.call_args.kwargs["render_options"].escape_radius_mode,
+                1,
+            )
+            self.assertEqual(
+                render.call_args.kwargs["render_options"].coordinate_mode,
+                1,
+            )
+            # This compact default recipe has no metadata/3D plane needs;
+            # its high-bailout 540p field is faster on AVX2 than OpenCL.
+            self.assertEqual(render.call_args.kwargs["render_options"].backend, 1)
+            self.assertTrue(render.call_args.kwargs["render_options"].strict)
+            self.assertFalse(render.call_args.kwargs["render_options"].allow_recovery)
+
+    def test_kfp_live_coordinate_mode_is_independent_of_bailout_mode(self):
+        """Classic-radius KFP files still use Kalles' viewport geometry."""
+
+        palette_file = Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp"
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="mandelbrot",
+                x_center="0.0",
+                y_center="0.0",
+                palette_file=palette_file,
+                max_zoom="1e12",
+            )
+            with mock.patch.object(
+                live_view.visualizer,
+                "_kfp_escape_radius_mode",
+                return_value=0,
+            ):
+                self.assertEqual(live_view._live_escape_radius_mode(config), 0)
+            self.assertEqual(live_view._live_coordinate_mode(config), 1)
+
+    def test_kfp_deep_alternate_formula_live_source_keeps_orbit_planes(self):
+        """Deep alternate-formula tiles must use the native KFP plane path."""
+
+        palette_file = Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp"
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="tricorn",
+                x_center="-1.000000000000000000000000000000000000000000",
+                y_center="0.100000000000000000000000000000000000000000",
+                palette_file=palette_file,
+                base_zoom="1e12",
+                max_zoom="1e12",
+            )
+            native_library = type(
+                "NativeStub",
+                (),
+                {"render_fractal_ex_planes": object()},
+            )()
+            calls = []
+
+            def fake_render(_config, width, height, _log_zoom, _library, max_iter, **kwargs):
+                calls.append(kwargs.get("return_planes", False))
+                field = np.zeros((height, width), dtype=np.float32)
+                return (field, object()) if kwargs.get("return_planes") else field
+
+            with mock.patch("live_view._render_live_source", side_effect=fake_render):
+                sources = live_view.build_live_zoom_sources(
+                    config,
+                    8,
+                    4,
+                    native_library,
+                    max_sources=1,
+                )
+
+            self.assertEqual(calls, [True])
+            self.assertEqual(len(sources.planes), 1)
+            self.assertIsNotNone(sources.planes[0])
+
     def test_nonfinite_shared_live_field_is_repaired_before_display(self):
         with TemporaryDirectory() as directory:
             audio = Path(directory) / "song.mp3"
@@ -420,6 +582,240 @@ class LiveViewHelperTests(unittest.TestCase):
                     [(12.0, reference)],
                 )
             np.testing.assert_array_equal(result, repaired)
+
+    def test_deep_non_kfp_live_source_uses_opencl_backend(self):
+        """The GUI preview should use the accelerated deep scalar path."""
+
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="mandelbrot",
+                x_center="-0.743643887037151000000000000000000000000000",
+                y_center="0.131825904205330000000000000000000000000000",
+                # This fixture intentionally starts at the normal deep
+                # threshold; it does not need an artificial e80 probe.
+                max_zoom="1e12",
+            )
+            reference = object()
+            field = np.zeros((4, 8), dtype=np.float32)
+            with mock.patch.object(
+                live_view.visualizer,
+                "_native_backend_id",
+                side_effect=lambda name, _library: 2 if name == "opencl" else 1,
+            ), mock.patch.object(
+                live_view.visualizer,
+                "_select_native_reference",
+                return_value=reference,
+            ), mock.patch.object(
+                live_view.visualizer,
+                "render_fractal",
+                return_value=field,
+            ) as render:
+                result = live_view._render_live_source(
+                    config,
+                    8,
+                    4,
+                    12.0,
+                    object(),
+                    192,
+                    [(12.0, reference)],
+                )
+
+            np.testing.assert_array_equal(result, field)
+            self.assertEqual(render.call_args.kwargs["render_options"].backend, 2)
+            self.assertFalse(render.call_args.kwargs["return_planes"])
+
+    def test_shallow_non_kfp_live_source_uses_opencl_backend_when_supported(self):
+        """The 540p live source should use the fast direct GPU field."""
+
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="tricorn",
+                x_center="-0.10000000000000000000",
+                y_center="0.70000000000000000000",
+                max_zoom="1e1",
+            )
+            field = np.zeros((4, 8), dtype=np.float32)
+            with mock.patch.object(
+                live_view.visualizer,
+                "_native_backend_id",
+                side_effect=lambda name, _library: 2 if name == "opencl" else 1,
+            ), mock.patch.object(
+                live_view.visualizer,
+                "render_fractal",
+                return_value=field,
+            ) as render:
+                result = live_view._render_live_source(
+                    config,
+                    8,
+                    4,
+                    1.0,
+                    object(),
+                    192,
+                )
+
+            np.testing.assert_array_equal(result, field)
+            self.assertEqual(render.call_args.kwargs["render_options"].backend, 2)
+
+    def test_explicit_scalar_live_backend_is_not_overridden(self):
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="tricorn",
+                x_center="-0.10000000000000000000",
+                y_center="0.70000000000000000000",
+                max_zoom="1e1",
+                native_backend="scalar",
+            )
+            field = np.zeros((4, 8), dtype=np.float32)
+            with mock.patch.object(
+                live_view.visualizer,
+                "_native_backend_id",
+                side_effect=lambda name, _library: 2 if name == "opencl" else 1,
+            ), mock.patch.object(
+                live_view.visualizer,
+                "render_fractal",
+                return_value=field,
+            ) as render:
+                result = live_view._render_live_source(
+                    config,
+                    8,
+                    4,
+                    1.0,
+                    object(),
+                    192,
+                )
+
+            np.testing.assert_array_equal(result, field)
+            self.assertEqual(render.call_args.kwargs["render_options"].backend, 1)
+
+    def test_ultra_deep_mandelbrot_kfp_live_source_uses_gpu_plane_backend(self):
+        """Deep Mandelbrot KFP metadata uses the validated GPU plane path."""
+
+        palette_file = Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp"
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="mandelbrot",
+                x_center="-0.743643887037151000000000000000000000000000",
+                y_center="0.131825904205330000000000000000000000000000",
+                palette_file=palette_file,
+                max_zoom="1e12",
+            )
+            reference = object()
+            native_library = type(
+                "CapabilityLibrary",
+                (),
+                {"fractal_backend_capabilities": lambda self: 2 | 4 | 8},
+            )()
+            field = np.zeros((4, 8), dtype=np.float32)
+            planes = visualizer.KfpFramePlanes(
+                orbit_iteration=np.zeros((4, 8), dtype=np.int64),
+                phase=np.zeros((4, 8), dtype=np.float64),
+                de_x=np.ones((4, 8), dtype=np.float64),
+                de_y=np.ones((4, 8), dtype=np.float64),
+                test1=np.ones((4, 8), dtype=np.float64),
+                test2=np.ones((4, 8), dtype=np.float64),
+            )
+            with mock.patch.object(
+                live_view.visualizer,
+                "_native_backend_id",
+                side_effect=lambda name, _library: 2 if name == "opencl" else 1,
+            ), mock.patch.object(
+                live_view.visualizer,
+                "_select_native_reference",
+                return_value=reference,
+            ), mock.patch.object(
+                live_view.visualizer,
+                "render_fractal",
+                return_value=(field, planes),
+            ) as render:
+                result, result_planes = live_view._render_live_source(
+                    config,
+                    8,
+                    4,
+                    80.0,
+                    native_library,
+                    192,
+                    [(80.0, reference)],
+                    return_planes=True,
+                )
+
+            np.testing.assert_array_equal(result, field)
+            self.assertIsNotNone(result_planes)
+            self.assertEqual(render.call_args.kwargs["render_options"].backend, 2)
+            self.assertTrue(render.call_args.kwargs["return_planes"])
+
+    def test_incomplete_kfp_planes_are_repaired_before_live_colour(self):
+        """Finite iteration fields cannot bypass Kalles plane validation."""
+
+        def make_planes(shape, phase):
+            return visualizer.KfpFramePlanes(
+                orbit_iteration=np.full(shape, 8, dtype=np.int64),
+                phase=np.full(shape, phase, dtype=np.float64),
+                de_x=np.full(shape, 1.0, dtype=np.float64),
+                de_y=np.full(shape, -1.0, dtype=np.float64),
+                test1=np.full(shape, 4.0, dtype=np.float64),
+                test2=np.full(shape, 2.0, dtype=np.float64),
+            )
+
+        with TemporaryDirectory() as directory:
+            audio = Path(directory) / "song.mp3"
+            audio.write_bytes(b"audio")
+            palette_file = Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp"
+            config = live_view.LiveViewConfig(
+                audio_path=audio,
+                formula="mandelbrot",
+                x_center="-0.743643887037151000000000000000000000000000",
+                y_center="0.131825904205330000000000000000000000000000",
+                palette_file=palette_file,
+                max_zoom="1e12",
+            )
+            reference = object()
+            field = np.ones((4, 8), dtype=np.float32)
+            broken_planes = make_planes(field.shape, np.nan)
+            repaired_planes = make_planes(field.shape, 0.5)
+            with mock.patch.object(
+                live_view.visualizer,
+                "_select_native_reference",
+                return_value=reference,
+            ), mock.patch.object(
+                live_view.visualizer,
+                "render_fractal",
+                return_value=(field, broken_planes),
+            ), mock.patch.object(
+                live_view.visualizer,
+                "_atlas_glitch_reference_field",
+                return_value=(field, repaired_planes),
+            ) as repair:
+                result, planes = live_view._render_live_source(
+                    config,
+                    8,
+                    4,
+                    12.0,
+                    object(),
+                    192,
+                    [(12.0, reference)],
+                    return_planes=True,
+                )
+            repair.assert_called_once()
+            np.testing.assert_array_equal(result, field)
+            self.assertIsNot(planes, repaired_planes)
+            self.assertIs(planes.orbit_iteration, repaired_planes.orbit_iteration)
+            self.assertIs(planes.test1, repaired_planes.test1)
+            self.assertIsNone(planes.test2)
+            self.assertIsNone(planes.phase)
+            self.assertIsNone(planes.de_x)
+            self.assertIsNone(planes.de_y)
 
     def test_live_sources_drop_an_unresolved_deep_tile(self):
         with TemporaryDirectory() as directory:

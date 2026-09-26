@@ -22,17 +22,26 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
         raise SystemExit(
             f"zoom exceeds the supported 10^{visualizer.MAX_LOG10_ZOOM:.0f} range"
         )
-    if args.formula == "mandelbrot" and args.renderer != "python" and log_zoom >= 12.0:
-        native_library = visualizer._get_native_library()
-        if native_library is None:
-            raise SystemExit("the native renderer is unavailable; run make first")
-    else:
-        native_library = visualizer._get_native_library() if args.renderer == "auto" else None
+    native_library = (
+        visualizer._get_native_library()
+        if args.renderer == "auto"
+        or (args.renderer != "python" and log_zoom >= 12.0)
+        else None
+    )
+    if args.renderer != "python" and log_zoom >= 12.0 and native_library is None:
+        raise SystemExit("the native renderer is unavailable; run make first")
     backend_library = native_library
     if args.renderer != "python" and backend_library is None:
         backend_library = visualizer._get_native_library()
     native_backend = (
-        visualizer._native_backend_id(args.backend, backend_library)
+        visualizer._native_backend_for_workload(
+            args.backend,
+            backend_library,
+            args.width,
+            args.height,
+            log_zoom,
+            args.formula,
+        )
         if args.renderer != "python"
         else 0
     )
@@ -51,7 +60,7 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
     reference_seconds = 0.0
     reference_stats = None
     stats_supported = False
-    if args.formula == "mandelbrot" and native_library is not None and log_zoom >= 12.0:
+    if native_library is not None and log_zoom >= 12.0:
         reference_iter = visualizer.max_iterations(
             log_zoom,
             args.iteration_base,
@@ -72,6 +81,8 @@ def _atlas_sweep(args: argparse.Namespace, np: Any, log_zoom: float) -> None:
             args.series_order,
             12.0,
             image_series_order=8 if args.disable_series else 32,
+            formula=args.formula,
+            julia_constant=args.julia_constant,
         )
         reference_seconds = time.perf_counter() - reference_started
         reference_stats = visualizer._native_get_reference_stats(native_library, reference)
@@ -265,7 +276,7 @@ def main() -> None:
         "--formula",
         choices=visualizer.FORMULA_CHOICES,
         default="mandelbrot",
-        help="formula to benchmark; alternate formulas use direct iteration",
+        help="formula to benchmark; alternate formulas have native deep support",
     )
     parser.add_argument(
         "--julia-c",
@@ -277,7 +288,10 @@ def main() -> None:
         "--backend",
         choices=("auto", "scalar", "avx2", "opencl"),
         default="auto",
-        help="native backend selection; OpenCL is direct/shallow only",
+        help=(
+            "native backend selection; OpenCL supports all shallow formulas "
+            "plus project-coordinate deep formulas"
+        ),
     )
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--series-order", type=int, choices=(1, 2, 3), default=3)
@@ -382,12 +396,6 @@ def main() -> None:
             raise SystemExit(str(error)) from error
     if args.formula != "mandelbrot" and log_zoom > 300.0:
         raise SystemExit("alternate formulas support benchmark zooms only through 1e300")
-    if args.formula != "mandelbrot" and log_zoom >= 12.0:
-        if args.renderer == "native":
-            raise SystemExit("alternate formulas are not available through the native deep benchmark")
-        args.renderer = "python"
-    if args.formula != "mandelbrot" and args.backend in {"avx2", "opencl"}:
-        raise SystemExit("alternate formulas require --backend scalar or auto")
     if args.reference_zoom_log is not None:
         if (
             not np.isfinite(args.reference_zoom_log)
@@ -504,19 +512,22 @@ def main() -> None:
     if args.renderer != "python" and backend_library is None:
         backend_library = visualizer._get_native_library()
     native_backend = (
-        visualizer._native_backend_id(args.backend, backend_library)
+        visualizer._native_backend_for_workload(
+            args.backend,
+            backend_library,
+            args.width,
+            args.height,
+            log_zoom,
+            args.formula,
+        )
         if args.renderer != "python"
         else 0
     )
-    if args.formula != "mandelbrot" and args.backend == "auto":
-        native_backend = 0
     render_options = visualizer.NativeRenderOptions(
         backend=native_backend,
         series_min_terms=32 if args.disable_series else 8,
         series_max_terms=32,
     )
-    if native_backend == 2 and log_zoom >= 6.0:
-        raise SystemExit("--backend opencl only supports direct zooms below 1e6")
     timings = []
     try:
         for _ in range(args.repeat):

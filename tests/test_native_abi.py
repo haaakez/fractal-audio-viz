@@ -3,6 +3,8 @@ import math
 import unittest
 from pathlib import Path
 
+from deep_zoom_points import FORMULA_POINT_CATALOGUES
+
 try:
     import mpmath as mp
 except ImportError:  # pragma: no cover - optional outside the Nix shell
@@ -24,7 +26,9 @@ class NativeRenderOptions(ctypes.Structure):
         ("max_bla_length", ctypes.c_int32),
         ("max_linear_bla_length", ctypes.c_int32),
         ("backend", ctypes.c_int32),
-        ("reserved", ctypes.c_int32 * 3),
+        ("escape_radius_mode", ctypes.c_int32),
+        ("coordinate_mode", ctypes.c_int32),
+        ("reserved", ctypes.c_int32 * 1),
         ("output_bias", ctypes.c_double),
     ]
 
@@ -42,6 +46,8 @@ class NativeRenderOptions(ctypes.Structure):
             max_bla_length=64,
             max_linear_bla_length=4096,
             backend=0,
+            escape_radius_mode=0,
+            coordinate_mode=0,
             output_bias=0.0,
         )
         values.update(overrides)
@@ -51,6 +57,19 @@ class NativeRenderOptions(ctypes.Structure):
         for name, value in values.items():
             setattr(result, name, float(value) if name == "output_bias" else int(value))
         return result
+
+
+class NativeRenderPlanes(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("orbit_iteration", ctypes.POINTER(ctypes.c_int64)),
+        ("phase", ctypes.POINTER(ctypes.c_double)),
+        ("de_x", ctypes.POINTER(ctypes.c_double)),
+        ("de_y", ctypes.POINTER(ctypes.c_double)),
+        ("test1", ctypes.POINTER(ctypes.c_double)),
+        ("test2", ctypes.POINTER(ctypes.c_double)),
+    ]
 
 
 class NativeRendererTests(unittest.TestCase):
@@ -85,6 +104,17 @@ class NativeRendererTests(unittest.TestCase):
                 ctypes.c_int,
             ]
             library.fractal_create_reference_reusable.restype = ctypes.c_void_p
+        if hasattr(library, "fractal_create_reference_reusable_options"):
+            library.fractal_create_reference_reusable_options.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(NativeRenderOptions),
+            ]
+            library.fractal_create_reference_reusable_options.restype = ctypes.c_void_p
         if hasattr(library, "fractal_clone_reference"):
             library.fractal_clone_reference.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             library.fractal_clone_reference.restype = ctypes.c_void_p
@@ -230,6 +260,59 @@ class NativeRendererTests(unittest.TestCase):
             ctypes.POINTER(NativeRenderOptions),
         ]
         library.fractal_render_mandelbrot_reference_ex.restype = ctypes.c_int
+        if hasattr(library, "fractal_render_points"):
+            library.fractal_render_points.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_int32),
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(NativeRenderOptions),
+            ]
+            library.fractal_render_points.restype = ctypes.c_int
+        if hasattr(library, "render_fractal_ex"):
+            library.render_fractal_ex.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.POINTER(NativeRenderOptions),
+            ]
+            library.render_fractal_ex.restype = ctypes.c_int
+        if hasattr(library, "render_fractal_ex_planes"):
+            library.render_fractal_ex_planes.argtypes = [
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.POINTER(NativeRenderOptions),
+                ctypes.POINTER(NativeRenderPlanes),
+            ]
+            library.render_fractal_ex_planes.restype = ctypes.c_int
         if hasattr(library, "fractal_set_stats_enabled"):
             library.fractal_set_stats_enabled.argtypes = [ctypes.c_int]
             library.fractal_set_stats_enabled.restype = None
@@ -246,6 +329,138 @@ class NativeRendererTests(unittest.TestCase):
 
     def test_abi_version(self):
         self.assertEqual(self.library.fractal_abi_version(), 10)
+
+    def test_direct_planes_export_kalles_zero_based_iteration(self):
+        """The first escaping z sample must carry Kalles' raw antal == 0."""
+
+        if not hasattr(self.library, "render_fractal_ex_planes"):
+            raise unittest.SkipTest("native render metadata ABI is unavailable")
+        output = (ctypes.c_float * 1)()
+        orbit_iteration = (ctypes.c_int64 * 1)()
+        phase = (ctypes.c_double * 1)()
+        de_x = (ctypes.c_double * 1)()
+        de_y = (ctypes.c_double * 1)()
+        test1 = (ctypes.c_double * 1)()
+        test2 = (ctypes.c_double * 1)()
+        planes = NativeRenderPlanes()
+        planes.struct_size = ctypes.sizeof(NativeRenderPlanes)
+        planes.version = 1
+        planes.orbit_iteration = ctypes.cast(
+            orbit_iteration, ctypes.POINTER(ctypes.c_int64)
+        )
+        planes.phase = ctypes.cast(phase, ctypes.POINTER(ctypes.c_double))
+        planes.de_x = ctypes.cast(de_x, ctypes.POINTER(ctypes.c_double))
+        planes.de_y = ctypes.cast(de_y, ctypes.POINTER(ctypes.c_double))
+        planes.test1 = ctypes.cast(test1, ctypes.POINTER(ctypes.c_double))
+        planes.test2 = ctypes.cast(test2, ctypes.POINTER(ctypes.c_double))
+        options = NativeRenderOptions.make(
+            disable_bla=1,
+            disable_cycle=1,
+            escape_radius_mode=0,
+            coordinate_mode=1,
+        )
+        status = self.library.render_fractal_ex_planes(
+            output,
+            1,
+            1,
+            b"1",
+            b"3",
+            b"0",
+            32,
+            256,
+            0,
+            1,
+            0,
+            0.0,
+            0.0,
+            ctypes.byref(options),
+            ctypes.byref(planes),
+        )
+        self.assertEqual(status, 0, self.library.fractal_last_error())
+        self.assertEqual(orbit_iteration[0], 0)
+        self.assertEqual(test1[0], 9.0)
+        self.assertEqual(test2[0], 0.0)
+        self.assertTrue(math.isfinite(output[0]))
+
+    def test_direct_plane_hints_preserve_kfp_orbit_data(self):
+        """Skipping unused phase/DE work must not change KFP orbit inputs."""
+
+        if not hasattr(self.library, "render_fractal_ex_planes"):
+            raise unittest.SkipTest("native render metadata ABI is unavailable")
+
+        width, height = 8, 4
+
+        def render(options):
+            count = width * height
+            output = (ctypes.c_float * count)()
+            orbit_iteration = (ctypes.c_int64 * count)()
+            phase = (ctypes.c_double * count)()
+            de_x = (ctypes.c_double * count)()
+            de_y = (ctypes.c_double * count)()
+            test1 = (ctypes.c_double * count)()
+            test2 = (ctypes.c_double * count)()
+            planes = NativeRenderPlanes()
+            planes.struct_size = ctypes.sizeof(NativeRenderPlanes)
+            planes.version = 1
+            planes.orbit_iteration = ctypes.cast(
+                orbit_iteration, ctypes.POINTER(ctypes.c_int64)
+            )
+            planes.phase = ctypes.cast(phase, ctypes.POINTER(ctypes.c_double))
+            planes.de_x = ctypes.cast(de_x, ctypes.POINTER(ctypes.c_double))
+            planes.de_y = ctypes.cast(de_y, ctypes.POINTER(ctypes.c_double))
+            planes.test1 = ctypes.cast(test1, ctypes.POINTER(ctypes.c_double))
+            planes.test2 = ctypes.cast(test2, ctypes.POINTER(ctypes.c_double))
+            status = self.library.render_fractal_ex_planes(
+                output,
+                width,
+                height,
+                b"1",
+                b"0.31",
+                b"0.57",
+                768,
+                256,
+                0,
+                4,
+                0,
+                0.0,
+                0.0,
+                ctypes.byref(options),
+                ctypes.byref(planes),
+            )
+            self.assertEqual(status, 0, self.library.fractal_last_error())
+            return (
+                list(output),
+                list(orbit_iteration),
+                list(phase),
+                list(de_x),
+                list(de_y),
+                list(test1),
+                list(test2),
+            )
+
+        legacy = render(
+            NativeRenderOptions.make(
+                escape_radius_mode=1,
+                coordinate_mode=1,
+            )
+        )
+        hinted_options = NativeRenderOptions.make(
+            escape_radius_mode=1,
+            coordinate_mode=1,
+        )
+        # FRACTAL_RENDER_HINT_SKIP_PHASE | FRACTAL_RENDER_HINT_SKIP_ANALYTIC_DE
+        hinted_options.reserved[0] = 3
+        hinted = render(hinted_options)
+
+        self.assertEqual(legacy[0], hinted[0])
+        self.assertEqual(legacy[1], hinted[1])
+        self.assertEqual(legacy[5], hinted[5])
+        self.assertEqual(legacy[6], hinted[6])
+        self.assertTrue(any(value != 0.0 for value in legacy[2]))
+        self.assertTrue(any(value != 0.0 for value in legacy[3]))
+        self.assertTrue(all(value == 0.0 for value in hinted[2]))
+        self.assertTrue(all(value == 0.0 for value in hinted[3]))
+        self.assertTrue(all(value == 0.0 for value in hinted[4]))
 
     def test_invalid_reference_handles_are_rejected_without_dereferencing(self):
         invalid = ctypes.c_void_p(1)
@@ -317,6 +532,62 @@ class NativeRendererTests(unittest.TestCase):
             if clone:
                 self.library.fractal_destroy_reference(clone)
             self.library.fractal_destroy_reference(root)
+
+    def test_kalles_high_bailout_reference_requires_matching_render_mode(self):
+        if not hasattr(self.library, "fractal_create_reference_reusable_options"):
+            raise unittest.SkipTest("Kalles bailout reference ABI is unavailable")
+        width = height = 8
+        max_iter = 1200
+        output_type = ctypes.c_float * (width * height)
+        output = output_type()
+        options = NativeRenderOptions.make(escape_radius_mode=1)
+        handle = self.library.fractal_create_reference_reusable_options(
+            b"-1.711030826576984823314722728180246694222252112777834549259732560022287905717123892927883662257081287304281205446785464750361745",
+            b"0.000001509818957972609043170877177447547323633361751210706181530872644435995661269979265353802853259051551728584671844401805",
+            b"1e12",
+            max_iter,
+            768,
+            3,
+            ctypes.byref(options),
+        )
+        self.assertTrue(handle, self.library.fractal_last_error())
+        try:
+            wrong_mode = NativeRenderOptions.make(escape_radius_mode=0)
+            self.assertNotEqual(
+                self.render_reference(
+                    output,
+                    width,
+                    height,
+                    b"1e12",
+                    handle,
+                    max_iter,
+                    2,
+                    3,
+                    256,
+                    wrong_mode,
+                ),
+                0,
+            )
+            self.assertIn(b"escape-radius mode", self.library.fractal_last_error())
+            self.assertEqual(
+                self.render_reference(
+                    output,
+                    width,
+                    height,
+                    b"1e12",
+                    handle,
+                    max_iter,
+                    2,
+                    3,
+                    256,
+                    options,
+                ),
+                0,
+                self.library.fractal_last_error(),
+            )
+            self.assertTrue(all(math.isfinite(value) for value in output))
+        finally:
+            self.library.fractal_destroy_reference(handle)
 
     def render_reference(self, output, width, height, zoom, handle, max_iter,
                          threads, series_order, series_block, options=None):
@@ -593,28 +864,240 @@ class NativeRendererTests(unittest.TestCase):
         finally:
             self.library.fractal_destroy_reference(handle)
 
-    def test_deep_opencl_backend_is_rejected_before_render(self):
+    def test_deep_opencl_backend_matches_scalar_across_depths(self):
+        if not self.library.fractal_backend_capabilities() & 4:
+            raise unittest.SkipTest("OpenCL double-precision backend is unavailable")
         width = height = 3
         output_type = ctypes.c_float * (width * height)
-        output = output_type()
+        center_real = (
+            b"-7.621179376797638683152412470302754234697554266277384201803182452707988048871166668157739268919140091423417335237629214081127371665327888360528335010378835950994472786588199757e-1"
+        )
+        center_imag = (
+            b"-9.573175593807915218110127195876981729185284295753173780078525497988166932168660068170631431015884613850090347745780605812248444859260422571076360932193737688403082995582081506e-2"
+        )
+        for zoom in (b"1e12", b"1e40", b"1e80"):
+            scalar = output_type()
+            opencl = output_type()
+            handle = self.library.fractal_create_reference(
+                center_real, center_imag, zoom, 1600, 768, 8,
+            )
+            self.assertTrue(handle, self.library.fractal_last_error())
+            try:
+                self.assertEqual(self.render_reference(
+                        scalar, width, height, zoom, handle, 1600, 2, 3, 64,
+                    NativeRenderOptions.make(backend=0),
+                ), 0)
+                status = self.render_reference(
+                        opencl, width, height, zoom, handle, 1600, 2, 3, 64,
+                    NativeRenderOptions.make(backend=2),
+                )
+                self.assertEqual(status, 0, self.library.fractal_last_error())
+                self.assertTrue(all(math.isfinite(value) for value in opencl))
+                self.assertLessEqual(
+                    max(abs(a - b) for a, b in zip(scalar, opencl)), 0.05)
+            finally:
+                self.library.fractal_destroy_reference(handle)
+
+    def test_deep_opencl_backend_covers_non_kfp_formulas(self):
+        """Deep ordinary formulas use the native scaled OpenCL recurrence."""
+
+        if not hasattr(self.library, "render_fractal_ex"):
+            raise unittest.SkipTest("formula-aware native renderer is unavailable")
+        if not self.library.fractal_backend_capabilities() & 4:
+            raise unittest.SkipTest("OpenCL double-precision backend is unavailable")
+
+        width, height, max_iter = 13, 9, 480
+        output_type = ctypes.c_float * (width * height)
+        cases = (
+            # Use the full catalogue strings: preperiodic alternate targets
+            # can amplify even a harmless-looking decimal truncation before
+            # the first deep frame is reached.
+            (1, FORMULA_POINT_CATALOGUES["julia"][1], -0.123, 0.745),
+            (2, FORMULA_POINT_CATALOGUES["burning-ship"][0], 0.0, 0.0),
+            (3, FORMULA_POINT_CATALOGUES["tricorn"][0], 0.0, 0.0),
+        )
+        for formula, point, julia_real, julia_imag in cases:
+            center_real = point.x.encode("ascii")
+            center_imag = point.y.encode("ascii")
+            scalar = output_type()
+            opencl = output_type()
+            scalar_options = NativeRenderOptions.make(
+                backend=0, disable_bla=1, disable_cycle=1
+            )
+            opencl_options = NativeRenderOptions.make(
+                backend=2, disable_bla=1, disable_cycle=1
+            )
+            arguments = (
+                width,
+                height,
+                b"1e12",
+                center_real,
+                center_imag,
+                max_iter,
+                768,
+                1,
+                2,
+                formula,
+                julia_real,
+                julia_imag,
+            )
+            self.assertEqual(
+                self.library.render_fractal_ex(
+                    scalar, *arguments, ctypes.byref(scalar_options)
+                ),
+                0,
+                self.library.fractal_last_error(),
+            )
+            self.assertEqual(
+                self.library.render_fractal_ex(
+                    opencl, *arguments, ctypes.byref(opencl_options)
+                ),
+                0,
+                self.library.fractal_last_error(),
+            )
+            for scalar_value, opencl_value in zip(scalar, opencl):
+                self.assertEqual(
+                    math.isfinite(scalar_value), math.isfinite(opencl_value)
+                )
+                if math.isfinite(scalar_value):
+                    self.assertLessEqual(abs(scalar_value - opencl_value), 0.05)
+
+    def test_ultra_deep_opencl_matches_even_frame_coordinate_modes(self):
+        """Even dimensions distinguish project and Kalles pixel origins."""
+
+        if not self.library.fractal_backend_capabilities() & 4:
+            raise unittest.SkipTest("OpenCL double-precision backend is unavailable")
+        width, height = 4, 2
+        output_type = ctypes.c_float * (width * height)
         handle = self.library.fractal_create_reference(
-            b"-0.743643887037151",
-            b"0.13182590420533",
-            b"1e1",
-            900,
-            512,
-            3,
+            b"-7.621179376797638683152412470302754234697554266277384201803182452707988048871166668157739268919140091423417335237629214081127371665327888360528335010378835950994472786588199757e-1",
+            b"-9.573175593807915218110127195876981729185284295753173780078525497988166932168660068170631431015884613850090347745780605812248444859260422571076360932193737688403082995582081506e-2",
+            b"1e80", 1600, 768, 8,
         )
         self.assertTrue(handle, self.library.fractal_last_error())
         try:
-            status = self.render_reference(
-                output, width, height, b"1e12", handle, 900, 2, 3, 64,
-                NativeRenderOptions.make(backend=2),
-            )
-            self.assertNotEqual(status, 0)
-            self.assertIn(b"direct", self.library.fractal_last_error())
+            coordinate_fields = []
+            for coordinate_mode in (0, 1):
+                scalar = output_type()
+                opencl = output_type()
+                self.assertEqual(self.render_reference(
+                    scalar, width, height, b"1e80", handle, 1600, 2, 3, 64,
+                    NativeRenderOptions.make(
+                        backend=0, coordinate_mode=coordinate_mode, disable_bla=1),
+                ), 0)
+                self.assertEqual(self.render_reference(
+                    opencl, width, height, b"1e80", handle, 1600, 2, 3, 64,
+                    NativeRenderOptions.make(
+                        backend=2, coordinate_mode=coordinate_mode, disable_bla=1),
+                ), 0, self.library.fractal_last_error())
+                for cpu_value, backend_value in zip(scalar, opencl):
+                    if math.isfinite(cpu_value):
+                        self.assertTrue(math.isfinite(backend_value))
+                        self.assertLessEqual(abs(cpu_value - backend_value), 0.05)
+                    else:
+                        # Explicit OpenCL uses the device-reconstructed
+                        # orbit. It may keep a pixel finite where the strict
+                        # CPU image-series path reports a repair sentinel;
+                        # the GPU opt-in must not turn finite CPU pixels into
+                        # NaNs or alter their values.
+                        self.assertTrue(math.isfinite(backend_value))
+                coordinate_fields.append(list(scalar))
+            self.assertNotEqual(coordinate_fields[0], coordinate_fields[1])
         finally:
             self.library.fractal_destroy_reference(handle)
+
+    def test_deep_opencl_point_repairs_match_scalar(self):
+        """Secondary point repairs must retain the ordinary GPU backend."""
+
+        if not hasattr(self.library, "fractal_render_points"):
+            raise unittest.SkipTest("native point renderer is unavailable")
+        if not self.library.fractal_backend_capabilities() & 4:
+            raise unittest.SkipTest("OpenCL double-precision backend is unavailable")
+
+        point_count = 12
+        output_type = ctypes.c_float * point_count
+        real_type = ctypes.c_double * point_count
+        imag_type = ctypes.c_double * point_count
+        exponent_type = ctypes.c_int32 * point_count
+        # These are small shared-exponent offsets around a deep reference,
+        # matching the arrays produced by the atlas glitch-repair path.
+        real = real_type(*([0.0, 0.5, -0.5] * 4))
+        imag = imag_type(*([0.0, 0.25, -0.25] * 4))
+        exponents = exponent_type(*([-260] * point_count))
+        scalar = output_type()
+        opencl = output_type()
+        handle = self.library.fractal_create_reference(
+            b"-0.743643887037151",
+            b"0.13182590420533",
+            b"1e80",
+            900,
+            768,
+            8,
+        )
+        self.assertTrue(handle, self.library.fractal_last_error())
+        try:
+            for output, backend in ((scalar, 0), (opencl, 2)):
+                options = NativeRenderOptions.make(
+                    backend=backend, disable_bla=1, disable_cycle=1,
+                )
+                status = self.library.fractal_render_points(
+                    output,
+                    point_count,
+                    b"1e80",
+                    real,
+                    imag,
+                    exponents,
+                    handle,
+                    900,
+                    2,
+                    3,
+                    64,
+                    ctypes.byref(options),
+                )
+                self.assertEqual(status, 0, self.library.fractal_last_error())
+            for scalar_value, opencl_value in zip(scalar, opencl):
+                self.assertEqual(math.isfinite(scalar_value), math.isfinite(opencl_value))
+                if math.isfinite(scalar_value):
+                    self.assertLessEqual(abs(scalar_value - opencl_value), 0.05)
+        finally:
+            self.library.fractal_destroy_reference(handle)
+
+    def test_ultra_deep_opencl_cache_switches_reference_generations(self):
+        """A cached orbit must never leak into a subsequent deep reference."""
+
+        if not self.library.fractal_backend_capabilities() & 4:
+            raise unittest.SkipTest("OpenCL double-precision backend is unavailable")
+        width = height = 3
+        output_type = ctypes.c_float * (width * height)
+        first = output_type()
+        second = output_type()
+        scalar = output_type()
+        first_handle = self.library.fractal_create_reference(
+            b"-0.762117937679763868315241247030275423469755426637842",
+            b"-0.095731755938079152181101271958769918291851734",
+            b"1e80", 1200, 768, 8)
+        second_handle = self.library.fractal_create_reference(
+            b"0.300000000000000000000000000000000000000000000000000",
+            b"0.200000000000000000000000000000000000000000000000000",
+            b"1e80", 1200, 768, 8)
+        self.assertTrue(first_handle, self.library.fractal_last_error())
+        self.assertTrue(second_handle, self.library.fractal_last_error())
+        try:
+            options = NativeRenderOptions.make(backend=2)
+            self.assertEqual(self.render_reference(
+                first, width, height, b"1e80", first_handle, 1200, 2, 3, 64,
+                options), 0)
+            self.assertEqual(self.render_reference(
+                second, width, height, b"1e80", second_handle, 1200, 2, 3, 64,
+                options), 0)
+            self.assertEqual(self.render_reference(
+                scalar, width, height, b"1e80", second_handle, 1200, 2, 3, 64,
+                NativeRenderOptions.make(backend=0)), 0)
+            self.assertLessEqual(max(abs(a - b) for a, b in zip(second, scalar)), 0.05)
+            self.assertGreater(max(abs(a - b) for a, b in zip(first, second)), 0.01)
+        finally:
+            self.library.fractal_destroy_reference(first_handle)
+            self.library.fractal_destroy_reference(second_handle)
 
     def test_native_atlas_compositor_blends_central_child(self):
         if not hasattr(self.library, "fractal_atlas_colourise"):

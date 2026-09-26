@@ -11,12 +11,9 @@ from __future__ import annotations
 # The canonical presets are deliberately boring and predictable: the name
 # describes the output tier, every tier is 60 fps, every tier targets e100,
 # and CRF 10 is visually near-lossless for this material while still producing
-# a useful compressed file. Outputs above Full HD use a native C++ field capped
-# at 1920x1080; users who need one scalar sample per output pixel can add
-# ``--quality quality --fractal-scale 1``. Exact bit-level output remains
-# available with ``--lossless``. Imported KFP palettes are the exception to
-# the 1080p cap: the native Kalles stencil gets a dense source up to 4K so its
-# distance and slope gradients do not become enlarged blocks.
+# a useful compressed file. Every quality profile renders its scalar field at
+# output density; only the explicit ``upscaled`` source mode asks for a
+# smaller source. Exact bit-level output remains available with ``--lossless``.
 DEFAULT_PROFILE = "4k60"
 NEAR_LOSSLESS_CRF = 10
 SOURCE_MODE_CHOICES = ("lossless-compressed", "native", "upscaled")
@@ -62,10 +59,10 @@ def _native_quality_profile(
         # sensible default for a near-lossless export, especially at 8K.
         "video_preset": "faster",
         "crf": NEAR_LOSSLESS_CRF,
-        # The lower-density lossless-compressed profiles are enlarged with
-        # nearest-neighbour sampling. This keeps the rendered detail crisp
-        # instead of smearing it across the output; the internal atlas still
-        # uses the native continuous crop path for smooth zoom motion.
+        # Ordinary lower-density lossless-compressed profiles are enlarged
+        # with nearest-neighbour sampling. Imported KFP palettes override
+        # that at every resized output and use Kalles' Lanczos3 bitmap scale;
+        # their relief/highlight detail is too fine for nearest-neighbour.
         "resample": "nearest",
         "lossless": False,
         "source_mode": "lossless-compressed",
@@ -82,29 +79,28 @@ PROFILE_DEFAULTS: dict[str, dict[str, object]] = {
     "fhd60": _native_quality_profile(
         1920, 1080, quality="balanced", fractal_scale=1.0, keyframe_factor=8.0
     ),
-    # The 1080p field cap keeps ordinary palettes on the same fast, fused C++
-    # path. Imported KFP palettes automatically request a denser source for
-    # their screen-space stencil; larger outputs still receive one final
-    # high-quality upscale.
+    # Quality profiles are output-density renders. The explicit ``upscaled``
+    # source mode remains available for quick previews without changing the
+    # normal profile contract.
     "2k60": _native_quality_profile(
         2560,
         1440,
         quality="balanced",
-        fractal_scale=0.75,
+        fractal_scale=1.0,
         keyframe_factor=8.0,
     ),
     "4k60": _native_quality_profile(
         3840,
         2160,
         quality="balanced",
-        fractal_scale=0.5,
+        fractal_scale=1.0,
         keyframe_factor=8.0,
     ),
     "8k60": _native_quality_profile(
         7680,
         4320,
         quality="balanced",
-        fractal_scale=0.25,
+        fractal_scale=1.0,
         keyframe_factor=8.0,
     ),
 }
@@ -113,9 +109,9 @@ PROFILE_DESCRIPTIONS: dict[str, str] = {
     "sd60": "Lossless-compressed 720x480 60 fps, CRF 10, e100.",
     "hd60": "Lossless-compressed 1280x720 60 fps, CRF 10, e100.",
     "fhd60": "Lossless-compressed 1920x1080 60 fps, CRF 10, e100.",
-    "2k60": "2K/60 lossless-compressed C++ pipeline from 1920x1080, CRF 10, e100.",
-    "4k60": "4K/60 lossless-compressed C++ pipeline from 1920x1080, CRF 10, e100.",
-    "8k60": "8K/60 lossless-compressed C++ pipeline from 1920x1080, CRF 10, e100.",
+    "2k60": "2K/60 output-density lossless-compressed C++ pipeline, CRF 10, e100.",
+    "4k60": "4K/60 output-density lossless-compressed C++ pipeline, CRF 10, e100.",
+    "8k60": "8K/60 output-density lossless-compressed C++ pipeline, CRF 10, e100.",
 }
 
 # Keep existing command lines usable while making the resolution presets the

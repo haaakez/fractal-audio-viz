@@ -12,10 +12,16 @@ __pycache__/
 *.zip
 *.tar.gz
 *.pyd
-# Render caches and generated keyframes
+# Local render outputs, test samples, manifests, and generated keyframes
 keyframes*/
 cache/
 renders/
+# Interrupted render leftovers can appear beside the selected output path.
+*.rendering-*
+# Local PostScript probe artifacts from ad-hoc benchmark runs.
+/np
+/time
+/visualizer
 dist/
 .release-runtime/
 .release-build/

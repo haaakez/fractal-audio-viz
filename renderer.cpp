@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cmath>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -66,8 +67,22 @@ constexpr int MAX_SAFE_BLA_LENGTH = 64;
 // Long linear maps are enabled only in the ultra-deep tier below; ordinary
 // e12--e40 frames stay on the independently validated 256/1024 limits.
 constexpr int MAX_SAFE_LINEAR_BLA_LENGTH = 4096;
+// MPFR direct recovery is deliberately restricted to bounded point cells. A
+// large unresolved region must be subdivided by the atlas caller first; doing
+// an exact arbitrary-precision iteration for every pixel in a frame-sized
+// point request would turn a bounded repair into an accidental full render.
+// Keep this in step with the atlas-side cell limit so the native fast path is
+// available for every cell the caller deliberately permits.
+constexpr std::size_t MAX_EXACT_POINT_REPAIR_PIXELS = 8192;
 constexpr int MAX_SAFE_DEEP_LINEAR_BLA_LENGTH = 1024;
+constexpr int ESCAPE_RADIUS_MODE_CLASSIC = 0;
+constexpr int ESCAPE_RADIUS_MODE_KALLES_HIGH = 1;
+constexpr int COORDINATE_MODE_PROJECT = FRACTAL_COORDINATE_MODE_PROJECT;
+constexpr int COORDINATE_MODE_KALLES = FRACTAL_COORDINATE_MODE_KALLES;
 constexpr long double ESCAPE_RADIUS_SQUARED = 4.0L;
+constexpr long double KALLES_HIGH_BAILOUT_RADIUS = 10000.0L;
+constexpr long double KALLES_HIGH_BAILOUT_SQUARED =
+    KALLES_HIGH_BAILOUT_RADIUS * KALLES_HIGH_BAILOUT_RADIUS;
 constexpr long double LOG_TWO = 0.693147180559945309417232121458176568L;
 constexpr long double LOG_TEN = 2.302585092994045684017991454684364208L;
 constexpr int MAX_NATIVE_ITERATIONS = 10'000'000;
@@ -95,6 +110,44 @@ inline float encode_render_iteration(int iteration, double output_bias) noexcept
 bool valid_formula(int formula) noexcept {
     return formula >= FRACTAL_FORMULA_MANDELBROT
         && formula <= FRACTAL_FORMULA_TRICORN;
+}
+
+bool valid_escape_radius_mode(int mode) noexcept {
+    return mode == ESCAPE_RADIUS_MODE_CLASSIC
+        || mode == ESCAPE_RADIUS_MODE_KALLES_HIGH;
+}
+
+bool valid_coordinate_mode(int mode) noexcept {
+    return mode == COORDINATE_MODE_PROJECT
+        || mode == COORDINATE_MODE_KALLES;
+}
+
+inline double pixel_axis_offset(int index, int dimension, int coordinate_mode) noexcept {
+    // CFraktalSFT::GetPixelCoordinates uses `i - m_nX / 2` and
+    // `j - m_nY / 2`; both divisions are integer divisions because the
+    // dimensions are ints. The project mode retains the historical
+    // pixel-centred `(dimension - 1) / 2` convention.
+    const double origin = coordinate_mode == COORDINATE_MODE_KALLES
+        ? static_cast<double>(dimension / 2)
+        : static_cast<double>(dimension - 1) / 2.0;
+    return static_cast<double>(index) - origin;
+}
+
+inline double viewport_height_factor(int coordinate_mode) noexcept {
+    // FraktalSFT stores Zoom as 2 / m_ZoomRadius and derives pixel spacing as
+    // (m_ZoomRadius * 2) / height. Therefore a Kalles view spans 4 / Zoom
+    // vertically. The project renderer's historical view remains 2.8 / Zoom.
+    return coordinate_mode == COORDINATE_MODE_KALLES ? 4.0 : 2.8;
+}
+
+inline long double escape_radius_squared_for_mode(int mode) noexcept {
+    return mode == ESCAPE_RADIUS_MODE_KALLES_HIGH
+        ? KALLES_HIGH_BAILOUT_SQUARED
+        : ESCAPE_RADIUS_SQUARED;
+}
+
+inline double escape_radius_squared_double(int mode) noexcept {
+    return static_cast<double>(escape_radius_squared_for_mode(mode));
 }
 
 bool valid_pixel_dimensions(int width, int height) noexcept {
@@ -176,6 +229,16 @@ int formula_power(int formula) noexcept {
     return 2;
 }
 
+template<int Formula>
+inline void iterate_direct_formula_static(
+    double zr,
+    double zi,
+    double parameter_real,
+    double parameter_imag,
+    double& next_real,
+    double& next_imag
+) noexcept;
+
 void iterate_direct_formula(
     int formula,
     double zr,
@@ -220,6 +283,103 @@ void iterate_direct_formula(
     }
 }
 
+/*
+ * Direct orbit step plus the first-order derivative used by Kalles' analytic
+ * distance/slope path.  For a parameter-plane render the derivative is with
+ * respect to c; for Julia it is with respect to the pixel's initial z.
+ * Burning Ship and Tricorn are not holomorphic, so the real Jacobian is the
+ * useful conservative analogue of the complex derivative there.
+ *
+ * Formula and parameter-plane status are compile-time values here. The old
+ * version accepted both as runtime arguments and paid for two predictable
+ * formula branches on every orbit iteration. Keeping the arithmetic in the
+ * same branches (including the volatile alternate-map products) preserves
+ * the reference values while letting the compiler specialize the hot loop.
+ */
+template<int Formula, bool ParameterPlane, bool NeedDerivative>
+inline void iterate_direct_formula_with_derivative(
+    double zr,
+    double zi,
+    double parameter_real,
+    double parameter_imag,
+    double derivative_real,
+    double derivative_imag,
+    double& next_real,
+    double& next_imag,
+    double& next_derivative_real,
+    double& next_derivative_imag
+) noexcept {
+    if constexpr (!NeedDerivative) {
+        iterate_direct_formula_static<Formula>(
+            zr,
+            zi,
+            parameter_real,
+            parameter_imag,
+            next_real,
+            next_imag);
+        next_derivative_real = 0.0;
+        next_derivative_imag = 0.0;
+        return;
+    }
+    const double add_real = ParameterPlane ? 1.0 : 0.0;
+    const double add_imag = ParameterPlane ? 0.0 : 0.0;
+    if constexpr (Formula == FRACTAL_FORMULA_BURNING_SHIP) {
+        const double absolute_real = std::abs(zr);
+        const double absolute_imag = std::abs(zi);
+        // Keep the piecewise alternate maps reproducible with the NumPy
+        // fallback. A fused multiply-add changes a late orbit by a few ulps
+        // and can move a boundary pixel to the other side of escape.
+        const volatile double real_square = absolute_real * absolute_real;
+        const volatile double imag_square = absolute_imag * absolute_imag;
+        const volatile double cross = 2.0 * absolute_real * absolute_imag;
+        const volatile double real_difference = real_square - imag_square;
+        const volatile double imaginary_product = cross + parameter_imag;
+        next_real = real_difference + parameter_real;
+        next_imag = imaginary_product;
+        const double sign_real = zr > 0.0 ? 1.0 : zr < 0.0 ? -1.0 : 0.0;
+        const double sign_imag = zi > 0.0 ? 1.0 : zi < 0.0 ? -1.0 : 0.0;
+        const double jacobian00 = 2.0 * absolute_real * sign_real;
+        const double jacobian01 = -2.0 * absolute_imag * sign_imag;
+        const double jacobian10 = 2.0 * absolute_imag * sign_real;
+        const double jacobian11 = 2.0 * absolute_real * sign_imag;
+        next_derivative_real = jacobian00 * derivative_real
+            + jacobian01 * derivative_imag + add_real;
+        next_derivative_imag = jacobian10 * derivative_real
+            + jacobian11 * derivative_imag + add_imag;
+        return;
+    }
+    if constexpr (Formula == FRACTAL_FORMULA_TRICORN) {
+        const volatile double real_square = zr * zr;
+        const volatile double imag_square = zi * zi;
+        const volatile double cross = -2.0 * zr * zi;
+        const volatile double real_difference = real_square - imag_square;
+        const volatile double imaginary_product = cross + parameter_imag;
+        next_real = real_difference + parameter_real;
+        next_imag = imaginary_product;
+        next_derivative_real = 2.0 * zr * derivative_real
+            - 2.0 * zi * derivative_imag + add_real;
+        next_derivative_imag = -2.0 * zi * derivative_real
+            - 2.0 * zr * derivative_imag + add_imag;
+        return;
+    }
+    if constexpr (Formula == FRACTAL_FORMULA_JULIA) {
+        const volatile double real_square = zr * zr;
+        const volatile double imag_square = zi * zi;
+        const volatile double cross = 2.0 * zr * zi;
+        const volatile double real_difference = real_square - imag_square;
+        const volatile double imaginary_product = cross + parameter_imag;
+        next_real = real_difference + parameter_real;
+        next_imag = imaginary_product;
+    } else {
+        next_real = zr * zr - zi * zi + parameter_real;
+        next_imag = 2.0 * zr * zi + parameter_imag;
+    }
+    next_derivative_real = 2.0 * zr * derivative_real
+        - 2.0 * zi * derivative_imag + add_real;
+    next_derivative_imag = 2.0 * zr * derivative_imag
+        + 2.0 * zi * derivative_real + add_imag;
+}
+
 #ifdef FRACTAL_HAVE_OPENCL
 
 // OpenCL reports collection sizes through the driver. Treat those values as
@@ -229,13 +389,20 @@ constexpr cl_uint MAX_OPENCL_PLATFORMS = 256;
 constexpr cl_uint MAX_OPENCL_DEVICES = 256;
 constexpr size_t MAX_OPENCL_INFO_BYTES = 1U << 20;
 
-// The OpenCL path is deliberately limited to the direct, shallow renderer.
-// Deep MPFR reference construction and perturbation/BLA remain on the CPU
-// until their scaled representation has a validated device implementation.
-// This keeps backend=2 useful for previews without silently making deep output
-// less correct merely because an OpenCL device is present.
+// OpenCL handles ordinary direct fields and the shared scaled perturbation
+// path. KFP plane output remains on the exact scalar implementation; the
+// alternate deep formulas use the same device recurrence without pretending
+// that their real-Jacobian BLA tables are interchangeable with Mandelbrot's.
 constexpr const char* OPENCL_DIRECT_KERNEL = R"CLC(
+#if defined(cl_khr_fp64)
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#elif defined(cl_amd_fp64)
+#pragma OPENCL EXTENSION cl_amd_fp64 : enable
+#endif
+
+#if !defined(FRACTAL_OPENCL_FAST_MATH)
+#pragma OPENCL FP_CONTRACT OFF
+#endif
 
 __kernel void mandelbrot_direct(
     __global float* output,
@@ -246,7 +413,12 @@ __kernel void mandelbrot_direct(
     const double width_span,
     const double height_span,
     const int max_iter,
-    const double output_bias
+    const double output_bias,
+    const int formula,
+    const double julia_real,
+    const double julia_imag,
+    const double escape_squared,
+    const int coordinate_mode
 ) {
     const size_t pixel = get_global_id(0);
     const size_t count = (size_t)width * (size_t)height;
@@ -254,30 +426,48 @@ __kernel void mandelbrot_direct(
 
     const int py = (int)(pixel / (size_t)width);
     const int px = (int)(pixel - (size_t)py * (size_t)width);
+    // Kalles uses integer half-dimensions; the historical project viewport
+    // is pixel-centred. Keep both coordinate contracts on the GPU so the
+    // OpenCL field is suitable for every ordinary (non-plane) profile.
+    const double x_origin = coordinate_mode != 0
+        ? (double)(width / 2) : (double)(width - 1) * 0.5;
+    const double y_origin = coordinate_mode != 0
+        ? (double)(height / 2) : (double)(height - 1) * 0.5;
     const double cx = center_real
-        + ((double)px - (double)(width - 1) * 0.5) * width_span / (double)width;
+        + ((double)px - x_origin) * width_span / (double)width;
     const double cy = center_imag
-        + ((double)(height - 1) * 0.5 - (double)py) * height_span / (double)height;
+        + (y_origin - (double)py) * height_span / (double)height;
 
-    const double q = (cx - 0.25) * (cx - 0.25) + cy * cy;
-    const int in_cardioid = q * (q + cx - 0.25) <= 0.25 * cy * cy;
-    const int in_bulb = (cx + 1.0) * (cx + 1.0) + cy * cy <= 0.0625;
-    if (in_cardioid || in_bulb) {
-        output[pixel] = (float)((double)max_iter - output_bias);
-        return;
+    if (formula == 0) {
+        const double q = (cx - 0.25) * (cx - 0.25) + cy * cy;
+        const int in_cardioid = q * (q + cx - 0.25) <= 0.25 * cy * cy;
+        const int in_bulb = (cx + 1.0) * (cx + 1.0) + cy * cy <= 0.0625;
+        if (in_cardioid || in_bulb) {
+            output[pixel] = (float)((double)max_iter - output_bias);
+            return;
+        }
     }
 
-    double zr = 0.0;
-    double zi = 0.0;
+    double zr = formula == 1 ? cx : 0.0;
+    double zi = formula == 1 ? cy : 0.0;
+    const double parameter_real = formula == 1 ? julia_real : cx;
+    const double parameter_imag = formula == 1 ? julia_imag : cy;
     int iteration = 0;
     for (; iteration < max_iter; ++iteration) {
-        const double next_real = zr * zr - zi * zi + cx;
-        const double next_imag = 2.0 * zr * zi + cy;
+        const double source_real = formula == 2 ? fabs(zr) : zr;
+        const double source_imag = formula == 2 ? fabs(zi) : zi;
+        const double next_real = source_real * source_real - source_imag * source_imag
+            + parameter_real;
+        const double next_imag = (formula == 3 ? -2.0 : 2.0)
+            * source_real * source_imag + parameter_imag;
         zr = next_real;
         zi = next_imag;
         const double magnitude_squared = zr * zr + zi * zi;
-        if (magnitude_squared > 4.0) {
-            const double magnitude = sqrt(fmax(magnitude_squared, 4.0000001));
+        if (magnitude_squared > escape_squared || !isfinite(magnitude_squared)) {
+            const double safe_squared = isfinite(magnitude_squared)
+                ? fmax(magnitude_squared, escape_squared + 1.0e-7)
+                : 1.7976931348623157e308;
+            const double magnitude = sqrt(safe_squared);
             output[pixel] = (float)((double)(iteration + 1)
                 - log(log(magnitude)) / log(2.0) - output_bias);
             return;
@@ -285,29 +475,3378 @@ __kernel void mandelbrot_direct(
     }
     output[pixel] = (float)((double)max_iter - output_bias);
 }
+
 )CLC";
+
+// The compatibility kernel above accepts a formula id so older callers can
+// keep one ABI. Production callers know the formula before launch, though,
+// so give OpenCL's JIT a literal formula through these wrappers. The helper
+// is inlined by the device compiler and the predictable alternate-formula
+// branches disappear from the hot orbit loop. Keep the argument lists
+// identical to the compatibility kernel: selecting a specialized entry
+// point remains a host-side detail and the public ABI does not change.
+constexpr const char* OPENCL_SPECIALIZED_DIRECT_KERNEL = R"CLC(
+inline void direct_render_pixel_specialized(
+    __global float* output,
+    const size_t pixel,
+    const int width,
+    const int height,
+    const double center_real,
+    const double center_imag,
+    const double width_span,
+    const double height_span,
+    const int max_iter,
+    const double output_bias,
+    const int formula,
+    const double julia_real,
+    const double julia_imag,
+    const double escape_squared,
+    const int coordinate_mode
+) {
+    const int py = (int)(pixel / (size_t)width);
+    const int px = (int)(pixel - (size_t)py * (size_t)width);
+    const double x_origin = coordinate_mode != 0
+        ? (double)(width / 2) : (double)(width - 1) * 0.5;
+    const double y_origin = coordinate_mode != 0
+        ? (double)(height / 2) : (double)(height - 1) * 0.5;
+    const double cx = center_real
+        + ((double)px - x_origin) * width_span / (double)width;
+    const double cy = center_imag
+        + (y_origin - (double)py) * height_span / (double)height;
+
+    if (formula == 0) {
+        const double q = (cx - 0.25) * (cx - 0.25) + cy * cy;
+        const int in_cardioid = q * (q + cx - 0.25) <= 0.25 * cy * cy;
+        const int in_bulb = (cx + 1.0) * (cx + 1.0) + cy * cy <= 0.0625;
+        if (in_cardioid || in_bulb) {
+            output[pixel] = (float)((double)max_iter - output_bias);
+            return;
+        }
+    }
+
+    double zr = formula == 1 ? cx : 0.0;
+    double zi = formula == 1 ? cy : 0.0;
+    const double parameter_real = formula == 1 ? julia_real : cx;
+    const double parameter_imag = formula == 1 ? julia_imag : cy;
+    int iteration = 0;
+    for (; iteration < max_iter; ++iteration) {
+        const double source_real = formula == 2 ? fabs(zr) : zr;
+        const double source_imag = formula == 2 ? fabs(zi) : zi;
+        const double next_real = source_real * source_real - source_imag * source_imag
+            + parameter_real;
+        const double next_imag = (formula == 3 ? -2.0 : 2.0)
+            * source_real * source_imag + parameter_imag;
+        zr = next_real;
+        zi = next_imag;
+        const double magnitude_squared = zr * zr + zi * zi;
+        if (magnitude_squared > escape_squared || !isfinite(magnitude_squared)) {
+            const double safe_squared = isfinite(magnitude_squared)
+                ? fmax(magnitude_squared, escape_squared + 1.0e-7)
+                : 1.7976931348623157e308;
+            const double magnitude = sqrt(safe_squared);
+            output[pixel] = (float)((double)(iteration + 1)
+                - log(log(magnitude)) / log(2.0) - output_bias);
+            return;
+        }
+    }
+    output[pixel] = (float)((double)max_iter - output_bias);
+}
+
+#define DIRECT_SPECIALIZED_KERNEL(kernel_name, literal_formula) \
+__kernel void kernel_name( \
+    __global float* output, const int width, const int height, \
+    const double center_real, const double center_imag, \
+    const double width_span, const double height_span, const int max_iter, \
+    const double output_bias, const int unused_formula, \
+    const double julia_real, const double julia_imag, \
+    const double escape_squared, const int coordinate_mode \
+) { \
+    const size_t pixel = get_global_id(0); \
+    const size_t count = (size_t)width * (size_t)height; \
+    if (pixel >= count) return; \
+    direct_render_pixel_specialized( \
+        output, pixel, width, height, center_real, center_imag, \
+        width_span, height_span, max_iter, output_bias, literal_formula, \
+        julia_real, julia_imag, escape_squared, coordinate_mode); \
+}
+
+DIRECT_SPECIALIZED_KERNEL(mandelbrot_direct_mandelbrot, 0)
+DIRECT_SPECIALIZED_KERNEL(mandelbrot_direct_julia, 1)
+DIRECT_SPECIALIZED_KERNEL(mandelbrot_direct_burning_ship, 2)
+DIRECT_SPECIALIZED_KERNEL(mandelbrot_direct_tricorn, 3)
+#undef DIRECT_SPECIALIZED_KERNEL
+)CLC";
+
+// Deep perturbation uses the same shared-exponent complex layout as the CPU
+// renderer. In particular, the pixel delta is never converted to a double,
+// which is the crucial difference between a useful e150 device pass and a
+// shallow-preview shortcut. Mandelbrot can use its compact linear BLA table;
+// Julia, Burning Ship, and Tricorn take formula-specific exact scaled steps.
+// The kernel deliberately reports Mandelbrot cancellation as NaN so the
+// existing reference-repair machinery can choose a new centre.
+constexpr const char* OPENCL_DEEP_PERTURBATION_KERNEL = R"CLC(
+#if defined(cl_khr_fp64)
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#elif defined(cl_amd_fp64)
+#pragma OPENCL EXTENSION cl_amd_fp64 : enable
+#endif
+
+typedef struct { double r; double i; int e; int pad; } sc;
+typedef struct { sc A; sc B; double radius_m; int radius_e; int length; } bla_step;
+
+inline sc sc_normalize(sc a) {
+    const double magnitude = fmax(fabs(a.r), fabs(a.i));
+    if (magnitude == 0.0) return (sc){0.0, 0.0, 0, 0};
+    // Products and sums of normalized values overwhelmingly need only a
+    // one-bit shift.  Keep this in the device kernel just as the host
+    // ScaledComplex path does: frexp/ldexp in every perturbation iteration
+    // is much more expensive on consumer GPUs than exact powers of two.
+    if (magnitude >= 2.0) {
+        int shift = 0;
+        (void)frexp(magnitude, &shift);
+        a.r = ldexp(a.r, -shift);
+        a.i = ldexp(a.i, -shift);
+        a.e += shift;
+        return a;
+    }
+    if (magnitude >= 1.0) {
+        a.r *= 0.5;
+        a.i *= 0.5;
+        a.e += 1;
+        return a;
+    }
+    if (magnitude >= 0.5) return a;
+    if (magnitude >= 0.25) {
+        a.r *= 2.0;
+        a.i *= 2.0;
+        a.e -= 1;
+        return a;
+    }
+    int shift = 0;
+    const double ignored = frexp(magnitude, &shift);
+    (void)ignored;
+    a.r = ldexp(a.r, -shift);
+    a.i = ldexp(a.i, -shift);
+    a.e += shift;
+    return a;
+}
+
+inline sc sc_add_device(sc a, sc b) {
+    if (a.r == 0.0 && a.i == 0.0) return b;
+    if (b.r == 0.0 && b.i == 0.0) return a;
+    if (b.e > a.e) { const sc temporary = a; a = b; b = temporary; }
+    const int difference = a.e - b.e;
+    if (difference > 60) return a;
+    return sc_normalize((sc){a.r + ldexp(b.r, -difference),
+                              a.i + ldexp(b.i, -difference), a.e, 0});
+}
+
+// The scalar deep renderer checks the escape margin in a small mantissa /
+// exponent type instead of squaring the rounded ``reference + delta`` value.
+// Keep the same compensated norm on the device: at a Kalles-coordinate
+// boundary, those last few bits decide whether a pixel is an escape or a
+// perturbation glitch.
+typedef struct { double m; int e; } fe;
+
+inline fe fe_normalize_device(double mantissa, int exponent) {
+    if (mantissa == 0.0) return (fe){0.0, 0};
+    int shift = 0;
+    const double magnitude = frexp(fabs(mantissa), &shift);
+    if (!(magnitude > 0.0) || !isfinite(magnitude)) {
+        return (fe){mantissa, exponent};
+    }
+    return (fe){ldexp(mantissa, -shift), exponent + shift};
+}
+
+inline fe fe_add_device(fe a, fe b) {
+    if (a.m == 0.0) return b;
+    if (b.m == 0.0) return a;
+    fe larger = a;
+    fe smaller = b;
+    if (b.e > a.e) {
+        larger = b;
+        smaller = a;
+    }
+    const int difference = larger.e - smaller.e;
+    if (difference > 60) return larger;
+    return fe_normalize_device(
+        larger.m + ldexp(smaller.m, -difference), larger.e);
+}
+
+inline fe fe_mul_device(fe a, fe b) {
+    if (a.m == 0.0 || b.m == 0.0) return (fe){0.0, 0};
+    return fe_normalize_device(a.m * b.m, a.e + b.e);
+}
+
+inline fe fe_scale_device(fe a, const double scale) {
+    return fe_normalize_device(a.m * scale, a.e);
+}
+
+// The perturbation glitch threshold is always the same positive scalar.  A
+// general ``frexp(a.m * 1e-7)`` in every reference iteration is needlessly
+// expensive on GPUs.  ``frexp(1e-7)`` is exactly (0.8388608, -23) in the
+// device double format, and reference norms are already normalized to
+// [0.5, 1), so the product needs at most one known two-power adjustment.
+inline fe fe_glitch_threshold_device(fe a) {
+    if (a.m == 0.0) return (fe){0.0, 0};
+    const double mantissa = a.m * 0.8388608;
+    if (mantissa < 0.5) return (fe){mantissa * 2.0, a.e - 24};
+    return (fe){mantissa, a.e - 23};
+}
+
+inline fe fe_component_device(sc value, const int imaginary) {
+    return fe_normalize_device(imaginary ? value.i : value.r, value.e);
+}
+
+inline fe fe_norm_device(sc value) {
+    return fe_add_device(
+        fe_mul_device(fe_component_device(value, 0),
+                      fe_component_device(value, 0)),
+        fe_mul_device(fe_component_device(value, 1),
+                      fe_component_device(value, 1)));
+}
+
+// ``sc_normalize`` keeps the larger component in [0.5, 1), so the squared
+// mantissa is bounded to [0.25, 2).  That means its normalized exponent can
+// only be -1, 0, or +1.  Avoiding frexp here matters on consumer GPUs: the
+// deep kernel performs this check once for the reconstructed value and once
+// for the reference on every perturbation iteration.  The branch layout is
+// intentionally identical to the host ``sc_norm_squared`` implementation.
+inline fe sc_norm_fast_device(sc value, const double norm) {
+    if (norm == 0.0) return (fe){0.0, 0};
+    if (!isfinite(norm)) return (fe){INFINITY, 2147483647};
+    const int squared_exponent = 2 * value.e;
+    if (norm >= 1.0) return (fe){norm * 0.5, squared_exponent + 1};
+    if (norm < 0.5) return (fe){norm * 2.0, squared_exponent - 1};
+    return (fe){norm, squared_exponent};
+}
+
+inline fe sc_escape_margin_with_delta_device(
+    sc reference,
+    sc delta,
+    fe bailout
+) {
+    const fe reference_real = fe_component_device(reference, 0);
+    const fe reference_imag = fe_component_device(reference, 1);
+    const fe delta_real = fe_component_device(delta, 0);
+    const fe delta_imag = fe_component_device(delta, 1);
+    const fe cross = fe_scale_device(
+        fe_add_device(
+            fe_mul_device(reference_real, delta_real),
+            fe_mul_device(reference_imag, delta_imag)),
+        2.0);
+    // Keep the same operation order as the scalar renderer.  Computing
+    // reference_norm + cross + delta_norm directly loses the tiny signed
+    // margin when reference_norm is close to the bailout radius.  Subtract
+    // the bailout first, then add the margin back around zero.
+    const fe reference_margin = fe_add_device(
+        fe_norm_device(reference),
+        fe_scale_device(bailout, -1.0));
+    return fe_add_device(
+        fe_add_device(reference_margin, cross),
+        fe_norm_device(delta));
+}
+
+inline fe sc_norm_squared_with_delta_device(
+    sc reference,
+    sc delta,
+    fe bailout
+) {
+    return fe_add_device(
+        bailout,
+        sc_escape_margin_with_delta_device(reference, delta, bailout));
+}
+
+inline int fe_compare_device(fe a, fe b) {
+    if (a.m == 0.0 && b.m == 0.0) return 0;
+    if (a.m == 0.0) return b.m > 0.0 ? -1 : 1;
+    if (b.m == 0.0) return a.m > 0.0 ? 1 : -1;
+    if ((a.m < 0.0) != (b.m < 0.0)) return a.m < 0.0 ? -1 : 1;
+    if (a.e != b.e) {
+        const int sign = a.e < b.e ? -1 : 1;
+        return a.m < 0.0 ? -sign : sign;
+    }
+    if (a.m == b.m) return 0;
+    const int sign = a.m < b.m ? -1 : 1;
+    return a.m < 0.0 ? -sign : sign;
+}
+
+inline int fe_is_finite_device(fe value) {
+    return isfinite(value.m) && value.e != 2147483647;
+}
+
+inline sc sc_mul_device(sc a, sc b) {
+    if ((a.r == 0.0 && a.i == 0.0) || (b.r == 0.0 && b.i == 0.0))
+        return (sc){0.0, 0.0, 0, 0};
+    return sc_normalize((sc){a.r * b.r - a.i * b.i,
+                              a.r * b.i + a.i * b.r, a.e + b.e, 0});
+}
+
+inline sc sc_neg_device(sc value) {
+    value.r = -value.r;
+    value.i = -value.i;
+    return value;
+}
+
+inline sc sc_sub_device(sc a, sc b) {
+    return sc_add_device(a, sc_neg_device(b));
+}
+
+inline sc sc_conjugate_device(sc value) {
+    value.i = -value.i;
+    return value;
+}
+
+inline sc sc_double_device(sc value) {
+    if (value.r == 0.0 && value.i == 0.0)
+        return (sc){0.0, 0.0, 0, 0};
+    value.e += 1;
+    return value;
+}
+
+inline sc sc_abs_device(sc value) {
+    value.r = fabs(value.r);
+    value.i = fabs(value.i);
+    return value;
+}
+
+inline int sc_outside_norm_device(sc value, const double norm,
+                                  const int bailout_exponent,
+                                  const double bailout_mantissa) {
+    if (!isfinite(norm)) return 1;
+    if (norm == 0.0) return 0;
+    int shift = 0;
+    const double normalized = frexp(norm, &shift);
+    const int exponent = 2 * value.e + shift;
+    return exponent > bailout_exponent
+        || (exponent == bailout_exponent && normalized > bailout_mantissa);
+}
+
+inline int sc_norm_less_device(sc a, const double an, sc b) {
+    const double bn = b.r * b.r + b.i * b.i;
+    if (an == 0.0) return bn != 0.0;
+    if (bn == 0.0) return 0;
+    if (!isfinite(an)) return 0;
+    if (!isfinite(bn)) return 1;
+    // sc_normalize keeps both component pairs in [0.5, 1), so their squared
+    // mantissas are already in [0.25, 2).  The shared exponent is therefore
+    // sufficient to order different scales; only equal exponents need the
+    // mantissa comparison.  The old implementation called frexp twice here
+    // on every perturbation iteration.
+    if (a.e != b.e) return a.e < b.e;
+    return an < bn;
+}
+
+inline int sc_norm_below_radius_device(sc value, const double radius_m,
+                                       const int radius_e) {
+    const double norm = value.r * value.r + value.i * value.i;
+    if (norm == 0.0) return 1;
+    if (!isfinite(norm) || !(radius_m > 0.0)) return 0;
+    int shift = 0;
+    double mantissa = norm;
+    if (mantissa >= 1.0) {
+        mantissa *= 0.5;
+        shift = 1;
+    } else if (mantissa < 0.5) {
+        mantissa *= 2.0;
+        shift = -1;
+    }
+    const int exponent = 2 * value.e + shift;
+    return exponent < radius_e || (exponent == radius_e && mantissa < radius_m);
+}
+
+inline double sc_component_device(sc value, const int imaginary) {
+    const double component = imaginary ? value.i : value.r;
+    const double result = ldexp(component, value.e);
+    return isfinite(result) ? result : 0.0;
+}
+
+inline void sc_store_de_device(sc total, sc derivative,
+                               const double spacing_mantissa,
+                               const int spacing_exponent,
+                               __global double *out_r,
+                               __global double *out_i) {
+    *out_r = 0.0; *out_i = 0.0;
+    const double magnitude = hypot(total.r, total.i);
+    const double log_magnitude = log(magnitude) + (double)total.e * 0.69314718055994530942;
+    if (!(magnitude > 0.0) || !(log_magnitude > 0.0) || !isfinite(log_magnitude)) return;
+    const sc unit = (sc){total.r / magnitude, total.i / magnitude, 0, 0};
+    const sc spacing = sc_normalize((sc){spacing_mantissa, 0.0, spacing_exponent, 0});
+    sc conjugate_derivative = derivative; conjugate_derivative.i = -conjugate_derivative.i;
+    const sc denominator = sc_mul_device(unit, sc_mul_device(conjugate_derivative, spacing));
+    const double denominator_norm = denominator.r * denominator.r + denominator.i * denominator.i;
+    if (!(denominator_norm > 0.0) || !isfinite(denominator_norm)) return;
+    const sc result = sc_normalize((sc){
+        magnitude * log_magnitude * denominator.r / denominator_norm,
+        -magnitude * log_magnitude * denominator.i / denominator_norm,
+        total.e - denominator.e, 0});
+    *out_r = sc_component_device(result, 0);
+    *out_i = sc_component_device(result, 1);
+}
+
+__kernel void mandelbrot_deep_perturbation(
+    __global float* output,
+    __global const sc* reference,
+    const int reference_count,
+    const int width,
+    const int height,
+    const double view_width_mantissa,
+    const int view_width_exponent,
+    const double view_height_mantissa,
+    const int view_height_exponent,
+    const int max_iter,
+    const double output_bias,
+    const int bailout_exponent,
+    const double bailout_mantissa,
+    const int coordinate_mode,
+    const double pixel_spacing_mantissa,
+    const int pixel_spacing_exponent,
+    const int write_planes,
+    __global long* orbit_iteration,
+    __global double* phase,
+    __global double* de_x,
+    __global double* de_y,
+    __global double* test1,
+    __global double* test2,
+    __global const bla_step* bla_steps,
+    __global const int* bla_offsets,
+    __global const int* bla_counts,
+    const int bla_level_count,
+    const int use_linear_bla,
+    const int formula,
+    const double parameter_real,
+    const double parameter_imag,
+    const int parameter_exponent,
+    __global const sc* point_offsets,
+    const int point_mode,
+    __global const fe* reference_norms
+) {
+    const size_t pixel = get_global_id(0);
+    const size_t count = (size_t)width * (size_t)height;
+    if (pixel >= count) return;
+    const int py = (int)(pixel / (size_t)width);
+    const int px = (int)(pixel - (size_t)py * (size_t)width);
+    // Project mode is pixel-centred; Kalles uses integer half-dimensions.
+    // The distinction matters only for even frames, which is why it is easy
+    // to miss in square/odd deep-zoom probes.
+    const double x_axis = coordinate_mode == 1
+        ? (double)px - (double)width * 0.5 : (double)px - (double)(width - 1) * 0.5;
+    const double y_axis = coordinate_mode == 1
+        ? (double)height * 0.5 - (double)py : (double)(height - 1) * 0.5 - (double)py;
+    // Forming the two values separately preserves subnormal viewport spans:
+    // normalize after assigning their true binary exponents instead of
+    // letting ldexp underflow an e150 delta first. Point repairs already have
+    // the exact shared-exponent offset in ``point_offsets``; using it directly
+    // avoids rebuilding the coordinate geometry a second time on the device.
+    sc delta_c;
+    if (point_mode) {
+        delta_c = sc_normalize(point_offsets[pixel]);
+    } else {
+        sc dx = (sc){view_width_mantissa * x_axis / (double)width, 0.0,
+                     view_width_exponent, 0};
+        sc dy = (sc){0.0, view_height_mantissa * y_axis / (double)height,
+                     view_height_exponent, 0};
+        delta_c = sc_add_device(sc_normalize(dx), sc_normalize(dy));
+    }
+    if (reference_count < 2) { output[pixel] = nan((uint)0); return; }
+    const int julia = formula == 1;
+    const sc zero = (sc){0.0, 0.0, 0, 0};
+    const sc parameter = (sc){parameter_real, parameter_imag,
+                              parameter_exponent, 0};
+    const sc parameter_delta = julia ? zero : delta_c;
+    sc delta = delta_c;
+    sc derivative = (sc){1.0, 0.0, 0, 0};
+    int iteration = julia ? 0 : 1;
+    int reference_index = julia ? 0 : 1;
+    int rebase_count = 0;
+    double previous_norm = 0.0;
+    while (iteration < max_iter && reference_index < reference_count) {
+        const sc reference_value = reference[reference_index];
+        const sc total = sc_add_device(reference_value, delta);
+        const double total_norm = total.r * total.r + total.i * total.i;
+        // The device can only inspect the reconstructed scaled value here.
+        // Do not rebuild the CPU bailout-centred margin: when the reference
+        // is many binary exponents below the bailout, that subtraction
+        // intentionally collapses to zero and would mark every interior
+        // pixel as a glitch. The reconstructed norm is the right quantity
+        // for the GPU's own recurrence and remains normalized in `fe`.
+        const fe reconstructed_norm = sc_norm_fast_device(total, total_norm);
+        // The reference orbit is immutable for the whole atlas.  Its norm
+        // therefore belongs in a compact read-only table, not in the inner
+        // pixel/iteration loop.  Recomputing this value used to perform two
+        // extra multiplies and a branch for every perturbation step.
+        const fe reference_norm = reference_norms[reference_index];
+        // Kalles-style cancellation/glitch guard. Do not colour a broken
+        // perturbation as an interior pixel.
+        if (formula == 0
+            && (reference_value.r != 0.0 || reference_value.i != 0.0)
+            && fe_is_finite_device(reference_norm)
+            && fe_compare_device(
+                reconstructed_norm,
+                fe_glitch_threshold_device(reference_norm)) < 0) {
+            output[pixel] = nan((uint)0);
+            return;
+        }
+        if (fe_compare_device(
+                reconstructed_norm,
+                (fe){bailout_mantissa, bailout_exponent}) > 0) {
+            const double magnitude_log = 0.5 * (
+                log(fmax(reconstructed_norm.m, 1.0e-300))
+                + (double)reconstructed_norm.e * 0.69314718055994530942);
+            output[pixel] = (float)((double)iteration
+                - log(fmax(magnitude_log, 1.0e-300)) / 0.69314718055994530942
+                - output_bias);
+            if (write_planes) {
+                orbit_iteration[pixel] = (long)(iteration - 1);
+                double p = atan2(total.i, total.r) / 6.28318530717958647692;
+                phase[pixel] = p - floor(p);
+                sc_store_de_device(total, derivative, pixel_spacing_mantissa,
+                                   pixel_spacing_exponent, &de_x[pixel], &de_y[pixel]);
+                test1[pixel] = ldexp(total_norm, 2 * total.e);
+                test2[pixel] = previous_norm;
+            }
+            return;
+        }
+        previous_norm = ldexp(total_norm, 2 * total.e);
+        // Restart from z_0 when the perturbation becomes larger than the
+        // reference state. This is the inexpensive Kalles rebase that keeps
+        // a single reference useful through winding filaments; without it a
+        // mathematically valid GPU perturbation drifts long before a true
+        // cancellation/glitch is detected.
+        if (formula == 0 && sc_norm_less_device(total, total_norm, delta)
+            && ++rebase_count <= 64) {
+            delta = total;
+            reference_index = 0;
+            continue;
+        }
+        // This is the same conservative linear BLA relation used by the
+        // CPU's ultra-deep tier: d' = A*d + B*dc.  It is valid only inside
+        // its uploaded radius; otherwise the kernel takes one exact scaled
+        // perturbation step below.  KFP plane output deliberately disables
+        // this until derivative composition is also ported.
+        if (formula == 0 && use_linear_bla && !write_planes && reference_index > 0) {
+            const int remaining = max_iter - iteration;
+            int jumped = 0;
+            const int offset = reference_index - 1;
+            // Only levels up to the trailing-zero count of the current
+            // reference offset can be aligned here. The old loop tested
+            // every level from the top, rejecting most of them with the
+            // same bit-mask before reaching the useful candidates.
+            const int highest_aligned_level = offset == 0
+                ? bla_level_count - 1
+                : min(bla_level_count - 1, (int)ctz((uint)offset));
+            for (int level = highest_aligned_level; level >= 0; --level) {
+                const int span = 1 << level;
+                if ((offset & (span - 1)) != 0) continue;
+                const int item = offset >> level;
+                if (item < 0 || item >= bla_counts[level]) continue;
+                const bla_step candidate = bla_steps[bla_offsets[level] + item];
+                if (candidate.length <= 1 || candidate.length > remaining
+                    || !sc_norm_below_radius_device(
+                        delta, candidate.radius_m, candidate.radius_e)) continue;
+                delta = sc_add_device(sc_mul_device(candidate.A, delta),
+                                      sc_mul_device(candidate.B, delta_c));
+                reference_index += candidate.length;
+                iteration += candidate.length;
+                jumped = 1;
+                break;
+            }
+            if (jumped) continue;
+        }
+        if (formula == 2) {
+            // Burning Ship is smooth only while both absolute-value signs
+            // stay fixed. Use its real 2x2 derivative in that region, and
+            // reconstruct the next state from the actual total at a cusp so
+            // the GPU does not smear an axis crossing into a rectangular
+            // deep-zoom tile.
+            const int crosses_real = (reference_value.r < 0.0)
+                != (total.r < 0.0);
+            const int crosses_imag = (reference_value.i < 0.0)
+                != (total.i < 0.0);
+            if ((crosses_real || crosses_imag)
+                && reference_index + 1 < reference_count) {
+                const sc absolute_total = sc_abs_device(total);
+                const sc squared = sc_mul_device(absolute_total, absolute_total);
+                delta = sc_add_device(
+                    sc_sub_device(sc_add_device(squared, parameter),
+                                  reference[reference_index + 1]),
+                    parameter_delta);
+            } else {
+                const sc absolute_reference = sc_abs_device(reference_value);
+                sc signed_delta = delta;
+                signed_delta.r *= reference_value.r < 0.0 ? -1.0 : 1.0;
+                signed_delta.i *= reference_value.i < 0.0 ? -1.0 : 1.0;
+                const sc linear = sc_double_device(
+                    sc_mul_device(absolute_reference, signed_delta));
+                const sc square = sc_mul_device(signed_delta, signed_delta);
+                delta = sc_add_device(sc_add_device(linear, square), parameter_delta);
+            }
+        } else if (formula == 3) {
+            const sc conjugate_reference = sc_conjugate_device(reference_value);
+            const sc conjugate_delta = sc_conjugate_device(delta);
+            delta = sc_add_device(
+                sc_double_device(sc_mul_device(conjugate_reference, conjugate_delta)),
+                sc_add_device(sc_mul_device(conjugate_delta, conjugate_delta),
+                              parameter_delta));
+        } else {
+            // Mandelbrot and Julia are holomorphic z² maps. Julia keeps c
+            // fixed; Mandelbrot carries the pixel offset as dc.
+            const sc linear = sc_double_device(sc_mul_device(reference_value, delta));
+            const sc square = sc_mul_device(delta, delta);
+            if (write_planes && formula == 0) {
+                derivative = sc_add_device(
+                    sc_double_device(sc_mul_device(total, derivative)),
+                    (sc){1.0, 0.0, 0, 0});
+            }
+            delta = sc_add_device(sc_add_device(linear, square), parameter_delta);
+        }
+        ++reference_index;
+        ++iteration;
+    }
+    output[pixel] = (float)((double)max_iter - output_bias);
+    if (write_planes) {
+        orbit_iteration[pixel] = (long)max_iter;
+        phase[pixel] = 0.0; de_x[pixel] = 0.0; de_y[pixel] = 0.0;
+        test1[pixel] = 0.0; test2[pixel] = 0.0;
+    }
+}
+)CLC";
+
+// The ordinary atlas spends most of its time in the exact Mandelbrot
+// perturbation interval before the linear-BLA tiers become valid.  Keep a
+// separate scalar entry point for that hot case: the generic kernel above
+// must support four formulas, KFP planes, point repairs, and BLA, but none of
+// those branches are needed for a normal field tile.  The recurrence and
+// bailout order intentionally match the Mandelbrot branch above.
+constexpr const char* OPENCL_DEEP_SCALAR_KERNEL = R"CLC(
+__kernel void mandelbrot_deep_perturbation_scalar(
+    __global float* output,
+    __global const sc* reference,
+    const int reference_count,
+    const int width,
+    const int height,
+    const double view_width_mantissa,
+    const int view_width_exponent,
+    const double view_height_mantissa,
+    const int view_height_exponent,
+    const int max_iter,
+    const double output_bias,
+    const int bailout_exponent,
+    const double bailout_mantissa,
+    const int coordinate_mode,
+    __global const fe* reference_norms
+) {
+    const size_t pixel = get_global_id(0);
+    const size_t count = (size_t)width * (size_t)height;
+    if (pixel >= count) return;
+    const int py = (int)(pixel / (size_t)width);
+    const int px = (int)(pixel - (size_t)py * (size_t)width);
+    const double x_axis = coordinate_mode == 1
+        ? (double)px - (double)width * 0.5
+        : (double)px - (double)(width - 1) * 0.5;
+    const double y_axis = coordinate_mode == 1
+        ? (double)height * 0.5 - (double)py
+        : (double)(height - 1) * 0.5 - (double)py;
+    const sc dx = sc_normalize((sc){
+        view_width_mantissa * x_axis / (double)width, 0.0,
+        view_width_exponent, 0});
+    const sc dy = sc_normalize((sc){
+        0.0, view_height_mantissa * y_axis / (double)height,
+        view_height_exponent, 0});
+    const sc delta_c = sc_add_device(dx, dy);
+    sc delta = delta_c;
+    if (reference_count < 2) {
+        output[pixel] = nan((uint)0);
+        return;
+    }
+    int iteration = 1;
+    int reference_index = 1;
+    int rebase_count = 0;
+    while (iteration < max_iter && reference_index < reference_count) {
+        const sc reference_value = reference[reference_index];
+        const sc total = sc_add_device(reference_value, delta);
+        const double total_norm = total.r * total.r + total.i * total.i;
+        const fe reconstructed_norm = sc_norm_fast_device(total, total_norm);
+        const fe reference_norm = reference_norms[reference_index];
+        if ((reference_value.r != 0.0 || reference_value.i != 0.0)
+            && fe_is_finite_device(reference_norm)
+            && fe_compare_device(
+                reconstructed_norm,
+                fe_glitch_threshold_device(reference_norm)) < 0) {
+            output[pixel] = nan((uint)0);
+            return;
+        }
+        if (fe_compare_device(
+                reconstructed_norm,
+                (fe){bailout_mantissa, bailout_exponent}) > 0) {
+            const double magnitude_log = 0.5 * (
+                log(fmax(reconstructed_norm.m, 1.0e-300))
+                + (double)reconstructed_norm.e * 0.69314718055994530942);
+            output[pixel] = (float)((double)iteration
+                - log(fmax(magnitude_log, 1.0e-300))
+                    / 0.69314718055994530942
+                - output_bias);
+            return;
+        }
+        // Both scaled values keep their largest component in [0.5, 1), so
+        // a two-or-more exponent lead proves that |total| cannot be smaller
+        // than |delta|. Avoid the two frexp calls in the common non-glitch
+        // case; retain the exact comparison at the only exponents where
+        // cancellation is possible.
+        if (total.e <= delta.e + 1
+            && sc_norm_less_device(total, total_norm, delta)
+            && ++rebase_count <= 64) {
+            delta = total;
+            reference_index = 0;
+            continue;
+        }
+        const sc linear = sc_double_device(sc_mul_device(reference_value, delta));
+        const sc square = sc_mul_device(delta, delta);
+        delta = sc_add_device(sc_add_device(linear, square), delta_c);
+        ++reference_index;
+        ++iteration;
+    }
+    output[pixel] = (float)((double)max_iter - output_bias);
+}
+)CLC";
+
+// The ordinary deep path uses the generic kernel once a linear-BLA table is
+// available, which keeps the implementation compact but leaves predictable
+// formula/plane branches in every pixel.  This variant is the same
+// Mandelbrot recurrence with the validated linear-BLA jump, without those
+// optional branches.  It is an optional entry point: the generic kernel stays
+// available as the correctness fallback for restrictive OpenCL compilers.
+constexpr const char* OPENCL_DEEP_SCALAR_BLA_KERNEL = R"CLC(
+__kernel void mandelbrot_deep_perturbation_scalar_bla(
+    __global float* output,
+    __global const sc* reference,
+    const int reference_count,
+    const int width,
+    const int height,
+    const double view_width_mantissa,
+    const int view_width_exponent,
+    const double view_height_mantissa,
+    const int view_height_exponent,
+    const int max_iter,
+    const double output_bias,
+    const int bailout_exponent,
+    const double bailout_mantissa,
+    const int coordinate_mode,
+    __global const fe* reference_norms,
+    __global const bla_step* bla_steps,
+    __global const int* bla_offsets,
+    __global const int* bla_counts,
+    const int bla_level_count
+) {
+    const size_t pixel = get_global_id(0);
+    const size_t count = (size_t)width * (size_t)height;
+    if (pixel >= count) return;
+    const int py = (int)(pixel / (size_t)width);
+    const int px = (int)(pixel - (size_t)py * (size_t)width);
+    const double x_axis = coordinate_mode == 1
+        ? (double)px - (double)width * 0.5
+        : (double)px - (double)(width - 1) * 0.5;
+    const double y_axis = coordinate_mode == 1
+        ? (double)height * 0.5 - (double)py
+        : (double)(height - 1) * 0.5 - (double)py;
+    const sc dx = sc_normalize((sc){
+        view_width_mantissa * x_axis / (double)width, 0.0,
+        view_width_exponent, 0});
+    const sc dy = sc_normalize((sc){
+        0.0, view_height_mantissa * y_axis / (double)height,
+        view_height_exponent, 0});
+    const sc delta_c = sc_add_device(dx, dy);
+    sc delta = delta_c;
+    if (reference_count < 2) {
+        output[pixel] = nan((uint)0);
+        return;
+    }
+    int iteration = 1;
+    int reference_index = 1;
+    int rebase_count = 0;
+    while (iteration < max_iter && reference_index < reference_count) {
+        const sc reference_value = reference[reference_index];
+        const sc total = sc_add_device(reference_value, delta);
+        const double total_norm = total.r * total.r + total.i * total.i;
+        const fe reconstructed_norm = sc_norm_fast_device(total, total_norm);
+        const fe reference_norm = reference_norms[reference_index];
+        if ((reference_value.r != 0.0 || reference_value.i != 0.0)
+            && fe_is_finite_device(reference_norm)
+            && fe_compare_device(
+                reconstructed_norm,
+                fe_glitch_threshold_device(reference_norm)) < 0) {
+            output[pixel] = nan((uint)0);
+            return;
+        }
+        if (fe_compare_device(
+                reconstructed_norm,
+                (fe){bailout_mantissa, bailout_exponent}) > 0) {
+            const double magnitude_log = 0.5 * (
+                log(fmax(reconstructed_norm.m, 1.0e-300))
+                + (double)reconstructed_norm.e * 0.69314718055994530942);
+            output[pixel] = (float)((double)iteration
+                - log(fmax(magnitude_log, 1.0e-300))
+                    / 0.69314718055994530942
+                - output_bias);
+            return;
+        }
+        if (total.e <= delta.e + 1
+            && sc_norm_less_device(total, total_norm, delta)
+            && ++rebase_count <= 64) {
+            delta = total;
+            reference_index = 0;
+            continue;
+        }
+
+        const int remaining = max_iter - iteration;
+        int jumped = 0;
+        const int offset = reference_index - 1;
+        const int highest_aligned_level = offset == 0
+            ? bla_level_count - 1
+            : min(bla_level_count - 1, (int)ctz((uint)offset));
+        for (int level = highest_aligned_level; level >= 0; --level) {
+            const int span = 1 << level;
+            if ((offset & (span - 1)) != 0) continue;
+            const int item = offset >> level;
+            if (item < 0 || item >= bla_counts[level]) continue;
+            const bla_step candidate = bla_steps[bla_offsets[level] + item];
+            if (candidate.length <= 1 || candidate.length > remaining
+                || !sc_norm_below_radius_device(
+                    delta, candidate.radius_m, candidate.radius_e)) continue;
+            delta = sc_add_device(sc_mul_device(candidate.A, delta),
+                                  sc_mul_device(candidate.B, delta_c));
+            reference_index += candidate.length;
+            iteration += candidate.length;
+            jumped = 1;
+            break;
+        }
+        if (jumped) continue;
+
+        const sc linear = sc_double_device(sc_mul_device(reference_value, delta));
+        const sc square = sc_mul_device(delta, delta);
+        delta = sc_add_device(sc_add_device(linear, square), delta_c);
+        ++reference_index;
+        ++iteration;
+    }
+    output[pixel] = (float)((double)max_iter - output_bias);
+}
+)CLC";
+
+// A large 4K deep field is dominated by the scaled recurrence, and consumer
+// NVIDIA GPUs execute fp64 at a small fraction of their fp32 rate.  This
+// kernel keeps the exponent-separated representation (so e150 does not
+// underflow) while storing the normalized mantissas as floats.  It is used
+// only for large scalar fields; strict double precision remains the default
+// for small probes, point repairs, and every orbit-dependent plane path.
+constexpr const char* OPENCL_DEEP_MIXED_KERNEL = R"CLC(
+typedef struct { float r; float i; int e; int pad; } fsc;
+typedef struct { float m; int e; } ffe;
+typedef struct { fsc A; fsc B; float radius_m; int radius_e; int length; } fbla_step;
+
+inline fsc fsc_normalize_device(fsc a) {
+    const float magnitude = fmax(fabs(a.r), fabs(a.i));
+    if (magnitude == 0.0f) return (fsc){0.0f, 0.0f, 0, 0};
+    if (magnitude >= 1.0f) {
+        if (magnitude < 2.0f) {
+            a.r *= 0.5f; a.i *= 0.5f; a.e += 1;
+            return a;
+        }
+        int shift = 0;
+        (void)frexp(magnitude, &shift);
+        a.r = ldexp(a.r, -shift);
+        a.i = ldexp(a.i, -shift);
+        a.e += shift;
+        return a;
+    }
+    if (magnitude >= 0.5f) return a;
+    if (magnitude >= 0.25f) {
+        a.r *= 2.0f; a.i *= 2.0f; a.e -= 1;
+        return a;
+    }
+    int shift = 0;
+    (void)frexp(magnitude, &shift);
+    a.r = ldexp(a.r, -shift);
+    a.i = ldexp(a.i, -shift);
+    a.e += shift;
+    return a;
+}
+
+inline fsc fsc_add_device(fsc a, fsc b) {
+    if (a.r == 0.0f && a.i == 0.0f) return b;
+    if (b.r == 0.0f && b.i == 0.0f) return a;
+    if (b.e > a.e) { const fsc temporary = a; a = b; b = temporary; }
+    const int difference = a.e - b.e;
+    if (difference > 24) return a;
+    return fsc_normalize_device((fsc){
+        a.r + ldexp(b.r, -difference),
+        a.i + ldexp(b.i, -difference), a.e, 0});
+}
+
+inline fsc fsc_mul_device(fsc a, fsc b) {
+    if ((a.r == 0.0f && a.i == 0.0f)
+        || (b.r == 0.0f && b.i == 0.0f)) {
+        return (fsc){0.0f, 0.0f, 0, 0};
+    }
+    return fsc_normalize_device((fsc){
+        a.r * b.r - a.i * b.i,
+        a.r * b.i + a.i * b.r, a.e + b.e, 0});
+}
+
+inline fsc fsc_neg_device(fsc value) {
+    value.r = -value.r; value.i = -value.i; return value;
+}
+
+inline fsc fsc_sub_device(fsc a, fsc b) {
+    return fsc_add_device(a, fsc_neg_device(b));
+}
+
+inline fsc fsc_conjugate_device(fsc value) {
+    value.i = -value.i; return value;
+}
+
+inline fsc fsc_double_device(fsc value) {
+    if (value.r == 0.0f && value.i == 0.0f)
+        return (fsc){0.0f, 0.0f, 0, 0};
+    value.e += 1; return value;
+}
+
+inline fsc fsc_abs_device(fsc value) {
+    value.r = fabs(value.r); value.i = fabs(value.i); return value;
+}
+
+inline ffe ffe_normalize_device(float mantissa, int exponent) {
+    if (mantissa == 0.0f) return (ffe){0.0f, 0};
+    int shift = 0;
+    (void)frexp(fabs(mantissa), &shift);
+    return (ffe){ldexp(mantissa, -shift), exponent + shift};
+}
+
+inline ffe ffe_add_device(ffe a, ffe b) {
+    if (a.m == 0.0f) return b;
+    if (b.m == 0.0f) return a;
+    ffe larger = a;
+    ffe smaller = b;
+    if (b.e > a.e) { larger = b; smaller = a; }
+    const int difference = larger.e - smaller.e;
+    if (difference > 24) return larger;
+    return ffe_normalize_device(
+        larger.m + ldexp(smaller.m, -difference), larger.e);
+}
+
+inline ffe ffe_mul_device(ffe a, ffe b) {
+    if (a.m == 0.0f || b.m == 0.0f) return (ffe){0.0f, 0};
+    return ffe_normalize_device(a.m * b.m, a.e + b.e);
+}
+
+inline ffe ffe_scale_device(ffe a, float scale) {
+    return ffe_normalize_device(a.m * scale, a.e);
+}
+
+inline ffe ffe_component_device(fsc value, int imaginary) {
+    return ffe_normalize_device(imaginary ? value.i : value.r, value.e);
+}
+
+inline ffe ffe_norm_device(fsc value) {
+    return ffe_add_device(
+        ffe_mul_device(ffe_component_device(value, 0),
+                       ffe_component_device(value, 0)),
+        ffe_mul_device(ffe_component_device(value, 1),
+                       ffe_component_device(value, 1)));
+}
+
+inline ffe fsc_norm_fast_device(fsc value, float norm) {
+    if (norm == 0.0f) return (ffe){0.0f, 0};
+    if (!isfinite(norm)) return (ffe){INFINITY, 2147483647};
+    const int squared_exponent = 2 * value.e;
+    if (norm >= 1.0f) return (ffe){norm * 0.5f, squared_exponent + 1};
+    if (norm < 0.5f) return (ffe){norm * 2.0f, squared_exponent - 1};
+    return (ffe){norm, squared_exponent};
+}
+
+inline ffe fsc_glitch_threshold_device(ffe value) {
+    if (value.m == 0.0f) return (ffe){0.0f, 0};
+    const float mantissa = value.m * 0.8388608f;
+    if (mantissa < 0.5f) return (ffe){mantissa * 2.0f, value.e - 24};
+    return (ffe){mantissa, value.e - 23};
+}
+
+inline int ffe_compare_device(ffe a, ffe b) {
+    if (a.m == 0.0f && b.m == 0.0f) return 0;
+    if (a.m == 0.0f) return b.m > 0.0f ? -1 : 1;
+    if (b.m == 0.0f) return a.m > 0.0f ? 1 : -1;
+    if ((a.m < 0.0f) != (b.m < 0.0f)) return a.m < 0.0f ? -1 : 1;
+    if (a.e != b.e) {
+        const int sign = a.e < b.e ? -1 : 1;
+        return a.m < 0.0f ? -sign : sign;
+    }
+    if (a.m == b.m) return 0;
+    const int sign = a.m < b.m ? -1 : 1;
+    return a.m < 0.0f ? -sign : sign;
+}
+
+inline int ffe_is_finite_device(ffe value) {
+    return isfinite(value.m) && value.e != 2147483647;
+}
+
+inline int fsc_norm_less_device(fsc a, float an, fsc b) {
+    const float bn = b.r * b.r + b.i * b.i;
+    if (an == 0.0f) return bn != 0.0f;
+    if (bn == 0.0f) return 0;
+    if (!isfinite(an)) return 0;
+    if (!isfinite(bn)) return 1;
+    if (a.e != b.e) return a.e < b.e;
+    return an < bn;
+}
+
+inline int fsc_norm_below_radius_device(
+    fsc value, float radius_m, int radius_e
+) {
+    const float norm = value.r * value.r + value.i * value.i;
+    if (norm == 0.0f) return 1;
+    if (!isfinite(norm) || !(radius_m > 0.0f)) return 0;
+    int shift = 0;
+    float mantissa = norm;
+    if (mantissa >= 1.0f) { mantissa *= 0.5f; shift = 1; }
+    else if (mantissa < 0.5f) { mantissa *= 2.0f; shift = -1; }
+    const int exponent = 2 * value.e + shift;
+    return exponent < radius_e
+        || (exponent == radius_e && mantissa < radius_m);
+}
+
+inline fsc fsc_parameter(float real, float imag, int exponent) {
+    return fsc_normalize_device((fsc){real, imag, exponent, 0});
+}
+
+__kernel void mandelbrot_deep_perturbation_mixed(
+    __global float* output,
+    __global const fsc* reference,
+    const int reference_count,
+    const int width,
+    const int height,
+    const float view_width_scale,
+    const int view_width_exponent,
+    const float view_height_scale,
+    const int view_height_exponent,
+    const int max_iter,
+    const float output_bias,
+    const int bailout_exponent,
+    const float bailout_mantissa,
+    const int coordinate_mode,
+    __global const ffe* reference_norms,
+    __global const fbla_step* bla_steps,
+    __global const int* bla_offsets,
+    __global const int* bla_counts,
+    const int bla_level_count,
+    const int formula,
+    const float parameter_real,
+    const float parameter_imag,
+    const int parameter_exponent
+) {
+    const size_t pixel = get_global_id(0);
+    const size_t count = (size_t)width * (size_t)height;
+    if (pixel >= count) return;
+    const int py = (int)(pixel / (size_t)width);
+    const int px = (int)(pixel - (size_t)py * (size_t)width);
+    const float x_axis = coordinate_mode == 1
+        ? (float)px - (float)width * 0.5f
+        : (float)px - (float)(width - 1) * 0.5f;
+    const float y_axis = coordinate_mode == 1
+        ? (float)height * 0.5f - (float)py
+        : (float)(height - 1) * 0.5f - (float)py;
+    const fsc dx = fsc_normalize_device((fsc){
+        view_width_scale * x_axis,
+        0.0f, view_width_exponent, 0});
+    const fsc dy = fsc_normalize_device((fsc){
+        0.0f,
+        view_height_scale * y_axis,
+        view_height_exponent, 0});
+    const fsc delta_c = fsc_add_device(dx, dy);
+    if (reference_count < 2) {
+        output[pixel] = nan((uint)0);
+        return;
+    }
+    const int julia = formula == 1;
+    const fsc zero = (fsc){0.0f, 0.0f, 0, 0};
+    const fsc parameter = fsc_parameter(
+        parameter_real, parameter_imag, parameter_exponent);
+    const fsc parameter_delta = julia ? zero : delta_c;
+    fsc delta = delta_c;
+    int iteration = julia ? 0 : 1;
+    int reference_index = julia ? 0 : 1;
+    int rebase_count = 0;
+    while (iteration < max_iter && reference_index < reference_count) {
+        const fsc reference_value = reference[reference_index];
+        const fsc total = fsc_add_device(reference_value, delta);
+        const float total_norm = total.r * total.r + total.i * total.i;
+        const ffe reconstructed_norm = fsc_norm_fast_device(total, total_norm);
+        // The host stores the already-scaled glitch threshold in this table.
+        // It is immutable for the reference orbit, so doing the multiply and
+        // exponent adjustment once during upload avoids another normalization
+        // branch in every perturbation iteration.
+        const ffe reference_norm = reference_norms[reference_index];
+        if (formula == 0
+            && (reference_value.r != 0.0f || reference_value.i != 0.0f)
+            && ffe_is_finite_device(reference_norm)
+            && ffe_compare_device(reconstructed_norm, reference_norm) < 0) {
+            output[pixel] = nan((uint)0);
+            return;
+        }
+        if (ffe_compare_device(
+                reconstructed_norm,
+                (ffe){(float)bailout_mantissa, bailout_exponent}) > 0) {
+            const float magnitude_log = 0.5f * (
+                log(fmax(reconstructed_norm.m, 1.0e-30f))
+                + (float)reconstructed_norm.e * 0.6931471805599453f);
+            output[pixel] = (float)iteration
+                - log(fmax(magnitude_log, 1.0e-30f))
+                    / 0.6931471805599453f
+                - (float)output_bias;
+            return;
+        }
+        if (formula == 0
+            && total.e <= delta.e + 1
+            && fsc_norm_less_device(total, total_norm, delta)
+            && ++rebase_count <= 64) {
+            delta = total;
+            reference_index = 0;
+            continue;
+        }
+        if (formula == 0 && bla_level_count > 0 && reference_index > 0) {
+            const int remaining = max_iter - iteration;
+            int jumped = 0;
+            const int offset = reference_index - 1;
+            const int highest_aligned_level = offset == 0
+                ? bla_level_count - 1
+                : min(bla_level_count - 1, (int)ctz((uint)offset));
+            for (int level = highest_aligned_level; level >= 0; --level) {
+                const int span = 1 << level;
+                if ((offset & (span - 1)) != 0) continue;
+                const int item = offset >> level;
+                if (item < 0 || item >= bla_counts[level]) continue;
+                const fbla_step candidate = bla_steps[bla_offsets[level] + item];
+                if (candidate.length <= 1 || candidate.length > remaining
+                    || !fsc_norm_below_radius_device(
+                        delta, candidate.radius_m, candidate.radius_e)) continue;
+                delta = fsc_add_device(
+                    fsc_mul_device(candidate.A, delta),
+                    fsc_mul_device(candidate.B, delta_c));
+                reference_index += candidate.length;
+                iteration += candidate.length;
+                jumped = 1;
+                break;
+            }
+            if (jumped) continue;
+        }
+        if (formula == 2) {
+            const int crosses_real = (reference_value.r < 0.0f)
+                != (total.r < 0.0f);
+            const int crosses_imag = (reference_value.i < 0.0f)
+                != (total.i < 0.0f);
+            if ((crosses_real || crosses_imag)
+                && reference_index + 1 < reference_count) {
+                const fsc absolute_total = fsc_abs_device(total);
+                const fsc squared = fsc_mul_device(absolute_total, absolute_total);
+                delta = fsc_add_device(
+                    fsc_sub_device(fsc_add_device(squared, parameter),
+                                   reference[reference_index + 1]),
+                    parameter_delta);
+            } else {
+                const fsc absolute_reference = fsc_abs_device(reference_value);
+                fsc signed_delta = delta;
+                signed_delta.r *= reference_value.r < 0.0f ? -1.0f : 1.0f;
+                signed_delta.i *= reference_value.i < 0.0f ? -1.0f : 1.0f;
+                const fsc linear = fsc_double_device(
+                    fsc_mul_device(absolute_reference, signed_delta));
+                const fsc square = fsc_mul_device(signed_delta, signed_delta);
+                delta = fsc_add_device(
+                    fsc_add_device(linear, square), parameter_delta);
+            }
+        } else if (formula == 3) {
+            const fsc conjugate_reference = fsc_conjugate_device(reference_value);
+            const fsc conjugate_delta = fsc_conjugate_device(delta);
+            delta = fsc_add_device(
+                fsc_double_device(
+                    fsc_mul_device(conjugate_reference, conjugate_delta)),
+                fsc_add_device(
+                    fsc_mul_device(conjugate_delta, conjugate_delta),
+                    parameter_delta));
+        } else {
+            const fsc linear = fsc_double_device(
+                fsc_mul_device(reference_value, delta));
+            const fsc square = fsc_mul_device(delta, delta);
+            delta = fsc_add_device(
+                fsc_add_device(linear, square), parameter_delta);
+        }
+        ++reference_index;
+        ++iteration;
+    }
+    output[pixel] = (float)max_iter - (float)output_bias;
+}
+
+// The normal export is Mandelbrot-only and has no orbit planes or point
+// repairs.  Keeping that formula in a separate entry point lets the OpenCL
+// compiler remove the Julia/Burning-Ship/Tricorn branches from the hot loop.
+// The argument layout intentionally matches the prefix of the mixed kernel so
+// the host-side setup stays straightforward.
+__kernel void mandelbrot_deep_perturbation_mixed_mandelbrot(
+    __global float* output,
+    __global const fsc* reference,
+    const int reference_count,
+    const int width,
+    const int height,
+    const float view_width_scale,
+    const int view_width_exponent,
+    const float view_height_scale,
+    const int view_height_exponent,
+    const int max_iter,
+    const float output_bias,
+    const int bailout_exponent,
+    const float bailout_mantissa,
+    const int coordinate_mode,
+    __global const ffe* reference_norms,
+    __global const fbla_step* bla_steps,
+    __global const int* bla_offsets,
+    __global const int* bla_counts,
+    const int bla_level_count
+) {
+    const size_t pixel = get_global_id(0);
+    const size_t count = (size_t)width * (size_t)height;
+    if (pixel >= count) return;
+    const int py = (int)(pixel / (size_t)width);
+    const int px = (int)(pixel - (size_t)py * (size_t)width);
+    const float x_axis = coordinate_mode == 1
+        ? (float)px - (float)width * 0.5f
+        : (float)px - (float)(width - 1) * 0.5f;
+    const float y_axis = coordinate_mode == 1
+        ? (float)height * 0.5f - (float)py
+        : (float)(height - 1) * 0.5f - (float)py;
+    const fsc dx = fsc_normalize_device((fsc){
+        view_width_scale * x_axis,
+        0.0f, view_width_exponent, 0});
+    const fsc dy = fsc_normalize_device((fsc){
+        0.0f,
+        view_height_scale * y_axis,
+        view_height_exponent, 0});
+    const fsc delta_c = fsc_add_device(dx, dy);
+    if (reference_count < 2) {
+        output[pixel] = nan((uint)0);
+        return;
+    }
+    fsc delta = delta_c;
+    int iteration = 1;
+    int reference_index = 1;
+    int rebase_count = 0;
+    while (iteration < max_iter && reference_index < reference_count) {
+        const fsc reference_value = reference[reference_index];
+        const fsc total = fsc_add_device(reference_value, delta);
+        const float total_norm = total.r * total.r + total.i * total.i;
+        const ffe reconstructed_norm = fsc_norm_fast_device(total, total_norm);
+        const ffe glitch_threshold = reference_norms[reference_index];
+        if ((reference_value.r != 0.0f || reference_value.i != 0.0f)
+            && ffe_is_finite_device(glitch_threshold)
+            && ffe_compare_device(reconstructed_norm, glitch_threshold) < 0) {
+            output[pixel] = nan((uint)0);
+            return;
+        }
+        if (ffe_compare_device(
+                reconstructed_norm,
+                (ffe){bailout_mantissa, bailout_exponent}) > 0) {
+            const float magnitude_log = 0.5f * (
+                log(fmax(reconstructed_norm.m, 1.0e-30f))
+                + (float)reconstructed_norm.e * 0.6931471805599453f);
+            output[pixel] = (float)iteration
+                - log(fmax(magnitude_log, 1.0e-30f))
+                    / 0.6931471805599453f
+                - output_bias;
+            return;
+        }
+        if (total.e <= delta.e + 1
+            && fsc_norm_less_device(total, total_norm, delta)
+            && ++rebase_count <= 64) {
+            delta = total;
+            reference_index = 0;
+            continue;
+        }
+        if (bla_level_count > 0 && reference_index > 0) {
+            const int remaining = max_iter - iteration;
+            int jumped = 0;
+            const int offset = reference_index - 1;
+            const int highest_aligned_level = offset == 0
+                ? bla_level_count - 1
+                : min(bla_level_count - 1, (int)ctz((uint)offset));
+            for (int level = highest_aligned_level; level >= 0; --level) {
+                const int span = 1 << level;
+                if ((offset & (span - 1)) != 0) continue;
+                const int item = offset >> level;
+                if (item < 0 || item >= bla_counts[level]) continue;
+                const fbla_step candidate = bla_steps[bla_offsets[level] + item];
+                if (candidate.length <= 1 || candidate.length > remaining
+                    || !fsc_norm_below_radius_device(
+                        delta, candidate.radius_m, candidate.radius_e)) continue;
+                delta = fsc_add_device(
+                    fsc_mul_device(candidate.A, delta),
+                    fsc_mul_device(candidate.B, delta_c));
+                reference_index += candidate.length;
+                iteration += candidate.length;
+                jumped = 1;
+                break;
+            }
+            if (jumped) continue;
+        }
+        const fsc linear = fsc_double_device(
+            fsc_mul_device(reference_value, delta));
+        const fsc square = fsc_mul_device(delta, delta);
+        delta = fsc_add_device(
+            fsc_add_device(linear, square), delta_c);
+        ++reference_index;
+        ++iteration;
+    }
+    output[pixel] = (float)max_iter - output_bias;
+}
+)CLC";
+
+// Ordinary Aurora colourisation is a table lookup once the CPU has built the
+// tiny audio-reactive palette. Keeping that lookup on the device avoids a
+// second full OpenMP pass when the field was rendered by OpenCL.
+constexpr const char* OPENCL_AURORA_COLOUR_KERNEL = R"CLC(
+#if defined(cl_khr_fp64)
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#elif defined(cl_amd_fp64)
+#pragma OPENCL EXTENSION cl_amd_fp64 : enable
+#endif
+
+__kernel void aurora_colourise(
+    __global const float* field,
+    __global const uchar* palette,
+    __global uchar* output,
+    const int pixel_count,
+    const int max_iter,
+    const int palette_size,
+    const double palette_index_scale
+) {
+    const size_t pixel = get_global_id(0);
+    if (pixel >= (size_t)pixel_count) return;
+    const float smooth = field[pixel];
+    const size_t destination = pixel * (size_t)3;
+    if (!isfinite(smooth) || smooth >= (float)max_iter) {
+        output[destination] = 0;
+        output[destination + 1] = 0;
+        output[destination + 2] = 0;
+        return;
+    }
+    const double scaled = (double)smooth * palette_index_scale;
+    int index = scaled >= (double)(palette_size - 1)
+        ? palette_size - 1
+        : (!isfinite(scaled) || scaled <= 0.0 ? 0 : (int)scaled);
+    const size_t source = (size_t)index * (size_t)3;
+    output[destination] = palette[source];
+    output[destination + 1] = palette[source + 1];
+    output[destination + 2] = palette[source + 2];
+}
+)CLC";
+
+// Scalar KFP profiles use the same finite-difference stencil as the native
+// SetColor path. Keep this as a separate kernel instead of trying to express
+// KFP through the ordinary Aurora lookup: the distance transfer, cyclic LUT
+// interpolation, slope relief, and ordered dither are all part of the KFP
+// image contract. Plane-aware, textured, and multi-colour profiles continue
+// to use the exact CPU implementation because they need data which is not in
+// the scalar field ABI.
+constexpr const char* OPENCL_KFP_COLOUR_KERNEL = R"CLC(
+#if defined(cl_khr_fp64)
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#elif defined(cl_amd_fp64)
+#pragma OPENCL EXTENSION cl_amd_fp64 : enable
+#endif
+
+inline double kfp_gpu_clamp(double value, double lower, double upper) {
+    return fmin(fmax(value, lower), upper);
+}
+
+inline double kfp_gpu_sample(
+    __global const float* field,
+    int width,
+    int height,
+    int x,
+    int y,
+    int max_iter,
+    double field_bias,
+    double smooth_offset
+) {
+    x = max(0, min(width - 1, x));
+    y = max(0, min(height - 1, y));
+    const float raw = field[(size_t)y * (size_t)width + (size_t)x];
+    if (!isfinite(raw)) return fmax(0.0, smooth_offset);
+    if ((double)raw >= (double)max_iter - field_bias) {
+        return (double)max_iter + 1.0;
+    }
+    return fmax(
+        0.0,
+        kfp_gpu_clamp((double)raw + field_bias, 0.0, (double)max_iter)
+            + smooth_offset);
+}
+
+inline double kfp_gpu_reflected_sample(
+    __global const float* field,
+    int width,
+    int height,
+    int x,
+    int y,
+    int offset_x,
+    int offset_y,
+    int max_iter,
+    double centre,
+    double field_bias,
+    double smooth_offset
+) {
+    const int sample_x = x + offset_x;
+    const int sample_y = y + offset_y;
+    if (sample_x >= 0 && sample_x < width
+        && sample_y >= 0 && sample_y < height) {
+        return kfp_gpu_sample(
+            field, width, height, sample_x, sample_y, max_iter,
+            field_bias, smooth_offset);
+    }
+    const int opposite_x = x - offset_x;
+    const int opposite_y = y - offset_y;
+    if (opposite_x >= 0 && opposite_x < width
+        && opposite_y >= 0 && opposite_y < height) {
+        return 2.0 * centre - kfp_gpu_sample(
+            field, width, height, opposite_x, opposite_y, max_iter,
+            field_bias, smooth_offset);
+    }
+    return centre;
+}
+
+inline double kfp_gpu_difference(
+    int differences,
+    double centre,
+    double left,
+    double right,
+    double up,
+    double down,
+    double top_left,
+    double top_right,
+    double bottom_left,
+    double bottom_right
+) {
+    const double inverse_sqrt_two = 0.7071067811865475244;
+    if (differences == 0) {
+        return fabs(left - centre) * 1.414
+            + fabs(up - centre) * 1.414
+            + fabs(top_left - centre)
+            + fabs(bottom_left - centre);
+    }
+    if (differences == 1) {
+        const double squared =
+            (left - centre) * (left - centre)
+            + (right - centre) * (right - centre)
+            + (up - centre) * (up - centre)
+            + (down - centre) * (down - centre)
+            + ((top_left - centre) * (top_left - centre)
+                + (bottom_right - centre) * (bottom_right - centre))
+                * inverse_sqrt_two * inverse_sqrt_two
+            + ((bottom_left - centre) * (bottom_left - centre)
+                + (top_right - centre) * (top_right - centre))
+                * inverse_sqrt_two * inverse_sqrt_two;
+        return sqrt(fmax(0.0, squared * 0.25)) * 2.8284271247461903;
+    }
+    if (differences == 2) {
+        const double squared =
+            (right - left) * (right - left) * 0.25
+            + (down - up) * (down - up) * 0.25
+            + (bottom_right - top_left) * (bottom_right - top_left) * 0.125
+            + (top_right - bottom_left) * (top_right - bottom_left) * 0.125;
+        return sqrt(fmax(0.0, squared * 0.5)) * 2.8284271247461903;
+    }
+    if (differences == 3) {
+        const double squared =
+            (top_left - centre) * (top_left - centre) * 0.5
+            + (left - up) * (left - up) * 0.5;
+        return sqrt(fmax(0.0, squared)) * 2.8284271247461903;
+    }
+    if (differences == 4) {
+        const double dx = ((up - top_left) + (centre - left)) * 0.5;
+        const double dy = ((left - top_left) + (centre - up)) * 0.5;
+        return sqrt(dx * dx + dy * dy) * 2.8284271247461903;
+    }
+    if (differences == 5) {
+        const double dx = (right + top_right + bottom_right
+            - left - top_left - bottom_left) / 6.0;
+        const double dy = (down + bottom_left + bottom_right
+            - up - top_left - top_right) / 6.0;
+        return sqrt(dx * dx + dy * dy) * 2.8284271247461903;
+    }
+    if (differences == 6) {
+        const double laplacian = top_left + 4.0 * up + top_right
+            + 4.0 * left - 20.0 * centre + 4.0 * right
+            + bottom_left + 4.0 * down + bottom_right;
+        return sqrt(fabs(laplacian / 6.0 * 1.4426950408889634))
+            * 2.8284271247461903;
+    }
+    // Differences_Analytic needs the derivative planes, which are deliberately
+    // outside this scalar kernel. The CPU-compatible scalar path defines it as
+    // zero when those planes are absent.
+    return 0.0;
+}
+
+inline uchar kfp_gpu_byte(float value, int x, int y, int channel) {
+    if (!isfinite(value)) value = 0.0f;
+    const uint coordinate = ((uint)x + (uint)channel * 67u + (uint)y * 236u) * 119u;
+    const float mask = (float)(coordinate & 255u) / 256.0f;
+    const int quantized = (int)floor(255.0f * value + mask);
+    return (uchar)max(0, min(255, quantized));
+}
+
+__kernel void kfp_colourise(
+    __global const float* field,
+    __global const uchar* lut,
+    __global uchar* output,
+    const int width,
+    const int height,
+    const int max_iter,
+    const double field_bias,
+    const double smooth_offset,
+    const int iter_division,
+    const double iter_div,
+    const double color_offset,
+    const int color_method,
+    const int smooth,
+    const int inverse_transition,
+    const int flat,
+    const int slopes,
+    const double slope_power,
+    const double slope_ratio,
+    const double slope_cosine,
+    const double slope_sine,
+    const int differences,
+    const int interior_red,
+    const int interior_green,
+    const int interior_blue,
+    const double transfer_minimum,
+    const double transfer_maximum,
+    const int lut_size
+) {
+    const size_t pixel = get_global_id(0);
+    const size_t pixel_count = (size_t)width * (size_t)height;
+    if (pixel >= pixel_count) return;
+    const int y = (int)(pixel / (size_t)width);
+    const int x = (int)(pixel - (size_t)y * (size_t)width);
+    const float raw = field[pixel];
+    const bool inside = isfinite(raw)
+        && (double)raw >= (double)max_iter - field_bias;
+    uchar* destination = output + pixel * (size_t)3;
+    if (inside) {
+        destination[0] = (uchar)interior_red;
+        destination[1] = (uchar)interior_green;
+        destination[2] = (uchar)interior_blue;
+        return;
+    }
+
+    const double centre = kfp_gpu_sample(
+        field, width, height, x, y, max_iter, field_bias, smooth_offset);
+    const double colour_iter = flat ? floor(centre) : centre;
+    const double left = kfp_gpu_reflected_sample(
+        field, width, height, x, y, -1, 0, max_iter, centre,
+        field_bias, smooth_offset);
+    const double right = kfp_gpu_reflected_sample(
+        field, width, height, x, y, 1, 0, max_iter, centre,
+        field_bias, smooth_offset);
+    const double up = kfp_gpu_reflected_sample(
+        field, width, height, x, y, 0, -1, max_iter, centre,
+        field_bias, smooth_offset);
+    const double down = kfp_gpu_reflected_sample(
+        field, width, height, x, y, 0, 1, max_iter, centre,
+        field_bias, smooth_offset);
+    const double top_left = kfp_gpu_reflected_sample(
+        field, width, height, x, y, -1, -1, max_iter, centre,
+        field_bias, smooth_offset);
+    const double top_right = kfp_gpu_reflected_sample(
+        field, width, height, x, y, 1, -1, max_iter, centre,
+        field_bias, smooth_offset);
+    const double bottom_left = kfp_gpu_reflected_sample(
+        field, width, height, x, y, -1, 1, max_iter, centre,
+        field_bias, smooth_offset);
+    const double bottom_right = kfp_gpu_reflected_sample(
+        field, width, height, x, y, 1, 1, max_iter, centre,
+        field_bias, smooth_offset);
+
+    double gradient = 0.0;
+    if (color_method >= 5 && color_method <= 8) {
+        gradient = kfp_gpu_difference(
+            differences, centre, left, right, up, down,
+            top_left, top_right, bottom_left, bottom_right);
+    }
+    double distance = gradient * (double)width / 640.0;
+    if (isnan(distance) || distance < 0.0) distance = 0.0;
+
+    double transfer = colour_iter;
+    if (color_method == 1) transfer = sqrt(fmax(0.0, colour_iter));
+    else if (color_method == 2) transfer = pow(fmax(0.0, colour_iter), 1.0 / 3.0);
+    else if (color_method == 3) transfer = log(fmax(1.0, colour_iter));
+    else if (color_method == 4) transfer = 1024.0
+        * (colour_iter - transfer_minimum)
+        / fmax(transfer_maximum - transfer_minimum, 1.0e-12);
+    else if (color_method == 5) transfer = fmin(distance, 1024.0);
+    else if (color_method == 6) {
+        const double distance_transfer = fmin(sqrt(fmax(0.0, distance)), 1024.0);
+        transfer = distance_transfer > iter_div ? centre : distance_transfer;
+    } else if (color_method == 7) transfer = log(fmax(1.0, distance + 1.0));
+    else if (color_method == 8) transfer = sqrt(fmax(0.0, distance));
+    else if (color_method == 9) transfer = log(1.0 + log(1.0 + fmax(0.0, colour_iter)));
+    else if (color_method == 10) transfer = atan(colour_iter);
+    else if (color_method == 11) transfer = sqrt(sqrt(fmax(0.0, colour_iter)));
+    if (isnan(transfer) || transfer < 0.0) transfer = 0.0;
+    if (color_method == 5 || color_method == 7 || color_method == 8) {
+        transfer = kfp_gpu_clamp(transfer, 0.0, 1024.0);
+    }
+
+    double palette_value = transfer;
+    if (iter_division) palette_value /= iter_div;
+    double position = fmod(palette_value + color_offset, (double)lut_size);
+    if (position < 0.0) position += (double)lut_size;
+    const double lower_position = floor(position);
+    const int lower = max(0, min(lut_size - 1, (int)lower_position));
+    double fraction = position - lower_position;
+    if (smooth && inverse_transition) fraction = 1.0 - fraction;
+    const int upper = (lower + 1) % lut_size;
+    float red;
+    float green;
+    float blue;
+    if (smooth) {
+        const double inverse_fraction = 1.0 - fraction;
+        red = (float)(((double)lut[lower * 3] * inverse_fraction
+            + (double)lut[upper * 3] * fraction) / 255.0f);
+        green = (float)(((double)lut[lower * 3 + 1] * inverse_fraction
+            + (double)lut[upper * 3 + 1] * fraction) / 255.0f);
+        blue = (float)(((double)lut[lower * 3 + 2] * inverse_fraction
+            + (double)lut[upper * 3 + 2] * fraction) / 255.0f);
+    } else {
+        red = (float)lut[lower * 3] / 255.0f;
+        green = (float)lut[lower * 3 + 1] / 255.0f;
+        blue = (float)lut[lower * 3 + 2] / 255.0f;
+    }
+
+    if (slopes && slope_power > 0.0 && slope_ratio > 0.0) {
+        const double horizontal = x > 0 ? left - centre : centre - right;
+        const double vertical = y == 0 ? centre - down : up - centre;
+        const double projected = (
+            horizontal * slope_cosine + vertical * slope_sine)
+            * slope_power * (double)width / 640.0;
+        const double strength = atan(fabs(projected))
+            / (3.14159265358979323846 / 2.0) * slope_ratio / 100.0;
+        const double factor = 1.0 - strength;
+        if (projected >= 0.0) {
+            red = (float)((double)red * factor);
+            green = (float)((double)green * factor);
+            blue = (float)((double)blue * factor);
+        } else {
+            red = (float)((double)red * factor + strength);
+            green = (float)((double)green * factor + strength);
+            blue = (float)((double)blue * factor + strength);
+        }
+    }
+    destination[0] = kfp_gpu_byte(red, x, y, 0);
+    destination[1] = kfp_gpu_byte(green, x, y, 1);
+    destination[2] = kfp_gpu_byte(blue, x, y, 2);
+}
+)CLC";
+
+// RGB atlas composition is also a per-video-frame operation.  Keeping this
+// sampler on the same device as the KFP colour pass avoids downloading two
+// 1080p tiles to the CPU, running a second bilinear loop there, and uploading
+// the result again for every frame.  The kernel deliberately mirrors the
+// native RGB compositor's centred crop, child rectangle, and narrow feather.
+constexpr const char* OPENCL_RGB_ATLAS_KERNEL = R"CLC(
+#if defined(cl_khr_fp64)
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#elif defined(cl_amd_fp64)
+#pragma OPENCL EXTENSION cl_amd_fp64 : enable
+#endif
+
+inline float rgb_clamp_float(float value, float lower, float upper) {
+    return fmin(fmax(value, lower), upper);
+}
+
+inline void rgb_axis_sample(
+    int destination,
+    int destination_size,
+    int source_size,
+    float zoom,
+    int* index0,
+    int* index1,
+    float* weight
+) {
+    zoom = fmax(zoom, 1.0f);
+    const float crop_size = (float)source_size / zoom;
+    const float left = ((float)source_size - crop_size) * 0.5f;
+    float source = left
+        + ((float)destination + 0.5f) * crop_size / (float)destination_size
+        - 0.5f;
+    source = fmin(fmax(source, 0.0f), (float)(source_size - 1));
+    const int lower = (int)floor(source);
+    *index0 = lower;
+    *index1 = min(lower + 1, source_size - 1);
+    *weight = source - (float)lower;
+}
+
+inline uchar rgb_sample_channel(
+    __global const uchar* source,
+    int source_width,
+    int x0,
+    int x1,
+    int y0,
+    int y1,
+    float x_weight,
+    float y_weight,
+    int channel
+) {
+    const size_t top = (size_t)y0 * (size_t)source_width * 3U;
+    const size_t bottom = (size_t)y1 * (size_t)source_width * 3U;
+    const float top_value =
+        (float)source[top + (size_t)x0 * 3U + (size_t)channel]
+            * (1.0f - x_weight)
+        + (float)source[top + (size_t)x1 * 3U + (size_t)channel]
+            * x_weight;
+    const float bottom_value =
+        (float)source[bottom + (size_t)x0 * 3U + (size_t)channel]
+            * (1.0f - x_weight)
+        + (float)source[bottom + (size_t)x1 * 3U + (size_t)channel]
+            * x_weight;
+    const float value = bottom_value * y_weight
+        + top_value * (1.0f - y_weight);
+    return (uchar)max(0, min(255, (int)floor(value + 0.5f)));
+}
+
+inline uchar rgb_sample_channel_at(
+    __global const uchar* source,
+    int source_width,
+    int source_height,
+    int destination_x,
+    int destination_y,
+    int destination_width,
+    int destination_height,
+    double zoom,
+    int channel
+) {
+    int x0, x1, y0, y1;
+    float x_weight, y_weight;
+    rgb_axis_sample(
+        destination_x, destination_width, source_width, zoom,
+        &x0, &x1, &x_weight);
+    rgb_axis_sample(
+        destination_y, destination_height, source_height, zoom,
+        &y0, &y1, &y_weight);
+    return rgb_sample_channel(
+        source, source_width, x0, x1, y0, y1,
+        x_weight, y_weight, channel);
+}
+
+inline void rgb_sample_rgb_at(
+    __global const uchar* source,
+    int source_width,
+    int source_height,
+    int destination_x,
+    int destination_y,
+    int destination_width,
+    int destination_height,
+    float zoom,
+    __private uchar* output
+) {
+    int x0, x1, y0, y1;
+    float x_weight, y_weight;
+    rgb_axis_sample(
+        destination_x, destination_width, source_width, zoom,
+        &x0, &x1, &x_weight);
+    rgb_axis_sample(
+        destination_y, destination_height, source_height, zoom,
+        &y0, &y1, &y_weight);
+    for (int channel = 0; channel < 3; ++channel) {
+        output[channel] = rgb_sample_channel(
+            source, source_width, x0, x1, y0, y1,
+            x_weight, y_weight, channel);
+    }
+}
+
+__kernel void rgb_crop(
+    __global const uchar* source,
+    const int source_width,
+    const int source_height,
+    __global uchar* output,
+    const int output_width,
+    const int output_height,
+    const float zoom
+) {
+    const size_t pixel = get_global_id(0);
+    const size_t pixel_count = (size_t)output_width * (size_t)output_height;
+    if (pixel >= pixel_count) return;
+    const int y = (int)(pixel / (size_t)output_width);
+    const int x = (int)(pixel - (size_t)y * (size_t)output_width);
+    const size_t destination = pixel * 3U;
+    uchar rgb[3];
+    rgb_sample_rgb_at(
+        source, source_width, source_height, x, y,
+        output_width, output_height, (float)zoom, rgb);
+    output[destination] = rgb[0];
+    output[destination + 1] = rgb[1];
+    output[destination + 2] = rgb[2];
+}
+
+__kernel void rgb_atlas_composite(
+    __global const uchar* parent,
+    const int parent_width,
+    const int parent_height,
+    __global const uchar* child,
+    const int child_width,
+    const int child_height,
+    __global uchar* output,
+    const int output_width,
+    const int output_height,
+    const float parent_zoom,
+    const float child_fraction,
+    const float child_zoom,
+    const int feather,
+    const int use_child
+) {
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    if (x >= output_width || y >= output_height) return;
+    const size_t pixel = (size_t)y * (size_t)output_width + (size_t)x;
+    const size_t destination = pixel * 3U;
+    uchar parent_rgb[3];
+    rgb_sample_rgb_at(
+        parent, parent_width, parent_height, x, y,
+        output_width, output_height, (float)parent_zoom, parent_rgb);
+    output[destination] = parent_rgb[0];
+    output[destination + 1] = parent_rgb[1];
+    output[destination + 2] = parent_rgb[2];
+    if (!use_child) return;
+
+    const int visible_width = max(
+        1, (int)floor((double)output_width * child_fraction + 0.5));
+    const int visible_height = max(
+        1, (int)floor((double)output_height * child_fraction + 0.5));
+    const int child_left = (output_width - visible_width) / 2;
+    const int child_top = (output_height - visible_height) / 2;
+    if (x < child_left || x >= child_left + visible_width
+        || y < child_top || y >= child_top + visible_height) return;
+
+    const int child_x = x - child_left;
+    const int child_y = y - child_top;
+    uchar child_rgb[3];
+    rgb_sample_rgb_at(
+        child, child_width, child_height, child_x, child_y,
+        visible_width, visible_height, (float)child_zoom, child_rgb);
+
+    float alpha = 1.0f;
+    const int effective_feather = min(
+        feather, min(visible_width, visible_height));
+    if (effective_feather >= 2) {
+        const int edge_distance = min(
+            min(child_x, visible_width - 1 - child_x),
+            min(child_y, visible_height - 1 - child_y));
+        const float linear = rgb_clamp_float(
+            (float)edge_distance / (float)effective_feather,
+            0.0f, 1.0f);
+        alpha = linear * linear * (3.0f - 2.0f * linear);
+    }
+    for (int channel = 0; channel < 3; ++channel) {
+        const float value = (float)parent_rgb[channel] * (1.0f - alpha)
+            + (float)child_rgb[channel] * alpha;
+        output[destination + (size_t)channel] =
+            (uchar)max(0, min(255, (int)floor(value + 0.5f)));
+    }
+}
+)CLC";
+
+// Ordinary Aurora frames used to compose a complete scalar atlas on the CPU,
+// upload that 8 MB surface, and then run the very small palette lookup kernel.
+// Keep the source tiles resident instead: this kernel performs the same
+// bilinear crop/interior handling and narrow child seam directly on the
+// device, then immediately applies the Aurora LUT.  The double arithmetic is
+// intentional; it matches the native atlas coordinate calculation and keeps
+// very deep, narrow crops from accumulating visible pixel drift.
+constexpr const char* OPENCL_ATLAS_AURORA_KERNEL = R"CLC(
+#if defined(cl_khr_fp64)
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+#elif defined(cl_amd_fp64)
+#pragma OPENCL EXTENSION cl_amd_fp64 : enable
+#endif
+
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+typedef struct {
+    int index0;
+    int index1;
+    float weight;
+    float padding;
+} atlas_axis;
+#endif
+
+inline void atlas_aurora_axis(
+    int destination,
+    int destination_size,
+    int source_size,
+    double zoom,
+    __private int* index0,
+    __private int* index1,
+    __private float* weight
+) {
+    zoom = fmax(zoom, 1.0);
+    const double crop_size = (double)source_size / zoom;
+    const double left = ((double)source_size - crop_size) * 0.5;
+    double source = left
+        + ((double)destination + 0.5) * crop_size
+            / (double)destination_size
+        - 0.5;
+    source = fmin(fmax(source, 0.0), (double)(source_size - 1));
+    const int lower = (int)floor(source);
+    *index0 = lower;
+    *index1 = min(lower + 1, source_size - 1);
+    *weight = (float)(source - (double)lower);
+}
+
+inline float atlas_aurora_sample(
+    __global const float* source,
+    int source_width,
+    int source_height,
+    int destination_x,
+    int destination_y,
+    int destination_width,
+    int destination_height,
+    double zoom,
+    int source_max_iter,
+    double source_field_bias,
+    __private int* inside
+) {
+    int x0, x1, y0, y1;
+    float x_weight, y_weight;
+    atlas_aurora_axis(
+        destination_x, destination_width, source_width, zoom,
+        &x0, &x1, &x_weight);
+    atlas_aurora_axis(
+        destination_y, destination_height, source_height, zoom,
+        &y0, &y1, &y_weight);
+    const double xw = (double)x_weight;
+    const double yw = (double)y_weight;
+    const float values[4] = {
+        source[(size_t)y0 * (size_t)source_width + (size_t)x0],
+        source[(size_t)y0 * (size_t)source_width + (size_t)x1],
+        source[(size_t)y1 * (size_t)source_width + (size_t)x0],
+        source[(size_t)y1 * (size_t)source_width + (size_t)x1],
+    };
+    const double weights[4] = {
+        (1.0 - yw) * (1.0 - xw),
+        (1.0 - yw) * xw,
+        yw * (1.0 - xw),
+        yw * xw,
+    };
+    double interior_weight = 0.0;
+    double exterior_weight = 0.0;
+    double exterior_value = 0.0;
+    for (int index = 0; index < 4; ++index) {
+        const float value = values[index];
+        const double weight = weights[index];
+        if (isfinite(value)
+            && (double)value >= (double)source_max_iter - source_field_bias) {
+            interior_weight += weight;
+        } else if (isfinite(value)) {
+            exterior_weight += weight;
+            exterior_value += ((double)value + source_field_bias) * weight;
+        }
+    }
+    if (interior_weight >= 0.5) {
+        *inside = 1;
+        return (float)source_max_iter;
+    }
+    *inside = 0;
+    if (exterior_weight <= 1.0e-12) return 0.0f;
+    return (float)(exterior_value / exterior_weight);
+}
+
+inline float atlas_aurora_value(
+    __global const float* source,
+    int source_width,
+    int source_height,
+    int destination_x,
+    int destination_y,
+    int destination_width,
+    int destination_height,
+    double zoom,
+    int source_max_iter,
+    double source_field_bias,
+    int effective_iter,
+    double output_field_bias
+) {
+    int inside = 0;
+    const float sample = atlas_aurora_sample(
+        source, source_width, source_height,
+        destination_x, destination_y,
+        destination_width, destination_height,
+        zoom, source_max_iter, source_field_bias, &inside);
+    return inside
+        ? (float)((double)effective_iter - output_field_bias)
+        : sample - (float)output_field_bias;
+}
+
+// The source atlas is already float-valued and the destination palette index
+// is quantised to a small integer LUT.  On GPUs with weak fp64 throughput,
+// doing the crop/interpolation in float is substantially cheaper while still
+// retaining the exact source texel selection and the same interior rule.
+// This entry point is compiled only for the explicit fast OpenCL atlas mode;
+// the strict path above remains the default and the reference implementation.
+inline float atlas_aurora_value_float(
+    __global const float* source,
+    int source_width,
+    int source_height,
+    int destination_x,
+    int destination_y,
+    int destination_width,
+    int destination_height,
+    double zoom,
+    int source_max_iter,
+    double source_field_bias,
+    int effective_iter,
+    double output_field_bias
+) {
+    const float effective_zoom = fmax((float)zoom, 1.0f);
+    const float x_crop = (float)source_width / effective_zoom;
+    const float y_crop = (float)source_height / effective_zoom;
+    const float x_left = ((float)source_width - x_crop) * 0.5f;
+    const float y_top = ((float)source_height - y_crop) * 0.5f;
+    float x_source = x_left
+        + ((float)destination_x + 0.5f) * x_crop
+            / (float)destination_width
+        - 0.5f;
+    float y_source = y_top
+        + ((float)destination_y + 0.5f) * y_crop
+            / (float)destination_height
+        - 0.5f;
+    x_source = fmin(fmax(x_source, 0.0f), (float)(source_width - 1));
+    y_source = fmin(fmax(y_source, 0.0f), (float)(source_height - 1));
+    const int x0 = (int)floor(x_source);
+    const int y0 = (int)floor(y_source);
+    const int x1 = min(x0 + 1, source_width - 1);
+    const int y1 = min(y0 + 1, source_height - 1);
+    const float x_weight = x_source - (float)x0;
+    const float y_weight = y_source - (float)y0;
+    const float values[4] = {
+        source[(size_t)y0 * (size_t)source_width + (size_t)x0],
+        source[(size_t)y0 * (size_t)source_width + (size_t)x1],
+        source[(size_t)y1 * (size_t)source_width + (size_t)x0],
+        source[(size_t)y1 * (size_t)source_width + (size_t)x1],
+    };
+    const float weights[4] = {
+        (1.0f - y_weight) * (1.0f - x_weight),
+        (1.0f - y_weight) * x_weight,
+        y_weight * (1.0f - x_weight),
+        y_weight * x_weight,
+    };
+    const float field_bias = (float)source_field_bias;
+    const float interior_threshold =
+        (float)source_max_iter - field_bias;
+    float interior_weight = 0.0f;
+    float exterior_weight = 0.0f;
+    float exterior_value = 0.0f;
+    for (int index = 0; index < 4; ++index) {
+        const float value = values[index];
+        const float weight = weights[index];
+        if (isfinite(value) && value >= interior_threshold) {
+            interior_weight += weight;
+        } else if (isfinite(value)) {
+            exterior_weight += weight;
+            exterior_value += (value + field_bias) * weight;
+        }
+    }
+    if (interior_weight >= 0.5f) {
+        return (float)effective_iter - (float)output_field_bias;
+    }
+    if (exterior_weight <= 1.0e-6f) return 0.0f;
+    return exterior_value / exterior_weight - (float)output_field_bias;
+}
+
+#if defined(FRACTAL_OPENCL_ATLAS_FLOAT)
+#define atlas_aurora_value_render atlas_aurora_value_float
+#else
+#define atlas_aurora_value_render atlas_aurora_value
+#endif
+
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+inline float atlas_aurora_value_mapped(
+    __global const float* source,
+    int source_width,
+    int destination_x,
+    int destination_y,
+    __global const atlas_axis* x_map,
+    __global const atlas_axis* y_map,
+    int source_max_iter,
+    double source_field_bias,
+    int effective_iter,
+    double output_field_bias
+) {
+    const atlas_axis x_axis = x_map[destination_x];
+    const atlas_axis y_axis = y_map[destination_y];
+    const double xw = (double)x_axis.weight;
+    const double yw = (double)y_axis.weight;
+    const float values[4] = {
+        source[(size_t)y_axis.index0 * (size_t)source_width
+               + (size_t)x_axis.index0],
+        source[(size_t)y_axis.index0 * (size_t)source_width
+               + (size_t)x_axis.index1],
+        source[(size_t)y_axis.index1 * (size_t)source_width
+               + (size_t)x_axis.index0],
+        source[(size_t)y_axis.index1 * (size_t)source_width
+               + (size_t)x_axis.index1],
+    };
+    const double weights[4] = {
+        (1.0 - yw) * (1.0 - xw),
+        (1.0 - yw) * xw,
+        yw * (1.0 - xw),
+        yw * xw,
+    };
+    double interior_weight = 0.0;
+    double exterior_weight = 0.0;
+    double exterior_value = 0.0;
+    const double interior_threshold = (double)source_max_iter
+        - source_field_bias;
+    for (int index = 0; index < 4; ++index) {
+        const float value = values[index];
+        const double weight = weights[index];
+        if (isfinite(value) && (double)value >= interior_threshold) {
+            interior_weight += weight;
+        } else if (isfinite(value)) {
+            exterior_weight += weight;
+            exterior_value += ((double)value + source_field_bias) * weight;
+        }
+    }
+    if (interior_weight >= 0.5) {
+        return (float)((double)effective_iter - output_field_bias);
+    }
+    if (exterior_weight <= 1.0e-12) return 0.0f;
+    return (float)(exterior_value / exterior_weight - output_field_bias);
+}
+#if defined(FRACTAL_OPENCL_ATLAS_FLOAT)
+inline float atlas_aurora_value_mapped_float(
+    __global const float* source,
+    int source_width,
+    int destination_x,
+    int destination_y,
+    __global const atlas_axis* x_map,
+    __global const atlas_axis* y_map,
+    int source_max_iter,
+    double source_field_bias,
+    int effective_iter,
+    double output_field_bias
+) {
+    const atlas_axis x_axis = x_map[destination_x];
+    const atlas_axis y_axis = y_map[destination_y];
+    const float xw = x_axis.weight;
+    const float yw = y_axis.weight;
+    const float values[4] = {
+        source[(size_t)y_axis.index0 * (size_t)source_width
+               + (size_t)x_axis.index0],
+        source[(size_t)y_axis.index0 * (size_t)source_width
+               + (size_t)x_axis.index1],
+        source[(size_t)y_axis.index1 * (size_t)source_width
+               + (size_t)x_axis.index0],
+        source[(size_t)y_axis.index1 * (size_t)source_width
+               + (size_t)x_axis.index1],
+    };
+    const float weights[4] = {
+        (1.0f - yw) * (1.0f - xw),
+        (1.0f - yw) * xw,
+        yw * (1.0f - xw),
+        yw * xw,
+    };
+    const float field_bias = (float)source_field_bias;
+    const float interior_threshold =
+        (float)source_max_iter - field_bias;
+    float interior_weight = 0.0f;
+    float exterior_weight = 0.0f;
+    float exterior_value = 0.0f;
+    for (int index = 0; index < 4; ++index) {
+        const float value = values[index];
+        const float weight = weights[index];
+        if (isfinite(value) && value >= interior_threshold) {
+            interior_weight += weight;
+        } else if (isfinite(value)) {
+            exterior_weight += weight;
+            exterior_value += (value + field_bias) * weight;
+        }
+    }
+    if (interior_weight >= 0.5f) {
+        return (float)effective_iter - (float)output_field_bias;
+    }
+    if (exterior_weight <= 1.0e-6f) return 0.0f;
+    return exterior_value / exterior_weight - (float)output_field_bias;
+}
+#define atlas_aurora_value_mapped_render atlas_aurora_value_mapped_float
+#else
+#define atlas_aurora_value_mapped_render atlas_aurora_value_mapped
+#endif
+#endif
+
+inline uchar4 atlas_aurora_lookup(
+    float smooth,
+    int effective_iter,
+    __global const uchar* palette,
+    ulong palette_offset,
+    int palette_size,
+    float palette_index_scale,
+    int interior_red,
+    int interior_green,
+    int interior_blue
+) {
+    if (!isfinite(smooth) || smooth >= (float)effective_iter) {
+        return (uchar4)(
+            (uchar)clamp(interior_red, 0, 255),
+            (uchar)clamp(interior_green, 0, 255),
+            (uchar)clamp(interior_blue, 0, 255),
+            (uchar)0);
+    }
+    // The palette scale is generated as float on the host and the field is
+    // already float-valued. Keep this hot lookup in single precision; the
+    // old double promotion made every 4K pixel pay the RTX FP64 penalty.
+    const float scaled = smooth * palette_index_scale;
+    const int index = scaled >= (float)(palette_size - 1)
+        ? palette_size - 1
+        : (!isfinite(scaled) || scaled <= 0.0 ? 0 : (int)scaled);
+    const size_t source = palette_offset + (size_t)index * (size_t)3;
+    return (uchar4)(
+        palette[source], palette[source + 1], palette[source + 2], (uchar)0);
+}
+
+inline uchar atlas_aurora_blend_channel(
+    uchar parent,
+    uchar child,
+    float alpha
+) {
+    const double value = (double)parent * (1.0 - (double)alpha)
+        + (double)child * (double)alpha;
+    return (uchar)rint(fmin(fmax(value, 0.0), 255.0));
+}
+
+#if defined(FRACTAL_OPENCL_ATLAS_IMAGES)
+// The ordinary Aurora source is a scalar field with an interior marker.  The
+// image path stores three bilinearly sampled quantities in an RGBA image:
+// exterior value, exterior weight, and interior weight.  That preserves the
+// scalar compositor's treatment of NaNs and interior pixels while allowing
+// the hardware sampler to do the four-tap interpolation in one operation.
+__constant sampler_t atlas_aurora_sampler =
+    CLK_NORMALIZED_COORDS_FALSE
+    | CLK_ADDRESS_CLAMP
+    | CLK_FILTER_LINEAR;
+
+inline float atlas_aurora_image_value(
+    read_only image2d_t source,
+    int source_width,
+    int source_height,
+    int destination_x,
+    int destination_y,
+    int destination_width,
+    int destination_height,
+    double zoom,
+    int source_max_iter,
+    int effective_iter
+) {
+    const float effective_zoom = fmax((float)zoom, 1.0f);
+    const float crop_width = (float)source_width / effective_zoom;
+    const float crop_height = (float)source_height / effective_zoom;
+    const float left = ((float)source_width - crop_width) * 0.5f;
+    const float top = ((float)source_height - crop_height) * 0.5f;
+    float source_x = left
+        + ((float)destination_x + 0.5f) * crop_width
+            / (float)destination_width
+        - 0.5f;
+    float source_y = top
+        + ((float)destination_y + 0.5f) * crop_height
+            / (float)destination_height
+        - 0.5f;
+    source_x = fmin(fmax(source_x, 0.0f), (float)(source_width - 1));
+    source_y = fmin(fmax(source_y, 0.0f), (float)(source_height - 1));
+    const float4 sample = read_imagef(
+        source,
+        atlas_aurora_sampler,
+        (float2)(source_x + 0.5f, source_y + 0.5f));
+    if (sample.z >= 0.5f) {
+        return (float)effective_iter;
+    }
+    if (sample.y <= 1.0e-6f) return 0.0f;
+    (void)source_max_iter;
+    return sample.x / sample.y;
+}
+
+__kernel void aurora_atlas_colourise_image(
+    read_only image2d_t parent,
+    const int parent_width,
+    const int parent_height,
+    const int parent_max_iter,
+    read_only image2d_t child,
+    const int child_width,
+    const int child_height,
+    const int child_max_iter,
+    __global const uchar* palette,
+    __global uchar* output,
+    const int output_width,
+    const int output_height,
+    const double parent_zoom,
+    const double child_fraction,
+    const double child_zoom,
+    const double parent_field_bias,
+    const double child_field_bias,
+    const double output_field_bias,
+    const int effective_iter,
+    const int feather,
+    const int palette_size,
+    const float palette_index_scale,
+    const int interior_red,
+    const int interior_green,
+    const int interior_blue,
+    const int use_child,
+    const ulong output_offset,
+    const ulong palette_offset
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+    , __global const atlas_axis* parent_x_map
+    , __global const atlas_axis* parent_y_map
+    , __global const atlas_axis* child_x_map
+    , __global const atlas_axis* child_y_map
+    , const int parent_x_map_offset
+    , const int parent_y_map_offset
+    , const int child_x_map_offset
+    , const int child_y_map_offset
+#endif
+) {
+    const size_t pixel_count = (size_t)output_width * (size_t)output_height;
+    const int linear_launch = get_work_dim() == 1;
+    const size_t linear_id = get_global_id(0);
+    const int x = linear_launch
+        ? (int)(linear_id % (size_t)output_width)
+        : (int)linear_id;
+    const int y = linear_launch
+        ? (int)(linear_id / (size_t)output_width)
+        : (int)get_global_id(1);
+    if (linear_launch
+        ? linear_id >= pixel_count
+        : (x >= output_width || y >= output_height)) return;
+    const size_t pixel = (size_t)y * (size_t)output_width + (size_t)x;
+    const size_t destination = output_offset + pixel * (size_t)3;
+    const int full_child = use_child && child_fraction >= 0.999999;
+    float smooth;
+    if (full_child) {
+        smooth = atlas_aurora_image_value(
+            child, child_width, child_height, x, y,
+            output_width, output_height, child_zoom, child_max_iter,
+            effective_iter);
+        const uchar4 colour = atlas_aurora_lookup(
+            smooth, effective_iter, palette, palette_offset, palette_size,
+            palette_index_scale, interior_red, interior_green, interior_blue);
+        output[destination] = colour.x;
+        output[destination + 1] = colour.y;
+        output[destination + 2] = colour.z;
+        return;
+    }
+
+    if (use_child) {
+        const int visible_width = max(
+            1, (int)floor((double)output_width * child_fraction + 0.5));
+        const int visible_height = max(
+            1, (int)floor((double)output_height * child_fraction + 0.5));
+        const int child_left = (output_width - visible_width) / 2;
+        const int child_top = (output_height - visible_height) / 2;
+        if (x >= child_left && x < child_left + visible_width
+            && y >= child_top && y < child_top + visible_height) {
+            const int child_x = x - child_left;
+            const int child_y = y - child_top;
+            const float child_value = atlas_aurora_image_value(
+                child, child_width, child_height, child_x, child_y,
+                visible_width, visible_height, child_zoom, child_max_iter,
+                effective_iter);
+            const int seam_feather = min(
+                feather, min(visible_width / 8, visible_height / 8));
+            float alpha = 1.0f;
+            if (seam_feather >= 2) {
+                const int edge_distance = min(
+                    min(child_x, visible_width - 1 - child_x),
+                    min(child_y, visible_height - 1 - child_y));
+                const float linear = fmin(
+                    1.0f,
+                    (float)edge_distance / (float)seam_feather);
+                const float eased = linear * linear
+                    * (3.0f - 2.0f * linear);
+                alpha = eased;
+            }
+            if (alpha >= 0.999999f) {
+                const uchar4 colour = atlas_aurora_lookup(
+                    child_value, effective_iter, palette, palette_offset,
+                    palette_size, palette_index_scale, interior_red,
+                    interior_green, interior_blue);
+                output[destination] = colour.x;
+                output[destination + 1] = colour.y;
+                output[destination + 2] = colour.z;
+                return;
+            }
+            smooth = atlas_aurora_image_value(
+                parent, parent_width, parent_height, x, y,
+                output_width, output_height, parent_zoom, parent_max_iter,
+                effective_iter);
+            const uchar4 parent_colour = atlas_aurora_lookup(
+                smooth, effective_iter, palette, palette_offset, palette_size,
+                palette_index_scale, interior_red, interior_green, interior_blue);
+            const uchar4 child_colour = atlas_aurora_lookup(
+                child_value, effective_iter, palette, palette_offset,
+                palette_size, palette_index_scale, interior_red,
+                interior_green, interior_blue);
+            output[destination] = atlas_aurora_blend_channel(
+                parent_colour.x, child_colour.x, alpha);
+            output[destination + 1] = atlas_aurora_blend_channel(
+                parent_colour.y, child_colour.y, alpha);
+            output[destination + 2] = atlas_aurora_blend_channel(
+                parent_colour.z, child_colour.z, alpha);
+            return;
+        }
+    }
+
+    smooth = atlas_aurora_image_value(
+        parent, parent_width, parent_height, x, y,
+        output_width, output_height, parent_zoom, parent_max_iter,
+        effective_iter);
+    const uchar4 colour = atlas_aurora_lookup(
+        smooth, effective_iter, palette, palette_offset, palette_size,
+        palette_index_scale, interior_red, interior_green, interior_blue);
+    output[destination] = colour.x;
+    output[destination + 1] = colour.y;
+    output[destination + 2] = colour.z;
+    (void)parent_field_bias;
+    (void)child_field_bias;
+    (void)output_field_bias;
+}
+#endif
+
+__kernel void aurora_atlas_colourise(
+    __global const float* parent,
+    const int parent_width,
+    const int parent_height,
+    const int parent_max_iter,
+    __global const float* child,
+    const int child_width,
+    const int child_height,
+    const int child_max_iter,
+    __global const uchar* palette,
+    __global uchar* output,
+    const int output_width,
+    const int output_height,
+    const double parent_zoom,
+    const double child_fraction,
+    const double child_zoom,
+    const double parent_field_bias,
+    const double child_field_bias,
+    const double output_field_bias,
+    const int effective_iter,
+    const int feather,
+    const int palette_size,
+    const float palette_index_scale,
+    const int interior_red,
+    const int interior_green,
+    const int interior_blue,
+    const int use_child,
+    const ulong output_offset,
+    const ulong palette_offset
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+    , __global const atlas_axis* parent_x_map
+    , __global const atlas_axis* parent_y_map
+    , __global const atlas_axis* child_x_map
+    , __global const atlas_axis* child_y_map
+    , const int parent_x_map_offset
+    , const int parent_y_map_offset
+    , const int child_x_map_offset
+    , const int child_y_map_offset
+#endif
+) {
+    const size_t pixel_count = (size_t)output_width * (size_t)output_height;
+    const int linear_launch = get_work_dim() == 1;
+    const size_t linear_id = get_global_id(0);
+    const int x = linear_launch
+        ? (int)(linear_id % (size_t)output_width)
+        : (int)linear_id;
+    const int y = linear_launch
+        ? (int)(linear_id / (size_t)output_width)
+        : (int)get_global_id(1);
+    if (linear_launch
+        ? linear_id >= pixel_count
+        : (x >= output_width || y >= output_height)) return;
+    const size_t pixel = (size_t)y * (size_t)output_width + (size_t)x;
+
+    const int full_child = use_child && child_fraction >= 0.999999;
+    float smooth;
+    const size_t destination = output_offset + pixel * (size_t)3;
+    if (full_child) {
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+        smooth = atlas_aurora_value_mapped_render(
+            child, child_width, x, y,
+            child_x_map + child_x_map_offset,
+            child_y_map + child_y_map_offset,
+            child_max_iter, child_field_bias, effective_iter, output_field_bias);
+#else
+        smooth = atlas_aurora_value_render(
+            child, child_width, child_height, x, y,
+            output_width, output_height, child_zoom, child_max_iter,
+            child_field_bias, effective_iter, output_field_bias);
+#endif
+        const uchar4 colour = atlas_aurora_lookup(
+            smooth, effective_iter, palette, palette_offset, palette_size,
+            palette_index_scale, interior_red, interior_green, interior_blue);
+        output[destination] = colour.x;
+        output[destination + 1] = colour.y;
+        output[destination + 2] = colour.z;
+        return;
+    }
+
+    if (use_child) {
+        const int visible_width = max(
+            1, (int)floor((double)output_width * child_fraction + 0.5));
+        const int visible_height = max(
+            1, (int)floor((double)output_height * child_fraction + 0.5));
+        const int child_left = (output_width - visible_width) / 2;
+        const int child_top = (output_height - visible_height) / 2;
+        if (x >= child_left && x < child_left + visible_width
+            && y >= child_top && y < child_top + visible_height) {
+            const int child_x = x - child_left;
+            const int child_y = y - child_top;
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+            const float child_value = atlas_aurora_value_mapped_render(
+                child, child_width, child_x, child_y,
+                child_x_map + child_x_map_offset,
+                child_y_map + child_y_map_offset,
+                child_max_iter,
+                child_field_bias, effective_iter, output_field_bias);
+#else
+            const float child_value = atlas_aurora_value_render(
+                child, child_width, child_height, child_x, child_y,
+                visible_width, visible_height, child_zoom,
+                child_max_iter, child_field_bias,
+                effective_iter, output_field_bias);
+#endif
+            const int seam_feather = min(
+                feather, min(visible_width / 8, visible_height / 8));
+            float alpha = 1.0f;
+            if (seam_feather >= 2) {
+                const int edge_distance = min(
+                    min(child_x, visible_width - 1 - child_x),
+                    min(child_y, visible_height - 1 - child_y));
+                const float linear = fmin(
+                    1.0f,
+                    (float)edge_distance / (float)seam_feather);
+                const float eased = linear * linear
+                    * (3.0f - 2.0f * linear);
+                alpha = eased;
+            }
+            if (alpha >= 0.999999f) {
+                const uchar4 colour = atlas_aurora_lookup(
+                    child_value, effective_iter, palette, palette_offset,
+                    palette_size,
+                    palette_index_scale, interior_red, interior_green,
+                    interior_blue);
+                output[destination] = colour.x;
+                output[destination + 1] = colour.y;
+                output[destination + 2] = colour.z;
+                return;
+            }
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+            smooth = atlas_aurora_value_mapped_render(
+                parent, parent_width, x, y,
+                parent_x_map + parent_x_map_offset,
+                parent_y_map + parent_y_map_offset,
+                parent_max_iter, parent_field_bias,
+                effective_iter, output_field_bias);
+#else
+            smooth = atlas_aurora_value_render(
+                parent, parent_width, parent_height, x, y,
+                output_width, output_height, parent_zoom, parent_max_iter,
+                parent_field_bias, effective_iter, output_field_bias);
+#endif
+            const uchar4 parent_colour = atlas_aurora_lookup(
+                smooth, effective_iter, palette, palette_offset, palette_size,
+                palette_index_scale, interior_red, interior_green,
+                interior_blue);
+            const uchar4 child_colour = atlas_aurora_lookup(
+                child_value, effective_iter, palette, palette_offset,
+                palette_size,
+                palette_index_scale, interior_red, interior_green,
+                interior_blue);
+            output[destination] = atlas_aurora_blend_channel(
+                parent_colour.x, child_colour.x, alpha);
+            output[destination + 1] = atlas_aurora_blend_channel(
+                parent_colour.y, child_colour.y, alpha);
+            output[destination + 2] = atlas_aurora_blend_channel(
+                parent_colour.z, child_colour.z, alpha);
+            return;
+        }
+    }
+
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+    smooth = atlas_aurora_value_mapped_render(
+        parent, parent_width, x, y,
+        parent_x_map + parent_x_map_offset,
+        parent_y_map + parent_y_map_offset,
+        parent_max_iter, parent_field_bias, effective_iter, output_field_bias);
+#else
+    smooth = atlas_aurora_value_render(
+        parent, parent_width, parent_height, x, y,
+        output_width, output_height, parent_zoom, parent_max_iter,
+        parent_field_bias, effective_iter, output_field_bias);
+#endif
+
+    const uchar4 colour = atlas_aurora_lookup(
+        smooth, effective_iter, palette, palette_offset, palette_size,
+        palette_index_scale, interior_red, interior_green, interior_blue
+    );
+    output[destination] = colour.x;
+    output[destination + 1] = colour.y;
+    output[destination + 2] = colour.z;
+}
+#undef atlas_aurora_value_render
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+#undef atlas_aurora_value_mapped_render
+#endif
+)CLC";
+
+// The ordinary atlas crop uses separable coordinates: the horizontal source
+// coordinate depends only on x and the vertical source coordinate only on y.
+// The original fused kernel recalculated both axes for every pixel, including
+// the same fp64 divisions and floors for every pixel in one workgroup.  This
+// variant computes the two axes once per local row/column, then reuses them
+// from local memory.  It keeps the old kernel available for drivers that do
+// not accept the fixed 16-column launch shape.
+constexpr const char* OPENCL_ATLAS_TILED_KERNEL = R"CLC(
+#define ATLAS_TILED_LOCAL_X 16
+#define ATLAS_TILED_LOCAL_Y 16
+
+inline float atlas_aurora_value_from_axes_tiled(
+    __global const float* source,
+    int source_width,
+    int x0,
+    int x1,
+    float x_weight,
+    int y0,
+    int y1,
+    float y_weight,
+    int source_max_iter,
+    double source_field_bias,
+    int effective_iter,
+    double output_field_bias
+) {
+    const float values[4] = {
+        source[(size_t)y0 * (size_t)source_width + (size_t)x0],
+        source[(size_t)y0 * (size_t)source_width + (size_t)x1],
+        source[(size_t)y1 * (size_t)source_width + (size_t)x0],
+        source[(size_t)y1 * (size_t)source_width + (size_t)x1],
+    };
+#if defined(FRACTAL_OPENCL_ATLAS_FLOAT)
+    const float xw = x_weight;
+    const float yw = y_weight;
+    const float weights[4] = {
+        (1.0f - yw) * (1.0f - xw),
+        (1.0f - yw) * xw,
+        yw * (1.0f - xw),
+        yw * xw,
+    };
+    const float field_bias = (float)source_field_bias;
+    const float interior_threshold =
+        (float)source_max_iter - field_bias;
+    float interior_weight = 0.0f;
+    float exterior_weight = 0.0f;
+    float exterior_value = 0.0f;
+    for (int index = 0; index < 4; ++index) {
+        const float value = values[index];
+        const float weight = weights[index];
+        if (isfinite(value) && value >= interior_threshold) {
+            interior_weight += weight;
+        } else if (isfinite(value)) {
+            exterior_weight += weight;
+            exterior_value += (value + field_bias) * weight;
+        }
+    }
+    if (interior_weight >= 0.5f) {
+        return (float)effective_iter - (float)output_field_bias;
+    }
+    if (exterior_weight <= 1.0e-6f) return 0.0f;
+    return exterior_value / exterior_weight - (float)output_field_bias;
+#else
+    const double xw = (double)x_weight;
+    const double yw = (double)y_weight;
+    const double weights[4] = {
+        (1.0 - yw) * (1.0 - xw),
+        (1.0 - yw) * xw,
+        yw * (1.0 - xw),
+        yw * xw,
+    };
+    double interior_weight = 0.0;
+    double exterior_weight = 0.0;
+    double exterior_value = 0.0;
+    for (int index = 0; index < 4; ++index) {
+        const float value = values[index];
+        const double weight = weights[index];
+        if (isfinite(value)
+            && (double)value >= (double)source_max_iter - source_field_bias) {
+            interior_weight += weight;
+        } else if (isfinite(value)) {
+            exterior_weight += weight;
+            exterior_value += ((double)value + source_field_bias) * weight;
+        }
+    }
+    if (interior_weight >= 0.5) {
+        return (float)((double)effective_iter - output_field_bias);
+    }
+    if (exterior_weight <= 1.0e-12) return 0.0f;
+    return (float)(exterior_value / exterior_weight - output_field_bias);
+#endif
+}
+
+__kernel void aurora_atlas_colourise_tiled(
+    __global const float* parent,
+    const int parent_width,
+    const int parent_height,
+    const int parent_max_iter,
+    __global const float* child,
+    const int child_width,
+    const int child_height,
+    const int child_max_iter,
+    __global const uchar* palette,
+    __global uchar* output,
+    const int output_width,
+    const int output_height,
+    const double parent_zoom,
+    const double child_fraction,
+    const double child_zoom,
+    const double parent_field_bias,
+    const double child_field_bias,
+    const double output_field_bias,
+    const int effective_iter,
+    const int feather,
+    const int palette_size,
+    const float palette_index_scale,
+    const int interior_red,
+    const int interior_green,
+    const int interior_blue,
+    const int use_child,
+    const ulong output_offset,
+    const ulong palette_offset
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+    , __global const atlas_axis* parent_x_map
+    , __global const atlas_axis* parent_y_map
+    , __global const atlas_axis* child_x_map
+    , __global const atlas_axis* child_y_map
+    , const int parent_x_map_offset
+    , const int parent_y_map_offset
+    , const int child_x_map_offset
+    , const int child_y_map_offset
+#endif
+) {
+    const int local_x = (int)get_local_id(0);
+    const int local_y = (int)get_local_id(1);
+    const int x = (int)get_global_id(0);
+    const int y = (int)get_global_id(1);
+    const int clamped_x = min(max(x, 0), output_width - 1);
+    const int clamped_y = min(max(y, 0), output_height - 1);
+    const int full_child = use_child && child_fraction >= 0.999999;
+    const int visible_width = max(
+        1, (int)floor((double)output_width * child_fraction + 0.5));
+    const int visible_height = max(
+        1, (int)floor((double)output_height * child_fraction + 0.5));
+    const int child_left = (output_width - visible_width) / 2;
+    const int child_top = (output_height - visible_height) / 2;
+    const int safe_child_width = child_width > 0 ? child_width : parent_width;
+    const int safe_child_height = child_height > 0 ? child_height : parent_height;
+    const int child_x = full_child
+        ? clamped_x
+        : min(max(clamped_x - child_left, 0), visible_width - 1);
+    const int child_y = full_child
+        ? clamped_y
+        : min(max(clamped_y - child_top, 0), visible_height - 1);
+    const int child_destination_width = full_child
+        ? output_width : visible_width;
+    const int child_destination_height = full_child
+        ? output_height : visible_height;
+
+    __local int parent_x0[ATLAS_TILED_LOCAL_X];
+    __local int parent_x1[ATLAS_TILED_LOCAL_X];
+    __local float parent_x_weight[ATLAS_TILED_LOCAL_X];
+    __local int parent_y0[ATLAS_TILED_LOCAL_Y];
+    __local int parent_y1[ATLAS_TILED_LOCAL_Y];
+    __local float parent_y_weight[ATLAS_TILED_LOCAL_Y];
+    __local int child_x0[ATLAS_TILED_LOCAL_X];
+    __local int child_x1[ATLAS_TILED_LOCAL_X];
+    __local float child_x_weight[ATLAS_TILED_LOCAL_X];
+    __local int child_y0[ATLAS_TILED_LOCAL_Y];
+    __local int child_y1[ATLAS_TILED_LOCAL_Y];
+    __local float child_y_weight[ATLAS_TILED_LOCAL_Y];
+
+    if (local_y == 0) {
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+        const atlas_axis parent_axis =
+            parent_x_map[parent_x_map_offset + clamped_x];
+        const atlas_axis child_axis =
+            child_x_map[child_x_map_offset + child_x];
+        parent_x0[local_x] = parent_axis.index0;
+        parent_x1[local_x] = parent_axis.index1;
+        parent_x_weight[local_x] = parent_axis.weight;
+        child_x0[local_x] = child_axis.index0;
+        child_x1[local_x] = child_axis.index1;
+        child_x_weight[local_x] = child_axis.weight;
+#else
+        int x0, x1;
+        float weight;
+        atlas_aurora_axis(
+            clamped_x, output_width, parent_width, parent_zoom,
+            &x0, &x1, &weight);
+        parent_x0[local_x] = x0;
+        parent_x1[local_x] = x1;
+        parent_x_weight[local_x] = weight;
+        atlas_aurora_axis(
+            child_x, child_destination_width, safe_child_width, child_zoom,
+            &x0, &x1, &weight);
+        child_x0[local_x] = x0;
+        child_x1[local_x] = x1;
+        child_x_weight[local_x] = weight;
+#endif
+    }
+    if (local_x == 0) {
+#if defined(FRACTAL_OPENCL_ATLAS_MAPS)
+        const atlas_axis parent_axis =
+            parent_y_map[parent_y_map_offset + clamped_y];
+        const atlas_axis child_axis =
+            child_y_map[child_y_map_offset + child_y];
+        parent_y0[local_y] = parent_axis.index0;
+        parent_y1[local_y] = parent_axis.index1;
+        parent_y_weight[local_y] = parent_axis.weight;
+        child_y0[local_y] = child_axis.index0;
+        child_y1[local_y] = child_axis.index1;
+        child_y_weight[local_y] = child_axis.weight;
+#else
+        int y0, y1;
+        float weight;
+        atlas_aurora_axis(
+            clamped_y, output_height, parent_height, parent_zoom,
+            &y0, &y1, &weight);
+        parent_y0[local_y] = y0;
+        parent_y1[local_y] = y1;
+        parent_y_weight[local_y] = weight;
+        atlas_aurora_axis(
+            child_y, child_destination_height, safe_child_height, child_zoom,
+            &y0, &y1, &weight);
+        child_y0[local_y] = y0;
+        child_y1[local_y] = y1;
+        child_y_weight[local_y] = weight;
+#endif
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (x >= output_width || y >= output_height) return;
+
+    const size_t pixel = (size_t)y * (size_t)output_width + (size_t)x;
+    const size_t destination = output_offset + pixel * (size_t)3;
+    float smooth;
+    if (full_child) {
+        smooth = atlas_aurora_value_from_axes_tiled(
+            child, safe_child_width,
+            child_x0[local_x], child_x1[local_x], child_x_weight[local_x],
+            child_y0[local_y], child_y1[local_y], child_y_weight[local_y],
+            child_max_iter, child_field_bias, effective_iter, output_field_bias);
+        const uchar4 colour = atlas_aurora_lookup(
+            smooth, effective_iter, palette, palette_offset, palette_size,
+            palette_index_scale, interior_red, interior_green, interior_blue);
+        output[destination] = colour.x;
+        output[destination + 1] = colour.y;
+        output[destination + 2] = colour.z;
+        return;
+    }
+
+    if (use_child
+        && x >= child_left && x < child_left + visible_width
+        && y >= child_top && y < child_top + visible_height) {
+        const int local_child_x = x - child_left;
+        const int local_child_y = y - child_top;
+        const float child_value = atlas_aurora_value_from_axes_tiled(
+            child, safe_child_width,
+            child_x0[local_x], child_x1[local_x], child_x_weight[local_x],
+            child_y0[local_y], child_y1[local_y], child_y_weight[local_y],
+            child_max_iter, child_field_bias, effective_iter, output_field_bias);
+        const int seam_feather = min(
+            feather, min(visible_width / 8, visible_height / 8));
+        float alpha = 1.0f;
+        if (seam_feather >= 2) {
+            const int edge_distance = min(
+                min(local_child_x, visible_width - 1 - local_child_x),
+                min(local_child_y, visible_height - 1 - local_child_y));
+            const float linear = fmin(
+                1.0f, (float)edge_distance / (float)seam_feather);
+            const float eased = linear * linear * (3.0f - 2.0f * linear);
+            alpha = eased;
+        }
+        if (alpha >= 0.999999f) {
+            const uchar4 colour = atlas_aurora_lookup(
+                child_value, effective_iter, palette, palette_offset,
+                palette_size, palette_index_scale, interior_red,
+                interior_green, interior_blue);
+            output[destination] = colour.x;
+            output[destination + 1] = colour.y;
+            output[destination + 2] = colour.z;
+            return;
+        }
+        smooth = atlas_aurora_value_from_axes_tiled(
+            parent, parent_width,
+            parent_x0[local_x], parent_x1[local_x], parent_x_weight[local_x],
+            parent_y0[local_y], parent_y1[local_y], parent_y_weight[local_y],
+            parent_max_iter, parent_field_bias, effective_iter, output_field_bias);
+        const uchar4 parent_colour = atlas_aurora_lookup(
+            smooth, effective_iter, palette, palette_offset, palette_size,
+            palette_index_scale, interior_red, interior_green, interior_blue);
+        const uchar4 child_colour = atlas_aurora_lookup(
+            child_value, effective_iter, palette, palette_offset, palette_size,
+            palette_index_scale, interior_red, interior_green, interior_blue);
+        output[destination] = atlas_aurora_blend_channel(
+            parent_colour.x, child_colour.x, alpha);
+        output[destination + 1] = atlas_aurora_blend_channel(
+            parent_colour.y, child_colour.y, alpha);
+        output[destination + 2] = atlas_aurora_blend_channel(
+            parent_colour.z, child_colour.z, alpha);
+        return;
+    }
+
+    smooth = atlas_aurora_value_from_axes_tiled(
+        parent, parent_width,
+        parent_x0[local_x], parent_x1[local_x], parent_x_weight[local_x],
+        parent_y0[local_y], parent_y1[local_y], parent_y_weight[local_y],
+        parent_max_iter, parent_field_bias, effective_iter, output_field_bias);
+    const uchar4 colour = atlas_aurora_lookup(
+        smooth, effective_iter, palette, palette_offset, palette_size,
+        palette_index_scale, interior_red, interior_green, interior_blue);
+    output[destination] = colour.x;
+    output[destination + 1] = colour.y;
+    output[destination + 2] = colour.z;
+}
+
+#undef ATLAS_TILED_LOCAL_X
+#undef ATLAS_TILED_LOCAL_Y
+)CLC";
+
+struct OpenClAtlasAxis {
+    std::int32_t index0 = 0;
+    std::int32_t index1 = 0;
+    float weight = 0.0f;
+    float padding = 0.0f;
+};
+
+static_assert(sizeof(OpenClAtlasAxis) == 16,
+              "OpenCL atlas axis layout must remain a 16-byte record");
+
+void fill_opencl_atlas_axis(
+    std::vector<OpenClAtlasAxis>& output,
+    int destination_size,
+    int source_size,
+    double zoom
+) {
+    output.resize(static_cast<size_t>(destination_size));
+    const double effective_zoom = std::max(zoom, 1.0);
+    const double crop_size = static_cast<double>(source_size) / effective_zoom;
+    const double left = (static_cast<double>(source_size) - crop_size) * 0.5;
+    for (int index = 0; index < destination_size; ++index) {
+        double source = left
+            + (static_cast<double>(index) + 0.5) * crop_size
+                / static_cast<double>(destination_size)
+            - 0.5;
+        source = std::min(
+            std::max(source, 0.0), static_cast<double>(source_size - 1));
+        const int lower = static_cast<int>(std::floor(source));
+        OpenClAtlasAxis& axis = output[static_cast<size_t>(index)];
+        axis.index0 = lower;
+        axis.index1 = std::min(lower + 1, source_size - 1);
+        axis.weight = static_cast<float>(source - static_cast<double>(lower));
+    }
+}
+
+std::vector<float> pack_opencl_atlas_image(
+    const float* source,
+    int width,
+    int height,
+    int max_iter
+) {
+    const size_t pixel_count = static_cast<size_t>(width)
+        * static_cast<size_t>(height);
+    if (pixel_count > std::numeric_limits<size_t>::max() / 4U) {
+        throw std::runtime_error("OpenCL atlas image is too large");
+    }
+    std::vector<float> packed(pixel_count * 4U, 0.0f);
+    for (size_t index = 0; index < pixel_count; ++index) {
+        const float value = source[index];
+        if (!std::isfinite(value)) continue;
+        float* pixel = packed.data() + index * 4U;
+        if (value >= static_cast<float>(max_iter)) {
+            pixel[2] = 1.0f;
+        } else {
+            pixel[0] = value;
+            pixel[1] = 1.0f;
+        }
+    }
+    return packed;
+}
+
+bool opencl_atlas_force_2d_launch() {
+    const char* setting = std::getenv("FRACTAL_OPENCL_ATLAS_2D");
+    if (!setting || setting[0] == '\0') return false;
+    return std::strcmp(setting, "0") != 0
+        && std::strcmp(setting, "false") != 0
+        && std::strcmp(setting, "off") != 0
+        && std::strcmp(setting, "no") != 0;
+}
+
+size_t opencl_atlas_tiled_workgroup(
+    size_t workgroup_limit,
+    size_t pixel_count
+) {
+    if (workgroup_limit < 16) return 0;
+    const size_t target = pixel_count <= static_cast<size_t>(1920) * 1080
+        ? 256U : 128U;
+    size_t workgroup = std::min(workgroup_limit, target);
+    workgroup = std::min(workgroup, static_cast<size_t>(256));
+    workgroup -= workgroup % 16U;
+    return workgroup >= 16 ? workgroup : 0;
+}
+
+bool opencl_atlas_use_secondary_queue() {
+    const char* setting = std::getenv("FRACTAL_OPENCL_ATLAS_SINGLE_QUEUE");
+    if (!setting || setting[0] == '\0') return true;
+    return std::strcmp(setting, "0") == 0
+        || std::strcmp(setting, "false") == 0
+        || std::strcmp(setting, "off") == 0
+        || std::strcmp(setting, "no") == 0;
+}
+
+bool opencl_atlas_use_pipelined_batch() {
+    const char* setting = std::getenv("FRACTAL_OPENCL_ATLAS_PIPELINE");
+    // The complete-batch schedule is the measured fast path on the current
+    // NVIDIA implementation. Keep an explicit opt-out for older ICDs that
+    // need the pairwise compatibility schedule.
+    if (!setting || setting[0] == '\0') return true;
+    return std::strcmp(setting, "0") != 0
+        && std::strcmp(setting, "false") != 0
+        && std::strcmp(setting, "off") != 0
+        && std::strcmp(setting, "no") != 0;
+}
 
 struct OpenClRuntime {
     cl_context context = nullptr;
     cl_command_queue queue = nullptr;
+    // The batched atlas compositor can use a second in-order queue to overlap
+    // one frame's readback with the next frame's colour kernel.  It is
+    // deliberately optional: older ICDs may expose only one usable queue.
+    cl_command_queue atlas_queue_secondary = nullptr;
     cl_program program = nullptr;
     cl_kernel kernel = nullptr;
+    std::array<cl_kernel, 4> direct_formula_kernels{};
+    cl_kernel deep_kernel = nullptr;
+    cl_kernel deep_scalar_kernel = nullptr;
+    cl_kernel deep_scalar_bla_kernel = nullptr;
+    cl_kernel deep_mixed_kernel = nullptr;
+    cl_kernel deep_mixed_mandelbrot_kernel = nullptr;
+    cl_kernel colour_kernel = nullptr;
+    cl_kernel kfp_colour_kernel = nullptr;
+    cl_kernel rgb_crop_kernel = nullptr;
+    cl_kernel rgb_composite_kernel = nullptr;
+    cl_kernel atlas_colour_kernel = nullptr;
+    cl_kernel atlas_colour_kernel_secondary = nullptr;
+    cl_kernel atlas_tiled_colour_kernel = nullptr;
+    cl_kernel atlas_tiled_colour_kernel_secondary = nullptr;
+    cl_kernel atlas_image_colour_kernel = nullptr;
+    cl_kernel atlas_image_colour_kernel_secondary = nullptr;
+    // Zero means that the driver could not validate a common explicit local
+    // size for all field kernels; callers then let OpenCL choose one.
+    size_t workgroup_size = 0;
+    size_t deep_scalar_workgroup_size = 0;
+    size_t deep_scalar_bla_workgroup_size = 0;
+    size_t deep_mixed_workgroup_size = 0;
+    size_t deep_mixed_mandelbrot_workgroup_size = 0;
+    size_t colour_workgroup_size = 0;
+    size_t kfp_colour_workgroup_size = 0;
+    size_t rgb_workgroup_size = 0;
+    size_t atlas_colour_workgroup_size = 0;
+    size_t atlas_colour_workgroup_limit = 0;
+    size_t atlas_tiled_colour_workgroup_limit = 0;
+    bool device_is_gpu = false;
+    // Ordinary live/export fields are rendered repeatedly at the same source
+    // size. Keep their device destination alive between calls instead of
+    // paying a driver allocation/free round-trip for every atlas tile.
+    cl_mem direct_output = nullptr;
+    size_t direct_output_capacity = 0;
+    cl_mem deep_output = nullptr;
+    size_t deep_output_capacity = 0;
+    cl_mem colour_field = nullptr;
+    size_t colour_field_capacity = 0;
+    cl_mem colour_palette = nullptr;
+    size_t colour_palette_capacity = 0;
+    cl_mem colour_output = nullptr;
+    size_t colour_output_capacity = 0;
+    cl_mem rgb_parent = nullptr;
+    size_t rgb_parent_capacity = 0;
+    cl_mem rgb_child = nullptr;
+    size_t rgb_child_capacity = 0;
+    cl_mem rgb_output = nullptr;
+    size_t rgb_output_capacity = 0;
+    cl_mem atlas_parent = nullptr;
+    size_t atlas_parent_capacity = 0;
+    cl_mem atlas_child = nullptr;
+    size_t atlas_child_capacity = 0;
+    cl_mem atlas_output = nullptr;
+    size_t atlas_output_capacity = 0;
+    bool atlas_axis_maps = false;
+    cl_mem atlas_parent_x_axis = nullptr;
+    size_t atlas_parent_x_axis_capacity = 0;
+    cl_mem atlas_parent_y_axis = nullptr;
+    size_t atlas_parent_y_axis_capacity = 0;
+    cl_mem atlas_child_x_axis = nullptr;
+    size_t atlas_child_x_axis_capacity = 0;
+    cl_mem atlas_child_y_axis = nullptr;
+    size_t atlas_child_y_axis_capacity = 0;
+    cl_mem atlas_parent_image = nullptr;
+    cl_mem atlas_child_image = nullptr;
+    size_t atlas_parent_image_width = 0;
+    size_t atlas_parent_image_height = 0;
+    size_t atlas_child_image_width = 0;
+    size_t atlas_child_image_height = 0;
+    std::uint64_t atlas_parent_image_cache_token = 0;
+    std::uint64_t atlas_child_image_cache_token = 0;
+    bool atlas_images = false;
+    // The static KFP atlas keeps the same immutable RGB tiles for many video
+    // frames.  The ordinary RGB ABI still uploads on every call; this token
+    // pair is used only by the explicitly cached compositor entry point.
+    std::uint64_t rgb_parent_cache_token = 0;
+    size_t rgb_parent_cache_bytes = 0;
+    std::uint64_t rgb_child_cache_token = 0;
+    size_t rgb_child_cache_bytes = 0;
+    std::uint64_t atlas_parent_cache_token = 0;
+    size_t atlas_parent_cache_bytes = 0;
+    std::uint64_t atlas_child_cache_token = 0;
+    size_t atlas_child_cache_bytes = 0;
+    cl_mem deep_reference = nullptr;
+    size_t deep_reference_capacity = 0;
+    std::uint64_t deep_reference_generation = 0;
+    cl_mem deep_reference_norms = nullptr;
+    size_t deep_reference_norms_capacity = 0;
+    std::uint64_t deep_reference_norms_generation = 0;
+    cl_mem mixed_reference = nullptr;
+    size_t mixed_reference_capacity = 0;
+    std::uint64_t mixed_reference_generation = 0;
+    cl_mem mixed_reference_norms = nullptr;
+    size_t mixed_reference_norms_capacity = 0;
+    std::uint64_t mixed_reference_norms_generation = 0;
+    cl_mem deep_point_offsets = nullptr;
+    size_t deep_point_offsets_capacity = 0;
+    cl_mem deep_bla = nullptr;
+    cl_mem deep_bla_offsets = nullptr;
+    cl_mem deep_bla_counts = nullptr;
+    size_t deep_bla_capacity = 0;
+    size_t deep_bla_levels_capacity = 0;
+    std::uint64_t deep_bla_generation = 0;
+    int deep_bla_level_count = 0;
+    cl_mem mixed_bla = nullptr;
+    cl_mem mixed_bla_offsets = nullptr;
+    cl_mem mixed_bla_counts = nullptr;
+    size_t mixed_bla_capacity = 0;
+    size_t mixed_bla_levels_capacity = 0;
+    std::uint64_t mixed_bla_generation = 0;
+    int mixed_bla_level_count = 0;
     std::mutex mutex;
     std::string error;
 
     ~OpenClRuntime() {
+        if (deep_bla_counts) clReleaseMemObject(deep_bla_counts);
+        if (deep_bla_offsets) clReleaseMemObject(deep_bla_offsets);
+        if (deep_bla) clReleaseMemObject(deep_bla);
+        if (mixed_bla_counts) clReleaseMemObject(mixed_bla_counts);
+        if (mixed_bla_offsets) clReleaseMemObject(mixed_bla_offsets);
+        if (mixed_bla) clReleaseMemObject(mixed_bla);
+        if (mixed_reference_norms) clReleaseMemObject(mixed_reference_norms);
+        if (mixed_reference) clReleaseMemObject(mixed_reference);
+        if (deep_reference_norms) clReleaseMemObject(deep_reference_norms);
+        if (deep_reference) clReleaseMemObject(deep_reference);
+        if (colour_output) clReleaseMemObject(colour_output);
+        if (colour_palette) clReleaseMemObject(colour_palette);
+        if (colour_field) clReleaseMemObject(colour_field);
+        if (rgb_output) clReleaseMemObject(rgb_output);
+        if (rgb_child) clReleaseMemObject(rgb_child);
+        if (rgb_parent) clReleaseMemObject(rgb_parent);
+        if (atlas_output) clReleaseMemObject(atlas_output);
+        if (atlas_child_y_axis) clReleaseMemObject(atlas_child_y_axis);
+        if (atlas_child_x_axis) clReleaseMemObject(atlas_child_x_axis);
+        if (atlas_parent_y_axis) clReleaseMemObject(atlas_parent_y_axis);
+        if (atlas_parent_x_axis) clReleaseMemObject(atlas_parent_x_axis);
+        if (atlas_child) clReleaseMemObject(atlas_child);
+        if (atlas_parent) clReleaseMemObject(atlas_parent);
+        if (atlas_child_image) clReleaseMemObject(atlas_child_image);
+        if (atlas_parent_image) clReleaseMemObject(atlas_parent_image);
+        if (deep_output) clReleaseMemObject(deep_output);
+        if (deep_point_offsets) clReleaseMemObject(deep_point_offsets);
+        if (direct_output) clReleaseMemObject(direct_output);
+        for (cl_kernel direct_kernel : direct_formula_kernels) {
+            if (direct_kernel) clReleaseKernel(direct_kernel);
+        }
+        if (deep_kernel) clReleaseKernel(deep_kernel);
+        if (deep_scalar_kernel) clReleaseKernel(deep_scalar_kernel);
+        if (deep_scalar_bla_kernel) clReleaseKernel(deep_scalar_bla_kernel);
+        if (deep_mixed_kernel) clReleaseKernel(deep_mixed_kernel);
+        if (deep_mixed_mandelbrot_kernel) {
+            clReleaseKernel(deep_mixed_mandelbrot_kernel);
+        }
+        if (colour_kernel) clReleaseKernel(colour_kernel);
+        if (kfp_colour_kernel) clReleaseKernel(kfp_colour_kernel);
+        if (rgb_crop_kernel) clReleaseKernel(rgb_crop_kernel);
+        if (rgb_composite_kernel) clReleaseKernel(rgb_composite_kernel);
+        if (atlas_tiled_colour_kernel_secondary) {
+            clReleaseKernel(atlas_tiled_colour_kernel_secondary);
+        }
+        if (atlas_tiled_colour_kernel) {
+            clReleaseKernel(atlas_tiled_colour_kernel);
+        }
+        if (atlas_colour_kernel_secondary) {
+            clReleaseKernel(atlas_colour_kernel_secondary);
+        }
+        if (atlas_colour_kernel) clReleaseKernel(atlas_colour_kernel);
+        if (atlas_image_colour_kernel_secondary) {
+            clReleaseKernel(atlas_image_colour_kernel_secondary);
+        }
+        if (atlas_image_colour_kernel) {
+            clReleaseKernel(atlas_image_colour_kernel);
+        }
         if (kernel) clReleaseKernel(kernel);
         if (program) clReleaseProgram(program);
+        if (atlas_queue_secondary) {
+            clReleaseCommandQueue(atlas_queue_secondary);
+        }
         if (queue) clReleaseCommandQueue(queue);
         if (context) clReleaseContext(context);
     }
 };
+
+bool ensure_opencl_atlas_image(
+    OpenClRuntime& runtime,
+    cl_mem& image,
+    size_t& image_width,
+    size_t& image_height,
+    int width,
+    int height,
+    std::uint64_t& cache_token,
+    cl_int& status
+) {
+    const size_t requested_width = static_cast<size_t>(width);
+    const size_t requested_height = static_cast<size_t>(height);
+    if (image
+        && image_width == requested_width
+        && image_height == requested_height) {
+        return true;
+    }
+    cl_image_format format{};
+    format.image_channel_order = CL_RGBA;
+    format.image_channel_data_type = CL_FLOAT;
+    cl_image_desc description{};
+    description.image_type = CL_MEM_OBJECT_IMAGE2D;
+    description.image_width = requested_width;
+    description.image_height = requested_height;
+    cl_mem replacement = clCreateImage(
+        runtime.context,
+        CL_MEM_READ_ONLY,
+        &format,
+        &description,
+        nullptr,
+        &status);
+    if (status != CL_SUCCESS || !replacement) return false;
+    if (image) clReleaseMemObject(image);
+    image = replacement;
+    image_width = requested_width;
+    image_height = requested_height;
+    cache_token = 0;
+    return true;
+}
 
 std::once_flag opencl_once;
 std::unique_ptr<OpenClRuntime> opencl_runtime;
 
 std::string opencl_error_text(cl_int status) {
     return "OpenCL error " + std::to_string(static_cast<int>(status));
+}
+
+bool opencl_device_supports_fp64(cl_device_id device) {
+    size_t extension_size = 0;
+    const cl_int status = clGetDeviceInfo(
+        device, CL_DEVICE_EXTENSIONS, 0, nullptr, &extension_size);
+    if (status != CL_SUCCESS || extension_size == 0
+        || extension_size > MAX_OPENCL_INFO_BYTES) {
+        return false;
+    }
+    std::string extensions(extension_size, '\0');
+    if (clGetDeviceInfo(
+            device, CL_DEVICE_EXTENSIONS, extension_size,
+            extensions.data(), nullptr) != CL_SUCCESS) {
+        return false;
+    }
+    return extensions.find("cl_khr_fp64") != std::string::npos
+        || extensions.find("cl_amd_fp64") != std::string::npos;
+}
+
+struct OpenClDeviceCandidate {
+    cl_device_id device = nullptr;
+    cl_platform_id platform = nullptr;
+    cl_ulong global_memory = 0;
+    std::uint64_t throughput = 0;
+    cl_uint compute_units = 0;
+    cl_uint clock_mhz = 0;
+    bool is_gpu = false;
+};
+
+OpenClDeviceCandidate inspect_opencl_device(
+    cl_platform_id platform,
+    cl_device_id device,
+    bool is_gpu
+) {
+    OpenClDeviceCandidate candidate;
+    candidate.device = device;
+    candidate.platform = platform;
+    candidate.is_gpu = is_gpu;
+    // These are performance hints only. A driver is allowed to omit or
+    // reject individual queries, so retain the device with zero-valued
+    // fields rather than making capability probing fail.
+    clGetDeviceInfo(
+        device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(candidate.global_memory),
+        &candidate.global_memory, nullptr);
+    clGetDeviceInfo(
+        device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(candidate.compute_units),
+        &candidate.compute_units, nullptr);
+    clGetDeviceInfo(
+        device, CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(candidate.clock_mhz),
+        &candidate.clock_mhz, nullptr);
+    const std::uint64_t clock = candidate.clock_mhz > 0
+        ? static_cast<std::uint64_t>(candidate.clock_mhz) : 1U;
+    candidate.throughput = static_cast<std::uint64_t>(candidate.compute_units)
+        * clock;
+    return candidate;
+}
+
+bool better_opencl_device(
+    const OpenClDeviceCandidate& candidate,
+    const OpenClDeviceCandidate& current
+) {
+    // Compute units × advertised clock is a conservative portable ordering
+    // for devices exposed through different ICDs. Global memory breaks ties
+    // in favour of a discrete card over a small integrated adapter, while
+    // the final fields keep enumeration deterministic when a driver reports
+    // no performance metadata.
+    if (candidate.throughput != current.throughput) {
+        return candidate.throughput > current.throughput;
+    }
+    if (candidate.global_memory != current.global_memory) {
+        return candidate.global_memory > current.global_memory;
+    }
+    if (candidate.compute_units != current.compute_units) {
+        return candidate.compute_units > current.compute_units;
+    }
+    return candidate.clock_mhz > current.clock_mhz;
 }
 
 void initialise_opencl() {
@@ -335,8 +3874,7 @@ void initialise_opencl() {
             return;
         }
 
-        cl_device_id selected = nullptr;
-        cl_platform_id selected_platform = nullptr;
+        OpenClDeviceCandidate selected_candidate;
         for (cl_platform_id platform : platforms) {
             cl_uint device_count = 0;
             if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &device_count)
@@ -346,13 +3884,20 @@ void initialise_opencl() {
                 if (clGetDeviceIDs(
                         platform, CL_DEVICE_TYPE_GPU, device_count,
                         devices.data(), nullptr) == CL_SUCCESS) {
-                    selected = devices.front();
-                    selected_platform = platform;
-                    break;
+                    for (cl_device_id device : devices) {
+                        if (opencl_device_supports_fp64(device)) {
+                            const OpenClDeviceCandidate candidate =
+                                inspect_opencl_device(platform, device, true);
+                            if (!selected_candidate.device
+                                || better_opencl_device(candidate, selected_candidate)) {
+                                selected_candidate = candidate;
+                            }
+                        }
+                    }
                 }
             }
         }
-        if (!selected) {
+        if (!selected_candidate.device) {
             for (cl_platform_id platform : platforms) {
                 cl_uint device_count = 0;
                 if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 0, nullptr, &device_count)
@@ -362,40 +3907,28 @@ void initialise_opencl() {
                     if (clGetDeviceIDs(
                             platform, CL_DEVICE_TYPE_CPU, device_count,
                             devices.data(), nullptr) == CL_SUCCESS) {
-                        selected = devices.front();
-                        selected_platform = platform;
-                        break;
+                        for (cl_device_id device : devices) {
+                            if (opencl_device_supports_fp64(device)) {
+                                const OpenClDeviceCandidate candidate =
+                                    inspect_opencl_device(platform, device, false);
+                                if (!selected_candidate.device
+                                    || better_opencl_device(candidate, selected_candidate)) {
+                                    selected_candidate = candidate;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        if (!selected || !selected_platform) {
-            runtime->error = "no OpenCL GPU or CPU device is available";
+        if (!selected_candidate.device || !selected_candidate.platform) {
+            runtime->error = "no double-precision OpenCL GPU or CPU device is available";
             opencl_runtime = std::move(runtime);
             return;
         }
-
-        size_t extension_size = 0;
-        status = clGetDeviceInfo(
-            selected, CL_DEVICE_EXTENSIONS, 0, nullptr, &extension_size);
-        if (status != CL_SUCCESS || extension_size == 0
-            || extension_size > MAX_OPENCL_INFO_BYTES) {
-            runtime->error = status != CL_SUCCESS
-                ? opencl_error_text(status)
-                : "selected OpenCL device reported invalid extension metadata";
-            opencl_runtime = std::move(runtime);
-            return;
-        }
-        std::string extensions(extension_size, '\0');
-        if (clGetDeviceInfo(
-                selected, CL_DEVICE_EXTENSIONS, extension_size,
-                extensions.data(), nullptr) != CL_SUCCESS
-            || (extensions.find("cl_khr_fp64") == std::string::npos
-                && extensions.find("cl_amd_fp64") == std::string::npos)) {
-            runtime->error = "selected OpenCL device has no double-precision extension";
-            opencl_runtime = std::move(runtime);
-            return;
-        }
+        cl_device_id selected = selected_candidate.device;
+        cl_platform_id selected_platform = selected_candidate.platform;
+        runtime->device_is_gpu = selected_candidate.is_gpu;
 
         cl_context_properties properties[] = {
             CL_CONTEXT_PLATFORM,
@@ -415,8 +3948,29 @@ void initialise_opencl() {
             opencl_runtime = std::move(runtime);
             return;
         }
-        const size_t source_length = std::char_traits<char>::length(OPENCL_DIRECT_KERNEL);
-        const char* kernel_source = OPENCL_DIRECT_KERNEL;
+        // A separate in-order queue is enough to let the driver overlap
+        // independent atlas kernel/readback ranges.  Failure is non-fatal;
+        // the compositor keeps its proven single-queue implementation.
+        cl_int secondary_queue_status = CL_SUCCESS;
+        runtime->atlas_queue_secondary = clCreateCommandQueue(
+            runtime->context, selected, 0, &secondary_queue_status);
+        if (secondary_queue_status != CL_SUCCESS
+            || !runtime->atlas_queue_secondary) {
+            runtime->atlas_queue_secondary = nullptr;
+        }
+        const std::string combined_source = std::string(OPENCL_DIRECT_KERNEL)
+            + "\n" + OPENCL_SPECIALIZED_DIRECT_KERNEL
+            + "\n" + OPENCL_DEEP_PERTURBATION_KERNEL
+            + "\n" + OPENCL_DEEP_SCALAR_KERNEL
+            + "\n" + OPENCL_DEEP_SCALAR_BLA_KERNEL
+            + "\n" + OPENCL_DEEP_MIXED_KERNEL
+            + "\n" + OPENCL_AURORA_COLOUR_KERNEL
+            + "\n" + OPENCL_KFP_COLOUR_KERNEL
+            + "\n" + OPENCL_RGB_ATLAS_KERNEL
+            + "\n" + OPENCL_ATLAS_AURORA_KERNEL
+            + "\n" + OPENCL_ATLAS_TILED_KERNEL;
+        const size_t source_length = combined_source.size();
+        const char* kernel_source = combined_source.c_str();
         runtime->program = clCreateProgramWithSource(
             runtime->context, 1, &kernel_source, &source_length, &status);
         if (status != CL_SUCCESS || !runtime->program) {
@@ -424,7 +3978,61 @@ void initialise_opencl() {
             opencl_runtime = std::move(runtime);
             return;
         }
-        status = clBuildProgram(runtime->program, 1, &selected, "", nullptr, nullptr);
+        // NVIDIA's double-precision OpenCL compiler can leave a sizeable
+        // amount of throughput on the table when every multiply/add in the
+        // scaled-complex recurrence is kept as a separately rounded
+        // operation. Keep the strict program as the default, but allow a
+        // complete export/live-view run to opt into the driver's fused,
+        // relaxed scheduling for a measured comparison. The option is read
+        // before the one-time runtime build, so all kernels in one process
+        // use the same arithmetic contract.
+        const bool fast_math = std::getenv("FRACTAL_OPENCL_FAST_MATH") != nullptr;
+        const bool atlas_float = std::getenv("FRACTAL_OPENCL_ATLAS_FLOAT") != nullptr;
+        const char* atlas_maps_setting =
+            std::getenv("FRACTAL_OPENCL_ATLAS_MAPS");
+        const bool atlas_axis_maps = atlas_maps_setting != nullptr
+            && atlas_maps_setting[0] != '\0'
+            && std::strcmp(atlas_maps_setting, "0") != 0
+            && std::strcmp(atlas_maps_setting, "false") != 0
+            && std::strcmp(atlas_maps_setting, "off") != 0
+            && std::strcmp(atlas_maps_setting, "no") != 0;
+        const char* atlas_images_setting =
+            std::getenv("FRACTAL_OPENCL_ATLAS_IMAGES");
+        const bool atlas_images = atlas_images_setting != nullptr
+            && atlas_images_setting[0] != '\0'
+            && std::strcmp(atlas_images_setting, "0") != 0
+            && std::strcmp(atlas_images_setting, "false") != 0
+            && std::strcmp(atlas_images_setting, "off") != 0
+            && std::strcmp(atlas_images_setting, "no") != 0;
+        runtime->atlas_images = atlas_images;
+        // The image sampler owns the coordinate interpolation, so it is
+        // mutually exclusive with the explicit axis-map path.
+        runtime->atlas_axis_maps = atlas_axis_maps && !atlas_images;
+        std::string build_options;
+        if (fast_math) {
+            build_options = "-cl-fast-relaxed-math";
+            build_options += " -D FRACTAL_OPENCL_FAST_MATH=1";
+        }
+        if (atlas_float) {
+            if (!build_options.empty()) {
+                build_options += " ";
+            }
+            build_options += "-D FRACTAL_OPENCL_ATLAS_FLOAT=1";
+        }
+        if (runtime->atlas_axis_maps) {
+            if (!build_options.empty()) {
+                build_options += " ";
+            }
+            build_options += "-D FRACTAL_OPENCL_ATLAS_MAPS=1";
+        }
+        if (atlas_images) {
+            if (!build_options.empty()) {
+                build_options += " ";
+            }
+            build_options += "-D FRACTAL_OPENCL_ATLAS_IMAGES=1";
+        }
+        status = clBuildProgram(
+            runtime->program, 1, &selected, build_options.c_str(), nullptr, nullptr);
         if (status != CL_SUCCESS) {
             size_t log_size = 0;
             clGetProgramBuildInfo(
@@ -449,6 +4057,400 @@ void initialise_opencl() {
         runtime->kernel = clCreateKernel(runtime->program, "mandelbrot_direct", &status);
         if (status != CL_SUCCESS || !runtime->kernel) {
             runtime->error = opencl_error_text(status);
+        } else {
+            constexpr std::array<const char*, 4> specialized_names{
+                "mandelbrot_direct_mandelbrot",
+                "mandelbrot_direct_julia",
+                "mandelbrot_direct_burning_ship",
+                "mandelbrot_direct_tricorn",
+            };
+            for (size_t index = 0; index < specialized_names.size(); ++index) {
+                cl_int specialized_status = CL_SUCCESS;
+                cl_kernel specialized = clCreateKernel(
+                    runtime->program, specialized_names[index], &specialized_status);
+                if (specialized_status == CL_SUCCESS && specialized) {
+                    runtime->direct_formula_kernels[index] = specialized;
+                }
+                // A single driver may reject one optional entry point while
+                // accepting the others. Keep the compatible kernel usable
+                // instead of turning that partial capability into a global
+                // OpenCL failure.
+            }
+            runtime->deep_kernel = clCreateKernel(
+                runtime->program, "mandelbrot_deep_perturbation", &status);
+            if (status != CL_SUCCESS || !runtime->deep_kernel) {
+                runtime->error = opencl_error_text(status);
+            } else {
+                cl_int scalar_status = CL_SUCCESS;
+                runtime->deep_scalar_kernel = clCreateKernel(
+                    runtime->program, "mandelbrot_deep_perturbation_scalar",
+                    &scalar_status);
+                // This is an optional hot-path specialization. The generic
+                // kernel remains the correctness fallback if an older or
+                // unusually strict ICD rejects the extra entry point.
+                if (scalar_status != CL_SUCCESS || !runtime->deep_scalar_kernel) {
+                    runtime->deep_scalar_kernel = nullptr;
+                }
+                cl_int scalar_bla_status = CL_SUCCESS;
+                runtime->deep_scalar_bla_kernel = clCreateKernel(
+                    runtime->program, "mandelbrot_deep_perturbation_scalar_bla",
+                    &scalar_bla_status);
+                // The scalar+BLA entry point is another optional
+                // specialization. Keep the generic BLA kernel available when
+                // an older compiler cannot validate this longer argument list.
+                if (scalar_bla_status != CL_SUCCESS
+                    || !runtime->deep_scalar_bla_kernel) {
+                    runtime->deep_scalar_bla_kernel = nullptr;
+                }
+                cl_int mixed_status = CL_SUCCESS;
+                runtime->deep_mixed_kernel = clCreateKernel(
+                    runtime->program, "mandelbrot_deep_perturbation_mixed",
+                    &mixed_status);
+                // Mixed precision is an optional throughput path.  A driver
+                // that cannot compile it must retain the strict fp64 path.
+                if (mixed_status != CL_SUCCESS || !runtime->deep_mixed_kernel) {
+                    runtime->deep_mixed_kernel = nullptr;
+                }
+                cl_int mixed_mandelbrot_status = CL_SUCCESS;
+                runtime->deep_mixed_mandelbrot_kernel = clCreateKernel(
+                    runtime->program,
+                    "mandelbrot_deep_perturbation_mixed_mandelbrot",
+                    &mixed_mandelbrot_status);
+                // The Mandelbrot-only mixed entry point is an optional
+                // throughput specialization. Keep the formula-generic mixed
+                // kernel as the fallback for older OpenCL compilers.
+                if (mixed_mandelbrot_status != CL_SUCCESS
+                    || !runtime->deep_mixed_mandelbrot_kernel) {
+                    runtime->deep_mixed_mandelbrot_kernel = nullptr;
+                }
+            }
+        }
+        const auto kernel_workgroup_limit = [selected](cl_kernel kernel) {
+            size_t limit = 0;
+            if (!kernel || clGetKernelWorkGroupInfo(
+                    kernel, selected, CL_KERNEL_WORK_GROUP_SIZE,
+                    sizeof(limit), &limit, nullptr) != CL_SUCCESS) {
+                return static_cast<size_t>(0);
+            }
+            return limit;
+        };
+        const auto choose_workgroup = [selected](
+            cl_kernel kernel,
+            size_t limit,
+            size_t fallback
+        ) {
+            if (!kernel || limit == 0) return static_cast<size_t>(0);
+            size_t preferred = 0;
+            if (clGetKernelWorkGroupInfo(
+                    kernel, selected,
+                    CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                    sizeof(preferred), &preferred, nullptr) != CL_SUCCESS
+                || preferred == 0 || preferred > 256) {
+                preferred = fallback;
+            }
+            if (const char* override_text = std::getenv(
+                    "FRACTAL_OPENCL_WORKGROUP")) {
+                char* end = nullptr;
+                const unsigned long long requested = std::strtoull(
+                    override_text, &end, 10);
+                if (end != override_text && *end == '\0'
+                    && requested > 0
+                    && requested <= static_cast<unsigned long long>(limit)
+                    && requested % preferred == 0) {
+                    return static_cast<size_t>(requested);
+                }
+            }
+            return std::min(preferred, limit);
+        };
+        if (runtime->error.empty() && runtime->kernel && runtime->deep_kernel) {
+            size_t common_limit = kernel_workgroup_limit(runtime->kernel);
+            const size_t deep_limit = kernel_workgroup_limit(runtime->deep_kernel);
+            if (common_limit == 0 || deep_limit == 0) {
+                common_limit = 0;
+            } else {
+                common_limit = std::min(common_limit, deep_limit);
+                for (cl_kernel direct_kernel : runtime->direct_formula_kernels) {
+                    if (!direct_kernel) continue;
+                    const size_t limit = kernel_workgroup_limit(direct_kernel);
+                    if (limit == 0) {
+                        common_limit = 0;
+                        break;
+                    }
+                    common_limit = std::min(common_limit, limit);
+                }
+            }
+            runtime->workgroup_size = choose_workgroup(
+                runtime->kernel, common_limit, 256);
+            if (runtime->deep_scalar_kernel) {
+                const size_t scalar_limit = kernel_workgroup_limit(
+                    runtime->deep_scalar_kernel);
+                runtime->deep_scalar_workgroup_size = choose_workgroup(
+                    runtime->deep_scalar_kernel,
+                    scalar_limit,
+                    runtime->workgroup_size > 0 ? runtime->workgroup_size : 256);
+            }
+            if (runtime->deep_scalar_bla_kernel) {
+                const size_t scalar_bla_limit = kernel_workgroup_limit(
+                    runtime->deep_scalar_bla_kernel);
+                runtime->deep_scalar_bla_workgroup_size = choose_workgroup(
+                    runtime->deep_scalar_bla_kernel,
+                    scalar_bla_limit,
+                    runtime->workgroup_size > 0 ? runtime->workgroup_size : 256);
+            }
+            if (runtime->deep_mixed_kernel) {
+                const size_t mixed_limit = kernel_workgroup_limit(
+                    runtime->deep_mixed_kernel);
+                runtime->deep_mixed_workgroup_size = choose_workgroup(
+                    runtime->deep_mixed_kernel,
+                    mixed_limit,
+                    runtime->workgroup_size > 0 ? runtime->workgroup_size : 256);
+                // The mixed recurrence has no plane writes and benefits from
+                // twice the driver's conservative preferred multiple on the
+                // tested discrete NVIDIA path. Keep the public override as
+                // the authority, and only widen the automatic GPU choice
+                // when the kernel advertises a compatible limit.
+                if (!std::getenv("FRACTAL_OPENCL_WORKGROUP")
+                    && runtime->device_is_gpu
+                    && runtime->deep_mixed_workgroup_size > 0
+                    && runtime->deep_mixed_workgroup_size
+                        <= std::numeric_limits<size_t>::max() / 2) {
+                    const size_t wider = runtime->deep_mixed_workgroup_size * 2;
+                    if (wider <= mixed_limit) {
+                        runtime->deep_mixed_workgroup_size = wider;
+                    }
+                }
+            }
+            if (runtime->deep_mixed_mandelbrot_kernel) {
+                const size_t mixed_mandelbrot_limit = kernel_workgroup_limit(
+                    runtime->deep_mixed_mandelbrot_kernel);
+                runtime->deep_mixed_mandelbrot_workgroup_size = choose_workgroup(
+                    runtime->deep_mixed_mandelbrot_kernel,
+                    mixed_mandelbrot_limit,
+                    runtime->deep_mixed_workgroup_size > 0
+                        ? runtime->deep_mixed_workgroup_size
+                        : (runtime->workgroup_size > 0
+                            ? runtime->workgroup_size : 256));
+                if (!std::getenv("FRACTAL_OPENCL_WORKGROUP")
+                    && runtime->device_is_gpu
+                    && runtime->deep_mixed_mandelbrot_workgroup_size > 0
+                    && runtime->deep_mixed_mandelbrot_workgroup_size
+                        <= std::numeric_limits<size_t>::max() / 2) {
+                    const size_t wider =
+                        runtime->deep_mixed_mandelbrot_workgroup_size * 2;
+                    if (wider <= mixed_mandelbrot_limit) {
+                        runtime->deep_mixed_mandelbrot_workgroup_size = wider;
+                    }
+                }
+            }
+
+            // Keep the device-side launch choice observable when tuning a
+            // new driver.  This is opt-in so normal GUI/live-view runs stay
+            // quiet, but it avoids guessing from an unavailable `clinfo`
+            // installation.
+            if (std::getenv("FRACTAL_OPENCL_DIAGNOSTICS") != nullptr) {
+                const auto report_kernel = [selected, kernel_workgroup_limit](
+                    const char* name, cl_kernel kernel, size_t chosen) {
+                    size_t preferred = 0;
+                    size_t private_bytes = 0;
+                    size_t local_bytes = 0;
+                    if (kernel) {
+                        clGetKernelWorkGroupInfo(
+                            kernel, selected,
+                            CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                            sizeof(preferred), &preferred, nullptr);
+                        clGetKernelWorkGroupInfo(
+                            kernel, selected, CL_KERNEL_PRIVATE_MEM_SIZE,
+                            sizeof(private_bytes), &private_bytes, nullptr);
+                        clGetKernelWorkGroupInfo(
+                            kernel, selected, CL_KERNEL_LOCAL_MEM_SIZE,
+                            sizeof(local_bytes), &local_bytes, nullptr);
+                    }
+                    std::fprintf(
+                        stderr,
+                        "OpenCL %s: limit=%zu preferred=%zu chosen=%zu private=%zu local=%zu\n",
+                        name, kernel_workgroup_limit(kernel), preferred, chosen,
+                        private_bytes, local_bytes);
+                };
+                report_kernel("generic-deep", runtime->deep_kernel,
+                              runtime->workgroup_size);
+                report_kernel("scalar-deep", runtime->deep_scalar_kernel,
+                              runtime->deep_scalar_workgroup_size);
+                report_kernel("scalar-bla-deep", runtime->deep_scalar_bla_kernel,
+                              runtime->deep_scalar_bla_workgroup_size);
+                report_kernel("mixed-deep", runtime->deep_mixed_kernel,
+                              runtime->deep_mixed_workgroup_size);
+                report_kernel(
+                    "mixed-mandelbrot-deep",
+                    runtime->deep_mixed_mandelbrot_kernel,
+                    runtime->deep_mixed_mandelbrot_workgroup_size);
+                size_t compute_units = 0;
+                clGetDeviceInfo(
+                    selected, CL_DEVICE_MAX_COMPUTE_UNITS,
+                    sizeof(compute_units), &compute_units, nullptr);
+                size_t device_limit = 0;
+                clGetDeviceInfo(
+                    selected, CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                    sizeof(device_limit), &device_limit, nullptr);
+                std::fprintf(
+                    stderr, "OpenCL device: compute_units=%zu max_workgroup=%zu gpu=%s\n",
+                    compute_units, device_limit, runtime->device_is_gpu ? "yes" : "no");
+            }
+        }
+        if (runtime->error.empty() && runtime->deep_kernel) {
+            cl_int colour_status = CL_SUCCESS;
+            runtime->colour_kernel = clCreateKernel(
+                runtime->program, "aurora_colourise", &colour_status);
+            // Colourisation is an optional second-stage acceleration. A
+            // device compiler may reject it (for example because of a
+            // restricted byte-addressing implementation) while accepting
+            // both double-precision field kernels. Keep the field backend
+            // usable in that case and let the caller retain its CPU mapper.
+            if (colour_status != CL_SUCCESS || !runtime->colour_kernel) {
+                runtime->colour_kernel = nullptr;
+            } else {
+                const size_t colour_limit = kernel_workgroup_limit(runtime->colour_kernel);
+                runtime->colour_workgroup_size = choose_workgroup(
+                    runtime->colour_kernel, colour_limit,
+                    runtime->workgroup_size > 0 ? runtime->workgroup_size : 256);
+            }
+            cl_int kfp_colour_status = CL_SUCCESS;
+            runtime->kfp_colour_kernel = clCreateKernel(
+                runtime->program, "kfp_colourise", &kfp_colour_status);
+            // KFP colourisation is an optional acceleration layer. Keep the
+            // field backend usable when an older or restricted OpenCL
+            // compiler accepts the orbit kernels but rejects this larger
+            // source-faithful stencil kernel.
+            if (kfp_colour_status != CL_SUCCESS || !runtime->kfp_colour_kernel) {
+                runtime->kfp_colour_kernel = nullptr;
+            } else {
+                const size_t kfp_colour_limit = kernel_workgroup_limit(
+                    runtime->kfp_colour_kernel);
+                runtime->kfp_colour_workgroup_size = choose_workgroup(
+                    runtime->kfp_colour_kernel,
+                    kfp_colour_limit,
+                    runtime->colour_workgroup_size > 0
+                        ? runtime->colour_workgroup_size
+                        : (runtime->workgroup_size > 0
+                            ? runtime->workgroup_size : 256));
+            }
+            cl_int rgb_status = CL_SUCCESS;
+            runtime->rgb_crop_kernel = clCreateKernel(
+                runtime->program, "rgb_crop", &rgb_status);
+            if (rgb_status != CL_SUCCESS || !runtime->rgb_crop_kernel) {
+                runtime->rgb_crop_kernel = nullptr;
+            }
+            rgb_status = CL_SUCCESS;
+            runtime->rgb_composite_kernel = clCreateKernel(
+                runtime->program, "rgb_atlas_composite", &rgb_status);
+            if (rgb_status != CL_SUCCESS || !runtime->rgb_composite_kernel) {
+                runtime->rgb_composite_kernel = nullptr;
+            }
+            if (runtime->rgb_crop_kernel && runtime->rgb_composite_kernel) {
+                const size_t crop_limit = kernel_workgroup_limit(
+                    runtime->rgb_crop_kernel);
+                const size_t composite_limit = kernel_workgroup_limit(
+                    runtime->rgb_composite_kernel);
+                const size_t common_rgb_limit = crop_limit > 0
+                    && composite_limit > 0
+                    ? std::min(crop_limit, composite_limit)
+                    : 0;
+                runtime->rgb_workgroup_size = choose_workgroup(
+                    runtime->rgb_crop_kernel,
+                    common_rgb_limit,
+                    runtime->kfp_colour_workgroup_size > 0
+                        ? runtime->kfp_colour_workgroup_size
+                    : (runtime->workgroup_size > 0
+                        ? runtime->workgroup_size : 256));
+            }
+            cl_int atlas_status = CL_SUCCESS;
+            runtime->atlas_colour_kernel = clCreateKernel(
+                runtime->program, "aurora_atlas_colourise", &atlas_status);
+            // The fused atlas path is an optional optimization.  Keep the
+            // ordinary OpenCL field and colour entry points usable on older
+            // drivers whose compiler accepts the smaller kernels only.
+            if (atlas_status != CL_SUCCESS || !runtime->atlas_colour_kernel) {
+                runtime->atlas_colour_kernel = nullptr;
+            } else {
+                cl_int secondary_kernel_status = CL_SUCCESS;
+                if (runtime->atlas_queue_secondary) {
+                    runtime->atlas_colour_kernel_secondary = clCreateKernel(
+                        runtime->program,
+                        "aurora_atlas_colourise",
+                        &secondary_kernel_status);
+                    if (secondary_kernel_status != CL_SUCCESS
+                        || !runtime->atlas_colour_kernel_secondary) {
+                        runtime->atlas_colour_kernel_secondary = nullptr;
+                    }
+                }
+                const size_t atlas_limit = kernel_workgroup_limit(
+                    runtime->atlas_colour_kernel);
+                runtime->atlas_colour_workgroup_limit = atlas_limit;
+                runtime->atlas_colour_workgroup_size = choose_workgroup(
+                    runtime->atlas_colour_kernel,
+                    atlas_limit,
+                    runtime->colour_workgroup_size > 0
+                        ? runtime->colour_workgroup_size
+                        : (runtime->workgroup_size > 0
+                            ? runtime->workgroup_size : 256));
+            }
+            cl_int tiled_atlas_status = CL_SUCCESS;
+            runtime->atlas_tiled_colour_kernel = clCreateKernel(
+                runtime->program,
+                "aurora_atlas_colourise_tiled",
+                &tiled_atlas_status);
+            if (tiled_atlas_status != CL_SUCCESS
+                || !runtime->atlas_tiled_colour_kernel) {
+                runtime->atlas_tiled_colour_kernel = nullptr;
+            } else {
+                cl_int tiled_secondary_status = CL_SUCCESS;
+                if (runtime->atlas_queue_secondary) {
+                    runtime->atlas_tiled_colour_kernel_secondary = clCreateKernel(
+                        runtime->program,
+                        "aurora_atlas_colourise_tiled",
+                        &tiled_secondary_status);
+                    if (tiled_secondary_status != CL_SUCCESS
+                        || !runtime->atlas_tiled_colour_kernel_secondary) {
+                        runtime->atlas_tiled_colour_kernel_secondary = nullptr;
+                    }
+                }
+                runtime->atlas_tiled_colour_workgroup_limit =
+                    kernel_workgroup_limit(runtime->atlas_tiled_colour_kernel);
+            }
+            if (runtime->atlas_images) {
+                cl_int image_status = CL_SUCCESS;
+                runtime->atlas_image_colour_kernel = clCreateKernel(
+                    runtime->program,
+                    "aurora_atlas_colourise_image",
+                    &image_status);
+                if (image_status != CL_SUCCESS
+                    || !runtime->atlas_image_colour_kernel) {
+                    runtime->atlas_image_colour_kernel = nullptr;
+                    runtime->atlas_images = false;
+                } else {
+                    cl_int image_secondary_status = CL_SUCCESS;
+                    if (runtime->atlas_queue_secondary) {
+                        runtime->atlas_image_colour_kernel_secondary =
+                            clCreateKernel(
+                                runtime->program,
+                                "aurora_atlas_colourise_image",
+                                &image_secondary_status);
+                        if (image_secondary_status != CL_SUCCESS
+                            || !runtime->atlas_image_colour_kernel_secondary) {
+                            runtime->atlas_image_colour_kernel_secondary = nullptr;
+                        }
+                    }
+                    const size_t image_limit = kernel_workgroup_limit(
+                        runtime->atlas_image_colour_kernel);
+                    runtime->atlas_colour_workgroup_limit = image_limit;
+                    runtime->atlas_colour_workgroup_size = choose_workgroup(
+                        runtime->atlas_image_colour_kernel,
+                        image_limit,
+                        runtime->colour_workgroup_size > 0
+                            ? runtime->colour_workgroup_size
+                            : (runtime->workgroup_size > 0
+                                ? runtime->workgroup_size : 256));
+                }
+            }
         }
         opencl_runtime = std::move(runtime);
     });
@@ -458,7 +4460,28 @@ bool opencl_available() {
     initialise_opencl();
     return opencl_runtime != nullptr
         && opencl_runtime->kernel != nullptr
+        && opencl_runtime->deep_kernel != nullptr
         && opencl_runtime->error.empty();
+}
+
+bool opencl_colour_available() {
+    return opencl_available()
+        && opencl_runtime != nullptr
+        && opencl_runtime->colour_kernel != nullptr;
+}
+
+bool opencl_kfp_colour_available() {
+    return opencl_available()
+        && opencl_runtime != nullptr
+        && opencl_runtime->kfp_colour_kernel != nullptr;
+}
+
+bool opencl_atlas_colour_available() {
+    return opencl_available()
+        && opencl_runtime != nullptr
+        && (opencl_runtime->atlas_colour_kernel != nullptr
+            || opencl_runtime->atlas_tiled_colour_kernel != nullptr
+            || opencl_runtime->atlas_image_colour_kernel != nullptr);
 }
 
 void render_direct_opencl(
@@ -469,7 +4492,12 @@ void render_direct_opencl(
     double x_center,
     double y_center,
     int max_iter,
-    double output_bias
+    double output_bias,
+    int formula,
+    double julia_real,
+    double julia_imag,
+    int escape_radius_mode,
+    int coordinate_mode
 ) {
     initialise_opencl();
     if (!opencl_available()) {
@@ -480,42 +4508,64 @@ void render_direct_opencl(
     }
     OpenClRuntime& runtime = *opencl_runtime;
     std::lock_guard<std::mutex> lock(runtime.mutex);
-    const double height_span = 2.8 / zoom;
+    const double height_span = viewport_height_factor(coordinate_mode) / zoom;
     const double width_span = height_span * static_cast<double>(width)
         / static_cast<double>(height);
+    const double escape_squared = escape_radius_squared_double(escape_radius_mode);
     const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
     cl_int status = CL_SUCCESS;
-    cl_mem device_output = clCreateBuffer(
-        runtime.context, CL_MEM_WRITE_ONLY,
-        count * sizeof(float), nullptr, &status);
-    if (status != CL_SUCCESS || !device_output) {
+    const size_t output_bytes = count * sizeof(float);
+    if (!runtime.direct_output || runtime.direct_output_capacity < output_bytes) {
+        cl_mem replacement = clCreateBuffer(
+            runtime.context, CL_MEM_WRITE_ONLY, output_bytes, nullptr, &status);
+        if (status != CL_SUCCESS || !replacement) {
+            throw std::runtime_error(opencl_error_text(status));
+        }
+        if (runtime.direct_output) clReleaseMemObject(runtime.direct_output);
+        runtime.direct_output = replacement;
+        runtime.direct_output_capacity = output_bytes;
+    }
+    cl_mem device_output = runtime.direct_output;
+    if (!device_output) {
         throw std::runtime_error(opencl_error_text(status));
     }
-    auto release_output = [&] { clReleaseMemObject(device_output); };
-    status = clSetKernelArg(runtime.kernel, 0, sizeof(device_output), &device_output);
-    status |= clSetKernelArg(runtime.kernel, 1, sizeof(width), &width);
-    status |= clSetKernelArg(runtime.kernel, 2, sizeof(height), &height);
-    status |= clSetKernelArg(runtime.kernel, 3, sizeof(x_center), &x_center);
-    status |= clSetKernelArg(runtime.kernel, 4, sizeof(y_center), &y_center);
-    status |= clSetKernelArg(runtime.kernel, 5, sizeof(width_span), &width_span);
-    status |= clSetKernelArg(runtime.kernel, 6, sizeof(height_span), &height_span);
-    status |= clSetKernelArg(runtime.kernel, 7, sizeof(max_iter), &max_iter);
-    status |= clSetKernelArg(runtime.kernel, 8, sizeof(output_bias), &output_bias);
+    cl_kernel selected_kernel = runtime.kernel;
+    if (valid_formula(formula)
+        && runtime.direct_formula_kernels[static_cast<size_t>(formula)]) {
+        selected_kernel = runtime.direct_formula_kernels[static_cast<size_t>(formula)];
+    }
+    status = clSetKernelArg(selected_kernel, 0, sizeof(device_output), &device_output);
+    status |= clSetKernelArg(selected_kernel, 1, sizeof(width), &width);
+    status |= clSetKernelArg(selected_kernel, 2, sizeof(height), &height);
+    status |= clSetKernelArg(selected_kernel, 3, sizeof(x_center), &x_center);
+    status |= clSetKernelArg(selected_kernel, 4, sizeof(y_center), &y_center);
+    status |= clSetKernelArg(selected_kernel, 5, sizeof(width_span), &width_span);
+    status |= clSetKernelArg(selected_kernel, 6, sizeof(height_span), &height_span);
+    status |= clSetKernelArg(selected_kernel, 7, sizeof(max_iter), &max_iter);
+    status |= clSetKernelArg(selected_kernel, 8, sizeof(output_bias), &output_bias);
+    status |= clSetKernelArg(selected_kernel, 9, sizeof(formula), &formula);
+    status |= clSetKernelArg(selected_kernel, 10, sizeof(julia_real), &julia_real);
+    status |= clSetKernelArg(selected_kernel, 11, sizeof(julia_imag), &julia_imag);
+    status |= clSetKernelArg(selected_kernel, 12, sizeof(escape_squared), &escape_squared);
+    status |= clSetKernelArg(selected_kernel, 13, sizeof(coordinate_mode), &coordinate_mode);
     if (status != CL_SUCCESS) {
-        release_output();
         throw std::runtime_error(opencl_error_text(status));
     }
-    const size_t global_size = ((count + 255U) / 256U) * 256U;
+    const size_t workgroup = runtime.workgroup_size;
+    const size_t global_size = workgroup > 0
+        ? ((count + workgroup - 1U) / workgroup) * workgroup
+        : count;
+    const size_t* local_work_size = workgroup > 0 ? &workgroup : nullptr;
     status = clEnqueueNDRangeKernel(
-        runtime.queue, runtime.kernel, 1, nullptr,
-        &global_size, nullptr, 0, nullptr, nullptr);
+        runtime.queue, selected_kernel, 1, nullptr,
+        &global_size, local_work_size, 0, nullptr, nullptr);
     if (status == CL_SUCCESS) {
         status = clEnqueueReadBuffer(
             runtime.queue, device_output, CL_TRUE, 0,
             count * sizeof(float), output, 0, nullptr, nullptr);
     }
-    if (status == CL_SUCCESS) status = clFinish(runtime.queue);
-    release_output();
+    // CL_TRUE readback waits for every preceding command in this in-order
+    // queue, so a separate clFinish would only add another driver round-trip.
     if (status != CL_SUCCESS) throw std::runtime_error(opencl_error_text(status));
 }
 
@@ -648,6 +4698,8 @@ FractalRenderOptions default_render_options() {
     options.max_bla_length = MAX_SAFE_BLA_LENGTH;
     options.max_linear_bla_length = MAX_SAFE_LINEAR_BLA_LENGTH;
     options.backend = 0; // scalar/native backend; future values are explicit.
+    options.escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC;
+    options.coordinate_mode = COORDINATE_MODE_PROJECT;
     options.output_bias = 0.0;
     return options;
 }
@@ -670,6 +4722,12 @@ FractalRenderOptions checked_render_options(const FractalRenderOptions* supplied
     validate_flag(options.disable_bla, "disable-BLA flag");
     validate_flag(options.disable_cycle, "disable-cycle flag");
     validate_flag(options.strict_cycle, "strict-cycle flag");
+    if (!valid_escape_radius_mode(options.escape_radius_mode)) {
+        throw std::runtime_error("unknown escape-radius mode");
+    }
+    if (!valid_coordinate_mode(options.coordinate_mode)) {
+        throw std::runtime_error("unknown coordinate mode");
+    }
     options.series_min_terms = std::clamp(options.series_min_terms, 1, 32);
     options.series_max_terms = std::clamp(options.series_max_terms, options.series_min_terms, 32);
     options.max_bla_length = std::clamp(options.max_bla_length, 1, MAX_SAFE_BLA_LENGTH);
@@ -935,6 +4993,18 @@ struct BilinearWorkspace {
     std::vector<float> child_edge_y;
     std::vector<float> kfp_parent_field;
     std::vector<float> kfp_child_field;
+    // Reprojected Kalles metadata for the fused plane-aware atlas path.
+    // These vectors are resized only for planes supplied by the caller and
+    // retain capacity between video frames to avoid allocator churn.
+    std::vector<std::int64_t> kfp_atlas_orbit_iteration;
+    std::vector<std::int64_t> kfp_atlas_iteration;
+    std::vector<double> kfp_atlas_bailout;
+    std::vector<double> kfp_atlas_transition;
+    std::vector<double> kfp_atlas_phase;
+    std::vector<double> kfp_atlas_de_x;
+    std::vector<double> kfp_atlas_de_y;
+    std::vector<double> kfp_atlas_test1;
+    std::vector<double> kfp_atlas_test2;
 };
 
 thread_local BilinearWorkspace bilinear_workspace;
@@ -979,6 +5049,71 @@ inline float sample_bilinear_mapped(
     const float bottom_value = bottom[x_index] * (1.0F - x_weight)
         + bottom[x_next] * x_weight;
     return top_value * (1.0F - y_weight) + bottom_value * y_weight;
+}
+
+inline double sample_bilinear_mapped_double(
+    const double* source,
+    int source_width,
+    const BilinearAxis& x_axis,
+    const BilinearAxis& y_axis,
+    int x,
+    int y,
+    bool preserve_negative = false
+) {
+    const int x_index = x_axis.index0[static_cast<size_t>(x)];
+    const int x_next = x_axis.index1[static_cast<size_t>(x)];
+    const double x_weight = static_cast<double>(
+        x_axis.weight[static_cast<size_t>(x)]);
+    const int y_index = y_axis.index0[static_cast<size_t>(y)];
+    const int y_next = y_axis.index1[static_cast<size_t>(y)];
+    const double y_weight = static_cast<double>(
+        y_axis.weight[static_cast<size_t>(y)]);
+    const double* top = source + static_cast<size_t>(y_index) * source_width;
+    const double* bottom = source + static_cast<size_t>(y_next) * source_width;
+    const auto ordinary = [preserve_negative](double value) {
+        return preserve_negative && value < 0.0 ? 0.0 : value;
+    };
+    const double top_value = ordinary(top[x_index]) * (1.0 - x_weight)
+        + ordinary(top[x_next]) * x_weight;
+    const double bottom_value = ordinary(bottom[x_index]) * (1.0 - x_weight)
+        + ordinary(bottom[x_next]) * x_weight;
+    return top_value * (1.0 - y_weight) + bottom_value * y_weight;
+}
+
+inline double sample_nearest_mapped_double(
+    const double* source,
+    int source_width,
+    const BilinearAxis& x_axis,
+    const BilinearAxis& y_axis,
+    int x,
+    int y
+) {
+    const int x_index = x_axis.weight[static_cast<size_t>(x)] < 0.5F
+        ? x_axis.index0[static_cast<size_t>(x)]
+        : x_axis.index1[static_cast<size_t>(x)];
+    const int y_index = y_axis.weight[static_cast<size_t>(y)] < 0.5F
+        ? y_axis.index0[static_cast<size_t>(y)]
+        : y_axis.index1[static_cast<size_t>(y)];
+    return source[static_cast<size_t>(y_index) * source_width
+        + static_cast<size_t>(x_index)];
+}
+
+inline std::int64_t sample_nearest_mapped_int64(
+    const std::int64_t* source,
+    int source_width,
+    const BilinearAxis& x_axis,
+    const BilinearAxis& y_axis,
+    int x,
+    int y
+) {
+    const int x_index = x_axis.weight[static_cast<size_t>(x)] < 0.5F
+        ? x_axis.index0[static_cast<size_t>(x)]
+        : x_axis.index1[static_cast<size_t>(x)];
+    const int y_index = y_axis.weight[static_cast<size_t>(y)] < 0.5F
+        ? y_axis.index0[static_cast<size_t>(y)]
+        : y_axis.index1[static_cast<size_t>(y)];
+    return source[static_cast<size_t>(y_index) * source_width
+        + static_cast<size_t>(x_index)];
 }
 
 // An iteration cap is an interior sentinel, not a colourable scalar.  A
@@ -1158,6 +5293,26 @@ inline std::uint8_t kfp_dithered_colour_byte(
         255));
 }
 
+inline std::uint8_t kfp_dithered_srgb_byte(
+    float value,
+    int x,
+    int y,
+    int channel
+) {
+    // Kalles' colour.h keeps the colour in float sRGB [0, 1] until this
+    // exact operation.  Keeping this as a separate helper is important: the
+    // older fast default kernel stores its palette in byte units, while the
+    // general KFP SetColor path must not quantise to 0..255 before dither.
+    if (!std::isfinite(value)) value = 0.0F;
+    const float mask = static_cast<float>(
+        kfp_colour_dither_mask(x, y, channel));
+    const float quantized = 255.0F * value + mask;
+    return static_cast<std::uint8_t>(std::clamp(
+        static_cast<int>(std::floor(quantized)),
+        0,
+        255));
+}
+
 inline double kfp_safe_sample(
     const float* field,
     int width,
@@ -1204,28 +5359,48 @@ inline bool kfp_inside_value(
 }
 
 // The renderer stores the compact smooth-iteration value produced by its
-// own scalar path.  Kalles reconstructs its colour value from nIter and
+// own scalar path. Kalles reconstructs its colour value from nIter and
 // transition as
 //
 //   nIter + 1 - log(log(|z|) / log(10000)) / log(power)
 //
-// while the scalar renderer deliberately omits the constant bailout term.
-// Add that constant only inside the KFP transfer; changing the shared scalar
-// field would move ordinary Aurora palettes as well.  The default Kalles
-// palette uses only the distance transfer, so its branch-free hot path keeps
-// the unshifted scalar differences where the constant cancels exactly.
+// while the scalar renderer already contains the `nIter + 1` part and the
+// `-log(log(|z|))/log(power)` part. Add only the selected bailout's
+// `log(log(radius))/log(power)` term inside the KFP transfer; changing the
+// shared scalar field would move ordinary Aurora palettes as well. The
+// default Kalles palette uses only the distance transfer, so its branch-free
+// hot path keeps the unshifted scalar differences where the constant cancels
+// exactly.
 inline double kfp_smooth_offset(const FractalKfpOptions& options) noexcept {
     if (options.smooth_method != 0
         || !std::isfinite(options.power) || options.power <= 0.0
         || std::abs(options.power - 1.0) < 1.0e-12) {
         return 0.0;
     }
-    return 1.0 + std::log(std::log(10000.0)) / std::log(options.power);
+    double radius = 10000.0;
+    switch (options.bailout_radius_preset) {
+        case 0:
+            radius = 10000.0;
+            break;
+        case 1:
+            radius = 2.0;
+            break;
+        case 2:
+            radius = std::pow(2.0, 1.0 / (options.power - 1.0));
+            break;
+        case 3:
+            radius = options.bailout_radius_custom;
+            break;
+        default:
+            return 0.0;
+    }
+    if (!std::isfinite(radius) || radius <= 1.0) return 0.0;
+    return std::log(std::log(radius)) / std::log(options.power);
 }
 
 // The bundled/default profile always uses Power=2. Keep its edge-only
 // correction in float so the AVX and scalar fast paths take the same route.
-constexpr float KFP_DEFAULT_SMOOTH_OFFSET = 4.2032545F;
+constexpr float KFP_DEFAULT_SMOOTH_OFFSET = 3.2032545F;
 
 inline double kfp_colour_sample(
     const float* field,
@@ -1317,11 +5492,22 @@ inline double kfp_difference_magnitude(
     double bottom_left,
     double bottom_right
 ) {
+    // Kalles' gradient.cpp calls this hypot1, which is deliberately just
+    // sqrt(x*x + y*y), rather than the range-stable std::hypot.  Keeping the
+    // same operation matters at palette boundaries and avoids a libm helper
+    // call in the two least-squares operators.
+    const auto kfp_hypot1 = [](double x, double y) noexcept {
+        return std::sqrt(x * x + y * y);
+    };
     constexpr double inverse_sqrt_two = 0.7071067811865475244008443621048490;
     constexpr double diagonal_distance_squared = 2.0;
     if (differences == 0) {
-        return std::abs(left - centre) * std::sqrt(2.0)
-            + std::abs(up - centre) * std::sqrt(2.0)
+        // CFraktalSFT::SetColor uses the historical literal 1.414 here,
+        // rather than recomputing sqrt(2). Keep that last bit of arithmetic
+        // identical for KFP profiles using the traditional stencil.
+        constexpr double axis_scale = 1.414;
+        return std::abs(left - centre) * axis_scale
+            + std::abs(up - centre) * axis_scale
             // Diagonal neighbours are sqrt(2) pixels away, cancelling the
             // historical sqrt(2) factor used before distance normalization.
             + std::abs(top_left - centre)
@@ -1358,14 +5544,14 @@ inline double kfp_difference_magnitude(
     if (differences == 4) {
         const double dx = ((up - top_left) + (centre - left)) * 0.5;
         const double dy = ((left - top_left) + (centre - up)) * 0.5;
-        return std::hypot(dx, dy) * 2.8284271247461903;
+        return kfp_hypot1(dx, dy) * 2.8284271247461903;
     }
     if (differences == 5) {
         const double dx = (right + top_right + bottom_right
             - left - top_left - bottom_left) / 6.0;
         const double dy = (down + bottom_left + bottom_right
             - up - top_left - top_right) / 6.0;
-        return std::hypot(dx, dy) * 2.8284271247461903;
+        return kfp_hypot1(dx, dy) * 2.8284271247461903;
     }
     if (differences == 6) {
         const double laplacian = top_left + 4.0 * up + top_right
@@ -1374,32 +5560,36 @@ inline double kfp_difference_magnitude(
         return std::sqrt(std::abs(laplacian / 6.0 * 1.4426950408889634))
             * 2.8284271247461903;
     }
-    const double squared =
-        (right - left) * (right - left) * 0.25
-        + (down - up) * (down - up) * 0.25;
-    return std::sqrt(std::max(0.0, squared)) * 2.8284271247461903;
+    // Differences_Analytic is the only remaining enum value. Kalles gets
+    // this transfer from its optional DE planes; the scalar ABI has no such
+    // planes, so its own SetColor leaves the distance value at zero.
+    return 0.0;
 }
 
 inline void kfp_hsv_to_rgb(
-    double hue,
-    double saturation,
-    double value,
-    double& red,
-    double& green,
-    double& blue
+    float hue,
+    float saturation,
+    float value,
+    float& red,
+    float& green,
+    float& blue
 ) {
-    hue = std::fmod(hue, 1.0);
-    if (hue < 0.0) hue += 1.0;
-    saturation = std::clamp(saturation, 0.0, 1.0);
-    value = std::clamp(value, 0.0, 1.0);
-    const double scaled_hue = hue * 6.0;
-    const int sector = std::min(5, static_cast<int>(std::floor(scaled_hue)));
-    double fraction = scaled_hue - std::floor(scaled_hue);
-    fraction = (sector & 1) == 0 ? 1.0 - fraction : fraction;
-    const double minimum = value * (1.0 - saturation);
-    const double transition = value * (1.0 - saturation * fraction);
+    // This is Kalles' colour.h::hsv2rgb.  The source deliberately uses float
+    // here, even though the wave accumulator in SetColor is double.  That
+    // narrowing is visible at palette boundaries and must be retained for
+    // imported .kfp files that use MultiColor.
+    const float scaled_hue = hue * 6.0F;
+    const int sector = static_cast<int>(std::floor(scaled_hue));
+    float fraction = scaled_hue - static_cast<float>(sector);
+    if ((sector & 1) == 0) fraction = 1.0F - fraction;
+    const float minimum = value * (1.0F - saturation);
+    const float transition = value * (1.0F - saturation * fraction);
+    red = 0.0F;
+    green = 0.0F;
+    blue = 0.0F;
     switch (sector) {
         case 0:
+        case 6:
             red = minimum;
             green = transition;
             blue = value;
@@ -1424,7 +5614,7 @@ inline void kfp_hsv_to_rgb(
             green = minimum;
             blue = transition;
             break;
-        default:
+        case 5:
             red = transition;
             green = minimum;
             blue = value;
@@ -1437,11 +5627,337 @@ struct KfpSlopeDirection {
     double sine = 0.0;
 };
 
-// The bundled Kalles palette is the hot path for video rendering.  Its
-// transfer is fixed (Differences=3, ColorMethod=7, 45-degree slopes, no
-// multi-colour wave), so it can use a small float kernel without changing the
-// semantics of arbitrary imported KFP files.  The generic writer below stays
-// available for every other recipe.
+// Values that are invariant for every pixel in one KFP colour pass. Keeping
+// them beside the pixel writer makes the exact Kalles path cheaper without
+// moving any arithmetic out of the reference-defined per-pixel stages.
+struct KfpPixelContext {
+    double smooth_offset = 0.0;
+    double smooth_power_log = 0.0;
+    double smooth_bailout_radius = 0.0;
+    double smooth_bailout_log = 0.0;
+    double smooth_norm_exponent = 0.0;
+    int smooth_method = 0;
+    bool has_iteration_planes = false;
+    bool has_constant_bailout = false;
+    bool has_smooth_power_log = false;
+    bool has_smooth_bailout_log = false;
+    bool has_smooth_norm_exponent = false;
+    bool texture_active = false;
+    bool needs_difference = false;
+    bool needs_slopes = false;
+};
+
+inline double kfp_selected_bailout_radius(
+    const FractalKfpOptions& options
+) noexcept {
+    double radius = 10000.0;
+    switch (options.bailout_radius_preset) {
+        case 0:
+            radius = 10000.0;
+            break;
+        case 1:
+            radius = 2.0;
+            break;
+        case 2:
+            if (options.power > 1.0 && std::isfinite(options.power)) {
+                radius = std::pow(2.0, 1.0 / (options.power - 1.0));
+            } else {
+                return 0.0;
+            }
+            break;
+        case 3:
+            radius = options.bailout_radius_custom;
+            break;
+        default:
+            return 0.0;
+    }
+    return std::isfinite(radius) && radius > 1.0 ? radius : 0.0;
+}
+
+inline double kfp_selected_bailout_norm(
+    const FractalKfpOptions& options
+) noexcept {
+    switch (options.bailout_norm_preset) {
+        case 0:
+            return 1.0;
+        case 1:
+            return 2.0;
+        case 2:
+            return std::numeric_limits<double>::infinity();
+        case 3:
+            return std::isfinite(options.bailout_norm_custom)
+                && options.bailout_norm_custom > 0.0
+                ? options.bailout_norm_custom : 0.0;
+        default:
+            return 0.0;
+    }
+}
+
+inline bool kfp_planes_have_iteration(const FractalKfpPlanes* planes) noexcept {
+    return planes != nullptr
+        && (planes->orbit_iteration != nullptr || planes->iteration != nullptr);
+}
+
+inline KfpPixelContext kfp_pixel_context(
+    const FractalKfpOptions& options,
+    double smooth_offset,
+    const FractalKfpPlanes* planes
+) noexcept {
+    KfpPixelContext context;
+    context.smooth_offset = smooth_offset;
+    context.smooth_method = options.smooth_method;
+    context.has_iteration_planes = kfp_planes_have_iteration(planes);
+    context.has_constant_bailout = planes != nullptr
+        && planes->bailout == nullptr;
+    context.smooth_bailout_radius = kfp_selected_bailout_radius(options);
+    if (std::isfinite(options.power) && options.power > 1.0) {
+        context.smooth_power_log = std::log(options.power);
+        context.has_smooth_power_log = std::isfinite(context.smooth_power_log)
+            && context.smooth_power_log != 0.0;
+    }
+    if (context.has_constant_bailout
+        && context.smooth_bailout_radius > 1.0
+        && std::isfinite(context.smooth_bailout_radius)) {
+        context.smooth_bailout_log = std::log(context.smooth_bailout_radius);
+        context.has_smooth_bailout_log = std::isfinite(context.smooth_bailout_log)
+            && context.smooth_bailout_log != 0.0;
+    }
+    const double norm = kfp_selected_bailout_norm(options);
+    if (norm > 0.0 && std::isfinite(norm)) {
+        context.smooth_norm_exponent = 1.0 / norm;
+        context.has_smooth_norm_exponent = true;
+    } else if (std::isinf(norm) && norm > 0.0) {
+        context.smooth_norm_exponent = 1.0;
+        context.has_smooth_norm_exponent = true;
+    }
+    context.texture_active = planes != nullptr
+        && planes->texture_rgb != nullptr
+        && options.texture_enabled != 0;
+    context.needs_difference = options.color_method >= 5
+        && options.color_method <= 8;
+    context.needs_slopes = options.slopes && options.slope_power > 0.0
+        && options.slope_ratio > 0.0;
+    return context;
+}
+
+inline double kfp_plane_bailout(
+    const FractalKfpOptions& options,
+    const FractalKfpPlanes* planes,
+    size_t index
+) noexcept {
+    if (planes != nullptr && planes->bailout != nullptr) {
+        const double value = planes->bailout[index];
+        if (std::isfinite(value) && value > 1.0) return value;
+    }
+    return kfp_selected_bailout_radius(options);
+}
+
+inline double kfp_plane_smooth_part(
+    const FractalKfpOptions& options,
+    const FractalKfpPlanes* planes,
+    size_t index,
+    const KfpPixelContext* pixel_context = nullptr
+) noexcept {
+    if (planes == nullptr || planes->test1 == nullptr) return 0.0;
+    const double test1 = planes->test1[index];
+    if (!std::isfinite(test1) || test1 <= 0.0) return 0.0;
+    double smooth = 0.0;
+    const int smooth_method = pixel_context != nullptr
+        ? pixel_context->smooth_method : options.smooth_method;
+    if (smooth_method == 0) {
+        const double radius = pixel_context != nullptr
+            && pixel_context->has_constant_bailout
+            ? pixel_context->smooth_bailout_radius
+            : kfp_plane_bailout(options, planes, index);
+        const double power = options.power;
+        if (radius > 1.0 && std::isfinite(power) && power > 1.0) {
+            const double numerator = std::log(std::sqrt(test1));
+            const double denominator = pixel_context != nullptr
+                && pixel_context->has_smooth_bailout_log
+                ? pixel_context->smooth_bailout_log
+                : std::log(radius);
+            const double power_log = pixel_context != nullptr
+                && pixel_context->has_smooth_power_log
+                ? pixel_context->smooth_power_log
+                : std::log(power);
+            if (std::isfinite(numerator) && numerator > 0.0
+                && std::isfinite(denominator) && denominator != 0.0
+                && std::isfinite(power_log) && power_log != 0.0) {
+                smooth = 1.0 - std::log(numerator / denominator) / power_log;
+            }
+        }
+    } else if (smooth_method == 1 && planes->test2 != nullptr) {
+        const double test2 = planes->test2[index];
+        const double fallback_norm = pixel_context == nullptr
+            ? kfp_selected_bailout_norm(options) : 0.0;
+        const bool has_norm = pixel_context != nullptr
+            ? pixel_context->has_smooth_norm_exponent
+            : fallback_norm > 0.0;
+        if (std::isfinite(test2) && test2 >= 0.0 && has_norm) {
+            const double exponent = pixel_context != nullptr
+                && pixel_context->has_smooth_norm_exponent
+                ? pixel_context->smooth_norm_exponent
+                : (std::isinf(fallback_norm) ? 1.0 : 1.0 / fallback_norm);
+            const double root1 = std::pow(test1, exponent);
+            const double root2 = std::pow(test2, exponent);
+            const double denominator = root1 - root2;
+            const double radius = pixel_context != nullptr
+                && pixel_context->has_constant_bailout
+                ? pixel_context->smooth_bailout_radius
+                : kfp_plane_bailout(options, planes, index);
+            if (std::isfinite(root1) && std::isfinite(root2)
+                && std::isfinite(radius) && denominator != 0.0) {
+                smooth = 1.0 - (root1 - radius) / denominator;
+            }
+        }
+    }
+    return std::isfinite(smooth) ? smooth : 0.0;
+}
+
+struct KfpOrbitSample {
+    double colour = 0.0;
+    bool inside = false;
+};
+
+inline KfpOrbitSample kfp_plane_orbit_sample(
+    int max_iter,
+    const FractalKfpOptions& options,
+    const FractalKfpPlanes* planes,
+    size_t index,
+    const KfpPixelContext* pixel_context = nullptr
+) noexcept {
+    if (planes == nullptr || planes->orbit_iteration == nullptr) return {};
+    const std::int64_t raw = std::max<std::int64_t>(
+        0, planes->orbit_iteration[index]);
+    if (raw >= max_iter) {
+        return {static_cast<double>(max_iter) + 1.0, true};
+    }
+    const double combined = static_cast<double>(raw)
+        + kfp_plane_smooth_part(options, planes, index, pixel_context);
+    const bool inside = combined >= static_cast<double>(max_iter);
+    return {
+        inside ? static_cast<double>(max_iter) + 1.0 : combined,
+        inside,
+    };
+}
+
+inline double kfp_plane_colour_sample(
+    const float* field,
+    int width,
+    int height,
+    int x,
+    int y,
+    int max_iter,
+    const FractalKfpOptions& options,
+    const FractalKfpPlanes* planes,
+    double smooth_offset = std::numeric_limits<double>::quiet_NaN(),
+    const KfpPixelContext* pixel_context = nullptr
+) noexcept {
+    x = std::clamp(x, 0, width - 1);
+    y = std::clamp(y, 0, height - 1);
+    const size_t index = static_cast<size_t>(y) * static_cast<size_t>(width)
+        + static_cast<size_t>(x);
+    if (planes != nullptr && planes->orbit_iteration != nullptr) {
+        const KfpOrbitSample sample = kfp_plane_orbit_sample(
+            max_iter, options, planes, index, pixel_context);
+        // OutputIterationData stores nTrans = 1 - fraction.  SetColor then
+        // reconstructs the continuous value as nPixels + 1 - nTrans, which
+        // is the original raw counter plus its smoothing fraction.  Do not
+        // subtract the fraction twice here: that would mirror every Kalles
+        // transition around the next integer.
+        return sample.colour;
+    }
+    if (planes != nullptr && planes->iteration != nullptr) {
+        const std::int64_t stored = planes->iteration[index];
+        if (stored >= max_iter) return static_cast<double>(max_iter) + 1.0;
+        const double transition = planes->transition != nullptr
+            ? planes->transition[index] : 1.0;
+        return static_cast<double>(std::max<std::int64_t>(0, stored))
+            + 1.0 - (std::isfinite(transition) ? transition : 1.0);
+    }
+    if (!std::isfinite(smooth_offset)) {
+        smooth_offset = kfp_smooth_offset(options);
+    }
+    return kfp_colour_sample(field, width, height, x, y, max_iter,
+        smooth_offset, options.field_bias);
+}
+
+inline bool kfp_plane_inside(
+    int width,
+    int height,
+    int x,
+    int y,
+    int max_iter,
+    const FractalKfpOptions& options,
+    const FractalKfpPlanes* planes,
+    float scalar_value,
+    const KfpPixelContext* pixel_context = nullptr
+) noexcept {
+    (void)height;
+    if (planes != nullptr && planes->orbit_iteration != nullptr) {
+        const size_t index = static_cast<size_t>(y) * static_cast<size_t>(width)
+            + static_cast<size_t>(x);
+        return kfp_plane_orbit_sample(
+            max_iter, options, planes, index, pixel_context).inside;
+    }
+    if (planes != nullptr && planes->iteration != nullptr) {
+        const size_t index = static_cast<size_t>(y) * static_cast<size_t>(width)
+            + static_cast<size_t>(x);
+        return planes->iteration[index] >= max_iter;
+    }
+    return kfp_inside_value(scalar_value, max_iter, options.field_bias);
+}
+
+inline double kfp_plane_phase(
+    const FractalKfpPlanes* planes,
+    size_t index
+) noexcept {
+    if (planes == nullptr || planes->phase == nullptr) return 0.0;
+    const double value = planes->phase[index];
+    return std::isfinite(value) ? value : 0.0;
+}
+
+inline double kfp_plane_value(
+    const double* values,
+    size_t index
+) noexcept {
+    if (values == nullptr) return 0.0;
+    const double value = values[index];
+    return std::isfinite(value) ? value : 0.0;
+}
+
+inline double kfp_plane_stored_iteration(
+    const float* field,
+    int width,
+    int height,
+    int x,
+    int y,
+    int max_iter,
+    const FractalKfpOptions& options,
+    const FractalKfpPlanes* planes,
+    const KfpPixelContext* pixel_context = nullptr
+) noexcept {
+    const double value = kfp_plane_colour_sample(
+        field, width, height, x, y, max_iter, options, planes,
+        std::numeric_limits<double>::quiet_NaN(), pixel_context);
+    if (value > static_cast<double>(max_iter)) {
+        return static_cast<double>(max_iter);
+    }
+    return std::floor(std::max(0.0, value));
+}
+
+inline int kfp_texture_index(double value, int limit) noexcept {
+    if (limit <= 0 || !std::isfinite(value)) return 0;
+    if (value <= 0.0) return 0;
+    if (value >= static_cast<double>(limit - 1)) return limit - 1;
+    return static_cast<int>(value);
+}
+
+// This predicate is retained for profiling the old approximation, but it is
+// deliberately not used by production KFP rendering. That kernel replaces
+// libm log/atan and reconstructs only the bundled profile; it cannot be
+// pixel-identical to Kalles' complete SetColor path. The generic writer is
+// now the authoritative implementation for direct, crop, and atlas output.
 inline bool kfp_is_default_fast_options(
     const FractalKfpOptions& options
 ) noexcept {
@@ -1635,6 +6151,7 @@ inline __m256 kfp_fast_atan_nonnegative_avx(__m256 value) {
 inline void write_kfp_default_fast_block8(
     const float* field,
     int width,
+    int height,
     int source_x,
     int source_y,
     int dither_x,
@@ -1646,6 +6163,7 @@ inline void write_kfp_default_fast_block8(
     std::uint8_t* destination,
     double field_bias = 0.0
 ) {
+    (void) height;
     const size_t centre_index = static_cast<size_t>(source_y)
         * static_cast<size_t>(width) + static_cast<size_t>(source_x);
     const __m256 raw = _mm256_loadu_ps(field + centre_index);
@@ -2043,6 +6561,7 @@ inline void write_kfp_default_fast_pixel(
 inline void write_kfp_default_fast_block8(
     const float* field,
     int width,
+    int height,
     int source_x,
     int source_y,
     int dither_x,
@@ -2054,15 +6573,11 @@ inline void write_kfp_default_fast_block8(
     std::uint8_t* destination,
     double field_bias = 0.0
 ) {
-    // All callers establish an interior eight-pixel run.  The scalar writer
-    // only needs a height large enough to keep that already-established row
-    // on its interior stencil path.
-    const int scalar_height = source_y + 2;
     for (int lane = 0; lane < 8; ++lane) {
         write_kfp_default_fast_pixel(
             field,
             width,
-            scalar_height,
+            height,
             source_x + lane,
             source_y,
             dither_x + lane,
@@ -2120,6 +6635,7 @@ inline void colourise_kfp_default_fast_field(
                 write_kfp_default_fast_block8(
                     field,
                     width,
+                    height,
                     x,
                     y,
                     x,
@@ -2153,6 +6669,8 @@ inline void colourise_kfp_default_fast_field(
     }
 }
 
+inline bool kfp_show_glitches(const FractalKfpOptions& options) noexcept;
+
 inline void write_kfp_pixel(
     const float* field,
     int width,
@@ -2164,36 +6682,169 @@ inline void write_kfp_pixel(
     int spatial_width,
     int max_iter,
     const FractalKfpOptions& options,
+    const KfpPixelContext& pixel_context,
     const std::uint8_t* lut,
     int lut_size,
     double transfer_minimum,
     double transfer_maximum,
     const KfpSlopeDirection& slope_direction,
-    std::uint8_t* destination
+    std::uint8_t* destination,
+    const FractalKfpPlanes* planes = nullptr,
+    const double* orbit_colour_samples = nullptr,
+    const double* scalar_colour_samples = nullptr
 ) {
-    const float raw_value = field[static_cast<size_t>(y) * static_cast<size_t>(width)
-        + static_cast<size_t>(x)];
-    const bool inside = kfp_inside_value(raw_value, max_iter, options.field_bias);
-    if (inside) {
+    const bool orbit_planes = planes != nullptr
+        && planes->orbit_iteration != nullptr;
+    const bool has_iteration_planes = pixel_context.has_iteration_planes;
+    const bool materialized_scalar = !has_iteration_planes
+        && scalar_colour_samples != nullptr;
+    // A complete Kalles metadata pass sources the centre sample from the
+    // orbit/test planes. Avoid touching the scalar compatibility field in
+    // that case; it is otherwise an unnecessary bandwidth/cache read for
+    // every pixel and is not part of the colour decision.
+    const float raw_value = orbit_planes
+        ? 0.0F
+        : field[static_cast<size_t>(y) * static_cast<size_t>(width)
+            + static_cast<size_t>(x)];
+    const size_t plane_index = static_cast<size_t>(y) * static_cast<size_t>(width)
+        + static_cast<size_t>(x);
+    if (planes != nullptr && planes->transition != nullptr
+        && planes->transition[plane_index] < 0.0
+        && !kfp_show_glitches(options)) {
+        // SetColor returns without touching a hidden glitch pixel. Native
+        // callers provide a fresh output buffer, so use deterministic black
+        // rather than exposing stale or uninitialized memory.
+        destination[0] = 0;
+        destination[1] = 0;
+        destination[2] = 0;
+        return;
+    }
+    bool inside = false;
+    double smooth_iter = 0.0;
+    if (orbit_planes) {
+        if (orbit_colour_samples != nullptr) {
+            // The complete plane pass may have materialized this exact
+            // Kalles sample once for the whole frame. Reusing it here also
+            // covers the centre pixel; the stencil below reuses the same
+            // array for neighbouring pixels.
+            smooth_iter = orbit_colour_samples[plane_index];
+            inside = smooth_iter > static_cast<double>(max_iter);
+        } else {
+            // The orbit path needs the same smoothed value for both the
+            // interior test and SetColor. Share that sample so high-bailout
+            // KFP frames do not pay for the log/pow smoothing stage twice per
+            // pixel.
+            const KfpOrbitSample sample = kfp_plane_orbit_sample(
+                max_iter, options, planes, plane_index, &pixel_context);
+            inside = sample.inside;
+            smooth_iter = sample.colour;
+        }
+    } else if (materialized_scalar) {
+        smooth_iter = scalar_colour_samples[plane_index];
+        // The cached continuous value can cross max_iter because its Kalles
+        // smoothing offset is added after the raw field was produced. That
+        // does not make an escaped sample interior; membership is defined by
+        // the original scalar cap, just as it is in kfp_plane_inside().
+        inside = kfp_inside_value(
+            raw_value, max_iter, options.field_bias);
+    } else {
+        inside = kfp_plane_inside(
+            width, height, x, y, max_iter, options, planes, raw_value,
+            &pixel_context);
+        smooth_iter = has_iteration_planes
+            ? kfp_plane_colour_sample(
+                field, width, height, x, y, max_iter, options, planes,
+                pixel_context.smooth_offset, &pixel_context)
+            : [&]() {
+                const double safe = std::isfinite(raw_value)
+                    ? std::clamp(
+                        static_cast<double>(raw_value) + options.field_bias,
+                        0.0,
+                        static_cast<double>(max_iter))
+                    : 0.0;
+                return std::max(0.0, safe + pixel_context.smooth_offset);
+            }();
+    }
+    const bool texture_active = pixel_context.texture_active;
+    if (inside && !texture_active) {
         destination[0] = static_cast<std::uint8_t>(options.interior_color[0]);
         destination[1] = static_cast<std::uint8_t>(options.interior_color[1]);
         destination[2] = static_cast<std::uint8_t>(options.interior_color[2]);
         return;
     }
 
-    const double smooth_offset = kfp_smooth_offset(options);
-    const double safe = std::isfinite(raw_value)
-        ? std::clamp(
-            static_cast<double>(raw_value) + options.field_bias,
-            0.0,
-            static_cast<double>(max_iter))
-        : 0.0;
-    const double smooth_iter = std::max(0.0, safe + smooth_offset);
+    const double smooth_offset = pixel_context.smooth_offset;
     const double colour_iter = options.flat
         ? std::floor(smooth_iter)
         : smooth_iter;
     const double centre = smooth_iter;
     const auto reflected = [&](int offset_x, int offset_y) {
+        if (has_iteration_planes) {
+            const int sample_x = x + offset_x;
+            const int sample_y = y + offset_y;
+            if (sample_x >= 0 && sample_x < width
+                && sample_y >= 0 && sample_y < height) {
+                const size_t sample_index = static_cast<size_t>(sample_y)
+                    * static_cast<size_t>(width)
+                    + static_cast<size_t>(sample_x);
+                if (orbit_planes && orbit_colour_samples != nullptr) {
+                    return orbit_colour_samples[sample_index];
+                }
+                return kfp_plane_colour_sample(
+                    field,
+                    width,
+                    height,
+                    sample_x,
+                    sample_y,
+                    max_iter,
+                    options,
+                    planes,
+                    smooth_offset,
+                    &pixel_context);
+            }
+            const int opposite_x = x - offset_x;
+            const int opposite_y = y - offset_y;
+            if (opposite_x >= 0 && opposite_x < width
+                && opposite_y >= 0 && opposite_y < height) {
+                const size_t opposite_index = static_cast<size_t>(opposite_y)
+                    * static_cast<size_t>(width)
+                    + static_cast<size_t>(opposite_x);
+                if (orbit_planes && orbit_colour_samples != nullptr) {
+                    return 2.0 * centre - orbit_colour_samples[opposite_index];
+                }
+                return 2.0 * centre - kfp_plane_colour_sample(
+                    field,
+                    width,
+                    height,
+                    opposite_x,
+                    opposite_y,
+                    max_iter,
+                    options,
+                    planes,
+                    smooth_offset,
+                    &pixel_context);
+            }
+            return centre;
+        }
+        if (materialized_scalar) {
+            const int sample_x = x + offset_x;
+            const int sample_y = y + offset_y;
+            if (sample_x >= 0 && sample_x < width
+                && sample_y >= 0 && sample_y < height) {
+                return scalar_colour_samples[
+                    static_cast<size_t>(sample_y) * static_cast<size_t>(width)
+                    + static_cast<size_t>(sample_x)];
+            }
+            const int opposite_x = x - offset_x;
+            const int opposite_y = y - offset_y;
+            if (opposite_x >= 0 && opposite_x < width
+                && opposite_y >= 0 && opposite_y < height) {
+                return 2.0 * centre - scalar_colour_samples[
+                    static_cast<size_t>(opposite_y) * static_cast<size_t>(width)
+                    + static_cast<size_t>(opposite_x)];
+            }
+            return centre;
+        }
         return kfp_reflected_sample(
             field,
             width,
@@ -2207,11 +6858,9 @@ inline void write_kfp_pixel(
             smooth_offset,
             options.field_bias);
     };
-    const bool needs_difference = options.color_method >= 5
-        && options.color_method <= 8;
-    const bool needs_slopes = options.slopes
-        && options.slope_power > 0.0
-        && options.slope_ratio > 0.0;
+    const bool needs_difference = pixel_context.needs_difference;
+    const bool needs_texture = texture_active;
+    const bool needs_slopes = pixel_context.needs_slopes;
     double left = centre;
     double right = centre;
     double up = centre;
@@ -2220,7 +6869,7 @@ inline void write_kfp_pixel(
     double top_right = centre;
     double bottom_left = centre;
     double bottom_right = centre;
-    if (needs_difference || needs_slopes) {
+    if (needs_difference || needs_slopes || needs_texture) {
         left = reflected(-1, 0);
         up = reflected(0, -1);
         if (needs_difference) {
@@ -2260,7 +6909,7 @@ inline void write_kfp_pixel(
         // the left/top edge, where Kalles falls forward.  Keep the narrow
         // difference stencil above, but load those two forward samples when
         // an edge slope actually needs them.
-        if (needs_slopes) {
+        if (needs_slopes || needs_texture) {
             if (x == 0) {
                 right = reflected(1, 0);
             }
@@ -2270,8 +6919,29 @@ inline void write_kfp_pixel(
         }
     }
 
-    const double gradient = needs_difference
-        ? kfp_difference_magnitude(
+    double analytic_slope_x = 0.0;
+    double analytic_slope_y = 0.0;
+    double gradient = 0.0;
+    if ((needs_difference || needs_slopes) && options.differences == 7
+        && planes != nullptr
+        && planes->de_x != nullptr && planes->de_y != nullptr) {
+        // Kalles stores the analytic derivatives as float and its SetColor
+        // path performs the reciprocal/norm calculation in float as well.
+        // Keep that narrowing here so native output follows the reference
+        // renderer instead of using a silently different double path.
+        const float de_x = static_cast<float>(
+            kfp_plane_value(planes->de_x, plane_index));
+        const float de_y = static_cast<float>(
+            kfp_plane_value(planes->de_y, plane_index));
+        const float denominator = de_x * de_x + de_y * de_y;
+        if (denominator > 0.0F && std::isfinite(denominator)) {
+            const float gradient_float = 1.0F / std::sqrt(denominator);
+            gradient = static_cast<double>(gradient_float);
+            analytic_slope_x = static_cast<double>(de_x / denominator);
+            analytic_slope_y = static_cast<double>(-de_y / denominator);
+        }
+    } else if (needs_difference) {
+        gradient = kfp_difference_magnitude(
             options.differences,
             centre,
             left,
@@ -2281,12 +6951,18 @@ inline void write_kfp_pixel(
             top_left,
             top_right,
             bottom_left,
-            bottom_right)
-        : 0.0;
-    const double distance = std::clamp(
-        std::isfinite(gradient) ? gradient * static_cast<double>(spatial_width) / 640.0 : 0.0,
-        0.0,
-        1.0e12);
+            bottom_right);
+    }
+    // Kalles clamps the *post-transfer* distance value to 1024.  Capping the
+    // raw DE here changes ColorMethod 7 (DistanceLog), because its logarithm
+    // is still sensitive to values such as 1e13 before that final clamp.
+    // Preserve finite large distances and let each Kalles transfer branch do
+    // its own final limiting.  A NaN is still treated as the zero-distance
+    // fallback used by the rest of this ABI.
+    double distance = std::isnan(gradient)
+        ? 0.0
+        : gradient * static_cast<double>(spatial_width) / 640.0;
+    if (distance < 0.0) distance = 0.0;
 
     double transfer = colour_iter;
     switch (options.color_method) {
@@ -2294,7 +6970,10 @@ inline void write_kfp_pixel(
             transfer = std::sqrt(std::max(0.0, colour_iter));
             break;
         case 2:
-            transfer = std::cbrt(colour_iter);
+            // Kalles uses pow(fmax(0, iter), 1/3), rather than cbrt().
+            // They agree mathematically for positive values but can round
+            // differently, which matters at a palette boundary.
+            transfer = std::pow(std::max(0.0, colour_iter), 1.0 / 3.0);
             break;
         case 3:
             transfer = std::log(std::max(1.0, colour_iter));
@@ -2326,52 +7005,92 @@ inline void write_kfp_pixel(
             transfer = std::sqrt(std::max(0.0, distance));
             break;
         case 9:
-            transfer = std::log1p(std::log1p(std::max(0.0, colour_iter)));
+            // Keep the source expression instead of log1p(log1p()). Kalles'
+            // CPU renderer evaluates log(1 + log(1 + iter)).
+            transfer = std::log(
+                1.0 + std::log(1.0 + std::max(0.0, colour_iter)));
             break;
         case 10:
             transfer = std::atan(colour_iter);
             break;
         case 11:
-            transfer = std::pow(std::max(0.0, colour_iter), 0.25);
+            // This is deliberately written as two square roots, matching
+            // CFraktalSFT::SetColor rather than a generic pow(x, .25).
+            transfer = std::sqrt(std::sqrt(std::max(0.0, colour_iter)));
             break;
         default:
             break;
     }
-    if (!std::isfinite(transfer)) transfer = 0.0;
+    // Keep positive infinity until the method-specific clamp below.  Kalles'
+    // distance branches turn it into 1024; collapsing it to zero first would
+    // produce a different palette position.  Negative/NaN values remain the
+    // safe zero fallback.
+    if (std::isnan(transfer) || transfer < 0.0) transfer = 0.0;
     if (options.color_method == 5 || options.color_method == 7
         || options.color_method == 8) {
         transfer = std::clamp(transfer, 0.0, 1024.0);
     }
 
-    double position = std::fmod(
-        transfer / options.iter_div + options.color_offset,
-        static_cast<double>(lut_size));
-    if (position < 0.0) position += static_cast<double>(lut_size);
-    const double lower_position = std::floor(position);
-    const int lower = std::clamp(static_cast<int>(lower_position), 0, lut_size - 1);
-    double red;
-    double green;
-    double blue;
-    if (options.smooth) {
-        double fraction = position - lower_position;
-        if (options.inverse_transition) fraction = 1.0 - fraction;
-        const int upper = (lower + 1) % lut_size;
-        red = static_cast<double>(lut[lower * 3]) * (1.0 - fraction)
-            + static_cast<double>(lut[upper * 3]) * fraction;
-        green = static_cast<double>(lut[lower * 3 + 1]) * (1.0 - fraction)
-            + static_cast<double>(lut[upper * 3 + 1]) * fraction;
-        blue = static_cast<double>(lut[lower * 3 + 2]) * (1.0 - fraction)
-            + static_cast<double>(lut[upper * 3 + 2]) * fraction;
-    } else {
-        red = static_cast<double>(lut[lower * 3]);
-        green = static_cast<double>(lut[lower * 3 + 1]);
-        blue = static_cast<double>(lut[lower * 3 + 2]);
+    const double phase_shift = planes != nullptr && planes->phase != nullptr
+        ? options.phase_color_strength / 100.0 * 1024.0
+            * kfp_plane_phase(planes, plane_index)
+        : 0.0;
+    // CFraktalSFT::SetColor applies the serialized IterDiv once, after the
+    // colour-method transfer and before the palette offset.  Keep this as a
+    // separate stage: it is not part of the distance transfer itself.
+    double palette_value = transfer;
+    if (options.iter_div != 1.0) {
+        palette_value /= options.iter_div;
     }
+    // Kalles' srgb struct is float-valued in the complete SetColor path.
+    // Keep palette, multi-colour, texture, and slope stages in that same
+    // normalized representation; doing the whole stage in double and only
+    // narrowing at the final byte conversion produces visible one-level
+    // differences in steep KFP gradients.
+    float red;
+    float green;
+    float blue;
+    const auto palette_rgb = [&](double palette_input,
+                                 float& output_red,
+                                 float& output_green,
+                                 float& output_blue) {
+        double position = std::fmod(
+            palette_input, static_cast<double>(lut_size));
+        if (position < 0.0) position += static_cast<double>(lut_size);
+        const double lower_position = std::floor(position);
+        const int lower = std::clamp(
+            static_cast<int>(lower_position), 0, lut_size - 1);
+        if (options.smooth) {
+            double fraction = position - lower_position;
+            if (options.inverse_transition) fraction = 1.0 - fraction;
+            const int upper = (lower + 1) % lut_size;
+            // This preserves the source order: the byte interpolation is
+            // formed in double because `offs` is double, then assigned to
+            // srgb after division by the float literal 255.0f.
+            const double inverse_fraction = 1.0 - fraction;
+            output_red = static_cast<float>(
+                (static_cast<double>(lut[lower * 3]) * inverse_fraction
+                    + static_cast<double>(lut[upper * 3]) * fraction)
+                / 255.0F);
+            output_green = static_cast<float>(
+                (static_cast<double>(lut[lower * 3 + 1]) * inverse_fraction
+                    + static_cast<double>(lut[upper * 3 + 1]) * fraction)
+                / 255.0F);
+            output_blue = static_cast<float>(
+                (static_cast<double>(lut[lower * 3 + 2]) * inverse_fraction
+                    + static_cast<double>(lut[upper * 3 + 2]) * fraction)
+                / 255.0F);
+        } else {
+            output_red = static_cast<float>(lut[lower * 3]) / 255.0F;
+            output_green = static_cast<float>(lut[lower * 3 + 1]) / 255.0F;
+            output_blue = static_cast<float>(lut[lower * 3 + 2]) / 255.0F;
+        }
+    };
 
-    if (options.multi_color && options.multi_color_count > 0) {
+    const double base_palette_input = palette_value + options.color_offset;
+    if (options.multi_color) {
         const double wave_input = options.smooth
-            ? transfer / options.iter_div + options.color_offset
-            : std::floor(transfer / options.iter_div + options.color_offset);
+            ? base_palette_input : std::floor(base_palette_input);
         double hue_sum = 0.0;
         double saturation_sum = 0.0;
         double value_sum = 0.0;
@@ -2399,27 +7118,110 @@ inline void write_kfp_pixel(
                     break;
             }
         }
-        const double hue = hue_count > 0 ? hue_sum / hue_count : 0.0;
-        const double saturation = saturation_count > 0
-            ? saturation_sum / saturation_count : 1.0;
-        const double value = value_count > 0 ? value_sum / value_count : 1.0;
-        double multi_red;
-        double multi_green;
-        double multi_blue;
+        const float hue = static_cast<float>(
+            hue_count > 0 ? hue_sum / hue_count : 0.0);
+        // Kalles initializes nS and nB to zero.  A palette containing only a
+        // hue wave therefore produces black until it also supplies a
+        // saturation/brightness wave; defaulting either component to one is
+        // a tempting HSV convenience, but is not Kalles' renderer.
+        const float saturation = static_cast<float>(
+            saturation_count > 0 ? saturation_sum / saturation_count : 0.0);
+        const float value = static_cast<float>(
+            value_count > 0 ? value_sum / value_count : 0.0);
+        float multi_red;
+        float multi_green;
+        float multi_blue;
         kfp_hsv_to_rgb(
             hue, saturation, value, multi_red, multi_green, multi_blue);
-        multi_red *= 255.0;
-        multi_green *= 255.0;
-        multi_blue *= 255.0;
         if (options.blend_multi_color) {
-            red = (red + multi_red) * 0.5;
-            green = (green + multi_green) * 0.5;
-            blue = (blue + multi_blue) * 0.5;
+            // In Kalles' SetColor the phase shift belongs to the ordinary
+            // palette half of a blended MultiColor result.  It does not
+            // alter the wave input, and a non-blended MultiColor result is
+            // completely phase-independent.
+            palette_rgb(
+                base_palette_input + phase_shift,
+                red,
+                green,
+                blue);
+            red = (red + multi_red) * 0.5F;
+            green = (green + multi_green) * 0.5F;
+            blue = (blue + multi_blue) * 0.5F;
         } else {
             red = multi_red;
             green = multi_green;
             blue = multi_blue;
         }
+    }
+    else {
+        palette_rgb(base_palette_input + phase_shift, red, green, blue);
+    }
+
+    if (texture_active && inside) {
+        // Kalles seeds textured interior pixels with the configured interior
+        // colour, then lets the image merge replace it.  Without this reset,
+        // an interior pixel would inherit an arbitrary palette sample before
+        // SetTexture runs.
+        red = static_cast<float>(options.interior_color[0]) / 255.0F;
+        green = static_cast<float>(options.interior_color[1]) / 255.0F;
+        blue = static_cast<float>(options.interior_color[2]) / 255.0F;
+    }
+
+    if (texture_active) {
+        // This is CFraktalSFT::SetTexture's integer CPU path.  The image is
+        // supplied top-down by the caller, while Kalles stores its DIB
+        // bottom-up, so the final row lookup is inverted below.
+        const double texture_power = options.texture_power;
+        const double texture_ratio = options.texture_ratio;
+        const double texture_dx = x > 0
+            ? left - centre
+            : (x + 1 < width ? centre - right : 0.0);
+        const double texture_dy = y > 0
+            ? up - centre
+            : (y + 1 < height ? centre - down : 0.0);
+        const auto texture_offset = [&](double difference) {
+            const double adjusted = 1.0 + difference;
+            const double powered = std::pow(adjusted, texture_power);
+            const bool forward = powered > 1.0;
+            const double selected = forward ? powered : 1.0 / powered;
+            // Kalles deliberately lets +/-infinity reach atan(); atan(inf)
+            // is the finite limiting warp produced by its SetTexture code.
+            // Only NaN is invalid here. Rejecting infinity made high-power
+            // textures silently sample the unwarped centre instead.
+            const double mapped = !std::isnan(selected)
+                ? (std::atan(selected) - 3.14159265358979323846 / 4.0)
+                    / (3.14159265358979323846 / 4.0)
+                    * (texture_ratio / 100.0)
+                : 0.0;
+            return std::isfinite(mapped)
+                ? (forward ? texture_power * mapped : -texture_power * mapped)
+                : 0.0;
+        };
+        const int image_offset = std::isfinite(texture_power)
+            ? static_cast<int>(std::clamp(
+                texture_power / 64.0,
+                static_cast<double>(std::numeric_limits<int>::min()),
+                static_cast<double>(std::numeric_limits<int>::max())))
+            : 0;
+        const int sample_x = kfp_texture_index(
+            static_cast<double>(x + image_offset) + texture_offset(texture_dx),
+            planes->texture_width);
+        const int sample_y = kfp_texture_index(
+            static_cast<double>(y + image_offset) + texture_offset(texture_dy),
+            planes->texture_height);
+        const int row = planes->texture_height - 1 - sample_y;
+        const std::uint8_t* texture = planes->texture_rgb
+            + static_cast<size_t>(row) * static_cast<size_t>(planes->texture_stride)
+            + static_cast<size_t>(sample_x) * 3U;
+        const double merge = options.texture_merge;
+        red = static_cast<float>(
+            static_cast<double>(red) * (1.0 - merge)
+            + merge * static_cast<double>(texture[0]) / 255.0);
+        green = static_cast<float>(
+            static_cast<double>(green) * (1.0 - merge)
+            + merge * static_cast<double>(texture[1]) / 255.0);
+        blue = static_cast<float>(
+            static_cast<double>(blue) * (1.0 - merge)
+            + merge * static_cast<double>(texture[2]) / 255.0);
     }
 
     if (needs_slopes) {
@@ -2427,32 +7229,41 @@ inline void write_kfp_pixel(
         // neighbour and falls forward only at the left edge. Keep this
         // orientation in the native path so imported .kfp relief is aligned
         // with the reference renderer users normally see.
-        const double horizontal = x > 0
-            ? left - centre
-            : centre - right;
+        const double horizontal = options.differences == 7
+            && planes != nullptr && planes->de_x != nullptr
+            && planes->de_y != nullptr
+            ? analytic_slope_x
+            : (x > 0 ? left - centre : centre - right);
+        const double vertical = options.differences == 7
+            && planes != nullptr && planes->de_x != nullptr
+            && planes->de_y != nullptr
+            ? analytic_slope_y
+            : (y == 0 ? centre - down : up - centre);
         const double projected = (
             (horizontal * slope_direction.cosine)
-            + ((y == 0 ? centre - down : up - centre) * slope_direction.sine))
+            + (vertical * slope_direction.sine))
                 * options.slope_power * static_cast<double>(spatial_width) / 640.0;
-        const double strength = std::clamp(
-            std::atan(std::abs(projected)) / (3.14159265358979323846 / 2.0)
-                * options.slope_ratio / 100.0,
-            0.0,
-            1.0);
+        // Kalles does not clamp the post-atan SlopeRatio multiplier.  The UI
+        // normally keeps it in the visible range, but imported profiles are
+        // allowed to use stronger values and the source renderer preserves
+        // those values.
+        const double strength = std::atan(std::abs(projected))
+            / (3.14159265358979323846 / 2.0)
+            * options.slope_ratio / 100.0;
         if (projected >= 0.0) {
-            red *= 1.0 - strength;
-            green *= 1.0 - strength;
-            blue *= 1.0 - strength;
+            red = static_cast<float>(static_cast<double>(red) * (1.0 - strength));
+            green = static_cast<float>(static_cast<double>(green) * (1.0 - strength));
+            blue = static_cast<float>(static_cast<double>(blue) * (1.0 - strength));
         } else {
-            red = red * (1.0 - strength) + 255.0 * strength;
-            green = green * (1.0 - strength) + 255.0 * strength;
-            blue = blue * (1.0 - strength) + 255.0 * strength;
+            red = static_cast<float>(static_cast<double>(red) * (1.0 - strength) + strength);
+            green = static_cast<float>(static_cast<double>(green) * (1.0 - strength) + strength);
+            blue = static_cast<float>(static_cast<double>(blue) * (1.0 - strength) + strength);
         }
     }
 
-    destination[0] = kfp_dithered_colour_byte(red, dither_x, dither_y, 0);
-    destination[1] = kfp_dithered_colour_byte(green, dither_x, dither_y, 1);
-    destination[2] = kfp_dithered_colour_byte(blue, dither_x, dither_y, 2);
+    destination[0] = kfp_dithered_srgb_byte(red, dither_x, dither_y, 0);
+    destination[1] = kfp_dithered_srgb_byte(green, dither_x, dither_y, 1);
+    destination[2] = kfp_dithered_srgb_byte(blue, dither_x, dither_y, 2);
 }
 
 struct KfpTransferBounds {
@@ -2465,7 +7276,8 @@ KfpTransferBounds kfp_transfer_bounds(
     int width,
     int height,
     int max_iter,
-    double field_bias = 0.0
+    double field_bias = 0.0,
+    double smooth_offset = 0.0
 ) {
     double minimum = std::numeric_limits<double>::infinity();
     double maximum = -std::numeric_limits<double>::infinity();
@@ -2481,10 +7293,75 @@ KfpTransferBounds kfp_transfer_bounds(
                 0.0,
                 static_cast<double>(max_iter))
             : 0.0;
-        // CFraktalSFT::GetIterations reports the integer nIter0 range for
-        // ColorMethod_Stretched; the fractional transition is applied only
-        // after that range has been selected.
-        const double value = std::floor(safe);
+        // The compatibility field stores the already-smoothed scalar value,
+        // so mirror the Python fallback's materialized nPixels range here.
+        // A complete Kalles plane render uses kfp_transfer_bounds_planes and
+        // gets the true pre-smoothing nIter0 range instead. Kalles also
+        // excludes the final escaped band (nPixels >= max_iter - 1) from
+        // GetIterations' stretched range.
+        const double value = std::floor(safe + smooth_offset);
+        if (value >= static_cast<double>(max_iter - 1)) continue;
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+    }
+    if (!std::isfinite(minimum) || !std::isfinite(maximum)) {
+        return {};
+    }
+    return {minimum, maximum};
+}
+
+KfpTransferBounds kfp_transfer_bounds_planes(
+    const float* field,
+    int width,
+    int height,
+    int max_iter,
+    const FractalKfpOptions& options,
+    const FractalKfpPlanes* planes,
+    const double* orbit_colour_samples = nullptr
+) {
+    const KfpPixelContext pixel_context = kfp_pixel_context(
+        options, kfp_smooth_offset(options), planes);
+    double minimum = std::numeric_limits<double>::infinity();
+    double maximum = -std::numeric_limits<double>::infinity();
+#ifdef _OPENMP
+#pragma omp parallel for reduction(min:minimum) reduction(max:maximum) schedule(static)
+#endif
+    for (int pixel = 0; pixel < width * height; ++pixel) {
+        const int y = pixel / width;
+        const int x = pixel - y * width;
+        const float scalar_value = field[pixel];
+        if (planes != nullptr && planes->orbit_iteration != nullptr) {
+            const size_t plane_index = static_cast<size_t>(pixel);
+            const double sample_colour = orbit_colour_samples != nullptr
+                ? orbit_colour_samples[plane_index]
+                : kfp_plane_orbit_sample(
+                    max_iter, options, planes, plane_index,
+                    &pixel_context).colour;
+            // Materialized orbit samples encode an interior value as
+            // max_iter + 1, exactly as KfpOrbitSample does.
+            if (sample_colour > static_cast<double>(max_iter)) continue;
+            // For an escaped orbit, the stored integer used by Kalles'
+            // GetIterations is the floor of the same continuous sample that
+            // SetColor consumes. Reuse it rather than running smoothing a
+            // second time through kfp_plane_stored_iteration.
+            const double value = std::floor(std::max(0.0, sample_colour));
+            if (value >= static_cast<double>(max_iter - 1)) continue;
+            minimum = std::min(minimum, value);
+            maximum = std::max(maximum, value);
+            continue;
+        }
+        if (kfp_plane_inside(
+                width, height, x, y, max_iter, options, planes, scalar_value,
+                &pixel_context)) {
+            continue;
+        }
+        const double value = kfp_plane_stored_iteration(
+            field, width, height, x, y, max_iter, options, planes,
+            &pixel_context);
+        // CFraktalSFT::GetIterations skips nPixels >= maxIter - 1 when it
+        // computes the bounds for ColorMethod 4.  Keep this test on the
+        // post-OutputIterationData integer value, not on the smoothed field.
+        if (value >= static_cast<double>(max_iter - 1)) continue;
         minimum = std::min(minimum, value);
         maximum = std::max(maximum, value);
     }
@@ -2495,7 +7372,9 @@ KfpTransferBounds kfp_transfer_bounds(
 }
 
 bool valid_kfp_options(const FractalKfpOptions* options, int lut_size) noexcept {
-    if (!options || options->struct_size < sizeof(FractalKfpOptions)
+    const std::uint32_t legacy_size = static_cast<std::uint32_t>(
+        offsetof(FractalKfpOptions, show_glitches));
+    if (!options || options->struct_size < legacy_size
         || options->version != FRACTAL_KFP_OPTIONS_VERSION
         || lut_size < 2 || lut_size > 65536
         || !std::isfinite(options->iter_div) || options->iter_div <= 0.0
@@ -2517,7 +7396,26 @@ bool valid_kfp_options(const FractalKfpOptions* options, int lut_size) noexcept 
         || !std::isfinite(options->slope_angle)
         || options->differences < 0 || options->differences > 7
         || !std::isfinite(options->field_bias)
-        || options->field_bias < 0.0) {
+        || options->field_bias < 0.0
+        || options->bailout_radius_preset < 0
+        || options->bailout_radius_preset > 3
+        || !std::isfinite(options->bailout_radius_custom)
+        || options->bailout_radius_custom <= 0.0
+        || options->bailout_norm_preset < 0
+        || options->bailout_norm_preset > 3
+        || !std::isfinite(options->bailout_norm_custom)
+        || options->bailout_norm_custom <= 0.0
+        || options->texture_enabled < 0 || options->texture_enabled > 1
+        || !std::isfinite(options->texture_merge)
+        || !std::isfinite(options->texture_power)
+        || !std::isfinite(options->texture_ratio)
+        || options->texture_resize < 0 || options->texture_resize > 1
+        || options->use_opengl < 0 || options->use_opengl > 1
+        || options->use_srgb < 0 || options->use_srgb > 1) {
+        return false;
+    }
+    if (options->struct_size >= legacy_size + sizeof(options->show_glitches)
+        && (options->show_glitches < 0 || options->show_glitches > 1)) {
         return false;
     }
     for (std::uint32_t index = 0; index < options->multi_color_count; ++index) {
@@ -2531,6 +7429,59 @@ bool valid_kfp_options(const FractalKfpOptions* options, int lut_size) noexcept 
     return options->interior_color[0] >= 0 && options->interior_color[0] <= 255
         && options->interior_color[1] >= 0 && options->interior_color[1] <= 255
         && options->interior_color[2] >= 0 && options->interior_color[2] <= 255;
+}
+
+inline bool kfp_show_glitches(const FractalKfpOptions& options) noexcept {
+    const std::uint32_t field_offset = static_cast<std::uint32_t>(
+        offsetof(FractalKfpOptions, show_glitches));
+    if (options.struct_size < field_offset + sizeof(options.show_glitches)) {
+        // The field was appended without changing the version so older
+        // callers remain valid. Kalles' default is to show glitch pixels.
+        return true;
+    }
+    return options.show_glitches != 0;
+}
+
+bool valid_kfp_planes(
+    const FractalKfpPlanes* planes,
+    int width,
+    int height
+) noexcept {
+    if (planes == nullptr) return true;
+    if (planes->struct_size < sizeof(FractalKfpPlanes)
+        || planes->version != FRACTAL_KFP_PLANES_VERSION) {
+        return false;
+    }
+    if (planes->texture_rgb == nullptr) {
+        return planes->texture_width == 0
+            && planes->texture_height == 0
+            && planes->texture_stride == 0;
+    }
+    if (planes->texture_width <= 0 || planes->texture_height <= 0
+        || static_cast<std::int64_t>(planes->texture_stride)
+            < static_cast<std::int64_t>(planes->texture_width) * 3) {
+        return false;
+    }
+    const std::uint64_t texture_bytes = static_cast<std::uint64_t>(
+        planes->texture_stride) * static_cast<std::uint64_t>(planes->texture_height);
+    return texture_bytes <= static_cast<std::uint64_t>(MAX_NATIVE_PIXELS) * 3U
+        && valid_pixel_dimensions(width, height);
+}
+
+bool valid_render_planes(
+    const FractalRenderPlanes* planes,
+    int width,
+    int height
+) noexcept {
+    if (!planes || !valid_pixel_dimensions(width, height)) return false;
+    return planes->struct_size >= sizeof(FractalRenderPlanes)
+        && planes->version == FRACTAL_RENDER_PLANES_VERSION
+        && planes->orbit_iteration != nullptr
+        && planes->phase != nullptr
+        && planes->de_x != nullptr
+        && planes->de_y != nullptr
+        && planes->test1 != nullptr
+        && planes->test2 != nullptr;
 }
 
 KfpSlopeDirection kfp_slope_direction(const FractalKfpOptions& options) noexcept {
@@ -2618,6 +7569,12 @@ struct FloatExp {
     bool zero() const { return mantissa == 0.0; }
 };
 
+inline const FloatExp& escape_radius_squared_float_exp(int mode) {
+    static const FloatExp classic = FloatExp::from_parts(4.0, 0);
+    static const FloatExp kalles_high = FloatExp::from_parts(1.0e8, 0);
+    return mode == ESCAPE_RADIUS_MODE_KALLES_HIGH ? kalles_high : classic;
+}
+
 // A complex value represented with one shared binary exponent.  The two
 // components of a perturbation normally have comparable magnitudes, so a
 // shared exponent avoids normalizing real and imaginary parts separately in
@@ -2640,6 +7597,20 @@ struct ScaledComplex {
         // one binary shift of the target interval. Handle that common case
         // without a libm frexp/ldexp pair; only severe cancellation needs the
         // general fallback.
+        if (magnitude >= 2.0) {
+            // A BLA polynomial can legitimately produce a value larger than
+            // two binary units in one component.  The old one-bit fast path
+            // left that value unnormalised, which made a later aligned sum
+            // compare exponent fields instead of actual magnitudes and could
+            // discard a neighbouring-pixel perturbation at extreme zoom.
+            int shift = 0;
+            (void)std::frexp(magnitude, &shift);
+            real = std::ldexp(real, -shift);
+            imag = std::ldexp(imag, -shift);
+            exponent = saturating_exponent(
+                static_cast<long long>(exponent) + static_cast<long long>(shift));
+            return;
+        }
         if (magnitude >= 1.0) {
             real *= 0.5;
             imag *= 0.5;
@@ -2790,13 +7761,388 @@ inline int sc_compare_norm(const ScaledNorm& a, const ScaledNorm& b) {
     return (a.mantissa > b.mantissa) - (a.mantissa < b.mantissa);
 }
 
-inline bool sc_outside_escape(const ScaledNorm& norm) {
-    // 4 == 0.5 * 2^3 in the normalized representation.
-    return sc_compare_norm(norm, ScaledNorm{0.5, 3}) > 0;
+inline bool sc_outside_escape(
+    const ScaledNorm& norm,
+    int escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC
+) {
+    const FloatExp& threshold = escape_radius_squared_float_exp(escape_radius_mode);
+    return sc_compare_norm(
+        norm,
+        ScaledNorm{threshold.mantissa, threshold.exponent}) > 0;
 }
 
 inline double sc_to_double(const ScaledComplex& value) {
     return std::ldexp(value.real, value.exponent);
+}
+
+inline double sc_imag_to_double(const ScaledComplex& value) {
+    return std::ldexp(value.imag, value.exponent);
+}
+
+inline double scaled_norm_to_double(const ScaledNorm& norm) {
+    if (norm.mantissa == 0.0) return 0.0;
+    if (!std::isfinite(norm.mantissa)) {
+        return std::numeric_limits<double>::max();
+    }
+    const double value = std::ldexp(norm.mantissa, norm.exponent);
+    return std::isfinite(value)
+        ? std::max(0.0, value)
+        : std::numeric_limits<double>::max();
+}
+
+inline ScaledNorm scaled_norm_from_double(double value) {
+    if (!(value > 0.0) || !std::isfinite(value)) {
+        return value > 0.0
+            ? ScaledNorm{std::numeric_limits<double>::max(), 0}
+            : ScaledNorm{};
+    }
+    int exponent = 0;
+    const double mantissa = std::frexp(value, &exponent);
+    return {mantissa, exponent};
+}
+
+/*
+ * Convert the scaled Mandelbrot derivative into the complex DE value that
+ * Kalles stores in m_nDEx/m_nDEy.  Kalles computes
+ *
+ *   de = |z| log|z| / (normalize(z) * transpose(J * s))
+ *
+ * for the identity transform, where J is the real 2x2 Jacobian and s is the
+ * pixel spacing.  For z², Kalles stores that Jacobian as
+ *
+ *   [ dr  -di ]
+ *   [ di   dr ]
+ *
+ * and evaluates ``normalise(z) * transpose(J)`` as the row-vector form
+ * ``z * conjugate(dz)``.  The conjugate is easy to lose when this special
+ * case is reduced to complex arithmetic; doing so leaves the ordinary
+ * palette unchanged but rotates the analytic slope field into the spoke and
+ * ring artefacts seen in relief renders.  Keep the exact Kalles orientation
+ * here while retaining scaled arithmetic for deep orbits.
+ */
+inline bool render_plane_de(
+    const ScaledComplex& total,
+    const ScaledComplex& derivative,
+    const FloatExp& pixel_spacing,
+    double& output_real,
+    double& output_imag
+) noexcept {
+    const double component_magnitude = std::hypot(total.real, total.imag);
+    if (!(component_magnitude > 0.0) || !std::isfinite(component_magnitude)) {
+        return false;
+    }
+    const double log_magnitude =
+        std::log(component_magnitude)
+        + static_cast<double>(total.exponent) * LOG_TWO;
+    if (!(log_magnitude > 0.0) || !std::isfinite(log_magnitude)) {
+        return false;
+    }
+    const double unit_real = total.real / component_magnitude;
+    const double unit_imag = total.imag / component_magnitude;
+    const ScaledComplex unit = ScaledComplex::from_float_exp(
+        FloatExp::from_parts(unit_real, 0),
+        FloatExp::from_parts(unit_imag, 0));
+    const ScaledComplex spacing = ScaledComplex::from_float_exp(
+        pixel_spacing,
+        FloatExp{});
+    const ScaledComplex denominator = sc_mul(
+        unit,
+        sc_mul(sc_conjugate(derivative), spacing));
+    const double denominator_squared =
+        denominator.real * denominator.real
+        + denominator.imag * denominator.imag;
+    if (!(denominator_squared > 0.0)
+        || !std::isfinite(denominator_squared)) {
+        return false;
+    }
+    // numerator = component_magnitude * 2^exponent * log(|z|).
+    // Division by the normalized denominator is represented with one shared
+    // exponent, then converted to the ABI's double pair at the end.
+    ScaledComplex result{
+        component_magnitude * log_magnitude * denominator.real
+            / denominator_squared,
+        -component_magnitude * log_magnitude * denominator.imag
+            / denominator_squared,
+        saturating_exponent(
+            static_cast<long long>(total.exponent)
+            - static_cast<long long>(denominator.exponent)),
+    };
+    result.normalize();
+    output_real = sc_to_double(result);
+    output_imag = sc_imag_to_double(result);
+    return std::isfinite(output_real) && std::isfinite(output_imag);
+}
+
+// The scaled-arithmetic helpers are defined below the legacy DE helper. Keep
+// declarations here so the Kalles-compatible matrix code can sit beside the
+// existing complex implementation without changing the hot-loop helper
+// ordering.
+inline FloatExp fe_neg(const FloatExp& value);
+inline FloatExp fe_abs(const FloatExp& value);
+inline FloatExp fe_add(const FloatExp& a, const FloatExp& b);
+inline FloatExp fe_mul(const FloatExp& a, const FloatExp& b);
+inline FloatExp fe_mul(const FloatExp& a, double b);
+inline FloatExp fe_div(const FloatExp& a, const FloatExp& b);
+inline FloatExp fe_sqr(const FloatExp& value);
+
+/*
+ * Kalles stores the full real 2x2 Jacobian for non-holomorphic formulas.
+ * Keeping only a complex derivative is sufficient for z^2/Julia, but it
+ * silently turns Tricorn and Burning Ship analytic distance colouring into a
+ * Mandelbrot-shaped approximation.  This form mirrors compute_de() in
+ * Kalles' fraktal_sft.h: J is the screen-space Jacobian and the palette gets
+ * |z| log|z| / (normalise(z) * transpose(J * pixel_spacing)).
+ */
+struct AlternateJacobian {
+    // Row-major: [dRe/dx, dRe/dy, dIm/dx, dIm/dy].
+    FloatExp xa{};
+    FloatExp xb{};
+    FloatExp ya{};
+    FloatExp yb{};
+};
+
+inline AlternateJacobian alternate_identity_jacobian() {
+    return {
+        FloatExp::from_parts(1.0, 0),
+        FloatExp{},
+        FloatExp{},
+        FloatExp::from_parts(1.0, 0),
+    };
+}
+
+inline AlternateJacobian alternate_holomorphic_jacobian(
+    const ScaledComplex& derivative
+) {
+    const FloatExp real = FloatExp::from_parts(
+        derivative.real,
+        derivative.exponent);
+    const FloatExp imag = FloatExp::from_parts(
+        derivative.imag,
+        derivative.exponent);
+    return {
+        real,
+        fe_neg(imag),
+        imag,
+        real,
+    };
+}
+
+inline bool render_plane_de_matrix(
+    const ScaledComplex& total,
+    const AlternateJacobian& jacobian,
+    const FloatExp& pixel_spacing,
+    double& output_real,
+    double& output_imag
+) noexcept {
+    const double component_magnitude = std::hypot(total.real, total.imag);
+    if (!(component_magnitude > 0.0) || !std::isfinite(component_magnitude)) {
+        return false;
+    }
+    const double log_magnitude =
+        std::log(component_magnitude)
+        + static_cast<double>(total.exponent) * LOG_TWO;
+    if (!(log_magnitude > 0.0) || !std::isfinite(log_magnitude)) {
+        return false;
+    }
+    const double unit_real = total.real / component_magnitude;
+    const double unit_imag = total.imag / component_magnitude;
+    const FloatExp scaled_xa = fe_mul(jacobian.xa, pixel_spacing);
+    const FloatExp scaled_xb = fe_mul(jacobian.xb, pixel_spacing);
+    const FloatExp scaled_ya = fe_mul(jacobian.ya, pixel_spacing);
+    const FloatExp scaled_yb = fe_mul(jacobian.yb, pixel_spacing);
+    // transpose(J) * normalise(z), written with Kalles' row-major derivative
+    // names.  For a holomorphic derivative this reduces to zhat * dz/dc,
+    // exactly the complex implementation above.
+    const FloatExp denominator_real = fe_add(
+        fe_mul(scaled_xa, unit_real),
+        fe_mul(scaled_ya, unit_imag));
+    const FloatExp denominator_imag = fe_add(
+        fe_mul(scaled_xb, unit_real),
+        fe_mul(scaled_yb, unit_imag));
+    const FloatExp denominator_squared = fe_add(
+        fe_sqr(denominator_real),
+        fe_sqr(denominator_imag));
+    if (denominator_squared.zero() || !denominator_squared.finite()) {
+        return false;
+    }
+    const FloatExp numerator = FloatExp::from_parts(
+        component_magnitude * log_magnitude,
+        total.exponent);
+    const FloatExp result_real = fe_div(
+        fe_mul(numerator, denominator_real),
+        denominator_squared);
+    const FloatExp result_imag = fe_div(
+        fe_neg(fe_mul(numerator, denominator_imag)),
+        denominator_squared);
+    output_real = std::ldexp(result_real.mantissa, result_real.exponent);
+    output_imag = std::ldexp(result_imag.mantissa, result_imag.exponent);
+    return std::isfinite(output_real) && std::isfinite(output_imag);
+}
+
+inline AlternateJacobian alternate_jacobian_step(
+    int formula,
+    const ScaledComplex& total,
+    const AlternateJacobian& previous,
+    bool parameter_plane
+) {
+    const FloatExp real = FloatExp::from_parts(total.real, total.exponent);
+    const FloatExp imag = FloatExp::from_parts(total.imag, total.exponent);
+    FloatExp m00{};
+    FloatExp m01{};
+    FloatExp m10{};
+    FloatExp m11{};
+    if (formula == FRACTAL_FORMULA_TRICORN) {
+        m00 = fe_mul(real, 2.0);
+        m01 = fe_mul(imag, -2.0);
+        m10 = fe_mul(imag, -2.0);
+        m11 = fe_mul(real, -2.0);
+    } else if (formula == FRACTAL_FORMULA_BURNING_SHIP) {
+        const FloatExp absolute_real = fe_abs(real);
+        const FloatExp absolute_imag = fe_abs(imag);
+        const double real_sign = real.mantissa < 0.0 ? -1.0 : 1.0;
+        const double imag_sign = imag.mantissa < 0.0 ? -1.0 : 1.0;
+        m00 = fe_mul(absolute_real, 2.0 * real_sign);
+        m01 = fe_mul(absolute_imag, -2.0 * imag_sign);
+        m10 = fe_mul(absolute_imag, 2.0 * real_sign);
+        m11 = fe_mul(absolute_real, 2.0 * imag_sign);
+    } else {
+        m00 = fe_mul(real, 2.0);
+        m01 = fe_mul(imag, -2.0);
+        m10 = fe_mul(imag, 2.0);
+        m11 = fe_mul(real, 2.0);
+    }
+    AlternateJacobian result{
+        fe_add(
+            fe_add(fe_mul(m00, previous.xa), fe_mul(m01, previous.ya)),
+            parameter_plane ? FloatExp::from_parts(1.0, 0) : FloatExp{}),
+        fe_add(
+            fe_add(fe_mul(m00, previous.xb), fe_mul(m01, previous.yb)),
+            FloatExp{}),
+        fe_add(
+            fe_add(fe_mul(m10, previous.xa), fe_mul(m11, previous.ya)),
+            FloatExp{}),
+        fe_add(
+            fe_add(fe_mul(m10, previous.xb), fe_mul(m11, previous.yb)),
+            parameter_plane ? FloatExp::from_parts(1.0, 0) : FloatExp{}),
+    };
+    return result;
+}
+
+inline AlternateJacobian alternate_linear_bla_jacobian(
+    const std::array<FloatExp, 8>& coefficients,
+    const AlternateJacobian& previous,
+    bool parameter_plane
+) {
+    const auto& c = coefficients;
+    return {
+        fe_add(
+            fe_add(fe_mul(c[0], previous.xa), fe_mul(c[1], previous.ya)),
+            parameter_plane ? c[4] : FloatExp{}),
+        fe_add(
+            fe_add(fe_mul(c[0], previous.xb), fe_mul(c[1], previous.yb)),
+            parameter_plane ? c[5] : FloatExp{}),
+        fe_add(
+            fe_add(fe_mul(c[2], previous.xa), fe_mul(c[3], previous.ya)),
+            parameter_plane ? c[6] : FloatExp{}),
+        fe_add(
+            fe_add(fe_mul(c[2], previous.xb), fe_mul(c[3], previous.yb)),
+            parameter_plane ? c[7] : FloatExp{}),
+    };
+}
+
+inline double render_plane_phase(const ScaledComplex& value) {
+    const double real = sc_to_double(value);
+    const double imag = sc_imag_to_double(value);
+    if (!std::isfinite(real) || !std::isfinite(imag)) return 0.0;
+    double phase = std::atan2(imag, real) / TWO_PI;
+    phase -= std::floor(phase);
+    return std::isfinite(phase) ? phase : 0.0;
+}
+
+inline void clear_render_planes_pixel(
+    FractalRenderPlanes* planes,
+    size_t index,
+    int max_iter
+) noexcept {
+    if (planes == nullptr) return;
+    planes->orbit_iteration[index] = max_iter;
+    planes->phase[index] = 0.0;
+    planes->de_x[index] = 0.0;
+    planes->de_y[index] = 0.0;
+    planes->test1[index] = 0.0;
+    planes->test2[index] = 0.0;
+}
+
+// The deep Mandelbrot loops keep the current orbit sample in `iteration`
+// form: z_1 is iteration 1, z_2 is iteration 2, and so on.  Kalles' `antal`
+// is the number of samples completed before the one being tested, so the
+// metadata for z_n is n - 1.  Keep the conversion at the call sites instead
+// of changing the generic plane writer, which is also used by the zero-based
+// direct renderer and the Julia alternate path.
+inline int kalles_mandelbrot_raw_iteration(int iteration) noexcept {
+    return std::max(0, iteration - 1);
+}
+
+inline void store_render_planes_escape(
+    FractalRenderPlanes* planes,
+    size_t index,
+    int iteration,
+    const ScaledComplex& total,
+    const ScaledNorm& test1,
+    const ScaledNorm& test2,
+    const ScaledComplex* derivative = nullptr,
+    const FloatExp* pixel_spacing = nullptr
+) noexcept {
+    if (planes == nullptr) return;
+    planes->orbit_iteration[index] = iteration;
+    planes->phase[index] = render_plane_phase(total);
+    planes->de_x[index] = 0.0;
+    planes->de_y[index] = 0.0;
+    if (derivative != nullptr && pixel_spacing != nullptr) {
+        double de_x = 0.0;
+        double de_y = 0.0;
+        if (render_plane_de(
+                total,
+                *derivative,
+                *pixel_spacing,
+                de_x,
+                de_y)) {
+            planes->de_x[index] = de_x;
+            planes->de_y[index] = de_y;
+        }
+    }
+    planes->test1[index] = scaled_norm_to_double(test1);
+    planes->test2[index] = scaled_norm_to_double(test2);
+}
+
+inline void store_render_planes_escape_jacobian(
+    FractalRenderPlanes* planes,
+    size_t index,
+    int iteration,
+    const ScaledComplex& total,
+    const ScaledNorm& test1,
+    const ScaledNorm& test2,
+    const AlternateJacobian& jacobian,
+    const FloatExp& pixel_spacing
+) noexcept {
+    if (planes == nullptr) return;
+    planes->orbit_iteration[index] = iteration;
+    planes->phase[index] = render_plane_phase(total);
+    planes->de_x[index] = 0.0;
+    planes->de_y[index] = 0.0;
+    double de_x = 0.0;
+    double de_y = 0.0;
+    if (render_plane_de_matrix(
+            total,
+            jacobian,
+            pixel_spacing,
+            de_x,
+            de_y)) {
+        planes->de_x[index] = de_x;
+        planes->de_y[index] = de_y;
+    }
+    planes->test1[index] = scaled_norm_to_double(test1);
+    planes->test2[index] = scaled_norm_to_double(test2);
 }
 
 inline long double smooth_escape_value(int iteration, const ScaledNorm& norm) {
@@ -3014,7 +8360,8 @@ inline FloatExp fec_norm_squared(const FloatExpComplex& value) {
 
 inline FloatExp fec_escape_margin_with_delta(
     const FloatExpComplex& reference,
-    const FloatExpComplex& delta
+    const FloatExpComplex& delta,
+    int escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC
 ) {
     const FloatExp cross = fe_mul(
         fe_add(
@@ -3023,7 +8370,7 @@ inline FloatExp fec_escape_margin_with_delta(
         2.0);
     const FloatExp reference_margin = fe_sub(
         fec_norm_squared(reference),
-        FloatExp::from_parts(4.0, 0));
+        escape_radius_squared_float_exp(escape_radius_mode));
     return fe_add(
         fe_add(reference_margin, cross),
         fec_norm_squared(delta));
@@ -3040,7 +8387,8 @@ inline FloatExp sc_component_as_float_exp(
 
 inline FloatExp sc_escape_margin_with_delta(
     const ScaledComplex& reference,
-    const ScaledComplex& delta
+    const ScaledComplex& delta,
+    int escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC
 ) {
     // Adding a tiny delta to an O(1) reference is intentionally lossy in the
     // compact ScaledComplex representation: the fast aligned sum discards a
@@ -3058,7 +8406,8 @@ inline FloatExp sc_escape_margin_with_delta(
         sc_component_as_float_exp(delta, false),
         sc_component_as_float_exp(delta, true),
     };
-    return fec_escape_margin_with_delta(reference_parts, delta_parts);
+    return fec_escape_margin_with_delta(
+        reference_parts, delta_parts, escape_radius_mode);
 }
 
 inline FloatExp sc_escape_margin_with_reference_margin(
@@ -3081,19 +8430,22 @@ inline FloatExp sc_escape_margin_with_reference_margin(
 
 inline ScaledNorm sc_norm_squared_with_delta(
     const ScaledComplex& reference,
-    const ScaledComplex& delta
+    const ScaledComplex& delta,
+    int escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC
 ) {
     const FloatExp norm = fe_add(
-        FloatExp::from_parts(4.0, 0),
-        sc_escape_margin_with_delta(reference, delta));
+        escape_radius_squared_float_exp(escape_radius_mode),
+        sc_escape_margin_with_delta(reference, delta, escape_radius_mode));
     return {norm.mantissa, norm.exponent};
 }
 
 inline bool sc_outside_escape_with_delta(
     const ScaledComplex& reference,
-    const ScaledComplex& delta
+    const ScaledComplex& delta,
+    int escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC
 ) {
-    const FloatExp margin = sc_escape_margin_with_delta(reference, delta);
+    const FloatExp margin = sc_escape_margin_with_delta(
+        reference, delta, escape_radius_mode);
     return fe_compare(
         margin,
         FloatExp{0.0, 0}) > 0;
@@ -3231,6 +8583,39 @@ inline ScaledComplex evaluate_image_series(
     return sc_mul(result, dc);
 }
 
+/*
+ * The image series is a polynomial in dc with no constant term.  Keep its
+ * derivative alongside the value so the Kalles analytic-DE plane can start at
+ * the same iteration as the scalar perturbation path.  Evaluating only the
+ * scalar series and restarting DE at one is visibly wrong on profiles using
+ * Differences=Analytic.
+ */
+inline ScaledComplex evaluate_image_series_with_derivative(
+    const ImageSeries& series,
+    const ScaledComplex& dc,
+    ScaledComplex& derivative
+) {
+    if (!series.enabled || series.coefficients.size() <= 1) {
+        derivative = {};
+        return {};
+    }
+    ScaledComplex value = series.coefficients.back();
+    ScaledComplex polynomial_derivative{};
+    for (size_t index = series.coefficients.size() - 1; index > 1; --index) {
+        polynomial_derivative = sc_add(
+            sc_mul(polynomial_derivative, dc),
+            value);
+        value = sc_add(
+            sc_mul(value, dc),
+            series.coefficients[index - 1]);
+    }
+    // value is q(dc), while the series result is q(dc)*dc.
+    derivative = sc_add(
+        sc_mul(polynomial_derivative, dc),
+        value);
+    return sc_mul(value, dc);
+}
+
 inline bool fec_finite(const FloatExpComplex& value) noexcept {
     return value.real.finite() && value.imag.finite();
 }
@@ -3321,6 +8706,70 @@ inline ScaledComplex apply_bla_series(
     return sc_add(
         sc_mul(delta, d_inner),
         sc_mul(parameter, c_inner));
+}
+
+inline ScaledComplex apply_bla_series_derivative(
+    const FastBlaStep& step,
+    const ScaledComplex& delta,
+    const ScaledComplex& parameter,
+    const ScaledComplex& derivative,
+    int order
+) {
+    const auto& coefficient = step.coefficients;
+    if (order <= 1) {
+        // P(d,c) = A*d + B*c.
+        return sc_add(
+            sc_mul(coefficient[0], derivative),
+            coefficient[1]);
+    }
+
+    // Differentiate the bivariate BLA polynomial with respect to the pixel
+    // parameter c, using dd/dc=derivative.  Keeping the partials separate is
+    // important: using only A*derivative loses the direct parameter term and
+    // produces the wrong Kalles distance estimator after every BLA jump.
+    ScaledComplex partial_delta = coefficient[0];
+    ScaledComplex partial_parameter = coefficient[1];
+    if (order >= 2) {
+        partial_delta = sc_add(
+            partial_delta,
+            sc_add(
+                sc_double(sc_mul(coefficient[2], delta)),
+                sc_mul(coefficient[3], parameter)));
+        partial_parameter = sc_add(
+            partial_parameter,
+            sc_add(
+                sc_mul(coefficient[3], delta),
+                sc_double(sc_mul(coefficient[4], parameter))));
+    }
+    if (order >= 3) {
+        const ScaledComplex delta_squared = sc_mul(delta, delta);
+        const ScaledComplex parameter_squared = sc_mul(parameter, parameter);
+        partial_delta = sc_add(
+            partial_delta,
+            sc_add(
+                sc_mul(
+                    sc_add(
+                        sc_double(sc_mul(coefficient[5], delta)),
+                        sc_mul(coefficient[5], delta)),
+                    delta),
+                sc_add(
+                    sc_double(sc_mul(coefficient[6], sc_mul(delta, parameter))),
+                    sc_mul(coefficient[7], parameter_squared))));
+        partial_parameter = sc_add(
+            partial_parameter,
+            sc_add(
+                sc_mul(coefficient[6], delta_squared),
+                sc_add(
+                    sc_double(sc_mul(coefficient[7], sc_mul(delta, parameter))),
+                    sc_mul(
+                        sc_add(
+                            sc_double(sc_mul(coefficient[8], parameter)),
+                            sc_mul(coefficient[8], parameter)),
+                        parameter))));
+    }
+    return sc_add(
+        sc_mul(partial_delta, derivative),
+        partial_parameter);
 }
 
 struct BlaLevels {
@@ -3419,6 +8868,10 @@ struct ReferenceOrbitData {
 };
 
 struct ReferenceContext {
+    // Assigned when the immutable context enters the opaque-handle registry.
+    // Device-side caches use this generation rather than a host pointer so a
+    // later allocation can never accidentally reuse an old GPU orbit.
+    std::uint64_t generation = 0;
     std::vector<FloatExpComplex> fast_orbit;
     std::shared_ptr<const ReferenceOrbitData> orbit;
     BlaLevels bla;
@@ -3431,18 +8884,792 @@ struct ReferenceContext {
     std::uint64_t bla_build_ns = 0;
     long double x_center = 0.0L;
     long double y_center = 0.0L;
+    // Keep the original decimal centres for the rare MPFR pixel rebase used
+    // after a compact perturbation glitch.  The long-double copies above are
+    // intentionally sufficient for ordinary metadata, but are not precise
+    // enough to reconstruct a 10^100-scale pixel coordinate.
+    std::string x_center_text;
+    std::string y_center_text;
     int formula = FRACTAL_FORMULA_MANDELBROT;
     double julia_real = 0.0;
     double julia_imag = 0.0;
     ScaledComplex parameter;
+    int escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC;
+    int coordinate_mode = COORDINATE_MODE_PROJECT;
 #ifdef FRACTAL_HAVE_MPFR
     mpfr_prec_t precision_bits = 0;
 #endif
 };
 
+#ifdef FRACTAL_HAVE_MPFR
+FloatExp parse_zoom_float_exp(const char* text, mpfr_prec_t precision_bits);
+#endif
+
+#ifdef FRACTAL_HAVE_OPENCL
+// Do not pass the C++ ScaledComplex object directly across the OpenCL ABI:
+// its tail padding is implementation-defined.  The explicit four-field
+// transfer record matches the kernel's ``sc`` exactly on 64-bit hosts.
+struct OpenClScaledComplex {
+    double real;
+    double imag;
+    std::int32_t exponent;
+    std::int32_t padding;
+};
+static_assert(sizeof(OpenClScaledComplex) == 24,
+              "OpenCL scaled-complex transfer layout changed");
+
+// OpenCL's ``fe`` is a double followed by a 32-bit exponent and has 16-byte
+// struct size/alignment on the supported devices.  Keep an explicit padded
+// host record so the reference-norm cache does not depend on C++ ABI padding.
+struct OpenClFloatExp {
+    double mantissa;
+    std::int32_t exponent;
+    std::int32_t padding;
+};
+static_assert(sizeof(OpenClFloatExp) == 16,
+              "OpenCL float-exponent transfer layout changed");
+
+struct OpenClLinearBlaStep {
+    OpenClScaledComplex a;
+    OpenClScaledComplex b;
+    double radius_mantissa;
+    std::int32_t radius_exponent;
+    std::int32_t length;
+};
+static_assert(sizeof(OpenClLinearBlaStep) == 64,
+              "OpenCL linear-BLA transfer layout changed");
+
+// Large deep ordinary fields are the one workload where an fp64 consumer GPU
+// can spend most of its time on arithmetic that does not need 53 mantissa
+// bits.  Keep the binary exponent in full precision, but use a float
+// mantissa for the device-side recurrence.  This is deliberately a separate
+// ABI from the strict path: KFP orbit planes and small correctness probes
+// continue to use the double-mantissa records above.
+struct OpenClMixedScaledComplex {
+    float real;
+    float imag;
+    std::int32_t exponent;
+    std::int32_t padding;
+};
+static_assert(sizeof(OpenClMixedScaledComplex) == 16,
+              "OpenCL mixed scaled-complex transfer layout changed");
+
+struct OpenClMixedFloatExp {
+    float mantissa;
+    std::int32_t exponent;
+};
+static_assert(sizeof(OpenClMixedFloatExp) == 8,
+              "OpenCL mixed float-exponent transfer layout changed");
+
+struct OpenClMixedLinearBlaStep {
+    OpenClMixedScaledComplex a;
+    OpenClMixedScaledComplex b;
+    float radius_mantissa;
+    std::int32_t radius_exponent;
+    std::int32_t length;
+};
+static_assert(sizeof(OpenClMixedLinearBlaStep) == 44,
+              "OpenCL mixed linear-BLA transfer layout changed");
+
+void render_deep_perturbation_opencl(
+    float* output,
+    int width,
+    int height,
+    const char* zoom_text,
+    const ReferenceContext& context,
+    int max_iter,
+    const FractalRenderOptions& options,
+    FractalRenderPlanes* planes = nullptr,
+    const std::vector<ScaledComplex>* point_offsets = nullptr
+) {
+    if (!context.orbit || context.orbit->scaled.size() < 2) {
+        throw std::runtime_error("OpenCL deep renderer has no complete reference orbit");
+    }
+    initialise_opencl();
+    if (!opencl_available()) {
+        throw std::runtime_error(
+            opencl_runtime && !opencl_runtime->error.empty()
+                ? opencl_runtime->error
+                : "OpenCL deep renderer is unavailable");
+    }
+    const FloatExp zoom = parse_zoom_float_exp(zoom_text, context.precision_bits);
+    const FloatExp view_height = fe_mul(
+        fe_div(FloatExp::from_parts(1.0, 0), zoom),
+        viewport_height_factor(options.coordinate_mode));
+    const FloatExp view_width = fe_mul(
+        view_height, static_cast<double>(width) / static_cast<double>(height));
+    const FloatExp pixel_spacing = fe_div(
+        view_height, FloatExp::from_parts(static_cast<double>(height), 0));
+    const FloatExp& bailout = escape_radius_squared_float_exp(options.escape_radius_mode);
+    if (!view_width.finite() || !view_height.finite() || !bailout.finite()) {
+        throw std::runtime_error("OpenCL deep renderer received a non-finite viewport");
+    }
+
+    const size_t reference_count_size = context.orbit->scaled.size();
+    if (reference_count_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("OpenCL deep reference is too large");
+    }
+    // The flattened hierarchy is immutable for a prepared reference.  Work
+    // out only its shape up front; materialize and upload it only when the
+    // device cache does not already hold this reference generation.
+    const std::vector<std::vector<LinearBlaStep>>* linear_bla_levels = nullptr;
+    size_t linear_bla_level_count = 0;
+    size_t linear_bla_step_count = 0;
+    if (planes == nullptr && options.disable_bla == 0) {
+        // Both hierarchies are built with the same conservative 2^-38
+        // linearisation bound.  The regular table is valid for the normal
+        // viewport radius and removes the e12--e80 exact-iteration cliff;
+        // the tighter table is needed once the reference itself is reused at
+        // ultra-deep zooms.  The device still checks each candidate's radius
+        // and alignment before applying it.
+        const auto& levels = view_height.exponent < -260
+            ? context.bla.deep_linear_levels
+            : context.bla.linear_levels;
+        linear_bla_level_count = std::min<size_t>(levels.size(), 30);
+        for (size_t level = 0; level < linear_bla_level_count; ++level) {
+            linear_bla_step_count += levels[level].size();
+        }
+        if (linear_bla_step_count > 0) linear_bla_levels = &levels;
+    }
+    const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height);
+    if (point_offsets != nullptr && point_offsets->size() != count) {
+        throw std::runtime_error("OpenCL point offsets do not match the output size");
+    }
+    if (point_offsets != nullptr && planes != nullptr) {
+        throw std::runtime_error("OpenCL point rendering cannot emit orbit planes");
+    }
+    OpenClRuntime& runtime = *opencl_runtime;
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    cl_int status = CL_SUCCESS;
+    const size_t output_bytes = count * sizeof(float);
+    if (!runtime.deep_output || runtime.deep_output_capacity < output_bytes) {
+        cl_mem replacement = clCreateBuffer(
+            runtime.context, CL_MEM_WRITE_ONLY, output_bytes, nullptr, &status);
+        if (status != CL_SUCCESS || !replacement) {
+            throw std::runtime_error(opencl_error_text(status));
+        }
+        if (runtime.deep_output) clReleaseMemObject(runtime.deep_output);
+        runtime.deep_output = replacement;
+        runtime.deep_output_capacity = output_bytes;
+    }
+    cl_mem device_output = runtime.deep_output;
+    if (!device_output) throw std::runtime_error(opencl_error_text(status));
+    const size_t reference_bytes = reference_count_size * sizeof(OpenClScaledComplex);
+    const bool cached_reference_matches = runtime.deep_reference != nullptr
+        && runtime.deep_reference_generation == context.generation
+        && runtime.deep_reference_capacity >= reference_bytes;
+    if (!cached_reference_matches) {
+        if (!runtime.deep_reference || runtime.deep_reference_capacity < reference_bytes) {
+            cl_mem replacement = clCreateBuffer(
+                runtime.context, CL_MEM_READ_ONLY, reference_bytes, nullptr, &status);
+            if (status != CL_SUCCESS || !replacement) {
+                throw std::runtime_error(opencl_error_text(status));
+            }
+            if (runtime.deep_reference) clReleaseMemObject(runtime.deep_reference);
+            runtime.deep_reference = replacement;
+            runtime.deep_reference_capacity = reference_bytes;
+        }
+        std::vector<OpenClScaledComplex> reference(reference_count_size);
+        for (size_t index = 0; index < reference.size(); ++index) {
+            const ScaledComplex& value = context.orbit->scaled[index];
+            reference[index] = {value.real, value.imag, value.exponent, 0};
+        }
+        status = clEnqueueWriteBuffer(runtime.queue, runtime.deep_reference, CL_TRUE, 0,
+            reference_bytes, reference.data(), 0, nullptr, nullptr);
+        if (status != CL_SUCCESS) throw std::runtime_error(opencl_error_text(status));
+        runtime.deep_reference_generation = context.generation;
+    }
+    cl_mem device_reference = runtime.deep_reference;
+    const size_t reference_norm_bytes = reference_count_size * sizeof(OpenClFloatExp);
+    const bool cached_reference_norms_match = runtime.deep_reference_norms != nullptr
+        && runtime.deep_reference_norms_generation == context.generation
+        && runtime.deep_reference_norms_capacity >= reference_norm_bytes;
+    if (!cached_reference_norms_match) {
+        if (!runtime.deep_reference_norms
+            || runtime.deep_reference_norms_capacity < reference_norm_bytes) {
+            cl_mem replacement = clCreateBuffer(
+                runtime.context, CL_MEM_READ_ONLY, reference_norm_bytes, nullptr, &status);
+            if (status != CL_SUCCESS || !replacement) {
+                throw std::runtime_error(opencl_error_text(status));
+            }
+            if (runtime.deep_reference_norms) {
+                clReleaseMemObject(runtime.deep_reference_norms);
+            }
+            runtime.deep_reference_norms = replacement;
+            runtime.deep_reference_norms_capacity = reference_norm_bytes;
+        }
+        std::vector<OpenClFloatExp> reference_norms(reference_count_size);
+        for (size_t index = 0; index < reference_norms.size(); ++index) {
+            const ScaledNorm norm = sc_norm_squared(context.orbit->scaled[index]);
+            reference_norms[index] = {
+                norm.mantissa, static_cast<std::int32_t>(norm.exponent), 0};
+        }
+        status = clEnqueueWriteBuffer(
+            runtime.queue, runtime.deep_reference_norms, CL_TRUE, 0,
+            reference_norm_bytes, reference_norms.data(), 0, nullptr, nullptr);
+        if (status != CL_SUCCESS) throw std::runtime_error(opencl_error_text(status));
+        runtime.deep_reference_norms_generation = context.generation;
+    }
+    cl_mem device_reference_norms = runtime.deep_reference_norms;
+    cl_mem device_point_offsets = device_reference;
+    if (point_offsets != nullptr) {
+        const size_t point_bytes = count * sizeof(OpenClScaledComplex);
+        if (!runtime.deep_point_offsets
+            || runtime.deep_point_offsets_capacity < point_bytes) {
+            cl_mem replacement = clCreateBuffer(
+                runtime.context, CL_MEM_READ_ONLY, point_bytes, nullptr, &status);
+            if (status != CL_SUCCESS || !replacement) {
+                throw std::runtime_error(opencl_error_text(status));
+            }
+            if (runtime.deep_point_offsets) clReleaseMemObject(runtime.deep_point_offsets);
+            runtime.deep_point_offsets = replacement;
+            runtime.deep_point_offsets_capacity = point_bytes;
+        }
+        std::vector<OpenClScaledComplex> packed_points(count);
+        for (size_t index = 0; index < count; ++index) {
+            const ScaledComplex& value = (*point_offsets)[index];
+            packed_points[index] = {value.real, value.imag, value.exponent, 0};
+        }
+        status = clEnqueueWriteBuffer(
+            runtime.queue, runtime.deep_point_offsets, CL_TRUE, 0,
+            point_bytes, packed_points.data(), 0, nullptr, nullptr);
+        if (status != CL_SUCCESS) throw std::runtime_error(opencl_error_text(status));
+        device_point_offsets = runtime.deep_point_offsets;
+    }
+    const auto cleanup = [&] {
+    };
+    cl_mem device_bla = device_reference;
+    cl_mem device_bla_offsets = device_reference;
+    cl_mem device_bla_counts = device_reference;
+    const int use_linear_bla = linear_bla_levels ? 1 : 0;
+    if (use_linear_bla) {
+        const size_t bla_bytes = linear_bla_step_count * sizeof(OpenClLinearBlaStep);
+        const size_t level_bytes = linear_bla_level_count * sizeof(std::int32_t);
+        const bool cached_bla_matches = runtime.deep_bla != nullptr
+            && runtime.deep_bla_generation == context.generation
+            && runtime.deep_bla_capacity >= bla_bytes
+            && runtime.deep_bla_levels_capacity >= level_bytes
+            && runtime.deep_bla_level_count == static_cast<int>(linear_bla_level_count);
+        if (cached_bla_matches) {
+            device_bla = runtime.deep_bla;
+            device_bla_offsets = runtime.deep_bla_offsets;
+            device_bla_counts = runtime.deep_bla_counts;
+        } else {
+            std::vector<OpenClLinearBlaStep> linear_bla;
+            std::vector<std::int32_t> linear_bla_offsets;
+            std::vector<std::int32_t> linear_bla_counts;
+            linear_bla.reserve(linear_bla_step_count);
+            linear_bla_offsets.reserve(linear_bla_level_count);
+            linear_bla_counts.reserve(linear_bla_level_count);
+            for (size_t level = 0; level < linear_bla_level_count; ++level) {
+                const auto& source_level = (*linear_bla_levels)[level];
+                linear_bla_offsets.push_back(static_cast<std::int32_t>(linear_bla.size()));
+                linear_bla_counts.push_back(static_cast<std::int32_t>(source_level.size()));
+                for (const LinearBlaStep& step : source_level) {
+                    linear_bla.push_back({
+                        {step.A.real, step.A.imag, step.A.exponent, 0},
+                        {step.B.real, step.B.imag, step.B.exponent, 0},
+                        step.radius_squared.mantissa, step.radius_squared.exponent,
+                        step.length,
+                    });
+                }
+            }
+            const bool reuse_bla_buffers = runtime.deep_bla != nullptr
+                && runtime.deep_bla_offsets != nullptr
+                && runtime.deep_bla_counts != nullptr
+                && runtime.deep_bla_capacity >= bla_bytes
+                && runtime.deep_bla_levels_capacity >= level_bytes;
+            cl_mem new_bla = reuse_bla_buffers ? runtime.deep_bla : clCreateBuffer(
+                runtime.context, CL_MEM_READ_ONLY, bla_bytes, nullptr, &status);
+            cl_mem new_offsets = reuse_bla_buffers ? runtime.deep_bla_offsets : nullptr;
+            cl_mem new_counts = reuse_bla_buffers ? runtime.deep_bla_counts : nullptr;
+            if (!reuse_bla_buffers && status == CL_SUCCESS && new_bla) {
+                new_offsets = clCreateBuffer(runtime.context, CL_MEM_READ_ONLY,
+                    level_bytes, nullptr, &status);
+            }
+            if (!reuse_bla_buffers && status == CL_SUCCESS && new_offsets) {
+                new_counts = clCreateBuffer(runtime.context, CL_MEM_READ_ONLY,
+                    level_bytes, nullptr, &status);
+            }
+            if (status == CL_SUCCESS && new_counts) {
+                status = clEnqueueWriteBuffer(runtime.queue, new_bla, CL_TRUE, 0,
+                    bla_bytes, linear_bla.data(), 0, nullptr, nullptr);
+            }
+            if (status == CL_SUCCESS && new_counts) {
+                status = clEnqueueWriteBuffer(runtime.queue, new_offsets, CL_TRUE, 0,
+                    level_bytes, linear_bla_offsets.data(), 0, nullptr, nullptr);
+            }
+            if (status == CL_SUCCESS && new_counts) {
+                status = clEnqueueWriteBuffer(runtime.queue, new_counts, CL_TRUE, 0,
+                    level_bytes, linear_bla_counts.data(), 0, nullptr, nullptr);
+            }
+            if (status != CL_SUCCESS || !new_bla || !new_offsets || !new_counts) {
+                if (!reuse_bla_buffers) {
+                    if (new_counts) clReleaseMemObject(new_counts);
+                    if (new_offsets) clReleaseMemObject(new_offsets);
+                    if (new_bla) clReleaseMemObject(new_bla);
+                }
+                throw std::runtime_error(opencl_error_text(status));
+            }
+            if (!reuse_bla_buffers) {
+                if (runtime.deep_bla_counts) clReleaseMemObject(runtime.deep_bla_counts);
+                if (runtime.deep_bla_offsets) clReleaseMemObject(runtime.deep_bla_offsets);
+                if (runtime.deep_bla) clReleaseMemObject(runtime.deep_bla);
+            }
+            runtime.deep_bla = new_bla;
+            runtime.deep_bla_offsets = new_offsets;
+            runtime.deep_bla_counts = new_counts;
+            runtime.deep_bla_capacity = bla_bytes;
+            runtime.deep_bla_levels_capacity = level_bytes;
+            runtime.deep_bla_generation = context.generation;
+            runtime.deep_bla_level_count = static_cast<int>(linear_bla_level_count);
+            device_bla = new_bla;
+            device_bla_offsets = new_offsets;
+            device_bla_counts = new_counts;
+        }
+    }
+    // Use the mixed path automatically for genuinely large scalar fields on
+    // a physical GPU.  Small ABI/correctness probes and orbit-plane renders
+    // retain the strict double contract.  FRACTAL_OPENCL_MIXED_PRECISION=0
+    // is an escape hatch for visual A/B comparisons; setting it to 1 forces
+    // the same production choice explicitly.
+    const char* mixed_precision_text = std::getenv(
+        "FRACTAL_OPENCL_MIXED_PRECISION");
+    const char* strict_precision_text = std::getenv(
+        "FRACTAL_OPENCL_STRICT_DOUBLE");
+    const bool mixed_precision_allowed = strict_precision_text == nullptr
+        || std::strcmp(strict_precision_text, "0") == 0;
+    const bool mixed_precision_forced = mixed_precision_text != nullptr
+        && std::strcmp(mixed_precision_text, "0") != 0;
+    const bool use_mixed_precision = runtime.deep_mixed_kernel != nullptr
+        && runtime.device_is_gpu
+        && mixed_precision_allowed
+        && (mixed_precision_forced || mixed_precision_text == nullptr)
+        && planes == nullptr
+        && point_offsets == nullptr
+        && count >= static_cast<size_t>(1920) * static_cast<size_t>(1080);
+    cl_mem mixed_device_reference = device_reference;
+    cl_mem mixed_device_reference_norms = device_reference_norms;
+    cl_mem mixed_device_bla = device_output;
+    cl_mem mixed_device_bla_offsets = device_output;
+    cl_mem mixed_device_bla_counts = device_output;
+    if (use_mixed_precision) {
+        const size_t mixed_reference_bytes = reference_count_size
+            * sizeof(OpenClMixedScaledComplex);
+        if (!runtime.mixed_reference
+            || runtime.mixed_reference_capacity < mixed_reference_bytes) {
+            cl_mem replacement = clCreateBuffer(
+                runtime.context, CL_MEM_READ_ONLY, mixed_reference_bytes,
+                nullptr, &status);
+            if (status != CL_SUCCESS || !replacement) {
+                throw std::runtime_error(opencl_error_text(status));
+            }
+            if (runtime.mixed_reference) clReleaseMemObject(runtime.mixed_reference);
+            runtime.mixed_reference = replacement;
+            runtime.mixed_reference_capacity = mixed_reference_bytes;
+        }
+        if (runtime.mixed_reference_generation != context.generation) {
+            std::vector<OpenClMixedScaledComplex> reference(reference_count_size);
+            for (size_t index = 0; index < reference.size(); ++index) {
+                const ScaledComplex& value = context.orbit->scaled[index];
+                reference[index] = {
+                    static_cast<float>(value.real),
+                    static_cast<float>(value.imag),
+                    value.exponent, 0};
+            }
+            status = clEnqueueWriteBuffer(
+                runtime.queue, runtime.mixed_reference, CL_TRUE, 0,
+                mixed_reference_bytes, reference.data(), 0, nullptr, nullptr);
+            if (status != CL_SUCCESS) {
+                throw std::runtime_error(opencl_error_text(status));
+            }
+            runtime.mixed_reference_generation = context.generation;
+        }
+        mixed_device_reference = runtime.mixed_reference;
+
+        const size_t mixed_norm_bytes = reference_count_size
+            * sizeof(OpenClMixedFloatExp);
+        if (!runtime.mixed_reference_norms
+            || runtime.mixed_reference_norms_capacity < mixed_norm_bytes) {
+            cl_mem replacement = clCreateBuffer(
+                runtime.context, CL_MEM_READ_ONLY, mixed_norm_bytes,
+                nullptr, &status);
+            if (status != CL_SUCCESS || !replacement) {
+                throw std::runtime_error(opencl_error_text(status));
+            }
+            if (runtime.mixed_reference_norms) {
+                clReleaseMemObject(runtime.mixed_reference_norms);
+            }
+            runtime.mixed_reference_norms = replacement;
+            runtime.mixed_reference_norms_capacity = mixed_norm_bytes;
+        }
+        if (runtime.mixed_reference_norms_generation != context.generation) {
+            // The mixed kernels use this table only for the Kalles glitch
+            // threshold. Upload that threshold directly instead of making
+            // every device iteration rescale the immutable reference norm.
+            std::vector<OpenClMixedFloatExp> reference_thresholds(
+                reference_count_size);
+            for (size_t index = 0; index < reference_thresholds.size(); ++index) {
+                const ScaledNorm norm = sc_norm_squared(context.orbit->scaled[index]);
+                float mantissa = static_cast<float>(norm.mantissa)
+                    * 0.8388608f;
+                std::int32_t exponent = static_cast<std::int32_t>(norm.exponent);
+                if (mantissa != 0.0f) {
+                    if (mantissa < 0.5f) {
+                        mantissa *= 2.0f;
+                        exponent -= 24;
+                    } else {
+                        exponent -= 23;
+                    }
+                } else {
+                    exponent = 0;
+                }
+                reference_thresholds[index] = {mantissa, exponent};
+            }
+            status = clEnqueueWriteBuffer(
+                runtime.queue, runtime.mixed_reference_norms, CL_TRUE, 0,
+                mixed_norm_bytes, reference_thresholds.data(),
+                0, nullptr, nullptr);
+            if (status != CL_SUCCESS) {
+                throw std::runtime_error(opencl_error_text(status));
+            }
+            runtime.mixed_reference_norms_generation = context.generation;
+        }
+        mixed_device_reference_norms = runtime.mixed_reference_norms;
+
+        if (linear_bla_levels != nullptr) {
+            const size_t mixed_bla_bytes = linear_bla_step_count
+                * sizeof(OpenClMixedLinearBlaStep);
+            const size_t mixed_level_bytes = linear_bla_level_count
+                * sizeof(std::int32_t);
+            const bool cached_mixed_bla = runtime.mixed_bla != nullptr
+                && runtime.mixed_bla_generation == context.generation
+                && runtime.mixed_bla_capacity >= mixed_bla_bytes
+                && runtime.mixed_bla_levels_capacity >= mixed_level_bytes
+                && runtime.mixed_bla_level_count
+                    == static_cast<int>(linear_bla_level_count);
+            if (cached_mixed_bla) {
+                mixed_device_bla = runtime.mixed_bla;
+                mixed_device_bla_offsets = runtime.mixed_bla_offsets;
+                mixed_device_bla_counts = runtime.mixed_bla_counts;
+            } else {
+                std::vector<OpenClMixedLinearBlaStep> mixed_bla;
+                std::vector<std::int32_t> mixed_offsets;
+                std::vector<std::int32_t> mixed_counts;
+                mixed_bla.reserve(linear_bla_step_count);
+                mixed_offsets.reserve(linear_bla_level_count);
+                mixed_counts.reserve(linear_bla_level_count);
+                for (size_t level = 0; level < linear_bla_level_count; ++level) {
+                    const auto& source_level = (*linear_bla_levels)[level];
+                    mixed_offsets.push_back(static_cast<std::int32_t>(mixed_bla.size()));
+                    mixed_counts.push_back(static_cast<std::int32_t>(source_level.size()));
+                    for (const LinearBlaStep& step : source_level) {
+                        mixed_bla.push_back({
+                            {static_cast<float>(step.A.real),
+                             static_cast<float>(step.A.imag), step.A.exponent, 0},
+                            {static_cast<float>(step.B.real),
+                             static_cast<float>(step.B.imag), step.B.exponent, 0},
+                            static_cast<float>(step.radius_squared.mantissa),
+                            step.radius_squared.exponent,
+                            step.length});
+                    }
+                }
+                const bool reuse_mixed_bla = runtime.mixed_bla != nullptr
+                    && runtime.mixed_bla_offsets != nullptr
+                    && runtime.mixed_bla_counts != nullptr
+                    && runtime.mixed_bla_capacity >= mixed_bla_bytes
+                    && runtime.mixed_bla_levels_capacity >= mixed_level_bytes;
+                cl_mem new_bla = reuse_mixed_bla ? runtime.mixed_bla
+                    : clCreateBuffer(runtime.context, CL_MEM_READ_ONLY,
+                                     mixed_bla_bytes, nullptr, &status);
+                cl_mem new_offsets = reuse_mixed_bla
+                    ? runtime.mixed_bla_offsets : nullptr;
+                cl_mem new_counts = reuse_mixed_bla
+                    ? runtime.mixed_bla_counts : nullptr;
+                if (!reuse_mixed_bla && status == CL_SUCCESS && new_bla) {
+                    new_offsets = clCreateBuffer(
+                        runtime.context, CL_MEM_READ_ONLY, mixed_level_bytes,
+                        nullptr, &status);
+                }
+                if (!reuse_mixed_bla && status == CL_SUCCESS && new_offsets) {
+                    new_counts = clCreateBuffer(
+                        runtime.context, CL_MEM_READ_ONLY, mixed_level_bytes,
+                        nullptr, &status);
+                }
+                if (status == CL_SUCCESS && new_counts) {
+                    status = clEnqueueWriteBuffer(
+                        runtime.queue, new_bla, CL_TRUE, 0, mixed_bla_bytes,
+                        mixed_bla.data(), 0, nullptr, nullptr);
+                }
+                if (status == CL_SUCCESS && new_counts) {
+                    status = clEnqueueWriteBuffer(
+                        runtime.queue, new_offsets, CL_TRUE, 0, mixed_level_bytes,
+                        mixed_offsets.data(), 0, nullptr, nullptr);
+                }
+                if (status == CL_SUCCESS && new_counts) {
+                    status = clEnqueueWriteBuffer(
+                        runtime.queue, new_counts, CL_TRUE, 0, mixed_level_bytes,
+                        mixed_counts.data(), 0, nullptr, nullptr);
+                }
+                if (status != CL_SUCCESS || !new_bla || !new_offsets || !new_counts) {
+                    if (!reuse_mixed_bla) {
+                        if (new_counts) clReleaseMemObject(new_counts);
+                        if (new_offsets) clReleaseMemObject(new_offsets);
+                        if (new_bla) clReleaseMemObject(new_bla);
+                    }
+                    throw std::runtime_error(opencl_error_text(status));
+                }
+                if (!reuse_mixed_bla) {
+                    if (runtime.mixed_bla_counts) clReleaseMemObject(runtime.mixed_bla_counts);
+                    if (runtime.mixed_bla_offsets) clReleaseMemObject(runtime.mixed_bla_offsets);
+                    if (runtime.mixed_bla) clReleaseMemObject(runtime.mixed_bla);
+                }
+                runtime.mixed_bla = new_bla;
+                runtime.mixed_bla_offsets = new_offsets;
+                runtime.mixed_bla_counts = new_counts;
+                runtime.mixed_bla_capacity = mixed_bla_bytes;
+                runtime.mixed_bla_levels_capacity = mixed_level_bytes;
+                runtime.mixed_bla_generation = context.generation;
+                runtime.mixed_bla_level_count = static_cast<int>(linear_bla_level_count);
+                mixed_device_bla = new_bla;
+                mixed_device_bla_offsets = new_offsets;
+                mixed_device_bla_counts = new_counts;
+            }
+        }
+    }
+    std::array<cl_mem, 6> device_planes{};
+    const std::array<size_t, 6> plane_sizes{
+        sizeof(std::int64_t), sizeof(double), sizeof(double), sizeof(double),
+        sizeof(double), sizeof(double)};
+    const std::array<void*, 6> plane_outputs{
+        planes ? static_cast<void*>(planes->orbit_iteration) : nullptr,
+        planes ? static_cast<void*>(planes->phase) : nullptr,
+        planes ? static_cast<void*>(planes->de_x) : nullptr,
+        planes ? static_cast<void*>(planes->de_y) : nullptr,
+        planes ? static_cast<void*>(planes->test1) : nullptr,
+        planes ? static_cast<void*>(planes->test2) : nullptr,
+    };
+    if (planes != nullptr) {
+        for (size_t index = 0; index < device_planes.size(); ++index) {
+            device_planes[index] = clCreateBuffer(
+                runtime.context, CL_MEM_WRITE_ONLY, count * plane_sizes[index],
+                nullptr, &status);
+            if (status != CL_SUCCESS || !device_planes[index]) {
+                for (cl_mem buffer : device_planes) if (buffer) clReleaseMemObject(buffer);
+                cleanup();
+                throw std::runtime_error(opencl_error_text(status));
+            }
+        }
+    } else {
+        // These arguments are never dereferenced when write_planes is zero.
+        // Supplying a valid allocation keeps ICDs that reject null cl_mem
+        // arguments happy without allocating six unused full-frame buffers.
+        device_planes.fill(device_output);
+    }
+    const auto cleanup_planes = [&] {
+        if (planes != nullptr) {
+            for (cl_mem buffer : device_planes) if (buffer) clReleaseMemObject(buffer);
+        }
+    };
+    status = CL_SUCCESS;
+    const int reference_count = static_cast<int>(reference_count_size);
+    const int bailout_exponent = bailout.exponent;
+    const double bailout_mantissa = bailout.mantissa;
+    const float mixed_bailout_mantissa = static_cast<float>(bailout.mantissa);
+    // The mixed kernel keeps the viewport exponent separate, so its
+    // mantissa/width ratio is safe to precompute once on the host.  Doing the
+    // division in the kernel used to reintroduce two fp64 operations for
+    // every pixel even though the recurrence itself was fp32.
+    const float mixed_view_width_scale = static_cast<float>(
+        view_width.mantissa / static_cast<double>(width));
+    const float mixed_view_height_scale = static_cast<float>(
+        view_height.mantissa / static_cast<double>(height));
+    const float mixed_output_bias = static_cast<float>(options.output_bias);
+    const int write_planes = planes != nullptr ? 1 : 0;
+    const int bla_level_count = static_cast<int>(linear_bla_level_count);
+    const int formula = context.formula;
+    const double parameter_real = context.parameter.real;
+    const double parameter_imag = context.parameter.imag;
+    const int parameter_exponent = context.parameter.exponent;
+    const float mixed_parameter_real = static_cast<float>(parameter_real);
+    const float mixed_parameter_imag = static_cast<float>(parameter_imag);
+    const int point_mode = point_offsets != nullptr ? 1 : 0;
+    const bool use_scalar_bla_kernel = runtime.deep_scalar_bla_kernel != nullptr
+        && !use_mixed_precision
+        && planes == nullptr
+        && point_offsets == nullptr
+        && formula == FRACTAL_FORMULA_MANDELBROT
+        && use_linear_bla;
+    const bool use_scalar_kernel = runtime.deep_scalar_kernel != nullptr
+        && !use_mixed_precision
+        && planes == nullptr
+        && point_offsets == nullptr
+        && formula == FRACTAL_FORMULA_MANDELBROT
+        && !use_linear_bla;
+    const bool use_simple_scalar_kernel = use_scalar_bla_kernel || use_scalar_kernel;
+    const bool use_mixed_mandelbrot_kernel = use_mixed_precision
+        && formula == FRACTAL_FORMULA_MANDELBROT
+        && runtime.deep_mixed_mandelbrot_kernel != nullptr;
+    cl_kernel active_kernel = use_mixed_precision
+        ? (use_mixed_mandelbrot_kernel
+            ? runtime.deep_mixed_mandelbrot_kernel
+            : runtime.deep_mixed_kernel)
+        : (use_scalar_bla_kernel
+            ? runtime.deep_scalar_bla_kernel
+            : (use_scalar_kernel ? runtime.deep_scalar_kernel : runtime.deep_kernel));
+    if (use_mixed_precision) {
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 0, sizeof(device_output), &device_output);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 1, sizeof(mixed_device_reference), &mixed_device_reference);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 2, sizeof(reference_count), &reference_count);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 3, sizeof(width), &width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 4, sizeof(height), &height);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 5, sizeof(mixed_view_width_scale), &mixed_view_width_scale);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 6, sizeof(view_width.exponent), &view_width.exponent);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 7, sizeof(mixed_view_height_scale), &mixed_view_height_scale);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 8, sizeof(view_height.exponent), &view_height.exponent);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 9, sizeof(max_iter), &max_iter);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 10, sizeof(mixed_output_bias), &mixed_output_bias);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 11, sizeof(bailout_exponent), &bailout_exponent);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 12, sizeof(mixed_bailout_mantissa), &mixed_bailout_mantissa);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 13, sizeof(options.coordinate_mode), &options.coordinate_mode);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 14, sizeof(cl_mem), &mixed_device_reference_norms);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 15, sizeof(cl_mem), &mixed_device_bla);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 16, sizeof(cl_mem), &mixed_device_bla_offsets);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 17, sizeof(cl_mem), &mixed_device_bla_counts);
+        const int mixed_bla_level_count =
+            runtime.mixed_bla_level_count > 0
+                && runtime.mixed_bla_generation == context.generation
+                ? runtime.mixed_bla_level_count : 0;
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 18, sizeof(mixed_bla_level_count), &mixed_bla_level_count);
+        if (!use_mixed_mandelbrot_kernel) {
+            if (status == CL_SUCCESS) status = clSetKernelArg(
+                active_kernel, 19, sizeof(formula), &formula);
+            if (status == CL_SUCCESS) status = clSetKernelArg(
+                active_kernel, 20, sizeof(mixed_parameter_real), &mixed_parameter_real);
+            if (status == CL_SUCCESS) status = clSetKernelArg(
+                active_kernel, 21, sizeof(mixed_parameter_imag), &mixed_parameter_imag);
+            if (status == CL_SUCCESS) status = clSetKernelArg(
+                active_kernel, 22, sizeof(parameter_exponent), &parameter_exponent);
+        }
+    } else if (use_simple_scalar_kernel) {
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 0, sizeof(device_output), &device_output);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 1, sizeof(device_reference), &device_reference);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 2, sizeof(reference_count), &reference_count);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 3, sizeof(width), &width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 4, sizeof(height), &height);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 5, sizeof(view_width.mantissa), &view_width.mantissa);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 6, sizeof(view_width.exponent), &view_width.exponent);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 7, sizeof(view_height.mantissa), &view_height.mantissa);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 8, sizeof(view_height.exponent), &view_height.exponent);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 9, sizeof(max_iter), &max_iter);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 10, sizeof(options.output_bias), &options.output_bias);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 11, sizeof(bailout_exponent), &bailout_exponent);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 12, sizeof(bailout_mantissa), &bailout_mantissa);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 13, sizeof(options.coordinate_mode), &options.coordinate_mode);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 14, sizeof(cl_mem), &device_reference_norms);
+        if (use_scalar_bla_kernel) {
+            if (status == CL_SUCCESS) status = clSetKernelArg(
+                active_kernel, 15, sizeof(cl_mem), &device_bla);
+            if (status == CL_SUCCESS) status = clSetKernelArg(
+                active_kernel, 16, sizeof(cl_mem), &device_bla_offsets);
+            if (status == CL_SUCCESS) status = clSetKernelArg(
+                active_kernel, 17, sizeof(cl_mem), &device_bla_counts);
+            if (status == CL_SUCCESS) status = clSetKernelArg(
+                active_kernel, 18, sizeof(bla_level_count), &bla_level_count);
+        }
+    } else {
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 0, sizeof(device_output), &device_output);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 1, sizeof(device_reference), &device_reference);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 2, sizeof(reference_count), &reference_count);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 3, sizeof(width), &width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 4, sizeof(height), &height);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 5, sizeof(view_width.mantissa), &view_width.mantissa);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 6, sizeof(view_width.exponent), &view_width.exponent);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 7, sizeof(view_height.mantissa), &view_height.mantissa);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 8, sizeof(view_height.exponent), &view_height.exponent);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 9, sizeof(max_iter), &max_iter);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 10, sizeof(options.output_bias), &options.output_bias);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 11, sizeof(bailout_exponent), &bailout_exponent);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 12, sizeof(bailout_mantissa), &bailout_mantissa);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 13, sizeof(options.coordinate_mode), &options.coordinate_mode);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 14, sizeof(pixel_spacing.mantissa), &pixel_spacing.mantissa);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 15, sizeof(pixel_spacing.exponent), &pixel_spacing.exponent);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 16, sizeof(write_planes), &write_planes);
+        for (size_t index = 0; status == CL_SUCCESS && index < device_planes.size(); ++index) {
+            status = clSetKernelArg(active_kernel, static_cast<cl_uint>(17 + index),
+                                    sizeof(cl_mem), &device_planes[index]);
+        }
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 23, sizeof(cl_mem), &device_bla);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 24, sizeof(cl_mem), &device_bla_offsets);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 25, sizeof(cl_mem), &device_bla_counts);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 26, sizeof(bla_level_count), &bla_level_count);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 27, sizeof(use_linear_bla), &use_linear_bla);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 28, sizeof(formula), &formula);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 29, sizeof(parameter_real), &parameter_real);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 30, sizeof(parameter_imag), &parameter_imag);
+        if (status == CL_SUCCESS) status = clSetKernelArg(active_kernel, 31, sizeof(parameter_exponent), &parameter_exponent);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 32, sizeof(cl_mem), &device_point_offsets);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 33, sizeof(point_mode), &point_mode);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            active_kernel, 34, sizeof(cl_mem), &device_reference_norms);
+    }
+    const size_t workgroup = use_mixed_precision
+        ? (use_mixed_mandelbrot_kernel
+            ? runtime.deep_mixed_mandelbrot_workgroup_size
+            : runtime.deep_mixed_workgroup_size)
+        : (use_scalar_bla_kernel
+            ? runtime.deep_scalar_bla_workgroup_size
+            : (use_scalar_kernel
+                ? runtime.deep_scalar_workgroup_size : runtime.workgroup_size));
+    const size_t global_size = workgroup > 0
+        ? ((count + workgroup - 1U) / workgroup) * workgroup
+        : count;
+    const size_t* local_work_size = workgroup > 0 ? &workgroup : nullptr;
+    if (status == CL_SUCCESS) status = clEnqueueNDRangeKernel(
+        runtime.queue, active_kernel, 1, nullptr, &global_size,
+        local_work_size, 0, nullptr, nullptr);
+    if (status == CL_SUCCESS) status = clEnqueueReadBuffer(
+        runtime.queue, device_output, CL_TRUE, 0, count * sizeof(float),
+        output, 0, nullptr, nullptr);
+    for (size_t index = 0; status == CL_SUCCESS && planes != nullptr
+         && index < device_planes.size(); ++index) {
+        status = clEnqueueReadBuffer(runtime.queue, device_planes[index], CL_TRUE, 0,
+                                     count * plane_sizes[index], plane_outputs[index],
+                                     0, nullptr, nullptr);
+    }
+    // The blocking output reads above already establish completion for this
+    // synchronous ABI call; do not serialize the driver a second time.
+    cleanup_planes();
+    cleanup();
+    if (status != CL_SUCCESS) throw std::runtime_error(opencl_error_text(status));
+}
+#endif
+
 void stabilize_alternate_reference_cycle(
     std::vector<FloatExpComplex>& fast_orbit,
-    ReferenceOrbitData& orbit
+    ReferenceOrbitData& orbit,
+    int escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC
 ) {
     // A decimal deep-zoom target can be a periodic point whose last supplied
     // digits are still amplified by a repelling cycle. MPFR faithfully
@@ -3496,9 +9723,12 @@ void stabilize_alternate_reference_cycle(
                 if (!std::isfinite(previous_radius)
                     || !std::isfinite(current_radius)
                     || !std::isfinite(following_radius)
-                    || previous_radius * previous_radius >= 4.0
-                    || current_radius * current_radius >= 4.0
-                    || following_radius * following_radius >= 4.0) {
+                    || previous_radius * previous_radius
+                        >= escape_radius_squared_double(escape_radius_mode)
+                    || current_radius * current_radius
+                        >= escape_radius_squared_double(escape_radius_mode)
+                    || following_radius * following_radius
+                        >= escape_radius_squared_double(escape_radius_mode)) {
                     matches = false;
                     break;
                 }
@@ -3558,6 +9788,7 @@ void* register_reference(std::unique_ptr<ReferenceContext> context) {
         if (token == 0 || reference_registry.find(token) != reference_registry.end()) {
             continue;
         }
+        shared->generation = static_cast<std::uint64_t>(token);
         reference_registry.emplace(token, std::move(shared));
         return reinterpret_cast<void*>(token);
     }
@@ -3594,8 +9825,13 @@ void render_direct_avx2(
     int formula,
     double julia_real,
     double julia_imag,
-    double output_bias
+    double output_bias,
+    int escape_radius_mode
 ) {
+    const double escape_squared = escape_radius_squared_double(escape_radius_mode);
+    const double safe_escape_squared = escape_squared + 1.0e-7;
+    const double log_formula_power = std::log(
+        static_cast<double>(formula_power(formula)));
 #ifdef _OPENMP
     if (threads > 0) {
         omp_set_dynamic(0);
@@ -3674,7 +9910,8 @@ void render_direct_avx2(
                 _mm256_store_pd(norm_values, norm);
                 int escaped = 0;
                 for (int lane = 0; lane < 4; ++lane) {
-                    if ((active_bits & (1 << lane)) && norm_values[lane] > 4.0) {
+                    if ((active_bits & (1 << lane))
+                        && norm_values[lane] > escape_squared) {
                         escaped_iteration[lane] = iteration + 1;
                         escaped_norm[lane] = norm_values[lane];
                         escaped |= 1 << lane;
@@ -3688,7 +9925,8 @@ void render_direct_avx2(
                     output[index] = encode_render_iteration(max_iter, output_bias);
                     continue;
                 }
-                const double magnitude = std::sqrt(std::max(escaped_norm[lane], 4.0000001));
+                const double magnitude = std::sqrt(
+                    std::max(escaped_norm[lane], safe_escape_squared));
                 output[index] = encode_render_value(
                     static_cast<long double>(escaped_iteration[lane])
                         - std::log(std::log(magnitude)) / static_cast<double>(LOG_TWO),
@@ -3728,12 +9966,13 @@ void render_direct_avx2(
                 zr = next_real;
                 zi = next_imag;
                 const double magnitude_squared = zr * zr + zi * zi;
-                if (magnitude_squared > ESCAPE_RADIUS_SQUARED) {
-                    const double magnitude = std::sqrt(std::max(magnitude_squared, 4.0000001));
+                if (magnitude_squared > escape_squared) {
+                    const double magnitude = std::sqrt(
+                        std::max(magnitude_squared, safe_escape_squared));
                     output[index] = encode_render_value(
                         static_cast<long double>(iteration + 1)
                             - std::log(std::log(magnitude))
-                                / std::log(static_cast<double>(formula_power(formula))),
+                                / log_formula_power,
                         output_bias);
                     break;
                 }
@@ -3745,6 +9984,134 @@ void render_direct_avx2(
     }
 }
 #endif
+
+template<int Formula>
+inline void iterate_direct_formula_static(
+    double zr,
+    double zi,
+    double parameter_real,
+    double parameter_imag,
+    double& next_real,
+    double& next_imag
+) noexcept {
+    if constexpr (Formula == FRACTAL_FORMULA_BURNING_SHIP) {
+        const double absolute_real = std::abs(zr);
+        const double absolute_imag = std::abs(zi);
+        // Keep the piecewise alternate maps reproducible with the NumPy
+        // fallback. A fused multiply-add changes a late orbit by a few ulps
+        // and can move a boundary pixel to the other side of escape.
+        const volatile double real_square = absolute_real * absolute_real;
+        const volatile double imag_square = absolute_imag * absolute_imag;
+        const volatile double cross = 2.0 * absolute_real * absolute_imag;
+        const volatile double real_difference = real_square - imag_square;
+        const volatile double imaginary_product = cross + parameter_imag;
+        next_real = real_difference + parameter_real;
+        next_imag = imaginary_product;
+    } else if constexpr (Formula == FRACTAL_FORMULA_TRICORN) {
+        const volatile double real_square = zr * zr;
+        const volatile double imag_square = zi * zi;
+        const volatile double cross = -2.0 * zr * zi;
+        const volatile double real_difference = real_square - imag_square;
+        const volatile double imaginary_product = cross + parameter_imag;
+        next_real = real_difference + parameter_real;
+        next_imag = imaginary_product;
+    } else if constexpr (Formula == FRACTAL_FORMULA_JULIA) {
+        const volatile double real_square = zr * zr;
+        const volatile double imag_square = zi * zi;
+        const volatile double cross = 2.0 * zr * zi;
+        const volatile double real_difference = real_square - imag_square;
+        const volatile double imaginary_product = cross + parameter_imag;
+        next_real = real_difference + parameter_real;
+        next_imag = imaginary_product;
+    } else {
+        next_real = zr * zr - zi * zi + parameter_real;
+        next_imag = 2.0 * zr * zi + parameter_imag;
+    }
+}
+
+template<int Formula>
+void render_direct_scalar_formula(
+    float* output,
+    int width,
+    int height,
+    const std::vector<double>& x_coordinates,
+    const std::vector<double>& y_coordinates,
+    int max_iter,
+    int threads,
+    double julia_real,
+    double julia_imag,
+    double output_bias,
+    int escape_radius_mode,
+    double log_formula_power
+) {
+    constexpr bool is_mandelbrot = Formula == FRACTAL_FORMULA_MANDELBROT;
+    constexpr bool is_julia = Formula == FRACTAL_FORMULA_JULIA;
+    const double escape_squared = escape_radius_squared_double(escape_radius_mode);
+    const double safe_escape_squared = escape_squared + 1.0e-7;
+#ifdef _OPENMP
+    if (threads > 0) {
+        omp_set_dynamic(0);
+        omp_set_num_threads(threads);
+    }
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int py = 0; py < height; ++py) {
+        const double cy = y_coordinates[static_cast<size_t>(py)];
+        const size_t row_offset = static_cast<size_t>(py)
+            * static_cast<size_t>(width);
+        for (int px = 0; px < width; ++px) {
+            const double cx = x_coordinates[static_cast<size_t>(px)];
+            const size_t index = row_offset + static_cast<size_t>(px);
+            if constexpr (is_mandelbrot) {
+                const double q = (cx - 0.25) * (cx - 0.25) + cy * cy;
+                const bool in_cardioid = q * (q + cx - 0.25)
+                    <= 0.25 * cy * cy;
+                const bool in_bulb = (cx + 1.0) * (cx + 1.0)
+                    + cy * cy <= 0.0625;
+                if (in_cardioid || in_bulb) {
+                    output[index] = encode_render_iteration(max_iter, output_bias);
+                    continue;
+                }
+            }
+
+            double zr = is_julia ? cx : 0.0;
+            double zi = is_julia ? cy : 0.0;
+            const double parameter_real = is_julia ? julia_real : cx;
+            const double parameter_imag = is_julia ? julia_imag : cy;
+            int iteration = 0;
+            for (; iteration < max_iter; ++iteration) {
+                double next_real = 0.0;
+                double next_imag = 0.0;
+                iterate_direct_formula_static<Formula>(
+                    zr,
+                    zi,
+                    parameter_real,
+                    parameter_imag,
+                    next_real,
+                    next_imag);
+                zr = next_real;
+                zi = next_imag;
+                const double magnitude_squared = zr * zr + zi * zi;
+                if (magnitude_squared > escape_squared
+                    || !std::isfinite(magnitude_squared)) {
+                    const double safe_squared = std::isfinite(magnitude_squared)
+                        ? std::max(magnitude_squared, safe_escape_squared)
+                        : std::numeric_limits<double>::max();
+                    const double magnitude = std::sqrt(safe_squared);
+                    output[index] = encode_render_value(
+                        static_cast<long double>(iteration + 1)
+                            - std::log(std::log(magnitude))
+                                / log_formula_power,
+                        output_bias);
+                    break;
+                }
+            }
+            if (iteration == max_iter) {
+                output[index] = encode_render_iteration(max_iter, output_bias);
+            }
+        }
+    }
+}
 
 void render_direct(
     float* output,
@@ -3759,7 +10126,9 @@ void render_direct(
     int formula = FRACTAL_FORMULA_MANDELBROT,
     double julia_real = 0.0,
     double julia_imag = 0.0,
-    double output_bias = 0.0
+    double output_bias = 0.0,
+    int escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC,
+    int coordinate_mode = COORDINATE_MODE_PROJECT
 ) {
     // This path is deliberately ordinary double precision.  The Python
     // layer routes only shallow views here; using long double for every
@@ -3768,11 +10137,22 @@ void render_direct(
     const double zoom_value = static_cast<double>(zoom);
     const double center_real = static_cast<double>(x_center);
     const double center_imag = static_cast<double>(y_center);
+    if (!valid_escape_radius_mode(escape_radius_mode)) {
+        throw std::runtime_error("unknown escape-radius mode");
+    }
+    if (!valid_coordinate_mode(coordinate_mode)) {
+        throw std::runtime_error("unknown coordinate mode");
+    }
+    if (!valid_formula(formula)) {
+        throw std::runtime_error("unknown fractal formula");
+    }
+    const double log_formula_power = std::log(
+        static_cast<double>(formula_power(formula)));
     if (!std::isfinite(zoom_value) || zoom_value <= 0.0
         || !std::isfinite(center_real) || !std::isfinite(center_imag)) {
         throw std::runtime_error("direct native coordinates or zoom exceed double range");
     }
-    const double height_span = 2.8 / zoom_value;
+    const double height_span = viewport_height_factor(coordinate_mode) / zoom_value;
     const double width_span = height_span * static_cast<double>(width) / static_cast<double>(height);
     if (!std::isfinite(height_span) || !std::isfinite(width_span)) {
         throw std::runtime_error("direct native viewport is outside double range");
@@ -3784,13 +10164,13 @@ void render_direct(
     std::vector<double> y_coordinates(static_cast<size_t>(height));
     for (int px = 0; px < width; ++px) {
         const double x_offset =
-            (static_cast<double>(px) - static_cast<double>(width - 1) / 2.0)
+            pixel_axis_offset(px, width, coordinate_mode)
             * width_span / static_cast<double>(width);
         x_coordinates[static_cast<size_t>(px)] = center_real + x_offset;
     }
     for (int py = 0; py < height; ++py) {
         const double y_offset =
-            (static_cast<double>(height - 1) / 2.0 - static_cast<double>(py))
+            -pixel_axis_offset(py, height, coordinate_mode)
             * height_span / static_cast<double>(height);
         y_coordinates[static_cast<size_t>(py)] = center_imag + y_offset;
     }
@@ -3807,7 +10187,8 @@ void render_direct(
             formula,
             julia_real,
             julia_imag,
-            output_bias);
+            output_bias,
+            escape_radius_mode);
         return;
     }
     if (backend == 1) {
@@ -3819,7 +10200,7 @@ void render_direct(
     }
 #endif
 #ifdef FRACTAL_HAVE_OPENCL
-    if (backend == 2 && formula == FRACTAL_FORMULA_MANDELBROT) {
+    if (backend == 2) {
         render_direct_opencl(
             output,
             width,
@@ -3828,24 +10209,78 @@ void render_direct(
             static_cast<double>(x_center),
             static_cast<double>(y_center),
             max_iter,
-            output_bias);
+            output_bias,
+            formula,
+            julia_real,
+            julia_imag,
+            escape_radius_mode,
+            coordinate_mode);
         return;
-    }
-    if (backend == 2) {
-        throw std::runtime_error(
-            "OpenCL direct rendering currently supports only the Mandelbrot formula");
     }
 #else
     if (backend == 2) {
         throw std::runtime_error("OpenCL backend is not available in this build");
     }
 #endif
+    // Formula selection is fixed for the whole frame. Dispatching once here
+    // removes the predictable formula/Julia branches from every orbit step
+    // in the shallow renderer used by live view and low-depth previews.
+    switch (formula) {
+        case FRACTAL_FORMULA_MANDELBROT:
+            render_direct_scalar_formula<FRACTAL_FORMULA_MANDELBROT>(
+                output, width, height, x_coordinates, y_coordinates,
+                max_iter, threads, julia_real, julia_imag, output_bias,
+                escape_radius_mode, log_formula_power);
+            return;
+        case FRACTAL_FORMULA_JULIA:
+            render_direct_scalar_formula<FRACTAL_FORMULA_JULIA>(
+                output, width, height, x_coordinates, y_coordinates,
+                max_iter, threads, julia_real, julia_imag, output_bias,
+                escape_radius_mode, log_formula_power);
+            return;
+        case FRACTAL_FORMULA_BURNING_SHIP:
+            render_direct_scalar_formula<FRACTAL_FORMULA_BURNING_SHIP>(
+                output, width, height, x_coordinates, y_coordinates,
+                max_iter, threads, julia_real, julia_imag, output_bias,
+                escape_radius_mode, log_formula_power);
+            return;
+        case FRACTAL_FORMULA_TRICORN:
+            render_direct_scalar_formula<FRACTAL_FORMULA_TRICORN>(
+                output, width, height, x_coordinates, y_coordinates,
+                max_iter, threads, julia_real, julia_imag, output_bias,
+                escape_radius_mode, log_formula_power);
+            return;
+        default:
+            throw std::runtime_error("unknown fractal formula");
+    }
+}
+
+template<int Formula, bool NeedDerivative>
+void render_direct_with_planes_formula(
+    float* output,
+    int width,
+    int height,
+    const std::vector<double>& x_coordinates,
+    const std::vector<double>& y_coordinates,
+    int max_iter,
+    int threads,
+    double julia_real,
+    double julia_imag,
+    double output_bias,
+    int escape_radius_mode,
+    double log_formula_power,
+    const FloatExp& pixel_spacing,
+    std::uint32_t plane_flags,
+    FractalRenderPlanes* planes
+) {
+    constexpr bool is_mandelbrot = Formula == FRACTAL_FORMULA_MANDELBROT;
+    constexpr bool is_julia = Formula == FRACTAL_FORMULA_JULIA;
+    constexpr bool has_analytic_de = is_mandelbrot || is_julia;
+    constexpr bool parameter_plane = !is_julia;
+    const double escape_squared = escape_radius_squared_double(escape_radius_mode);
+    const double safe_escape_squared = escape_squared + 1.0e-7;
 #ifdef _OPENMP
     if (threads > 0) {
-        // A requested team size is a performance contract for this native
-        // renderer.  Some libgomp environments enable dynamic teams and can
-        // silently collapse a deep render to one worker after it sees uneven
-        // work; that is exactly the wrong choice for a pathological tile.
         omp_set_dynamic(0);
         omp_set_num_threads(threads);
     }
@@ -3853,53 +10288,254 @@ void render_direct(
 #endif
     for (int py = 0; py < height; ++py) {
         const double cy = y_coordinates[static_cast<size_t>(py)];
+        const size_t row_offset = static_cast<size_t>(py)
+            * static_cast<size_t>(width);
         for (int px = 0; px < width; ++px) {
             const double cx = x_coordinates[static_cast<size_t>(px)];
-            const int index = py * width + px;
-            if (formula == FRACTAL_FORMULA_MANDELBROT) {
+            const size_t index = row_offset + static_cast<size_t>(px);
+            auto mark_inside = [&] {
+                output[index] = encode_render_iteration(max_iter, output_bias);
+                planes->orbit_iteration[index] = max_iter;
+                planes->phase[index] = 0.0;
+                planes->de_x[index] = 0.0;
+                planes->de_y[index] = 0.0;
+                planes->test1[index] = 0.0;
+                planes->test2[index] = 0.0;
+            };
+            if constexpr (is_mandelbrot) {
                 const double q = (cx - 0.25) * (cx - 0.25) + cy * cy;
-                const bool in_cardioid = q * (q + cx - 0.25) <= 0.25 * cy * cy;
-                const bool in_bulb = (cx + 1.0) * (cx + 1.0) + cy * cy <= 0.0625;
+                const bool in_cardioid = q * (q + cx - 0.25)
+                    <= 0.25 * cy * cy;
+                const bool in_bulb = (cx + 1.0) * (cx + 1.0)
+                    + cy * cy <= 0.0625;
                 if (in_cardioid || in_bulb) {
-                    output[index] = encode_render_iteration(max_iter, output_bias);
+                    mark_inside();
                     continue;
                 }
             }
 
-            double zr = formula == FRACTAL_FORMULA_JULIA ? cx : 0.0;
-            double zi = formula == FRACTAL_FORMULA_JULIA ? cy : 0.0;
-            const double parameter_real = formula == FRACTAL_FORMULA_JULIA
-                ? julia_real : cx;
-            const double parameter_imag = formula == FRACTAL_FORMULA_JULIA
-                ? julia_imag : cy;
+            double zr = 0.0;
+            double zi = 0.0;
+            double parameter_real = 0.0;
+            double parameter_imag = 0.0;
+            double derivative_real = 0.0;
+            if constexpr (is_julia) {
+                zr = cx;
+                zi = cy;
+                parameter_real = julia_real;
+                parameter_imag = julia_imag;
+                derivative_real = 1.0;
+            } else {
+                parameter_real = cx;
+                parameter_imag = cy;
+            }
+            double derivative_imag = 0.0;
+            double test1 = 0.0;
+            double test2 = 0.0;
             int iteration = 0;
             for (; iteration < max_iter; ++iteration) {
                 double next_real = 0.0;
                 double next_imag = 0.0;
-                iterate_direct_formula(
-                    formula, zr, zi, parameter_real, parameter_imag,
-                    next_real, next_imag);
+                double next_derivative_real = 0.0;
+                double next_derivative_imag = 0.0;
+                iterate_direct_formula_with_derivative<Formula, parameter_plane, NeedDerivative>(
+                    zr,
+                    zi,
+                    parameter_real,
+                    parameter_imag,
+                    derivative_real,
+                    derivative_imag,
+                    next_real,
+                    next_imag,
+                    next_derivative_real,
+                    next_derivative_imag);
                 zr = next_real;
                 zi = next_imag;
+                derivative_real = next_derivative_real;
+                derivative_imag = next_derivative_imag;
                 const double magnitude_squared = zr * zr + zi * zi;
-                if (magnitude_squared > ESCAPE_RADIUS_SQUARED
+                test2 = test1;
+                test1 = magnitude_squared;
+                if (magnitude_squared > escape_squared
                     || !std::isfinite(magnitude_squared)) {
                     const double safe_squared = std::isfinite(magnitude_squared)
-                        ? std::max(magnitude_squared, 4.0000001)
+                        ? std::max(magnitude_squared, safe_escape_squared)
                         : std::numeric_limits<double>::max();
                     const double magnitude = std::sqrt(safe_squared);
                     output[index] = encode_render_value(
                         static_cast<long double>(iteration + 1)
                             - std::log(std::log(magnitude))
-                                / std::log(static_cast<double>(formula_power(formula))),
+                                / log_formula_power,
                         output_bias);
+                    // Kalles increments `antal` after each tested sample;
+                    // the first escaped z^2+c sample therefore carries
+                    // `antal == 0`, matching this zero-based loop variable.
+                    planes->orbit_iteration[index] = iteration;
+                    planes->phase[index] = 0.0;
+                    if ((plane_flags & FRACTAL_RENDER_HINT_SKIP_PHASE) == 0) {
+                        planes->phase[index] = std::isfinite(zr)
+                            && std::isfinite(zi)
+                            ? [&] {
+                                double value = std::atan2(zi, zr)
+                                    / 6.283185307179586476925286766559005768;
+                                value -= std::floor(value);
+                                return value;
+                            }()
+                            : 0.0;
+                    }
+                    planes->de_x[index] = 0.0;
+                    planes->de_y[index] = 0.0;
+                    if constexpr (NeedDerivative && has_analytic_de) {
+                        if (std::isfinite(zr) && std::isfinite(zi)
+                            && std::isfinite(derivative_real)
+                            && std::isfinite(derivative_imag)) {
+                            const ScaledComplex total =
+                                ScaledComplex::from_float_exp(
+                                    FloatExp::from_parts(zr, 0),
+                                    FloatExp::from_parts(zi, 0));
+                            const ScaledComplex derivative =
+                                ScaledComplex::from_float_exp(
+                                    FloatExp::from_parts(derivative_real, 0),
+                                    FloatExp::from_parts(derivative_imag, 0));
+                            (void)render_plane_de(
+                                total,
+                                derivative,
+                                pixel_spacing,
+                                planes->de_x[index],
+                                planes->de_y[index]);
+                        }
+                    }
+                    planes->test1[index] = test1;
+                    planes->test2[index] = test2;
                     break;
                 }
             }
             if (iteration == max_iter) {
-                output[index] = encode_render_iteration(max_iter, output_bias);
+                mark_inside();
             }
         }
+    }
+}
+
+void render_direct_with_planes(
+    float* output,
+    int width,
+    int height,
+    long double zoom,
+    long double x_center,
+    long double y_center,
+    int max_iter,
+    int threads,
+    int formula,
+    double julia_real,
+    double julia_imag,
+    double output_bias,
+    int escape_radius_mode,
+    int coordinate_mode,
+    std::uint32_t plane_flags,
+    FractalRenderPlanes* planes
+) {
+    if (!planes || !planes->orbit_iteration || !planes->phase
+        || !planes->de_x || !planes->de_y
+        || !planes->test1 || !planes->test2) {
+        throw std::runtime_error("native render metadata planes are incomplete");
+    }
+    const double zoom_value = static_cast<double>(zoom);
+    const double center_real = static_cast<double>(x_center);
+    const double center_imag = static_cast<double>(y_center);
+    if (!valid_escape_radius_mode(escape_radius_mode)) {
+        throw std::runtime_error("unknown escape-radius mode");
+    }
+    if (!valid_coordinate_mode(coordinate_mode)) {
+        throw std::runtime_error("unknown coordinate mode");
+    }
+    if (!valid_formula(formula)) {
+        throw std::runtime_error("unknown fractal formula");
+    }
+    const double log_formula_power = std::log(
+        static_cast<double>(formula_power(formula)));
+    if (!std::isfinite(zoom_value) || zoom_value <= 0.0
+        || !std::isfinite(center_real) || !std::isfinite(center_imag)) {
+        throw std::runtime_error("direct native coordinates or zoom exceed double range");
+    }
+    const double height_span = viewport_height_factor(coordinate_mode) / zoom_value;
+    const double width_span = height_span * static_cast<double>(width)
+        / static_cast<double>(height);
+    if (!std::isfinite(height_span) || !std::isfinite(width_span)) {
+        throw std::runtime_error("direct native viewport is outside double range");
+    }
+    // This is the screen-space scale used by Kalles' analytic DE formula.
+    // Keep it beside the direct viewport geometry so shallow metadata and
+    // deep/BLA metadata use the same unit convention.
+    const FloatExp pixel_spacing = FloatExp::from_parts(
+        height_span / static_cast<double>(height),
+        0);
+    std::vector<double> x_coordinates(static_cast<size_t>(width));
+    std::vector<double> y_coordinates(static_cast<size_t>(height));
+    for (int px = 0; px < width; ++px) {
+        const double x_offset =
+            pixel_axis_offset(px, width, coordinate_mode)
+            * width_span / static_cast<double>(width);
+        x_coordinates[static_cast<size_t>(px)] = center_real + x_offset;
+    }
+    for (int py = 0; py < height; ++py) {
+        const double y_offset =
+            -pixel_axis_offset(py, height, coordinate_mode)
+            * height_span / static_cast<double>(height);
+        y_coordinates[static_cast<size_t>(py)] = center_imag + y_offset;
+    }
+    const bool skip_analytic_de =
+        (plane_flags & FRACTAL_RENDER_HINT_SKIP_ANALYTIC_DE) != 0;
+    switch (formula) {
+        case FRACTAL_FORMULA_MANDELBROT:
+            if (skip_analytic_de) {
+                render_direct_with_planes_formula<
+                    FRACTAL_FORMULA_MANDELBROT, false>(
+                    output, width, height, x_coordinates, y_coordinates,
+                    max_iter, threads, julia_real, julia_imag, output_bias,
+                    escape_radius_mode, log_formula_power, pixel_spacing,
+                    plane_flags, planes);
+            } else {
+                render_direct_with_planes_formula<
+                    FRACTAL_FORMULA_MANDELBROT, true>(
+                    output, width, height, x_coordinates, y_coordinates,
+                    max_iter, threads, julia_real, julia_imag, output_bias,
+                    escape_radius_mode, log_formula_power, pixel_spacing,
+                    plane_flags, planes);
+            }
+            return;
+        case FRACTAL_FORMULA_JULIA:
+            if (skip_analytic_de) {
+                render_direct_with_planes_formula<FRACTAL_FORMULA_JULIA, false>(
+                    output, width, height, x_coordinates, y_coordinates,
+                    max_iter, threads, julia_real, julia_imag, output_bias,
+                    escape_radius_mode, log_formula_power, pixel_spacing,
+                    plane_flags, planes);
+            } else {
+                render_direct_with_planes_formula<FRACTAL_FORMULA_JULIA, true>(
+                    output, width, height, x_coordinates, y_coordinates,
+                    max_iter, threads, julia_real, julia_imag, output_bias,
+                    escape_radius_mode, log_formula_power, pixel_spacing,
+                    plane_flags, planes);
+            }
+            return;
+        case FRACTAL_FORMULA_BURNING_SHIP:
+            render_direct_with_planes_formula<
+                FRACTAL_FORMULA_BURNING_SHIP, false>(
+                output, width, height, x_coordinates, y_coordinates,
+                max_iter, threads, julia_real, julia_imag, output_bias,
+                escape_radius_mode, log_formula_power, pixel_spacing,
+                plane_flags, planes);
+            return;
+        case FRACTAL_FORMULA_TRICORN:
+            render_direct_with_planes_formula<FRACTAL_FORMULA_TRICORN, false>(
+                output, width, height, x_coordinates, y_coordinates,
+                max_iter, threads, julia_real, julia_imag, output_bias,
+                escape_radius_mode, log_formula_power, pixel_spacing,
+                plane_flags, planes);
+            return;
+        default:
+            throw std::runtime_error("unknown fractal formula");
     }
 }
 
@@ -3909,6 +10545,8 @@ struct MpfrWorkspace {
     mpfr_t cx, cy, viewport_zoom, viewport_radius;
     mpfr_t parameter_real, parameter_imag;
     mpfr_t zr, zi, next_real, next_imag, temporary;
+    mpfr_t derivative_real, derivative_imag;
+    mpfr_t next_derivative_real, next_derivative_imag, temporary2;
     mpfr_t absolute_real, absolute_imag, norm_squared, margin;
     // Scratch values for recovering the repelling fixed point used by Julia
     // catalogue targets.  Iterating a finite decimal approximation is not a
@@ -3932,6 +10570,11 @@ struct MpfrWorkspace {
         mpfr_init2(next_real, precision_bits);
         mpfr_init2(next_imag, precision_bits);
         mpfr_init2(temporary, precision_bits);
+        mpfr_init2(derivative_real, precision_bits);
+        mpfr_init2(derivative_imag, precision_bits);
+        mpfr_init2(next_derivative_real, precision_bits);
+        mpfr_init2(next_derivative_imag, precision_bits);
+        mpfr_init2(temporary2, precision_bits);
         mpfr_init2(absolute_real, precision_bits);
         mpfr_init2(absolute_imag, precision_bits);
         mpfr_init2(norm_squared, precision_bits);
@@ -3958,6 +10601,8 @@ struct MpfrWorkspace {
             cx, cy, viewport_zoom, viewport_radius,
             parameter_real, parameter_imag, zr, zi,
             next_real, next_imag, temporary,
+            derivative_real, derivative_imag,
+            next_derivative_real, next_derivative_imag, temporary2,
             absolute_real, absolute_imag, norm_squared, margin,
             discriminant_real, discriminant_imag, discriminant_magnitude,
             root_real, root_imag,
@@ -3979,16 +10624,23 @@ void make_reference_orbit(
     int precision_bits,
     int formula,
     const char* julia_real_text,
-    const char* julia_imag_text
+    const char* julia_imag_text,
+    int escape_radius_mode,
+    int coordinate_mode
 ) {
     if (!valid_c_string(x_text) || !valid_c_string(y_text)
         || (viewport_zoom_text && !valid_c_string(viewport_zoom_text))
         || !valid_formula(formula)
+        || !valid_escape_radius_mode(escape_radius_mode)
+        || !valid_coordinate_mode(coordinate_mode)
         || !valid_c_string(julia_real_text)
         || !valid_c_string(julia_imag_text)) {
         throw std::runtime_error("native reference text is too long or null");
     }
     context.requested_max_iter = max_iter;
+    context.escape_radius_mode = escape_radius_mode;
+    context.x_center_text = x_text;
+    context.y_center_text = y_text;
     precision_bits = std::max(128, precision_bits);
     MpfrWorkspace workspace(static_cast<mpfr_prec_t>(precision_bits));
     mpfr_ptr cx = workspace.cx;
@@ -4029,7 +10681,10 @@ void make_reference_orbit(
         // Approximate diagonal half-span of the view.  BLA composition uses
         // this as the bound for |delta c|, so every cropped source frame is
         // covered by the same reusable approximation table.
-        mpfr_set_d(viewport_radius, 2.8, MPFR_RNDN);
+        mpfr_set_d(
+            viewport_radius,
+            viewport_height_factor(coordinate_mode),
+            MPFR_RNDN);
         mpfr_div(viewport_radius, viewport_radius, viewport_zoom, MPFR_RNDN);
         context.bla.input_radius = FloatExp::from_mpfr(viewport_radius);
     } else {
@@ -4149,7 +10804,11 @@ void make_reference_orbit(
         mpfr_mul(norm_squared, zr, zr, MPFR_RNDN);
         mpfr_mul(temporary, zi, zi, MPFR_RNDN);
         mpfr_add(norm_squared, norm_squared, temporary, MPFR_RNDN);
-        mpfr_sub_ui(margin, norm_squared, 4, MPFR_RNDN);
+        mpfr_set_d(
+            temporary,
+            static_cast<double>(escape_radius_squared_for_mode(escape_radius_mode)),
+            MPFR_RNDN);
+        mpfr_sub(margin, norm_squared, temporary, MPFR_RNDN);
         escape_margins.push_back(FloatExp::from_mpfr(margin));
         finite_orbit_size = context.fast_orbit.size();
         if (fixed_point_reference) continue;
@@ -4193,7 +10852,8 @@ void make_reference_orbit(
         throw std::runtime_error("reference orbit lost finite state at iteration zero");
     }
     context.bla.map_end = static_cast<int>(finite_orbit_size) - 1;
-    const FloatExp escape_radius_squared = FloatExp::from_parts(4.0, 0);
+    const FloatExp& escape_radius_squared =
+        escape_radius_squared_float_exp(escape_radius_mode);
     for (size_t index = 1; index < finite_orbit_size; ++index) {
         if (fe_compare(
                 fec_norm_squared(context.fast_orbit[index]),
@@ -4220,7 +10880,8 @@ void make_reference_orbit(
     if (formula != FRACTAL_FORMULA_MANDELBROT) {
         stabilize_alternate_reference_cycle(
             context.fast_orbit,
-            *render_orbit);
+            *render_orbit,
+            escape_radius_mode);
         // A false projected escape before cycle stabilization must not
         // shorten the alternate linear hierarchy. Recompute its endpoint
         // from the stabilized orbit; the exact perturbation loop still owns
@@ -4238,13 +10899,240 @@ void make_reference_orbit(
     context.orbit = std::move(render_orbit);
 }
 
+// A compact reference is deliberately stored with double mantissas, so a
+// parameter that diverges through a near-zero orbit can eventually cancel the
+// reference state more deeply than that representation can preserve.  A
+// strict atlas render must not turn that event into a guessed interior value.
+// Re-evaluate only the affected pixel with MPFR instead.  This is uncommon,
+// keeps the normal BLA path fast, and also gives the KFP colouriser the same
+// orbit/DE metadata as a successful perturbation render.
+bool render_exact_mandelbrot_pixel(
+    float& output,
+    size_t index,
+    const ReferenceContext& context,
+    const ScaledComplex& dc,
+    int max_iter,
+    double output_bias,
+    int escape_radius_mode,
+    const FloatExp& pixel_spacing,
+    FractalRenderPlanes* planes
+) {
+    if (context.x_center_text.empty() || context.y_center_text.empty()
+        || context.precision_bits < 128
+        || !sc_finite(dc)) {
+        return false;
+    }
+
+    // A point repair can contain thousands of glitch pixels. Reuse one MPFR
+    // scratch set per OpenMP worker instead of allocating and clearing a full
+    // high-precision workspace for every pixel. The viewport spacing also
+    // gives a tighter precision floor than the number of decorative decimal
+    // digits in the stored centre: retain a generous binary guard, but do not
+    // make every e100 repair pay for 170 decimal places that cannot affect a
+    // displayed pixel.
+    mpfr_prec_t exact_precision = context.precision_bits;
+    if (pixel_spacing.exponent < 0) {
+        const mpfr_prec_t spacing_precision = static_cast<mpfr_prec_t>(
+            -static_cast<long long>(pixel_spacing.exponent) + 128);
+        exact_precision = std::min(
+            exact_precision,
+            std::max<mpfr_prec_t>(256, spacing_precision));
+    }
+    thread_local std::unique_ptr<MpfrWorkspace> cached_workspace;
+    thread_local mpfr_prec_t cached_precision = 0;
+    if (!cached_workspace || cached_precision != exact_precision) {
+        cached_workspace = std::make_unique<MpfrWorkspace>(exact_precision);
+        cached_precision = exact_precision;
+    }
+    MpfrWorkspace& workspace = *cached_workspace;
+    if (mpfr_set_str(
+            workspace.parameter_real,
+            context.x_center_text.c_str(),
+            10,
+            MPFR_RNDN) != 0
+        || mpfr_set_str(
+            workspace.parameter_imag,
+            context.y_center_text.c_str(),
+            10,
+            MPFR_RNDN) != 0) {
+        return false;
+    }
+
+    // The point ABI supplies dc as an exact binary mantissa/exponent pair.
+    // Add that pair to the original decimal reference centre at the same
+    // precision as the MPFR orbit, instead of routing it through long double.
+    mpfr_set_d(workspace.temporary, dc.real, MPFR_RNDN);
+    mpfr_mul_2si(
+        workspace.temporary,
+        workspace.temporary,
+        static_cast<long>(dc.exponent),
+        MPFR_RNDN);
+    mpfr_add(
+        workspace.parameter_real,
+        workspace.parameter_real,
+        workspace.temporary,
+        MPFR_RNDN);
+    mpfr_set_d(workspace.temporary, dc.imag, MPFR_RNDN);
+    mpfr_mul_2si(
+        workspace.temporary,
+        workspace.temporary,
+        static_cast<long>(dc.exponent),
+        MPFR_RNDN);
+    mpfr_add(
+        workspace.parameter_imag,
+        workspace.parameter_imag,
+        workspace.temporary,
+        MPFR_RNDN);
+
+    mpfr_set_zero(workspace.zr, 0);
+    mpfr_set_zero(workspace.zi, 0);
+    mpfr_set_zero(workspace.derivative_real, 0);
+    mpfr_set_zero(workspace.derivative_imag, 0);
+    ScaledNorm previous_norm{};
+    const double escape_squared = escape_radius_squared_double(escape_radius_mode);
+
+    for (int iteration = 1; iteration <= max_iter; ++iteration) {
+        // z' = z^2 + c
+        mpfr_mul(workspace.next_real, workspace.zr, workspace.zr, MPFR_RNDN);
+        mpfr_mul(workspace.temporary, workspace.zi, workspace.zi, MPFR_RNDN);
+        mpfr_sub(workspace.next_real, workspace.next_real, workspace.temporary, MPFR_RNDN);
+        mpfr_mul(workspace.next_imag, workspace.zr, workspace.zi, MPFR_RNDN);
+        mpfr_mul_ui(workspace.next_imag, workspace.next_imag, 2, MPFR_RNDN);
+        mpfr_add(
+            workspace.next_real,
+            workspace.next_real,
+            workspace.parameter_real,
+            MPFR_RNDN);
+        mpfr_add(
+            workspace.next_imag,
+            workspace.next_imag,
+            workspace.parameter_imag,
+            MPFR_RNDN);
+
+        // dz'/dc = 2 z dz/dc + 1.  Keep the old z and derivative live until
+        // both components have been written to their separate scratch slots.
+        mpfr_mul(
+            workspace.next_derivative_real,
+            workspace.zr,
+            workspace.derivative_real,
+            MPFR_RNDN);
+        mpfr_mul(
+            workspace.temporary,
+            workspace.zi,
+            workspace.derivative_imag,
+            MPFR_RNDN);
+        mpfr_sub(
+            workspace.next_derivative_real,
+            workspace.next_derivative_real,
+            workspace.temporary,
+            MPFR_RNDN);
+        mpfr_mul_ui(
+            workspace.next_derivative_real,
+            workspace.next_derivative_real,
+            2,
+            MPFR_RNDN);
+        mpfr_add_ui(
+            workspace.next_derivative_real,
+            workspace.next_derivative_real,
+            1,
+            MPFR_RNDN);
+        mpfr_mul(
+            workspace.next_derivative_imag,
+            workspace.zr,
+            workspace.derivative_imag,
+            MPFR_RNDN);
+        mpfr_mul(
+            workspace.temporary,
+            workspace.zi,
+            workspace.derivative_real,
+            MPFR_RNDN);
+        mpfr_add(
+            workspace.next_derivative_imag,
+            workspace.next_derivative_imag,
+            workspace.temporary,
+            MPFR_RNDN);
+        mpfr_mul_ui(
+            workspace.next_derivative_imag,
+            workspace.next_derivative_imag,
+            2,
+            MPFR_RNDN);
+
+        mpfr_set(workspace.zr, workspace.next_real, MPFR_RNDN);
+        mpfr_set(workspace.zi, workspace.next_imag, MPFR_RNDN);
+        mpfr_set(
+            workspace.derivative_real,
+            workspace.next_derivative_real,
+            MPFR_RNDN);
+        mpfr_set(
+            workspace.derivative_imag,
+            workspace.next_derivative_imag,
+            MPFR_RNDN);
+
+        mpfr_mul(workspace.norm_squared, workspace.zr, workspace.zr, MPFR_RNDN);
+        mpfr_mul(workspace.temporary, workspace.zi, workspace.zi, MPFR_RNDN);
+        mpfr_add(
+            workspace.norm_squared,
+            workspace.norm_squared,
+            workspace.temporary,
+            MPFR_RNDN);
+        const ScaledNorm current_norm = sc_norm_squared(
+            ScaledComplex::from_float_exp(
+                FloatExp::from_mpfr(workspace.zr),
+                FloatExp::from_mpfr(workspace.zi)));
+        if (mpfr_cmp_d(workspace.norm_squared, escape_squared) > 0) {
+            // MPFR computes the logarithm before narrowing to the long-double
+            // smooth value, so a 32-bit field still receives the correct
+            // fractional escape iteration at a high bailout radius.
+            mpfr_log(workspace.temporary, workspace.norm_squared, MPFR_RNDN);
+            const long double log_magnitude = 0.5L * mpfr_get_ld(
+                workspace.temporary,
+                MPFR_RNDN);
+            if (!(log_magnitude > 0.0L)
+                || !std::isfinite(log_magnitude)) {
+                return false;
+            }
+            const long double smooth = static_cast<long double>(iteration)
+                - std::log(log_magnitude) / LOG_TWO;
+            output = encode_render_value(smooth, output_bias);
+            const ScaledComplex total = ScaledComplex::from_float_exp(
+                FloatExp::from_mpfr(workspace.zr),
+                FloatExp::from_mpfr(workspace.zi));
+            const ScaledComplex derivative = ScaledComplex::from_float_exp(
+                FloatExp::from_mpfr(workspace.derivative_real),
+                FloatExp::from_mpfr(workspace.derivative_imag));
+            store_render_planes_escape(
+                planes,
+                index,
+                kalles_mandelbrot_raw_iteration(iteration),
+                total,
+                current_norm,
+                previous_norm,
+                &derivative,
+                &pixel_spacing);
+            return true;
+        }
+        previous_norm = current_norm;
+    }
+
+    output = encode_render_iteration(max_iter, output_bias);
+    clear_render_planes_pixel(planes, index, max_iter);
+    return true;
+}
+
 #else
 
 void make_reference_orbit(
     ReferenceContext&, const char*, const char*, const char*, int, int,
-    int, const char*, const char*
+    int, const char*, const char*, int, int
 ) {
     throw std::runtime_error("deep rendering requires MPFR/GMP; rebuild with make");
+}
+
+bool render_exact_mandelbrot_pixel(
+    float&, size_t, const ReferenceContext&, const ScaledComplex&, int,
+    double, int, const FloatExp&, FractalRenderPlanes*
+) {
+    return false;
 }
 
 #endif
@@ -4268,7 +11156,8 @@ bool series_probe_is_safe(
     const FloatExpComplex& exact_delta,
     const FloatExpComplex& approximate_delta,
     const FloatExp& minimum_scale_squared,
-    const FloatExp& tolerance_squared
+    const FloatExp& tolerance_squared,
+    int escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC
 ) {
     const FloatExpComplex error = fec_sub(approximate_delta, exact_delta);
     FloatExp scale = fec_norm_squared(exact_delta);
@@ -4277,10 +11166,12 @@ bool series_probe_is_safe(
     if (fe_compare(fec_norm_squared(error), allowed) > 0) return false;
 
     const bool exact_inside = fe_compare(
-        fec_escape_margin_with_delta(reference, exact_delta),
+        fec_escape_margin_with_delta(
+            reference, exact_delta, escape_radius_mode),
         FloatExp{0.0, 0}) <= 0;
     const bool approximate_inside = fe_compare(
-        fec_escape_margin_with_delta(reference, approximate_delta),
+        fec_escape_margin_with_delta(
+            reference, approximate_delta, escape_radius_mode),
         FloatExp{0.0, 0}) <= 0;
     // The image-wide series is a jump from iteration zero to this endpoint.
     // Matching an already-escaped probe is not sufficient: an orbit can cross
@@ -4394,7 +11285,8 @@ void build_image_series(
                         exact_next,
                         approximate,
                         minimum_scale_squared,
-                        tolerance_squared)) {
+                        tolerance_squared,
+                        context.escape_radius_mode)) {
                     safe = false;
                     break;
                 }
@@ -5133,11 +12025,17 @@ inline FloatExp alternate_escape_margin(
             delta);
     }
     return sc_escape_margin_with_delta(
-        orbit.scaled[static_cast<size_t>(reference_index)], delta);
+        orbit.scaled[static_cast<size_t>(reference_index)],
+        delta,
+        context.escape_radius_mode);
 }
 
-inline ScaledNorm norm_from_escape_margin(const FloatExp& margin) {
-    const FloatExp norm = fe_add(FloatExp::from_parts(4.0, 0), margin);
+inline ScaledNorm norm_from_escape_margin(
+    const FloatExp& margin,
+    int escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC
+) {
+    const FloatExp norm = fe_add(
+        escape_radius_squared_float_exp(escape_radius_mode), margin);
     return {norm.mantissa, norm.exponent};
 }
 
@@ -5152,17 +12050,23 @@ void render_alternate_reference_impl(
     const FractalRenderOptions& options,
     RenderStats* stats_out,
     const std::vector<ScaledComplex>* point_offsets = nullptr,
-    const FloatExp* point_radius = nullptr
+    const FloatExp* point_radius = nullptr,
+    FractalRenderPlanes* planes = nullptr
 ) {
     if (!context.orbit || context.orbit->scaled.size() < 2) {
         throw std::runtime_error("alternate reference orbit is incomplete");
     }
     const auto render_started = std::chrono::steady_clock::now();
+    const int escape_radius_mode = options.escape_radius_mode;
     const FloatExp zoom = parse_zoom_float_exp(zoom_text, context.precision_bits);
     const FloatExp view_height = fe_mul(
-        fe_div(FloatExp::from_parts(1.0, 0), zoom), 2.8);
+        fe_div(FloatExp::from_parts(1.0, 0), zoom),
+        viewport_height_factor(options.coordinate_mode));
     const FloatExp view_width = fe_mul(
         view_height, static_cast<double>(width) / static_cast<double>(height));
+    const FloatExp pixel_spacing = fe_div(
+        view_height,
+        FloatExp::from_parts(static_cast<double>(height), 0));
     std::vector<FloatExp> x_offsets;
     std::vector<FloatExp> y_offsets;
     if (point_offsets == nullptr) {
@@ -5170,13 +12074,13 @@ void render_alternate_reference_impl(
         y_offsets.resize(static_cast<size_t>(height));
         for (int px = 0; px < width; ++px) {
             const double fraction =
-                (static_cast<double>(px) - static_cast<double>(width - 1) / 2.0)
+                pixel_axis_offset(px, width, options.coordinate_mode)
                 / static_cast<double>(width);
             x_offsets[static_cast<size_t>(px)] = fe_mul(view_width, fraction);
         }
         for (int py = 0; py < height; ++py) {
             const double fraction =
-                (static_cast<double>(height - 1) / 2.0 - static_cast<double>(py))
+                -pixel_axis_offset(py, height, options.coordinate_mode)
                 / static_cast<double>(height);
             y_offsets[static_cast<size_t>(py)] = fe_mul(view_height, fraction);
         }
@@ -5219,6 +12123,7 @@ void render_alternate_reference_impl(
         const int py = linear_pixel / width;
         const int px = linear_pixel - py * width;
         const int index = py * width + px;
+        clear_render_planes_pixel(planes, static_cast<size_t>(index), max_iter);
         const ScaledComplex dc = point_offsets != nullptr
             ? (*point_offsets)[static_cast<size_t>(linear_pixel)]
             : ScaledComplex::from_float_exp(
@@ -5231,6 +12136,7 @@ void render_alternate_reference_impl(
             parameter_norm.exponent,
         };
         ScaledComplex delta = dc;
+        AlternateJacobian jacobian = alternate_identity_jacobian();
         int reference_index = julia ? 0 : 1;
         int iteration = julia ? 0 : 1;
         if (image_series_available
@@ -5240,7 +12146,12 @@ void render_alternate_reference_impl(
                     context.image_series.radius_squared.mantissa,
                     context.image_series.radius_squared.exponent,
                 }) <= 0) {
-            delta = evaluate_image_series(context.image_series, dc);
+            ScaledComplex series_derivative{};
+            delta = evaluate_image_series_with_derivative(
+                context.image_series,
+                dc,
+                series_derivative);
+            jacobian = alternate_holomorphic_jacobian(series_derivative);
             reference_index = context.image_series.iteration;
             iteration = context.image_series.iteration;
         }
@@ -5251,10 +12162,37 @@ void render_alternate_reference_impl(
         ScaledComplex total = sc_add(
             context.orbit->scaled[static_cast<size_t>(reference_index)], delta);
         ScaledNorm total_norm = norm_from_escape_margin(
-            alternate_escape_margin(context, reference_index, delta));
+            alternate_escape_margin(context, reference_index, delta),
+            escape_radius_mode);
+        ScaledNorm palette_norm = planes != nullptr
+            ? sc_norm_squared(total)
+            : ScaledNorm{};
 
-        if (sc_outside_escape(total_norm)) {
+        const auto store_alternate_escape = [&](int escaped_iteration,
+                                                const ScaledComplex& escaped_total,
+                                                const ScaledNorm& previous_norm) {
+            if (planes == nullptr) return;
+            const ScaledNorm current_norm = sc_norm_squared(escaped_total);
+            // Julia starts by testing the pixel's initial z at iteration 0;
+            // the other alternate parameter-plane formulas start at z_1,
+            // just like the deep Mandelbrot path.
+            const int raw_iteration = julia
+                ? escaped_iteration
+                : kalles_mandelbrot_raw_iteration(escaped_iteration);
+            store_render_planes_escape_jacobian(
+                planes,
+                static_cast<size_t>(index),
+                raw_iteration,
+                escaped_total,
+                current_norm,
+                previous_norm,
+                jacobian,
+                pixel_spacing);
+        };
+
+        if (sc_outside_escape(total_norm, escape_radius_mode)) {
             output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
+            store_alternate_escape(iteration, total, ScaledNorm{});
             continue;
         }
 
@@ -5281,14 +12219,23 @@ void render_alternate_reference_impl(
                 const ScaledComplex parameter = julia
                     ? context.parameter
                     : sc_add(context.parameter, dc);
+                const ScaledNorm previous_palette_norm = palette_norm;
+                const ScaledComplex previous_total = total;
+                jacobian = alternate_jacobian_step(
+                    context.formula,
+                    previous_total,
+                    jacobian,
+                    !julia);
                 total = scaled_formula_step(context.formula, total, parameter);
                 ++iteration;
                 total_norm = sc_norm_squared(total);
-                if (sc_outside_escape(total_norm)) {
+                if (sc_outside_escape(total_norm, escape_radius_mode)) {
                     output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
+                    store_alternate_escape(iteration, total, previous_palette_norm);
                     escaped = true;
                     break;
                 }
+                if (planes != nullptr) palette_norm = sc_norm_squared(total);
                 continue;
             }
 
@@ -5304,6 +12251,7 @@ void render_alternate_reference_impl(
                 && reference_index + linear_step->length
                     < static_cast<int>(context.orbit->scaled.size())) {
                 const ScaledComplex previous_delta = delta;
+                const AlternateJacobian previous_jacobian = jacobian;
                 const int previous_reference_index = reference_index;
                 const int previous_iteration = iteration;
                 const int endpoint_index = reference_index + linear_step->length;
@@ -5312,7 +12260,7 @@ void render_alternate_reference_impl(
                 const FloatExp candidate_margin = alternate_escape_margin(
                     context, endpoint_index, candidate_delta);
                 const ScaledNorm candidate_norm = norm_from_escape_margin(
-                    candidate_margin);
+                    candidate_margin, escape_radius_mode);
                 const ScaledComplex candidate_total = sc_add(
                     context.orbit->scaled[static_cast<size_t>(endpoint_index)],
                     candidate_delta);
@@ -5323,10 +12271,15 @@ void render_alternate_reference_impl(
                     || sc_compare_norm(candidate_norm, ScaledNorm{0.75, 2}) >= 0;
                 if (!candidate_bad) {
                     delta = candidate_delta;
+                    jacobian = alternate_linear_bla_jacobian(
+                        linear_step->coefficients,
+                        jacobian,
+                        !julia);
                     reference_index = endpoint_index;
                     iteration = previous_iteration + linear_step->length;
                     total = candidate_total;
                     total_norm = candidate_norm;
+                    if (planes != nullptr) palette_norm = sc_norm_squared(total);
                     continue;
                 }
 
@@ -5336,11 +12289,21 @@ void render_alternate_reference_impl(
                 // formula-aware step at a time. This is also where Burning
                 // Ship axis crossings are handled exactly.
                 delta = previous_delta;
+                jacobian = previous_jacobian;
                 reference_index = previous_reference_index;
                 iteration = previous_iteration;
                 for (int replay = 0;
                      replay < linear_step->length && iteration < max_iter;
                      ++replay) {
+                    const ScaledNorm previous_replay_norm = palette_norm;
+                    const ScaledComplex previous_total = sc_add(
+                        context.orbit->scaled[static_cast<size_t>(reference_index)],
+                        delta);
+                    jacobian = alternate_jacobian_step(
+                        context.formula,
+                        previous_total,
+                        jacobian,
+                        !julia);
                     delta = alternate_delta_step(
                         context, reference_index, delta, parameter_delta);
                     ++reference_index;
@@ -5354,21 +12317,33 @@ void render_alternate_reference_impl(
                     }
                     const FloatExp replay_margin = alternate_escape_margin(
                         context, reference_index, delta);
-                    total_norm = norm_from_escape_margin(replay_margin);
+                    total_norm = norm_from_escape_margin(
+                        replay_margin, escape_radius_mode);
                     total = sc_add(
                         context.orbit->scaled[static_cast<size_t>(reference_index)],
                         delta);
                     if (fe_compare(replay_margin, FloatExp{0.0, 0}) > 0
-                        || sc_outside_escape(total_norm)) {
+                        || sc_outside_escape(total_norm, escape_radius_mode)) {
                         output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
+                        store_alternate_escape(iteration, total, previous_replay_norm);
                         escaped = true;
                         break;
                     }
+                    if (planes != nullptr) palette_norm = sc_norm_squared(total);
                 }
                 if (escaped || unresolved_pixel) break;
                 continue;
             }
 
+            const ScaledNorm previous_palette_norm = palette_norm;
+            const ScaledComplex previous_total = sc_add(
+                context.orbit->scaled[static_cast<size_t>(reference_index)],
+                delta);
+            jacobian = alternate_jacobian_step(
+                context.formula,
+                previous_total,
+                jacobian,
+                !julia);
             delta = alternate_delta_step(
                 context, reference_index, delta, parameter_delta);
             reference_index = next_index;
@@ -5382,15 +12357,17 @@ void render_alternate_reference_impl(
             }
             const FloatExp margin = alternate_escape_margin(
                 context, reference_index, delta);
-            total_norm = norm_from_escape_margin(margin);
+            total_norm = norm_from_escape_margin(margin, escape_radius_mode);
             total = sc_add(
                 context.orbit->scaled[static_cast<size_t>(reference_index)], delta);
             if (fe_compare(margin, FloatExp{0.0, 0}) > 0
-                || sc_outside_escape(total_norm)) {
+                || sc_outside_escape(total_norm, escape_radius_mode)) {
                 output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
+                store_alternate_escape(iteration, total, previous_palette_norm);
                 escaped = true;
                 break;
             }
+            if (planes != nullptr) palette_norm = sc_norm_squared(total);
 
             // Confirm a bounded cycle several times before declaring the
             // pixel interior. The perturbation is included in the comparison,
@@ -5415,6 +12392,10 @@ void render_alternate_reference_impl(
                         ++cycle_hits;
                         if (cycle_hits >= 3) {
                             output[index] = encode_render_iteration(max_iter, options.output_bias);
+                            clear_render_planes_pixel(
+                                planes,
+                                static_cast<size_t>(index),
+                                max_iter);
                             escaped = true;
                             break;
                         }
@@ -5432,6 +12413,7 @@ void render_alternate_reference_impl(
         }
         if (!escaped && !deadline_abort && !unresolved_pixel) {
             output[index] = encode_render_iteration(max_iter, options.output_bias);
+            clear_render_planes_pixel(planes, static_cast<size_t>(index), max_iter);
         }
     }
     if (stats_out != nullptr) {
@@ -5452,15 +12434,21 @@ bool render_scaled_double_tail(
     int& iteration,
     int& reference_index,
     ScaledComplex delta,
+    ScaledComplex& derivative,
     bool disable_cycle_detection,
     bool strict_cycle_detection,
     bool strict_render,
     double output_bias,
+    int escape_radius_mode,
     RenderTimeBudget* time_budget,
     std::uint32_t& budget_ticks,
     bool& deadline_abort,
     bool& unresolved_tail,
-    RenderStats* stats
+    RenderStats* stats,
+    FractalRenderPlanes* planes = nullptr,
+    size_t plane_index = 0,
+    const ScaledNorm* initial_norm = nullptr,
+    const FloatExp* pixel_spacing = nullptr
 ) {
     constexpr int MAX_TAIL_REBASES = 64;
     // A normal 960x540 probe at this location already needs about 4.6k
@@ -5470,6 +12458,8 @@ bool render_scaled_double_tail(
     constexpr int MAX_TAIL_STEPS = 65536;
     const double dc_real = sc_to_double(dc);
     const double dc_imag = std::ldexp(dc.imag, dc.exponent);
+    const double escape_squared = escape_radius_squared_double(escape_radius_mode);
+    const double safe_escape_squared = escape_squared + 1.0e-7;
     double delta_real = sc_to_double(delta);
     double delta_imag = std::ldexp(delta.imag, delta.exponent);
     output = encode_render_iteration(max_iter, output_bias);
@@ -5480,6 +12470,8 @@ bool render_scaled_double_tail(
     int tail_steps = 0;
     int tail_iterations = 0;
     int tail_rebases = 0;
+    ScaledNorm previous_norm = initial_norm != nullptr
+        ? *initial_norm : ScaledNorm{};
     bool cycle_ready = false;
     while (iteration < max_iter
         && reference_index >= 0
@@ -5498,6 +12490,18 @@ bool render_scaled_double_tail(
             context.orbit->real_double[static_cast<size_t>(reference_index)];
         const double reference_imag =
             context.orbit->imag_double[static_cast<size_t>(reference_index)];
+        // The double tail still needs the same derivative recurrence as the
+        // scaled perturbation path.  Build the current total before taking
+        // the next step; d(z²+c)/dc = 2*z*dz/dc + 1.
+        ScaledComplex prior_total{
+            reference_real + delta_real,
+            reference_imag + delta_imag,
+            0,
+        };
+        prior_total.normalize();
+        derivative = sc_add(
+            sc_double(sc_mul(prior_total, derivative)),
+            ScaledComplex{1.0, 0.0, 0});
         const double linear_real = 2.0 * (reference_real * delta_real - reference_imag * delta_imag);
         const double linear_imag = 2.0 * (reference_real * delta_imag + reference_imag * delta_real);
         const double square_real = delta_real * delta_real - delta_imag * delta_imag;
@@ -5541,14 +12545,28 @@ bool render_scaled_double_tail(
                 : encode_render_iteration(iteration, output_bias);
             return false;
         }
-        if (magnitude_squared > 4.0) {
-            const double magnitude = std::sqrt(std::max(magnitude_squared, 4.0000001));
+        if (magnitude_squared > escape_squared) {
+            const double magnitude = std::sqrt(
+                std::max(magnitude_squared, safe_escape_squared));
             output = encode_render_value(
                 static_cast<long double>(iteration)
                     - std::log(std::log(magnitude)) / static_cast<double>(LOG_TWO),
                 output_bias);
+            ScaledComplex escaped_total{total_real, total_imag, 0};
+            escaped_total.normalize();
+            const ScaledNorm current_norm = scaled_norm_from_double(magnitude_squared);
+            store_render_planes_escape(
+                planes,
+                plane_index,
+                kalles_mandelbrot_raw_iteration(iteration),
+                escaped_total,
+                current_norm,
+                previous_norm,
+                &derivative,
+                pixel_spacing);
             return false;
         }
+        previous_norm = scaled_norm_from_double(magnitude_squared);
         const double delta_magnitude_squared =
             delta_real * delta_real + delta_imag * delta_imag;
 
@@ -5581,6 +12599,7 @@ bool render_scaled_double_tail(
                     && magnitude_squared < 3.0
                     && cycle_distance_squared
                         <= cycle_tolerance * std::max(1.0, magnitude_squared)) {
+                    clear_render_planes_pixel(planes, plane_index, max_iter);
                     return false;
                 }
                 ++cycle_length;
@@ -5606,10 +12625,11 @@ bool render_scaled_double_tail(
                     ++stats->unresolved_pixels;
                 }
                 unresolved_tail = true;
-                output = strict_render
-                    ? std::numeric_limits<float>::quiet_NaN()
-                    : encode_render_iteration(iteration, output_bias);
-                return true;
+            output = strict_render
+                ? std::numeric_limits<float>::quiet_NaN()
+                : encode_render_iteration(iteration, output_bias);
+            clear_render_planes_pixel(planes, plane_index, max_iter);
+            return true;
             }
         }
     }
@@ -5621,6 +12641,7 @@ bool render_scaled_double_tail(
         output = strict_render
             ? std::numeric_limits<float>::quiet_NaN()
             : encode_render_iteration(iteration, output_bias);
+        clear_render_planes_pixel(planes, plane_index, max_iter);
     }
     return false;
 }
@@ -5640,17 +12661,26 @@ void render_bla_impl(
     const FractalRenderOptions& options,
     RenderStats* stats_out,
     const std::vector<ScaledComplex>* point_offsets = nullptr,
-    const FloatExp* point_radius = nullptr
+    const FloatExp* point_radius = nullptr,
+    FractalRenderPlanes* planes = nullptr
 ) {
     const auto render_started = std::chrono::steady_clock::now();
+    const int escape_radius_mode = options.escape_radius_mode;
     const FloatExp zoom = parse_zoom_float_exp(zoom_text, context.precision_bits);
     const FloatExp inverse_zoom = fe_div(FloatExp::from_parts(1.0, 0), zoom);
-    const FloatExp view_height = fe_mul(inverse_zoom, 2.8);
+    const FloatExp view_height = fe_mul(
+        inverse_zoom,
+        viewport_height_factor(options.coordinate_mode));
     const FloatExp view_width = fe_mul(
         view_height, static_cast<double>(width) / static_cast<double>(height));
+    const FloatExp pixel_spacing = fe_div(
+        view_height,
+        FloatExp::from_parts(static_cast<double>(height), 0));
     const FloatExp current_input_radius = point_radius != nullptr
         ? *point_radius
-        : fe_mul(inverse_zoom, 2.8);
+        : fe_mul(
+            inverse_zoom,
+            viewport_height_factor(options.coordinate_mode));
     const bool bla_radius_covers_view =
         fe_compare(current_input_radius, context.bla.input_radius) <= 0;
     const bool disable_bla = !bla_radius_covers_view || options.disable_bla != 0;
@@ -5716,13 +12746,13 @@ void render_bla_impl(
         y_offsets.resize(static_cast<size_t>(height));
         for (int py = 0; py < height; ++py) {
             const double y_fraction =
-                (static_cast<double>(height - 1) / 2.0 - static_cast<double>(py))
+                -pixel_axis_offset(py, height, options.coordinate_mode)
                 / static_cast<double>(height);
             y_offsets[static_cast<size_t>(py)] = fe_mul(view_height, y_fraction);
         }
         for (int px = 0; px < width; ++px) {
             const double x_fraction =
-                (static_cast<double>(px) - static_cast<double>(width - 1) / 2.0)
+                pixel_axis_offset(px, width, options.coordinate_mode)
                 / static_cast<double>(width);
             x_offsets[static_cast<size_t>(px)] = fe_mul(view_width, x_fraction);
         }
@@ -5789,7 +12819,12 @@ void render_bla_impl(
                     x_offsets[static_cast<size_t>(px)],
                     y_offsets[static_cast<size_t>(py)]);
             const int index = py * width + px;
+            clear_render_planes_pixel(planes, static_cast<size_t>(index), max_iter);
             ScaledComplex delta = dc;
+            // Mandelbrot parameter-plane derivative dz/dc at z_1=c is one.
+            // It is carried in the same scaled representation as delta so a
+            // Kalles analytic-DE palette remains useful at e100 and beyond.
+            ScaledComplex derivative{1.0, 0.0, 0};
             int reference_index = 1;
             int iteration = 1;
             if (image_series_available
@@ -5803,7 +12838,10 @@ void render_bla_impl(
                 // the same early reference iterations for every pixel.  The
                 // ordinary perturbation/BLA path remains responsible for the
                 // rest of the orbit and for all escape/rebase checks.
-                delta = evaluate_image_series(context.image_series, dc);
+                delta = evaluate_image_series_with_derivative(
+                    context.image_series,
+                    dc,
+                    derivative);
                 reference_index = context.image_series.iteration;
                 iteration = context.image_series.iteration;
                 if constexpr (CollectStats) {
@@ -5815,6 +12853,7 @@ void render_bla_impl(
             bool have_total = false;
             ScaledComplex total{};
             ScaledNorm total_norm{};
+            ScaledNorm previous_total_norm{};
             ScaledComplex cycle_tortoise{};
             int cycle_power = 1;
             int cycle_length = 0;
@@ -5839,6 +12878,15 @@ void render_bla_impl(
                 if (reference_index < 0
                     || reference_index >= static_cast<int>(context.orbit->scaled.size())) {
                     output[index] = encode_render_iteration(iteration, options.output_bias);
+                    store_render_planes_escape(
+                        planes,
+                        static_cast<size_t>(index),
+                        kalles_mandelbrot_raw_iteration(iteration),
+                        total,
+                        total_norm,
+                        previous_total_norm,
+                        &derivative,
+                        &pixel_spacing);
                     escaped = true;
                     break;
                 }
@@ -5847,7 +12895,8 @@ void render_bla_impl(
                         context.orbit->scaled[static_cast<size_t>(reference_index)], delta);
                     total_norm = sc_norm_squared_with_delta(
                         context.orbit->scaled[static_cast<size_t>(reference_index)],
-                        delta);
+                        delta,
+                        escape_radius_mode);
                 }
                 have_total = false;
                 // A compact scaled reference keeps only a double mantissa,
@@ -5869,6 +12918,30 @@ void render_bla_impl(
                     && fe_compare(
                         FloatExp{total_norm.mantissa, total_norm.exponent},
                         fe_mul(reference_norm, 1.0e-7)) < 0) {
+                    if constexpr (CollectStats) ++stats->glitch_count;
+                    if (point_offsets != nullptr
+                        && options.strict != 0
+                        && static_cast<std::size_t>(width)
+                            * static_cast<std::size_t>(height)
+                            <= MAX_EXACT_POINT_REPAIR_PIXELS
+                        && render_exact_mandelbrot_pixel(
+                            output[index],
+                            static_cast<size_t>(index),
+                            context,
+                            dc,
+                            max_iter,
+                            options.output_bias,
+                            escape_radius_mode,
+                            pixel_spacing,
+                            planes)) {
+                        // The compact path found a genuine cancellation, but
+                        // the MPFR rebase produced the exact pixel and its
+                        // KFP metadata. Treat it as complete so the Python
+                        // atlas does not split a correct single-pixel repair
+                        // into a much slower reference tree.
+                        escaped = true;
+                        break;
+                    }
                     // The compact reference has lost enough low bits for a
                     // direct subtraction to be unsafe.  Live/draft callers
                     // explicitly allow recovery, so rebase from the already
@@ -5887,16 +12960,25 @@ void render_bla_impl(
                     output[index] = std::numeric_limits<float>::quiet_NaN();
                     unresolved_pixel = true;
                     if constexpr (CollectStats) {
-                        ++stats->glitch_count;
                         ++stats->unresolved_pixels;
                     }
                     break;
                 }
-                if (sc_outside_escape(total_norm)
+                if (sc_outside_escape(total_norm, escape_radius_mode)
                     || sc_outside_escape_with_delta(
                         reference_state,
-                        delta)) {
+                        delta,
+                        escape_radius_mode)) {
                     output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
+                    store_render_planes_escape(
+                        planes,
+                        static_cast<size_t>(index),
+                        kalles_mandelbrot_raw_iteration(iteration),
+                        total,
+                        total_norm,
+                        previous_total_norm,
+                        &derivative,
+                        &pixel_spacing);
                     escaped = true;
                     break;
                 }
@@ -5970,6 +13052,10 @@ void render_bla_impl(
                                 }
                                 break;
                             }
+                            const ScaledNorm prior_norm = total_norm;
+                            derivative = sc_add(
+                                sc_double(sc_mul(total, derivative)),
+                                ScaledComplex{1.0, 0.0, 0});
                             total = sc_add(sc_mul(total, total), parameter);
                             ++iteration;
                             if constexpr (CollectStats) {
@@ -5977,11 +13063,21 @@ void render_bla_impl(
                                 ++stats->exact_steps;
                             }
                             total_norm = sc_norm_squared(total);
-                            if (sc_outside_escape(total_norm)) {
+                            if (sc_outside_escape(total_norm, escape_radius_mode)) {
                                 output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
+                                store_render_planes_escape(
+                                    planes,
+                                    static_cast<size_t>(index),
+                                    kalles_mandelbrot_raw_iteration(iteration),
+                                    total,
+                                    total_norm,
+                                    prior_norm,
+                                    &derivative,
+                                    &pixel_spacing);
                                 escaped = true;
                                 break;
                             }
+                            previous_total_norm = prior_norm;
                             // Once a pixel has left the compact reference
                             // orbit, it still needs an interior exit. Without
                             // this check the live path iterates every settled
@@ -6062,6 +13158,10 @@ void render_bla_impl(
                             }
                             break;
                         }
+                        const ScaledNorm prior_norm = total_norm;
+                        derivative = sc_add(
+                            sc_double(sc_mul(total, derivative)),
+                            ScaledComplex{1.0, 0.0, 0});
                         total = sc_add(
                             sc_mul(total, total),
                             parameter);
@@ -6071,11 +13171,21 @@ void render_bla_impl(
                             ++stats->exact_steps;
                         }
                         total_norm = sc_norm_squared(total);
-                        if (sc_outside_escape(total_norm)) {
+                        if (sc_outside_escape(total_norm, escape_radius_mode)) {
                             output[index] = smooth_escape_scaled(iteration, total_norm, options.output_bias);
+                            store_render_planes_escape(
+                                planes,
+                                static_cast<size_t>(index),
+                                kalles_mandelbrot_raw_iteration(iteration),
+                                total,
+                                total_norm,
+                                prior_norm,
+                                &derivative,
+                                &pixel_spacing);
                             escaped = true;
                             break;
                         }
+                        previous_total_norm = prior_norm;
                         if (cycle_detection_enabled
                             && iteration >= cycle_minimum_iteration
                             && (iteration & 31) == 0
@@ -6160,31 +13270,49 @@ void render_bla_impl(
                             ? render_scaled_double_tail<CollectStats, true>(
                                 output[index], dc, context, max_iter,
                                 iteration, reference_index, delta,
+                                derivative,
                                 !cycle_detection_enabled, strict_cycle_detection,
                                 options.strict != 0,
                                 options.output_bias,
+                                escape_radius_mode,
                                 time_budget, budget_ticks, deadline_abort,
                                 unresolved_pixel,
-                                stats)
+                                stats,
+                                planes,
+                                static_cast<size_t>(index),
+                                &total_norm,
+                                &pixel_spacing)
                             : render_scaled_double_tail<CollectStats, false>(
                                 output[index], dc, context, max_iter,
                                 iteration, reference_index, delta,
+                                derivative,
                                 !cycle_detection_enabled, strict_cycle_detection,
                                 options.strict != 0,
                                 options.output_bias,
+                                escape_radius_mode,
                                 time_budget, budget_ticks, deadline_abort,
                                 unresolved_pixel,
-                                stats);
+                                stats,
+                                planes,
+                                static_cast<size_t>(index),
+                                &total_norm,
+                                &pixel_spacing);
                     } else {
                         tail_pathological = render_scaled_double_tail<CollectStats, false>(
                             output[index], dc, context, max_iter,
                             iteration, reference_index, delta,
+                            derivative,
                             true, strict_cycle_detection,
                             options.strict != 0,
                             options.output_bias,
+                            escape_radius_mode,
                             time_budget, budget_ticks, deadline_abort,
                             unresolved_pixel,
-                            stats);
+                            stats,
+                            planes,
+                            static_cast<size_t>(index),
+                            &total_norm,
+                            &pixel_spacing);
                     }
                     if (deadline_abort) break;
                     if (unresolved_pixel) break;
@@ -6200,6 +13328,7 @@ void render_bla_impl(
                         // Restart from the original dc and use the slower but
                         // bounded scaled-exact recurrence for this pixel.
                         delta = dc;
+                        derivative = ScaledComplex{1.0, 0.0, 0};
                         reference_index = 1;
                         iteration = 1;
                         have_total = false;
@@ -6221,6 +13350,7 @@ void render_bla_impl(
                         record_bla_length(stats, map_length);
                     }
                     const ScaledComplex previous_delta = delta;
+                    const ScaledComplex previous_derivative = derivative;
                     const int previous_reference_index = reference_index;
                     const int previous_iteration = iteration;
                     const ScaledComplex input_delta = delta;
@@ -6229,13 +13359,24 @@ void render_bla_impl(
                             sc_mul(linear_step->A, input_delta),
                             sc_mul(linear_step->B, dc))
                         : apply_bla_series(*step, input_delta, dc, effective_order);
+                    derivative = linear_step != nullptr
+                        ? sc_add(
+                            sc_mul(linear_step->A, previous_derivative),
+                            linear_step->B)
+                        : apply_bla_series_derivative(
+                            *step,
+                            input_delta,
+                            dc,
+                            previous_derivative,
+                            effective_order);
                     reference_index += map_length;
                     iteration += map_length;
                     const ScaledComplex endpoint = sc_add(
                         context.orbit->scaled[static_cast<size_t>(reference_index)], delta);
                     const ScaledNorm endpoint_norm = sc_norm_squared_with_delta(
                         context.orbit->scaled[static_cast<size_t>(reference_index)],
-                        delta);
+                        delta,
+                        escape_radius_mode);
                     // A block that approaches the escape boundary is replayed
                     // one iteration at a time so smooth colouring does not
                     // acquire broad BLA-sized bands.
@@ -6245,6 +13386,7 @@ void render_bla_impl(
                         // this path could write max_iter and create a large
                         // false black region.
                         delta = previous_delta;
+                        derivative = previous_derivative;
                         reference_index = previous_reference_index;
                         iteration = previous_iteration;
                         if constexpr (CollectStats) {
@@ -6257,6 +13399,7 @@ void render_bla_impl(
                     }
                     if (sc_compare_norm(endpoint_norm, ScaledNorm{0.75, 2}) >= 0) {
                         delta = previous_delta;
+                        derivative = previous_derivative;
                         reference_index = previous_reference_index;
                         iteration = previous_iteration;
                         ScaledComplex replay_total{};
@@ -6275,6 +13418,10 @@ void render_bla_impl(
                             }
                             const ScaledComplex reference =
                                 context.orbit->scaled[static_cast<size_t>(reference_index)];
+                            const ScaledComplex prior_total = sc_add(reference, delta);
+                            derivative = sc_add(
+                                sc_double(sc_mul(prior_total, derivative)),
+                                ScaledComplex{1.0, 0.0, 0});
                             delta = sc_add(
                                 sc_double(sc_mul(reference, delta)),
                                 sc_add(sc_mul(delta, delta), dc));
@@ -6288,16 +13435,27 @@ void render_bla_impl(
                                 context.orbit->scaled[static_cast<size_t>(reference_index)], delta);
                             replay_norm = sc_norm_squared_with_delta(
                                 context.orbit->scaled[static_cast<size_t>(reference_index)],
-                                delta);
+                                delta,
+                                escape_radius_mode);
                             if (!sc_finite(delta) || !sc_finite(replay_total)) {
                                 retry_without_bla = true;
                                 break;
                             }
-                            if (sc_outside_escape(replay_norm)
+                            if (sc_outside_escape(replay_norm, escape_radius_mode)
                                 || sc_outside_escape_with_delta(
                                     context.orbit->scaled[static_cast<size_t>(reference_index)],
-                                    delta)) {
+                                    delta,
+                                    escape_radius_mode)) {
                                 output[index] = smooth_escape_scaled(iteration, replay_norm, options.output_bias);
+                                store_render_planes_escape(
+                                    planes,
+                                    static_cast<size_t>(index),
+                                    kalles_mandelbrot_raw_iteration(iteration),
+                                    replay_total,
+                                    replay_norm,
+                                    total_norm,
+                                    &derivative,
+                                    &pixel_spacing);
                                 escaped = true;
                                 break;
                             }
@@ -6306,6 +13464,7 @@ void render_bla_impl(
                         if (escaped) break;
                         if (retry_without_bla) {
                             delta = previous_delta;
+                            derivative = previous_derivative;
                             reference_index = previous_reference_index;
                             iteration = previous_iteration;
                             if constexpr (CollectStats) {
@@ -6318,10 +13477,12 @@ void render_bla_impl(
                         }
                         total = replay_total;
                         total_norm = replay_norm;
+                        previous_total_norm = total_norm;
                         have_total = true;
                     } else {
                         total = endpoint;
                         total_norm = endpoint_norm;
+                        previous_total_norm = total_norm;
                         have_total = true;
                         if constexpr (CollectStats) {
                             stats->logical_iterations += static_cast<std::uint64_t>(map_length);
@@ -6335,11 +13496,17 @@ void render_bla_impl(
                 // keeps the same operation count as a complex multiply.
                 const ScaledComplex reference =
                     context.orbit->scaled[static_cast<size_t>(reference_index)];
+                const ScaledNorm prior_norm = total_norm;
+                const ScaledComplex prior_total = sc_add(reference, delta);
+                derivative = sc_add(
+                    sc_double(sc_mul(prior_total, derivative)),
+                    ScaledComplex{1.0, 0.0, 0});
                 delta = sc_add(
                     sc_double(sc_mul(reference, delta)),
                     sc_add(sc_mul(delta, delta), dc));
                 ++reference_index;
                 ++iteration;
+                previous_total_norm = prior_norm;
                 if constexpr (CollectStats) {
                     ++stats->logical_iterations;
                     ++stats->exact_steps;
@@ -6407,7 +13574,8 @@ void render_bla_dispatch(
     const FractalRenderOptions& options,
     RenderStats* stats_out,
     const std::vector<ScaledComplex>* point_offsets = nullptr,
-    const FloatExp* point_radius = nullptr
+    const FloatExp* point_radius = nullptr,
+    FractalRenderPlanes* planes = nullptr
 ) {
     const bool enable_cycle_detection = options.disable_cycle == 0
         && (options.strict == 0 || options.strict_cycle != 0);
@@ -6415,12 +13583,12 @@ void render_bla_dispatch(
         render_bla_impl<CollectStats, true>(
             output, width, height, zoom_text, context, max_iter, threads,
             series_order, series_block, options, stats_out,
-            point_offsets, point_radius);
+            point_offsets, point_radius, planes);
     } else {
         render_bla_impl<CollectStats, false>(
             output, width, height, zoom_text, context, max_iter, threads,
             series_order, series_block, options, stats_out,
-            point_offsets, point_radius);
+            point_offsets, point_radius, planes);
     }
 }
 
@@ -6436,7 +13604,9 @@ std::unique_ptr<ReferenceContext> create_reference_context(
     bool retain_builder_orbit,
     int formula = FRACTAL_FORMULA_MANDELBROT,
     const char* julia_real_text = "0",
-    const char* julia_imag_text = "0"
+    const char* julia_imag_text = "0",
+    int escape_radius_mode = ESCAPE_RADIUS_MODE_CLASSIC,
+    int coordinate_mode = COORDINATE_MODE_PROJECT
 ) {
     if (!valid_c_string(x_center) || !valid_c_string(y_center)
         || !valid_c_string(viewport_zoom)) {
@@ -6454,6 +13624,8 @@ std::unique_ptr<ReferenceContext> create_reference_context(
 #endif
     auto context = std::make_unique<ReferenceContext>();
     if (!valid_formula(formula)
+        || !valid_escape_radius_mode(escape_radius_mode)
+        || !valid_coordinate_mode(coordinate_mode)
         || !valid_c_string(julia_real_text)
         || !valid_c_string(julia_imag_text)) {
         throw std::runtime_error("invalid native reference formula or Julia constant");
@@ -6461,13 +13633,24 @@ std::unique_ptr<ReferenceContext> create_reference_context(
     context->x_center = parse_coordinate(x_center, "real");
     context->y_center = parse_coordinate(y_center, "imaginary");
     context->formula = formula;
+    context->escape_radius_mode = escape_radius_mode;
+    context->coordinate_mode = coordinate_mode;
     context->julia_real = parse_coordinate(julia_real_text, "Julia real");
     context->julia_imag = parse_coordinate(julia_imag_text, "Julia imaginary");
     context->requested_series_order = std::clamp(series_order, 8, 32);
     const auto reference_started = std::chrono::steady_clock::now();
     make_reference_orbit(
-        *context, x_center, y_center, viewport_zoom, max_iter, precision_bits,
-        formula, julia_real_text, julia_imag_text);
+        *context,
+        x_center,
+        y_center,
+        viewport_zoom,
+        max_iter,
+        precision_bits,
+        formula,
+        julia_real_text,
+        julia_imag_text,
+        escape_radius_mode,
+        coordinate_mode);
     context->reference_build_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - reference_started).count());
@@ -6513,17 +13696,23 @@ std::unique_ptr<ReferenceContext> clone_reference_context(
     context->requested_series_order = source.requested_series_order;
     context->x_center = source.x_center;
     context->y_center = source.y_center;
+    context->x_center_text = source.x_center_text;
+    context->y_center_text = source.y_center_text;
     context->formula = source.formula;
     context->julia_real = source.julia_real;
     context->julia_imag = source.julia_imag;
     context->parameter = source.parameter;
+    context->escape_radius_mode = source.escape_radius_mode;
+    context->coordinate_mode = source.coordinate_mode;
     context->precision_bits = source.precision_bits;
     context->reference_build_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - reference_started).count());
     const auto bla_started = std::chrono::steady_clock::now();
     const FloatExp zoom = parse_zoom_float_exp(viewport_zoom, context->precision_bits);
-    context->bla.input_radius = fe_div(FloatExp::from_parts(2.8, 0), zoom);
+    context->bla.input_radius = fe_div(
+        FloatExp::from_parts(viewport_height_factor(context->coordinate_mode), 0),
+        zoom);
 
     if (source.formula != FRACTAL_FORMULA_MANDELBROT) {
         // Alternate references use a real-linear hierarchy rather than the
@@ -6614,6 +13803,2046 @@ int colourise_field_impl(
     }
 }
 
+#ifdef FRACTAL_HAVE_OPENCL
+int colourise_field_opencl_impl(
+    const float* field,
+    std::uint8_t* output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int threads
+) {
+    try {
+        if (!field || !output || !valid_pixel_dimensions(width, height)
+            || !valid_iteration_count(max_iter) || !valid_thread_count(threads)
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)) {
+            throw std::runtime_error("invalid OpenCL colour dimensions or palette");
+        }
+        initialise_opencl();
+        if (!opencl_colour_available()) {
+            throw std::runtime_error(
+                opencl_runtime && !opencl_runtime->error.empty()
+                    ? opencl_runtime->error
+                    : "OpenCL Aurora colourizer is unavailable");
+        }
+        const AuroraPalette& palette = aurora_palette_for(
+            max_iter, phase, vocal, instrumental, pitch);
+        const int palette_size = static_cast<int>(palette.rgb.size());
+        if (palette_size <= 0) {
+            throw std::runtime_error("OpenCL Aurora palette is empty");
+        }
+        static_assert(sizeof(std::array<std::uint8_t, 3>) == 3,
+                      "Aurora RGB entries must be tightly packed");
+        const size_t pixel_count = static_cast<size_t>(width)
+            * static_cast<size_t>(height);
+        const size_t field_bytes = pixel_count * sizeof(float);
+        const size_t output_bytes = pixel_count * 3U * sizeof(std::uint8_t);
+        const size_t palette_bytes = static_cast<size_t>(palette_size) * 3U;
+        const float index_scale_float = static_cast<float>(palette_size - 1)
+            / static_cast<float>(max_iter);
+        const double index_scale = static_cast<double>(index_scale_float);
+        OpenClRuntime& runtime = *opencl_runtime;
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        cl_int status = CL_SUCCESS;
+        const auto ensure_buffer = [&] (
+            cl_mem& buffer,
+            size_t& capacity,
+            cl_mem_flags flags,
+            size_t bytes
+        ) {
+            if (buffer && capacity >= bytes) return true;
+            cl_mem replacement = clCreateBuffer(
+                runtime.context, flags, bytes, nullptr, &status);
+            if (status != CL_SUCCESS || !replacement) return false;
+            if (buffer) clReleaseMemObject(buffer);
+            buffer = replacement;
+            capacity = bytes;
+            return true;
+        };
+        if (!ensure_buffer(runtime.colour_field, runtime.colour_field_capacity,
+                           CL_MEM_READ_ONLY, field_bytes)
+            || !ensure_buffer(runtime.colour_palette, runtime.colour_palette_capacity,
+                              CL_MEM_READ_ONLY, palette_bytes)
+            || !ensure_buffer(runtime.colour_output, runtime.colour_output_capacity,
+                              CL_MEM_WRITE_ONLY, output_bytes)) {
+            throw std::runtime_error(opencl_error_text(status));
+        }
+        status = clEnqueueWriteBuffer(runtime.queue, runtime.colour_field, CL_TRUE,
+            0, field_bytes, field, 0, nullptr, nullptr);
+        if (status == CL_SUCCESS) {
+            status = clEnqueueWriteBuffer(
+                runtime.queue, runtime.colour_palette, CL_TRUE, 0,
+                palette_bytes,
+                reinterpret_cast<const std::uint8_t*>(palette.rgb.data()),
+                0, nullptr, nullptr);
+        }
+        const int pixel_count_int = static_cast<int>(pixel_count);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.colour_kernel, 0, sizeof(runtime.colour_field), &runtime.colour_field);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.colour_kernel, 1, sizeof(runtime.colour_palette), &runtime.colour_palette);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.colour_kernel, 2, sizeof(runtime.colour_output), &runtime.colour_output);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.colour_kernel, 3, sizeof(pixel_count_int), &pixel_count_int);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.colour_kernel, 4, sizeof(max_iter), &max_iter);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.colour_kernel, 5, sizeof(palette_size), &palette_size);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.colour_kernel, 6, sizeof(index_scale), &index_scale);
+        const size_t workgroup = runtime.colour_workgroup_size;
+        const size_t global_size = workgroup > 0
+            ? ((pixel_count + workgroup - 1U) / workgroup) * workgroup
+            : pixel_count;
+        const size_t* local_work_size = workgroup > 0 ? &workgroup : nullptr;
+        if (status == CL_SUCCESS) status = clEnqueueNDRangeKernel(
+            runtime.queue, runtime.colour_kernel, 1, nullptr, &global_size,
+            local_work_size, 0, nullptr, nullptr);
+        if (status == CL_SUCCESS) status = clEnqueueReadBuffer(
+            runtime.queue, runtime.colour_output, CL_TRUE, 0, output_bytes,
+            output, 0, nullptr, nullptr);
+        if (status != CL_SUCCESS) throw std::runtime_error(opencl_error_text(status));
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("OpenCL colourizer failed with an unknown exception");
+        return 1;
+    }
+}
+
+int atlas_colourise_opencl_impl(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    double parent_field_bias,
+    double child_field_bias,
+    double output_field_bias,
+    int palette_max_iter,
+    int feather,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int threads,
+    std::uint64_t parent_cache_token,
+    std::uint64_t child_cache_token,
+    const std::uint8_t* accents,
+    const int* interior_color
+) {
+    try {
+        if (!parent || !output
+            || !valid_pixel_dimensions(parent_width, parent_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_iteration_count(parent_max_iter)
+            || !valid_thread_count(threads)
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)
+            || !std::isfinite(parent_zoom) || parent_zoom <= 0.0
+            || !std::isfinite(child_fraction)
+            || child_fraction < 0.0 || child_fraction > 1.0
+            || !std::isfinite(child_zoom) || child_zoom <= 0.0
+            || !std::isfinite(parent_field_bias) || parent_field_bias < 0.0
+            || parent_field_bias > static_cast<double>(parent_max_iter)
+            || !std::isfinite(child_field_bias) || child_field_bias < 0.0
+            || !std::isfinite(output_field_bias) || output_field_bias < 0.0
+            || feather < 0
+            || !valid_iteration_count(palette_max_iter)
+            || (interior_color != nullptr
+                && (interior_color[0] < 0 || interior_color[0] > 255
+                    || interior_color[1] < 0 || interior_color[1] > 255
+                    || interior_color[2] < 0 || interior_color[2] > 255))) {
+            throw std::runtime_error("invalid OpenCL atlas colour dimensions");
+        }
+        const bool use_child = child != nullptr && child_fraction > 0.0;
+        if (use_child && (!valid_pixel_dimensions(child_width, child_height)
+                          || !valid_iteration_count(child_max_iter)
+                          || child_field_bias > static_cast<double>(child_max_iter))) {
+            throw std::runtime_error("invalid OpenCL atlas child tile");
+        }
+        const int effective_iter = std::max(
+            palette_max_iter,
+            std::max(parent_max_iter, use_child ? child_max_iter : 0));
+        if (!valid_iteration_count(effective_iter)
+            || output_field_bias > static_cast<double>(effective_iter)) {
+            throw std::runtime_error("invalid OpenCL atlas iteration cap");
+        }
+        initialise_opencl();
+        if (!opencl_atlas_colour_available()) {
+            throw std::runtime_error(
+                opencl_runtime && !opencl_runtime->error.empty()
+                    ? opencl_runtime->error
+                    : "OpenCL fused atlas colourizer is unavailable");
+        }
+        const AuroraPalette& palette = aurora_palette_for(
+            effective_iter, phase, vocal, instrumental, pitch, accents);
+        const int palette_size = static_cast<int>(palette.rgb.size());
+        if (palette_size <= 0) {
+            throw std::runtime_error("OpenCL Aurora palette is empty");
+        }
+        static_assert(sizeof(std::array<std::uint8_t, 3>) == 3,
+                      "Aurora RGB entries must be tightly packed");
+        const size_t parent_bytes = static_cast<size_t>(parent_width)
+            * static_cast<size_t>(parent_height) * sizeof(float);
+        const size_t child_bytes = use_child
+            ? static_cast<size_t>(child_width)
+                * static_cast<size_t>(child_height) * sizeof(float)
+            : sizeof(float);
+        const size_t output_bytes = static_cast<size_t>(output_width)
+            * static_cast<size_t>(output_height) * 3U
+            * sizeof(std::uint8_t);
+        const size_t output_pixel_count = static_cast<size_t>(output_width)
+            * static_cast<size_t>(output_height);
+        // Pageable host uploads can be queued asynchronously for live/FHD
+        // surfaces, but on the discrete 4K path the driver's staging copy is
+        // faster when the small metadata uploads are completed synchronously.
+        const cl_bool metadata_upload_blocking = output_pixel_count
+            > static_cast<size_t>(1920) * 1080 ? CL_TRUE : CL_FALSE;
+        const size_t palette_bytes = static_cast<size_t>(palette_size) * 3U;
+        const float index_scale_float = static_cast<float>(palette_size - 1)
+            / static_cast<float>(effective_iter);
+        const float palette_index_scale = index_scale_float;
+        const int interior_red = interior_color != nullptr ? interior_color[0] : 0;
+        const int interior_green = interior_color != nullptr ? interior_color[1] : 0;
+        const int interior_blue = interior_color != nullptr ? interior_color[2] : 0;
+        OpenClRuntime& runtime = *opencl_runtime;
+        // Hardware image coordinates are float-valued.  Keep the sampler
+        // path for shallow/normal crops, and retain the double-coordinate
+        // buffer kernel for the very deep zooms where float coordinates would
+        // collapse several atlas pixels onto the same sample.
+        bool image_path = runtime.atlas_images
+            && runtime.atlas_image_colour_kernel != nullptr
+            && std::abs(parent_field_bias) <= 1.0e-12
+            && std::abs(child_field_bias) <= 1.0e-12
+            && std::abs(output_field_bias) <= 1.0e-12
+            && parent_zoom <= 1.0e6
+            && (!use_child || child_zoom <= 1.0e6);
+        std::vector<float> parent_image_data;
+        std::vector<float> child_image_data;
+        std::vector<OpenClAtlasAxis> parent_x_axis;
+        std::vector<OpenClAtlasAxis> parent_y_axis;
+        std::vector<OpenClAtlasAxis> child_x_axis;
+        std::vector<OpenClAtlasAxis> child_y_axis;
+        if (runtime.atlas_axis_maps) {
+            fill_opencl_atlas_axis(
+                parent_x_axis, output_width, parent_width, parent_zoom);
+            fill_opencl_atlas_axis(
+                parent_y_axis, output_height, parent_height, parent_zoom);
+            if (use_child) {
+                const int child_destination_width = child_fraction >= 0.999999
+                    ? output_width
+                    : std::max(
+                        1,
+                        static_cast<int>(std::floor(
+                            static_cast<double>(output_width) * child_fraction
+                            + 0.5)));
+                const int child_destination_height = child_fraction >= 0.999999
+                    ? output_height
+                    : std::max(
+                        1,
+                        static_cast<int>(std::floor(
+                            static_cast<double>(output_height) * child_fraction
+                            + 0.5)));
+                fill_opencl_atlas_axis(
+                    child_x_axis,
+                    child_destination_width,
+                    child_width,
+                    child_zoom);
+                fill_opencl_atlas_axis(
+                    child_y_axis,
+                    child_destination_height,
+                    child_height,
+                    child_zoom);
+            }
+        }
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        cl_command_queue atlas_queue = runtime.queue;
+        const size_t tiled_workgroup = opencl_atlas_tiled_workgroup(
+            runtime.atlas_tiled_colour_workgroup_limit,
+            output_pixel_count);
+        bool use_tiled_kernel = !image_path
+            && (!runtime.atlas_axis_maps
+                || output_pixel_count <= static_cast<size_t>(1920) * 1080)
+            && runtime.atlas_tiled_colour_kernel != nullptr
+            && tiled_workgroup > 0;
+        cl_kernel atlas_kernel = use_tiled_kernel
+            ? runtime.atlas_tiled_colour_kernel
+            : (image_path
+                ? runtime.atlas_image_colour_kernel
+                : runtime.atlas_colour_kernel);
+        cl_mem& atlas_parent = runtime.atlas_parent;
+        size_t& atlas_parent_capacity = runtime.atlas_parent_capacity;
+        cl_mem& atlas_child = runtime.atlas_child;
+        size_t& atlas_child_capacity = runtime.atlas_child_capacity;
+        cl_mem& atlas_palette = runtime.colour_palette;
+        size_t& atlas_palette_capacity = runtime.colour_palette_capacity;
+        cl_mem& atlas_output = runtime.atlas_output;
+        size_t& atlas_output_capacity = runtime.atlas_output_capacity;
+        std::uint64_t& atlas_parent_cache_token = runtime.atlas_parent_cache_token;
+        size_t& atlas_parent_cache_bytes = runtime.atlas_parent_cache_bytes;
+        std::uint64_t& atlas_child_cache_token = runtime.atlas_child_cache_token;
+        size_t& atlas_child_cache_bytes = runtime.atlas_child_cache_bytes;
+        cl_int status = CL_SUCCESS;
+        const auto ensure_buffer = [&] (
+            cl_mem& buffer,
+            size_t& capacity,
+            cl_mem_flags flags,
+            size_t bytes
+        ) {
+            if (buffer && capacity >= bytes) return true;
+            cl_mem replacement = clCreateBuffer(
+                runtime.context, flags, bytes, nullptr, &status);
+            if (status != CL_SUCCESS || !replacement) return false;
+            if (buffer) clReleaseMemObject(buffer);
+            buffer = replacement;
+            capacity = bytes;
+            if (&buffer == &atlas_parent) {
+                atlas_parent_cache_token = 0;
+                atlas_parent_cache_bytes = 0;
+            } else if (&buffer == &atlas_child) {
+                atlas_child_cache_token = 0;
+                atlas_child_cache_bytes = 0;
+            }
+            return true;
+        };
+        if (image_path
+            && (!ensure_opencl_atlas_image(
+                    runtime,
+                    runtime.atlas_parent_image,
+                    runtime.atlas_parent_image_width,
+                    runtime.atlas_parent_image_height,
+                    parent_width,
+                    parent_height,
+                    runtime.atlas_parent_image_cache_token,
+                    status)
+                || (use_child && !ensure_opencl_atlas_image(
+                    runtime,
+                    runtime.atlas_child_image,
+                    runtime.atlas_child_image_width,
+                    runtime.atlas_child_image_height,
+                    child_width,
+                    child_height,
+                    runtime.atlas_child_image_cache_token,
+                    status)))) {
+            // Some OpenCL implementations expose the atlas kernels but not
+            // float RGBA image objects.  Fall back to the proven buffer path
+            // in the same call instead of failing the render.
+            image_path = false;
+            use_tiled_kernel = (!runtime.atlas_axis_maps
+                || output_pixel_count <= static_cast<size_t>(1920) * 1080)
+                && runtime.atlas_tiled_colour_kernel != nullptr
+                && tiled_workgroup > 0;
+            atlas_kernel = use_tiled_kernel
+                ? runtime.atlas_tiled_colour_kernel
+                : runtime.atlas_colour_kernel;
+            status = CL_SUCCESS;
+        }
+        if ((!image_path
+                && (!ensure_buffer(atlas_parent, atlas_parent_capacity,
+                                   CL_MEM_READ_ONLY, parent_bytes)
+                    || !ensure_buffer(atlas_child, atlas_child_capacity,
+                                      CL_MEM_READ_ONLY, child_bytes)))
+            || !ensure_buffer(atlas_palette,
+                              atlas_palette_capacity,
+                              CL_MEM_READ_ONLY, palette_bytes)
+            || !ensure_buffer(
+                atlas_output,
+                atlas_output_capacity,
+                CL_MEM_WRITE_ONLY,
+                output_bytes)) {
+            throw std::runtime_error(opencl_error_text(status));
+        }
+        if (runtime.atlas_axis_maps) {
+            if (!ensure_buffer(
+                    runtime.atlas_parent_x_axis,
+                    runtime.atlas_parent_x_axis_capacity,
+                    CL_MEM_READ_ONLY,
+                    parent_x_axis.size() * sizeof(OpenClAtlasAxis))
+                || !ensure_buffer(
+                    runtime.atlas_parent_y_axis,
+                    runtime.atlas_parent_y_axis_capacity,
+                    CL_MEM_READ_ONLY,
+                    parent_y_axis.size() * sizeof(OpenClAtlasAxis))
+                || (use_child && !ensure_buffer(
+                    runtime.atlas_child_x_axis,
+                    runtime.atlas_child_x_axis_capacity,
+                    CL_MEM_READ_ONLY,
+                    child_x_axis.size() * sizeof(OpenClAtlasAxis)))
+                || (use_child && !ensure_buffer(
+                    runtime.atlas_child_y_axis,
+                    runtime.atlas_child_y_axis_capacity,
+                    CL_MEM_READ_ONLY,
+                    child_y_axis.size() * sizeof(OpenClAtlasAxis)))) {
+                throw std::runtime_error(opencl_error_text(status));
+            }
+        }
+        if (image_path) {
+            const bool parent_cached = parent_cache_token != 0
+                && runtime.atlas_parent_image_cache_token == parent_cache_token;
+            if (!parent_cached) {
+                parent_image_data = pack_opencl_atlas_image(
+                    parent, parent_width, parent_height, parent_max_iter);
+                const size_t origin[3] = {0, 0, 0};
+                const size_t region[3] = {
+                    static_cast<size_t>(parent_width),
+                    static_cast<size_t>(parent_height),
+                    1,
+                };
+                status = clEnqueueWriteImage(
+                    atlas_queue,
+                    runtime.atlas_parent_image,
+                    CL_TRUE,
+                    origin,
+                    region,
+                    static_cast<size_t>(parent_width) * 4U * sizeof(float),
+                    0,
+                    parent_image_data.data(),
+                    0,
+                    nullptr,
+                    nullptr);
+                runtime.atlas_parent_image_cache_token =
+                    parent_cache_token;
+            }
+            const bool child_cached = !use_child || (
+                child_cache_token != 0
+                && runtime.atlas_child_image_cache_token == child_cache_token);
+            if (status == CL_SUCCESS && use_child && !child_cached) {
+                child_image_data = pack_opencl_atlas_image(
+                    child, child_width, child_height, child_max_iter);
+                const size_t origin[3] = {0, 0, 0};
+                const size_t region[3] = {
+                    static_cast<size_t>(child_width),
+                    static_cast<size_t>(child_height),
+                    1,
+                };
+                status = clEnqueueWriteImage(
+                    atlas_queue,
+                    runtime.atlas_child_image,
+                    CL_TRUE,
+                    origin,
+                    region,
+                    static_cast<size_t>(child_width) * 4U * sizeof(float),
+                    0,
+                    child_image_data.data(),
+                    0,
+                    nullptr,
+                    nullptr);
+                runtime.atlas_child_image_cache_token = child_cache_token;
+            }
+        } else {
+            const bool parent_cached = parent_cache_token != 0
+                && atlas_parent_cache_token == parent_cache_token
+                && atlas_parent_cache_bytes == parent_bytes;
+            if (!parent_cached) {
+                status = clEnqueueWriteBuffer(
+                    atlas_queue, atlas_parent, CL_TRUE, 0,
+                    parent_bytes, parent, 0, nullptr, nullptr);
+                atlas_parent_cache_token = parent_cache_token;
+                atlas_parent_cache_bytes = parent_cache_token != 0
+                    ? parent_bytes : 0;
+            }
+            const bool child_cached = !use_child || (
+                child_cache_token != 0
+                && atlas_child_cache_token == child_cache_token
+                && atlas_child_cache_bytes == child_bytes);
+            if (status == CL_SUCCESS && use_child && !child_cached) {
+                status = clEnqueueWriteBuffer(
+                    atlas_queue, atlas_child, CL_TRUE, 0,
+                    child_bytes, child, 0, nullptr, nullptr);
+                atlas_child_cache_token = child_cache_token;
+                atlas_child_cache_bytes = child_cache_token != 0
+                    ? child_bytes : 0;
+            }
+        }
+        if (status == CL_SUCCESS) status = clEnqueueWriteBuffer(
+            atlas_queue, atlas_palette, metadata_upload_blocking, 0,
+            palette_bytes,
+            reinterpret_cast<const std::uint8_t*>(palette.rgb.data()),
+            0, nullptr, nullptr);
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clEnqueueWriteBuffer(
+                atlas_queue,
+                runtime.atlas_parent_x_axis,
+                metadata_upload_blocking,
+                0,
+                parent_x_axis.size() * sizeof(OpenClAtlasAxis),
+                parent_x_axis.data(),
+                0,
+                nullptr,
+                nullptr);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clEnqueueWriteBuffer(
+                atlas_queue,
+                runtime.atlas_parent_y_axis,
+                metadata_upload_blocking,
+                0,
+                parent_y_axis.size() * sizeof(OpenClAtlasAxis),
+                parent_y_axis.data(),
+                0,
+                nullptr,
+                nullptr);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps && use_child) {
+            status = clEnqueueWriteBuffer(
+                atlas_queue,
+                runtime.atlas_child_x_axis,
+                metadata_upload_blocking,
+                0,
+                child_x_axis.size() * sizeof(OpenClAtlasAxis),
+                child_x_axis.data(),
+                0,
+                nullptr,
+                nullptr);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps && use_child) {
+            status = clEnqueueWriteBuffer(
+                atlas_queue,
+                runtime.atlas_child_y_axis,
+                metadata_upload_blocking,
+                0,
+                child_y_axis.size() * sizeof(OpenClAtlasAxis),
+                child_y_axis.data(),
+                0,
+                nullptr,
+                nullptr);
+        }
+        cl_mem parent_buffer = image_path
+            ? runtime.atlas_parent_image : atlas_parent;
+        cl_mem child_buffer = image_path
+            ? (use_child ? runtime.atlas_child_image : runtime.atlas_parent_image)
+            : (use_child ? atlas_child : atlas_parent);
+        cl_mem palette_buffer = atlas_palette;
+        cl_mem output_buffer = atlas_output;
+        cl_mem parent_x_map = runtime.atlas_parent_x_axis;
+        cl_mem parent_y_map = runtime.atlas_parent_y_axis;
+        cl_mem child_x_map = use_child
+            ? runtime.atlas_child_x_axis : runtime.atlas_parent_x_axis;
+        cl_mem child_y_map = use_child
+            ? runtime.atlas_child_y_axis : runtime.atlas_parent_y_axis;
+        const int use_child_int = use_child ? 1 : 0;
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 0, sizeof(parent_buffer), &parent_buffer);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 1, sizeof(parent_width), &parent_width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 2, sizeof(parent_height), &parent_height);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 3, sizeof(parent_max_iter), &parent_max_iter);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 4, sizeof(child_buffer), &child_buffer);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 5, sizeof(child_width), &child_width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 6, sizeof(child_height), &child_height);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 7, sizeof(child_max_iter), &child_max_iter);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 8, sizeof(palette_buffer), &palette_buffer);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 9, sizeof(output_buffer), &output_buffer);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 10, sizeof(output_width), &output_width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 11, sizeof(output_height), &output_height);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 12, sizeof(parent_zoom), &parent_zoom);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 13, sizeof(child_fraction), &child_fraction);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 14, sizeof(child_zoom), &child_zoom);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 15, sizeof(parent_field_bias),
+            &parent_field_bias);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 16, sizeof(child_field_bias),
+            &child_field_bias);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 17, sizeof(output_field_bias),
+            &output_field_bias);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 18, sizeof(effective_iter), &effective_iter);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 19, sizeof(feather), &feather);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 20, sizeof(palette_size), &palette_size);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 21, sizeof(palette_index_scale),
+            &palette_index_scale);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 22, sizeof(interior_red), &interior_red);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 23, sizeof(interior_green), &interior_green);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 24, sizeof(interior_blue), &interior_blue);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 25, sizeof(use_child_int), &use_child_int);
+        const cl_ulong output_offset = 0;
+        const cl_ulong palette_offset = 0;
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 26, sizeof(output_offset), &output_offset);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            atlas_kernel, 27, sizeof(palette_offset), &palette_offset);
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clSetKernelArg(
+                atlas_kernel, 28, sizeof(parent_x_map), &parent_x_map);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clSetKernelArg(
+                atlas_kernel, 29, sizeof(parent_y_map), &parent_y_map);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clSetKernelArg(
+                atlas_kernel, 30, sizeof(child_x_map), &child_x_map);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clSetKernelArg(
+                atlas_kernel, 31, sizeof(child_y_map), &child_y_map);
+        }
+        const int parent_x_map_offset = 0;
+        const int parent_y_map_offset = 0;
+        const int child_x_map_offset = 0;
+        const int child_y_map_offset = 0;
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clSetKernelArg(
+                atlas_kernel, 32, sizeof(parent_x_map_offset),
+                &parent_x_map_offset);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clSetKernelArg(
+                atlas_kernel, 33, sizeof(parent_y_map_offset),
+                &parent_y_map_offset);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clSetKernelArg(
+                atlas_kernel, 34, sizeof(child_x_map_offset),
+                &child_x_map_offset);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clSetKernelArg(
+                atlas_kernel, 35, sizeof(child_y_map_offset),
+                &child_y_map_offset);
+        }
+        const size_t pixel_count = output_pixel_count;
+        size_t workgroup = runtime.atlas_colour_workgroup_size;
+        bool use_2d_launch = false;
+        size_t global_size_2d[2] = {
+            static_cast<size_t>(output_width),
+            static_cast<size_t>(output_height),
+        };
+        size_t global_size_1d = pixel_count;
+        size_t local_size_2d[2] = {0, 0};
+        if (use_tiled_kernel) {
+            workgroup = tiled_workgroup;
+            const size_t local_y = workgroup / 16U;
+            global_size_2d[0] =
+                ((static_cast<size_t>(output_width) + 15U) / 16U) * 16U;
+            global_size_2d[1] =
+                ((static_cast<size_t>(output_height) + local_y - 1U)
+                    / local_y) * local_y;
+            local_size_2d[0] = 16U;
+            local_size_2d[1] = local_y;
+            use_2d_launch = true;
+        } else {
+            // On the tested NVIDIA path, the atlas kernel benefits from a
+            // wider local group at preview/FHD sizes, while a smaller group
+            // wins at 4K. Keep the old launch selection for image/map paths.
+            if (!std::getenv("FRACTAL_OPENCL_WORKGROUP")
+                && runtime.device_is_gpu
+                && workgroup > 0
+                && runtime.atlas_colour_workgroup_limit > 0) {
+                const size_t target = pixel_count
+                    <= static_cast<size_t>(1920) * 1080 ? 256U : 128U;
+                if (target >= workgroup
+                    && target <= runtime.atlas_colour_workgroup_limit
+                    && target % workgroup == 0) {
+                    workgroup = target;
+                } else if (pixel_count <= static_cast<size_t>(1920) * 1080
+                           && workgroup <= runtime.atlas_colour_workgroup_limit / 2) {
+                    workgroup *= 2;
+                }
+            }
+            use_2d_launch = pixel_count
+                <= static_cast<size_t>(1920) * 1080
+                || opencl_atlas_force_2d_launch();
+            global_size_2d[0] = workgroup > 0
+                ? ((static_cast<size_t>(output_width) + workgroup - 1U)
+                    / workgroup) * workgroup
+                : static_cast<size_t>(output_width);
+            global_size_2d[1] = static_cast<size_t>(output_height);
+            global_size_1d = workgroup > 0
+                ? ((pixel_count + workgroup - 1U) / workgroup) * workgroup
+                : pixel_count;
+            local_size_2d[0] = workgroup;
+            local_size_2d[1] = 1U;
+        }
+        const size_t* local_work_size_2d =
+            workgroup > 0 ? local_size_2d : nullptr;
+        const size_t* local_work_size_1d =
+            workgroup > 0 ? &workgroup : nullptr;
+        if (status == CL_SUCCESS) status = clEnqueueNDRangeKernel(
+            atlas_queue, atlas_kernel, use_2d_launch ? 2 : 1, nullptr,
+            use_2d_launch ? global_size_2d : &global_size_1d,
+            use_2d_launch ? local_work_size_2d : local_work_size_1d,
+            0, nullptr, nullptr);
+        if (status == CL_SUCCESS) status = clEnqueueReadBuffer(
+            atlas_queue, atlas_output, CL_TRUE, 0,
+            output_bytes, output, 0, nullptr, nullptr);
+        if (status != CL_SUCCESS) throw std::runtime_error(opencl_error_text(status));
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("OpenCL fused atlas colourizer failed with an unknown exception");
+        return 1;
+    }
+}
+
+int atlas_colourise_opencl_batch_impl(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    const FractalAtlasColourFrame* frames,
+    int frame_count,
+    int threads,
+    std::uint64_t parent_cache_token,
+    std::uint64_t child_cache_token,
+    const std::uint8_t* accents,
+    const int* interior_color
+) {
+    try {
+        if (!parent || !output || !frames
+            || !valid_pixel_dimensions(parent_width, parent_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_iteration_count(parent_max_iter)
+            || !valid_thread_count(threads)
+            || frame_count < 1 || frame_count > 64
+            || (interior_color != nullptr
+                && (interior_color[0] < 0 || interior_color[0] > 255
+                    || interior_color[1] < 0 || interior_color[1] > 255
+                    || interior_color[2] < 0 || interior_color[2] > 255))) {
+            throw std::runtime_error("invalid batched OpenCL atlas dimensions");
+        }
+        const bool child_available = child != nullptr;
+        if (child_available
+            && (!valid_pixel_dimensions(child_width, child_height)
+                || !valid_iteration_count(child_max_iter))) {
+            throw std::runtime_error("invalid batched OpenCL atlas child tile");
+        }
+
+        static_assert(sizeof(std::array<std::uint8_t, 3>) == 3,
+                      "Aurora RGB entries must be tightly packed");
+        struct PaletteInfo {
+            size_t offset = 0;
+            int size = 0;
+            float index_scale = 0.0f;
+            int effective_iter = 0;
+        };
+        const size_t frame_output_bytes = static_cast<size_t>(output_width)
+            * static_cast<size_t>(output_height) * 3U;
+        if (frame_output_bytes == 0
+            || static_cast<size_t>(frame_count)
+                > std::numeric_limits<size_t>::max() / frame_output_bytes) {
+            throw std::runtime_error("batched OpenCL atlas output is too large");
+        }
+        const size_t output_bytes = frame_output_bytes
+            * static_cast<size_t>(frame_count);
+        const size_t output_pixel_count = static_cast<size_t>(output_width)
+            * static_cast<size_t>(output_height);
+        const cl_bool metadata_upload_blocking = output_pixel_count
+            > static_cast<size_t>(1920) * 1080 ? CL_TRUE : CL_FALSE;
+        const size_t parent_bytes = static_cast<size_t>(parent_width)
+            * static_cast<size_t>(parent_height) * sizeof(float);
+        const size_t child_bytes = child_available
+            ? static_cast<size_t>(child_width)
+                * static_cast<size_t>(child_height) * sizeof(float)
+            : sizeof(float);
+
+        std::vector<PaletteInfo> palette_info;
+        palette_info.reserve(static_cast<size_t>(frame_count));
+        std::vector<std::uint8_t> palette_data;
+        std::vector<int> use_child_values;
+        use_child_values.reserve(static_cast<size_t>(frame_count));
+        for (int index = 0; index < frame_count; ++index) {
+            const FractalAtlasColourFrame& frame = frames[index];
+            if (!valid_iteration_count(frame.palette_max_iter)
+                || !std::isfinite(frame.parent_zoom)
+                || frame.parent_zoom <= 0.0
+                || !std::isfinite(frame.child_fraction)
+                || frame.child_fraction < 0.0
+                || frame.child_fraction > 1.0
+                || !std::isfinite(frame.child_zoom)
+                || frame.child_zoom <= 0.0
+                || !std::isfinite(frame.parent_field_bias)
+                || frame.parent_field_bias < 0.0
+                || frame.parent_field_bias
+                    > static_cast<double>(parent_max_iter)
+                || !std::isfinite(frame.child_field_bias)
+                || frame.child_field_bias < 0.0
+                || !std::isfinite(frame.output_field_bias)
+                || frame.output_field_bias < 0.0
+                || frame.feather < 0
+                || !valid_colour_controls(
+                    frame.phase, frame.vocal,
+                    frame.instrumental, frame.pitch)) {
+                throw std::runtime_error(
+                    "invalid batched OpenCL atlas frame controls");
+            }
+            const bool use_child = child_available
+                && frame.child_fraction > 0.0;
+            if (frame.child_fraction > 0.0 && !child_available) {
+                throw std::runtime_error(
+                    "batched OpenCL atlas frame requires a child tile");
+            }
+            if (use_child
+                && frame.child_field_bias
+                    > static_cast<double>(child_max_iter)) {
+                throw std::runtime_error(
+                    "invalid batched OpenCL atlas child bias");
+            }
+            const int effective_iter = std::max(
+                static_cast<int>(frame.palette_max_iter),
+                std::max(parent_max_iter, use_child ? child_max_iter : 0));
+            if (!valid_iteration_count(effective_iter)
+                || frame.output_field_bias
+                    > static_cast<double>(effective_iter)) {
+                throw std::runtime_error(
+                    "invalid batched OpenCL atlas iteration cap");
+            }
+            const AuroraPalette& palette = aurora_palette_for(
+                effective_iter,
+                frame.phase,
+                frame.vocal,
+                frame.instrumental,
+                frame.pitch,
+                accents);
+            const int palette_size = static_cast<int>(palette.rgb.size());
+            if (palette_size <= 0) {
+                throw std::runtime_error("OpenCL Aurora palette is empty");
+            }
+            const size_t palette_bytes = static_cast<size_t>(palette_size) * 3U;
+            if (palette_data.size() > std::numeric_limits<size_t>::max()
+                    - palette_bytes) {
+                throw std::runtime_error("batched OpenCL atlas palette is too large");
+            }
+            const size_t palette_offset = palette_data.size();
+            const auto* palette_bytes_ptr = reinterpret_cast<const std::uint8_t*>(
+                palette.rgb.data());
+            palette_data.insert(
+                palette_data.end(),
+                palette_bytes_ptr,
+                palette_bytes_ptr + palette_bytes);
+            const float index_scale_float = static_cast<float>(palette_size - 1)
+                / static_cast<float>(effective_iter);
+            palette_info.push_back({
+                palette_offset,
+                palette_size,
+                index_scale_float,
+                effective_iter,
+            });
+            use_child_values.push_back(use_child ? 1 : 0);
+        }
+        if (palette_data.empty()) {
+            throw std::runtime_error("batched OpenCL atlas palette is empty");
+        }
+
+        initialise_opencl();
+        if (!opencl_atlas_colour_available()) {
+            throw std::runtime_error(
+                opencl_runtime && !opencl_runtime->error.empty()
+                    ? opencl_runtime->error
+                    : "OpenCL fused atlas colourizer is unavailable");
+        }
+        OpenClRuntime& runtime = *opencl_runtime;
+        bool image_path = runtime.atlas_images
+            && runtime.atlas_image_colour_kernel != nullptr;
+        for (int index = 0; image_path && index < frame_count; ++index) {
+            const FractalAtlasColourFrame& frame = frames[index];
+            const bool use_child = use_child_values[static_cast<size_t>(index)] != 0;
+            image_path = std::abs(frame.parent_field_bias) <= 1.0e-12
+                && std::abs(frame.child_field_bias) <= 1.0e-12
+                && std::abs(frame.output_field_bias) <= 1.0e-12
+                && frame.parent_zoom <= 1.0e6
+                && (!use_child || frame.child_zoom <= 1.0e6);
+        }
+        std::vector<float> parent_image_data;
+        std::vector<float> child_image_data;
+        std::vector<OpenClAtlasAxis> parent_x_maps;
+        std::vector<OpenClAtlasAxis> parent_y_maps;
+        std::vector<OpenClAtlasAxis> child_x_maps;
+        std::vector<OpenClAtlasAxis> child_y_maps;
+        if (runtime.atlas_axis_maps) {
+            const size_t frame_count_size = static_cast<size_t>(frame_count);
+            const size_t width_size = static_cast<size_t>(output_width);
+            const size_t height_size = static_cast<size_t>(output_height);
+            if (frame_count_size > std::numeric_limits<size_t>::max()
+                    / width_size
+                || frame_count_size > std::numeric_limits<size_t>::max()
+                    / height_size
+                || frame_count_size * width_size
+                    > static_cast<size_t>(std::numeric_limits<int>::max())
+                || frame_count_size * height_size
+                    > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                throw std::runtime_error(
+                    "batched OpenCL atlas axis maps are too large");
+            }
+            parent_x_maps.resize(frame_count_size * width_size);
+            parent_y_maps.resize(frame_count_size * height_size);
+            if (child_available) {
+                child_x_maps.resize(frame_count_size * width_size);
+                child_y_maps.resize(frame_count_size * height_size);
+            }
+            std::vector<OpenClAtlasAxis> axis;
+            for (int index = 0; index < frame_count; ++index) {
+                const FractalAtlasColourFrame& frame = frames[index];
+                fill_opencl_atlas_axis(
+                    axis, output_width, parent_width, frame.parent_zoom);
+                std::copy(
+                    axis.begin(), axis.end(),
+                    parent_x_maps.begin()
+                        + static_cast<size_t>(index) * width_size);
+                fill_opencl_atlas_axis(
+                    axis, output_height, parent_height, frame.parent_zoom);
+                std::copy(
+                    axis.begin(), axis.end(),
+                    parent_y_maps.begin()
+                        + static_cast<size_t>(index) * height_size);
+                if (child_available) {
+                    const int child_destination_width =
+                        frame.child_fraction >= 0.999999
+                            ? output_width
+                            : std::max(
+                                1,
+                                static_cast<int>(std::floor(
+                                    static_cast<double>(output_width)
+                                        * frame.child_fraction
+                                    + 0.5)));
+                    const int child_destination_height =
+                        frame.child_fraction >= 0.999999
+                            ? output_height
+                            : std::max(
+                                1,
+                                static_cast<int>(std::floor(
+                                    static_cast<double>(output_height)
+                                        * frame.child_fraction
+                                    + 0.5)));
+                    fill_opencl_atlas_axis(
+                        axis, child_destination_width,
+                        child_width, frame.child_zoom);
+                    std::copy(
+                        axis.begin(), axis.end(),
+                        child_x_maps.begin()
+                            + static_cast<size_t>(index) * width_size);
+                    fill_opencl_atlas_axis(
+                        axis, child_destination_height,
+                        child_height, frame.child_zoom);
+                    std::copy(
+                        axis.begin(), axis.end(),
+                        child_y_maps.begin()
+                            + static_cast<size_t>(index) * height_size);
+                }
+            }
+        }
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        cl_int status = CL_SUCCESS;
+        const auto ensure_buffer = [&] (
+            cl_mem& buffer,
+            size_t& capacity,
+            cl_mem_flags flags,
+            size_t bytes
+        ) {
+            if (buffer && capacity >= bytes) return true;
+            cl_mem replacement = clCreateBuffer(
+                runtime.context, flags, bytes, nullptr, &status);
+            if (status != CL_SUCCESS || !replacement) return false;
+            if (buffer) clReleaseMemObject(buffer);
+            buffer = replacement;
+            capacity = bytes;
+            if (&buffer == &runtime.atlas_parent) {
+                runtime.atlas_parent_cache_token = 0;
+                runtime.atlas_parent_cache_bytes = 0;
+            } else if (&buffer == &runtime.atlas_child) {
+                runtime.atlas_child_cache_token = 0;
+                runtime.atlas_child_cache_bytes = 0;
+            }
+            return true;
+        };
+        if (image_path
+            && (!ensure_opencl_atlas_image(
+                    runtime,
+                    runtime.atlas_parent_image,
+                    runtime.atlas_parent_image_width,
+                    runtime.atlas_parent_image_height,
+                    parent_width,
+                    parent_height,
+                    runtime.atlas_parent_image_cache_token,
+                    status)
+                || (child_available && !ensure_opencl_atlas_image(
+                    runtime,
+                    runtime.atlas_child_image,
+                    runtime.atlas_child_image_width,
+                    runtime.atlas_child_image_height,
+                    child_width,
+                    child_height,
+                    runtime.atlas_child_image_cache_token,
+                    status)))) {
+            image_path = false;
+            status = CL_SUCCESS;
+        }
+        if ((!image_path
+                && (!ensure_buffer(
+                    runtime.atlas_parent,
+                    runtime.atlas_parent_capacity,
+                    CL_MEM_READ_ONLY,
+                    parent_bytes)
+                    || (child_available && !ensure_buffer(
+                        runtime.atlas_child,
+                        runtime.atlas_child_capacity,
+                        CL_MEM_READ_ONLY,
+                        child_bytes))))
+            || !ensure_buffer(
+                runtime.colour_palette,
+                runtime.colour_palette_capacity,
+                CL_MEM_READ_ONLY,
+                palette_data.size())
+            || !ensure_buffer(
+                runtime.atlas_output,
+                runtime.atlas_output_capacity,
+                CL_MEM_WRITE_ONLY,
+                output_bytes)) {
+            throw std::runtime_error(opencl_error_text(status));
+        }
+        if (runtime.atlas_axis_maps) {
+            if (!ensure_buffer(
+                    runtime.atlas_parent_x_axis,
+                    runtime.atlas_parent_x_axis_capacity,
+                    CL_MEM_READ_ONLY,
+                    parent_x_maps.size() * sizeof(OpenClAtlasAxis))
+                || !ensure_buffer(
+                    runtime.atlas_parent_y_axis,
+                    runtime.atlas_parent_y_axis_capacity,
+                    CL_MEM_READ_ONLY,
+                    parent_y_maps.size() * sizeof(OpenClAtlasAxis))
+                || (child_available && !ensure_buffer(
+                    runtime.atlas_child_x_axis,
+                    runtime.atlas_child_x_axis_capacity,
+                    CL_MEM_READ_ONLY,
+                    child_x_maps.size() * sizeof(OpenClAtlasAxis)))
+                || (child_available && !ensure_buffer(
+                    runtime.atlas_child_y_axis,
+                    runtime.atlas_child_y_axis_capacity,
+                    CL_MEM_READ_ONLY,
+                    child_y_maps.size() * sizeof(OpenClAtlasAxis)))) {
+                throw std::runtime_error(opencl_error_text(status));
+            }
+        }
+        if (image_path) {
+            const bool parent_cached = parent_cache_token != 0
+                && runtime.atlas_parent_image_cache_token == parent_cache_token;
+            if (!parent_cached) {
+                parent_image_data = pack_opencl_atlas_image(
+                    parent, parent_width, parent_height, parent_max_iter);
+                const size_t origin[3] = {0, 0, 0};
+                const size_t region[3] = {
+                    static_cast<size_t>(parent_width),
+                    static_cast<size_t>(parent_height),
+                    1,
+                };
+                status = clEnqueueWriteImage(
+                    runtime.queue,
+                    runtime.atlas_parent_image,
+                    CL_TRUE,
+                    origin,
+                    region,
+                    static_cast<size_t>(parent_width) * 4U * sizeof(float),
+                    0,
+                    parent_image_data.data(),
+                    0,
+                    nullptr,
+                    nullptr);
+                runtime.atlas_parent_image_cache_token = parent_cache_token;
+            }
+            const bool child_cached = !child_available || (
+                child_cache_token != 0
+                && runtime.atlas_child_image_cache_token == child_cache_token);
+            if (status == CL_SUCCESS && child_available && !child_cached) {
+                child_image_data = pack_opencl_atlas_image(
+                    child, child_width, child_height, child_max_iter);
+                const size_t origin[3] = {0, 0, 0};
+                const size_t region[3] = {
+                    static_cast<size_t>(child_width),
+                    static_cast<size_t>(child_height),
+                    1,
+                };
+                status = clEnqueueWriteImage(
+                    runtime.queue,
+                    runtime.atlas_child_image,
+                    CL_TRUE,
+                    origin,
+                    region,
+                    static_cast<size_t>(child_width) * 4U * sizeof(float),
+                    0,
+                    child_image_data.data(),
+                    0,
+                    nullptr,
+                    nullptr);
+                runtime.atlas_child_image_cache_token = child_cache_token;
+            }
+        } else {
+            const bool parent_cached = parent_cache_token != 0
+                && runtime.atlas_parent_cache_token == parent_cache_token
+                && runtime.atlas_parent_cache_bytes == parent_bytes;
+            if (!parent_cached) {
+                status = clEnqueueWriteBuffer(
+                    runtime.queue, runtime.atlas_parent, CL_TRUE, 0,
+                    parent_bytes, parent, 0, nullptr, nullptr);
+                runtime.atlas_parent_cache_token = parent_cache_token;
+                runtime.atlas_parent_cache_bytes = parent_cache_token != 0
+                    ? parent_bytes : 0;
+            }
+            const bool child_cached = !child_available || (
+                child_cache_token != 0
+                && runtime.atlas_child_cache_token == child_cache_token
+                && runtime.atlas_child_cache_bytes == child_bytes);
+            if (status == CL_SUCCESS && child_available && !child_cached) {
+                status = clEnqueueWriteBuffer(
+                    runtime.queue, runtime.atlas_child, CL_TRUE, 0,
+                    child_bytes, child, 0, nullptr, nullptr);
+                runtime.atlas_child_cache_token = child_cache_token;
+                runtime.atlas_child_cache_bytes = child_cache_token != 0
+                    ? child_bytes : 0;
+            }
+        }
+        if (status == CL_SUCCESS) {
+            status = clEnqueueWriteBuffer(
+                runtime.queue,
+                runtime.colour_palette,
+                metadata_upload_blocking,
+                0,
+                palette_data.size(),
+                palette_data.data(),
+                0,
+                nullptr,
+                nullptr);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clEnqueueWriteBuffer(
+                runtime.queue,
+                runtime.atlas_parent_x_axis,
+                metadata_upload_blocking,
+                0,
+                parent_x_maps.size() * sizeof(OpenClAtlasAxis),
+                parent_x_maps.data(),
+                0,
+                nullptr,
+                nullptr);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps) {
+            status = clEnqueueWriteBuffer(
+                runtime.queue,
+                runtime.atlas_parent_y_axis,
+                metadata_upload_blocking,
+                0,
+                parent_y_maps.size() * sizeof(OpenClAtlasAxis),
+                parent_y_maps.data(),
+                0,
+                nullptr,
+                nullptr);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps && child_available) {
+            status = clEnqueueWriteBuffer(
+                runtime.queue,
+                runtime.atlas_child_x_axis,
+                metadata_upload_blocking,
+                0,
+                child_x_maps.size() * sizeof(OpenClAtlasAxis),
+                child_x_maps.data(),
+                0,
+                nullptr,
+                nullptr);
+        }
+        if (status == CL_SUCCESS && runtime.atlas_axis_maps && child_available) {
+            status = clEnqueueWriteBuffer(
+                runtime.queue,
+                runtime.atlas_child_y_axis,
+                metadata_upload_blocking,
+                0,
+                child_y_maps.size() * sizeof(OpenClAtlasAxis),
+                child_y_maps.data(),
+                0,
+                nullptr,
+                nullptr);
+        }
+
+        cl_mem parent_buffer = image_path
+            ? runtime.atlas_parent_image : runtime.atlas_parent;
+        cl_mem child_buffer = image_path
+            ? (child_available
+                ? runtime.atlas_child_image : runtime.atlas_parent_image)
+            : (child_available ? runtime.atlas_child : runtime.atlas_parent);
+        cl_mem palette_buffer = runtime.colour_palette;
+        cl_mem output_buffer = runtime.atlas_output;
+        cl_mem parent_x_map = runtime.atlas_parent_x_axis;
+        cl_mem parent_y_map = runtime.atlas_parent_y_axis;
+        cl_mem child_x_map = child_available
+            ? runtime.atlas_child_x_axis : runtime.atlas_parent_x_axis;
+        cl_mem child_y_map = child_available
+            ? runtime.atlas_child_y_axis : runtime.atlas_parent_y_axis;
+        const int child_width_arg = child_available ? child_width : 0;
+        const int child_height_arg = child_available ? child_height : 0;
+        const int child_max_iter_arg = child_available ? child_max_iter : 0;
+        const int interior_red = interior_color != nullptr
+            ? interior_color[0] : 0;
+        const int interior_green = interior_color != nullptr
+            ? interior_color[1] : 0;
+        const int interior_blue = interior_color != nullptr
+            ? interior_color[2] : 0;
+        const auto set_kernel_arg = [&] (
+            cl_kernel kernel,
+            cl_uint index,
+            size_t size,
+            const void* value
+        ) {
+            if (status == CL_SUCCESS && kernel) {
+                status = clSetKernelArg(
+                    kernel, index, size, value);
+            }
+        };
+        const size_t tiled_workgroup = opencl_atlas_tiled_workgroup(
+            runtime.atlas_tiled_colour_workgroup_limit,
+            output_pixel_count);
+        const bool use_tiled_kernel = !image_path
+            && (!runtime.atlas_axis_maps
+                || output_pixel_count <= static_cast<size_t>(1920) * 1080)
+            && runtime.atlas_tiled_colour_kernel != nullptr
+            && tiled_workgroup > 0;
+        cl_kernel atlas_kernel = use_tiled_kernel
+            ? runtime.atlas_tiled_colour_kernel
+            : (image_path
+                ? runtime.atlas_image_colour_kernel
+                : runtime.atlas_colour_kernel);
+        cl_kernel atlas_kernel_secondary = use_tiled_kernel
+            ? runtime.atlas_tiled_colour_kernel_secondary
+            : (image_path
+                ? runtime.atlas_image_colour_kernel_secondary
+                : runtime.atlas_colour_kernel_secondary);
+        const bool use_secondary_queue =
+            frame_count >= 2
+            && opencl_atlas_use_secondary_queue()
+            && runtime.atlas_queue_secondary != nullptr
+            && atlas_kernel_secondary != nullptr;
+        const auto set_static_kernel_args = [&](cl_kernel kernel) {
+            set_kernel_arg(kernel, 0, sizeof(parent_buffer), &parent_buffer);
+            set_kernel_arg(kernel, 1, sizeof(parent_width), &parent_width);
+            set_kernel_arg(kernel, 2, sizeof(parent_height), &parent_height);
+            set_kernel_arg(kernel, 3, sizeof(parent_max_iter), &parent_max_iter);
+            set_kernel_arg(kernel, 4, sizeof(child_buffer), &child_buffer);
+            set_kernel_arg(kernel, 5, sizeof(child_width_arg), &child_width_arg);
+            set_kernel_arg(kernel, 6, sizeof(child_height_arg), &child_height_arg);
+            set_kernel_arg(kernel, 7, sizeof(child_max_iter_arg), &child_max_iter_arg);
+            set_kernel_arg(kernel, 8, sizeof(palette_buffer), &palette_buffer);
+            set_kernel_arg(kernel, 9, sizeof(output_buffer), &output_buffer);
+            set_kernel_arg(kernel, 10, sizeof(output_width), &output_width);
+            set_kernel_arg(kernel, 11, sizeof(output_height), &output_height);
+            if (runtime.atlas_axis_maps) {
+                set_kernel_arg(kernel, 28, sizeof(parent_x_map), &parent_x_map);
+                set_kernel_arg(kernel, 29, sizeof(parent_y_map), &parent_y_map);
+                set_kernel_arg(kernel, 30, sizeof(child_x_map), &child_x_map);
+                set_kernel_arg(kernel, 31, sizeof(child_y_map), &child_y_map);
+            }
+        };
+        set_static_kernel_args(atlas_kernel);
+        if (use_secondary_queue) {
+            set_static_kernel_args(atlas_kernel_secondary);
+        }
+
+        const size_t pixel_count = output_pixel_count;
+        size_t workgroup = runtime.atlas_colour_workgroup_size;
+        bool use_2d_launch = false;
+        size_t global_size_2d[2] = {
+            static_cast<size_t>(output_width),
+            static_cast<size_t>(output_height),
+        };
+        size_t global_size_1d = pixel_count;
+        size_t local_size_2d[2] = {0, 0};
+        if (use_tiled_kernel) {
+            workgroup = tiled_workgroup;
+            const size_t local_y = workgroup / 16U;
+            global_size_2d[0] =
+                ((static_cast<size_t>(output_width) + 15U) / 16U) * 16U;
+            global_size_2d[1] =
+                ((static_cast<size_t>(output_height) + local_y - 1U)
+                    / local_y) * local_y;
+            local_size_2d[0] = 16U;
+            local_size_2d[1] = local_y;
+            use_2d_launch = true;
+        } else {
+            if (!std::getenv("FRACTAL_OPENCL_WORKGROUP")
+                && runtime.device_is_gpu
+                && workgroup > 0
+                && runtime.atlas_colour_workgroup_limit > 0) {
+                const size_t target = pixel_count
+                    <= static_cast<size_t>(1920) * 1080 ? 256U : 128U;
+                if (target >= workgroup
+                    && target <= runtime.atlas_colour_workgroup_limit
+                    && target % workgroup == 0) {
+                    workgroup = target;
+                } else if (pixel_count <= static_cast<size_t>(1920) * 1080
+                           && workgroup <= runtime.atlas_colour_workgroup_limit / 2) {
+                    workgroup *= 2;
+                }
+            }
+            use_2d_launch = pixel_count
+                <= static_cast<size_t>(1920) * 1080
+                || opencl_atlas_force_2d_launch();
+            global_size_2d[0] = workgroup > 0
+                ? ((static_cast<size_t>(output_width) + workgroup - 1U)
+                    / workgroup) * workgroup
+                : static_cast<size_t>(output_width);
+            global_size_2d[1] = static_cast<size_t>(output_height);
+            global_size_1d = workgroup > 0
+                ? ((pixel_count + workgroup - 1U) / workgroup) * workgroup
+                : pixel_count;
+            local_size_2d[0] = workgroup;
+            local_size_2d[1] = 1U;
+        }
+        const size_t* local_work_size_2d =
+            workgroup > 0 ? local_size_2d : nullptr;
+        const size_t* local_work_size_1d =
+            workgroup > 0 ? &workgroup : nullptr;
+        const auto set_frame_kernel_args = [&](cl_kernel kernel, int index) {
+            const FractalAtlasColourFrame& frame = frames[index];
+            const PaletteInfo& palette = palette_info[static_cast<size_t>(index)];
+            const int use_child = use_child_values[static_cast<size_t>(index)];
+            const cl_ulong output_offset = static_cast<cl_ulong>(
+                static_cast<size_t>(index) * frame_output_bytes);
+            const cl_ulong palette_offset = static_cast<cl_ulong>(
+                palette.offset);
+            set_kernel_arg(kernel, 12, sizeof(frame.parent_zoom), &frame.parent_zoom);
+            set_kernel_arg(kernel, 13, sizeof(frame.child_fraction), &frame.child_fraction);
+            set_kernel_arg(kernel, 14, sizeof(frame.child_zoom), &frame.child_zoom);
+            set_kernel_arg(
+                kernel, 15, sizeof(frame.parent_field_bias), &frame.parent_field_bias);
+            set_kernel_arg(
+                kernel, 16, sizeof(frame.child_field_bias), &frame.child_field_bias);
+            set_kernel_arg(
+                kernel, 17, sizeof(frame.output_field_bias), &frame.output_field_bias);
+            set_kernel_arg(
+                kernel, 18, sizeof(palette.effective_iter), &palette.effective_iter);
+            set_kernel_arg(kernel, 19, sizeof(frame.feather), &frame.feather);
+            set_kernel_arg(kernel, 20, sizeof(palette.size), &palette.size);
+            set_kernel_arg(
+                kernel, 21, sizeof(palette.index_scale), &palette.index_scale);
+            set_kernel_arg(kernel, 22, sizeof(interior_red), &interior_red);
+            set_kernel_arg(kernel, 23, sizeof(interior_green), &interior_green);
+            set_kernel_arg(kernel, 24, sizeof(interior_blue), &interior_blue);
+            set_kernel_arg(kernel, 25, sizeof(use_child), &use_child);
+            set_kernel_arg(kernel, 26, sizeof(output_offset), &output_offset);
+            set_kernel_arg(kernel, 27, sizeof(palette_offset), &palette_offset);
+            if (runtime.atlas_axis_maps) {
+                const int parent_x_map_offset = index * output_width;
+                const int parent_y_map_offset = index * output_height;
+                const int child_x_map_offset = child_available
+                    ? index * output_width : parent_x_map_offset;
+                const int child_y_map_offset = child_available
+                    ? index * output_height : parent_y_map_offset;
+                set_kernel_arg(
+                    kernel, 32, sizeof(parent_x_map_offset), &parent_x_map_offset);
+                set_kernel_arg(
+                    kernel, 33, sizeof(parent_y_map_offset), &parent_y_map_offset);
+                set_kernel_arg(
+                    kernel, 34, sizeof(child_x_map_offset), &child_x_map_offset);
+                set_kernel_arg(
+                    kernel, 35, sizeof(child_y_map_offset), &child_y_map_offset);
+            }
+        };
+        const auto enqueue_frame = [&] (
+            cl_command_queue queue,
+            cl_kernel kernel,
+            int index
+        ) {
+            set_frame_kernel_args(kernel, index);
+            if (status == CL_SUCCESS) {
+                status = clEnqueueNDRangeKernel(
+                    queue,
+                    kernel,
+                    use_2d_launch ? 2 : 1,
+                    nullptr,
+                    use_2d_launch ? global_size_2d : &global_size_1d,
+                    use_2d_launch ? local_work_size_2d : local_work_size_1d,
+                    0,
+                    nullptr,
+                    nullptr);
+            }
+        };
+        if (use_secondary_queue) {
+            // Metadata may have been queued asynchronously on the primary
+            // queue.  Finish it before the secondary queue starts consuming
+            // the same buffers; the frame kernels themselves remain
+            // independent because each writes a disjoint output range.
+            if (status == CL_SUCCESS) {
+                status = clFinish(runtime.queue);
+            }
+            if (opencl_atlas_use_pipelined_batch()) {
+                // Queue every disjoint output slice before asking either
+                // queue to read back. Set FRACTAL_OPENCL_ATLAS_PIPELINE=0
+                // to retain the pairwise compatibility schedule on an older
+                // ICD that is more stable when a read follows each pair.
+                for (int index = 0;
+                     index < frame_count && status == CL_SUCCESS;
+                     ++index) {
+                    const bool secondary = (index & 1) != 0;
+                    enqueue_frame(
+                        secondary ? runtime.atlas_queue_secondary
+                                  : runtime.queue,
+                        secondary ? atlas_kernel_secondary : atlas_kernel,
+                        index);
+                }
+                std::vector<cl_event> read_events(
+                    static_cast<size_t>(frame_count), nullptr);
+                for (int index = 0;
+                     index < frame_count && status == CL_SUCCESS;
+                     ++index) {
+                    const bool secondary = (index & 1) != 0;
+                    const size_t offset = static_cast<size_t>(index)
+                        * frame_output_bytes;
+                    status = clEnqueueReadBuffer(
+                        secondary ? runtime.atlas_queue_secondary
+                                  : runtime.queue,
+                        runtime.atlas_output,
+                        CL_FALSE,
+                        offset,
+                        frame_output_bytes,
+                        output + offset,
+                        0,
+                        nullptr,
+                        &read_events[static_cast<size_t>(index)]);
+                }
+                if (status == CL_SUCCESS) {
+                    status = clWaitForEvents(
+                        static_cast<cl_uint>(frame_count),
+                        read_events.data());
+                }
+                for (cl_event event : read_events) {
+                    if (event) clReleaseEvent(event);
+                }
+            } else {
+                for (int index = 0;
+                     index < frame_count && status == CL_SUCCESS;
+                     index += 2) {
+                    enqueue_frame(
+                        runtime.queue, atlas_kernel, index);
+                    if (index + 1 < frame_count) {
+                        enqueue_frame(
+                            runtime.atlas_queue_secondary,
+                            atlas_kernel_secondary,
+                            index + 1);
+                    }
+                    if (status != CL_SUCCESS) break;
+                    const size_t first_offset = static_cast<size_t>(index)
+                        * frame_output_bytes;
+                    if (index + 1 < frame_count) {
+                        const size_t second_offset = static_cast<size_t>(index + 1)
+                            * frame_output_bytes;
+                        cl_event read_events[2] = {nullptr, nullptr};
+                        status = clEnqueueReadBuffer(
+                            runtime.queue,
+                            runtime.atlas_output,
+                            CL_FALSE,
+                            first_offset,
+                            frame_output_bytes,
+                            output + first_offset,
+                            0,
+                            nullptr,
+                            &read_events[0]);
+                        if (status == CL_SUCCESS) {
+                            status = clEnqueueReadBuffer(
+                                runtime.atlas_queue_secondary,
+                                runtime.atlas_output,
+                                CL_FALSE,
+                                second_offset,
+                                frame_output_bytes,
+                                output + second_offset,
+                                0,
+                                nullptr,
+                                &read_events[1]);
+                        }
+                        if (status == CL_SUCCESS) {
+                            status = clWaitForEvents(2, read_events);
+                        }
+                        if (read_events[0]) clReleaseEvent(read_events[0]);
+                        if (read_events[1]) clReleaseEvent(read_events[1]);
+                    } else {
+                        status = clEnqueueReadBuffer(
+                            runtime.queue,
+                            runtime.atlas_output,
+                            CL_TRUE,
+                            first_offset,
+                            frame_output_bytes,
+                            output + first_offset,
+                            0,
+                            nullptr,
+                            nullptr);
+                    }
+                }
+            }
+        } else {
+            for (int index = 0;
+                index < frame_count && status == CL_SUCCESS;
+                 ++index) {
+                enqueue_frame(runtime.queue, atlas_kernel, index);
+            }
+            if (status == CL_SUCCESS) status = clEnqueueReadBuffer(
+                runtime.queue,
+                runtime.atlas_output,
+                CL_TRUE,
+                0,
+                output_bytes,
+                output,
+                0,
+                nullptr,
+                nullptr);
+        }
+        if (status != CL_SUCCESS) {
+            throw std::runtime_error(opencl_error_text(status));
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("batched OpenCL atlas colourizer failed with an unknown exception");
+        return 1;
+    }
+}
+
+int colourise_kfp_opencl_impl(
+    const float* field,
+    std::uint8_t* output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    try {
+        if (!field || !output || !valid_pixel_dimensions(width, height)
+            || !valid_iteration_count(max_iter) || !valid_thread_count(threads)
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)
+            || !lut || !valid_kfp_options(options, lut_size)) {
+            throw std::runtime_error("invalid OpenCL KFP colour dimensions or controls");
+        }
+        const FractalKfpOptions& transfer_options = *options;
+        // The scalar OpenCL kernel deliberately covers the complete scalar
+        // finite-difference/stencil contract, but it cannot carry Kalles'
+        // orbit metadata, texture pixels, or multi-colour wave state.
+        if (transfer_options.smooth_method != 0
+            || transfer_options.multi_color != 0
+            || transfer_options.texture_enabled != 0
+            || std::abs(transfer_options.phase_color_strength) > 1.0e-12) {
+            throw std::runtime_error(
+                "OpenCL KFP colourizer supports scalar non-textured profiles only");
+        }
+        if (transfer_options.field_bias > static_cast<double>(max_iter)) {
+            throw std::runtime_error("OpenCL KFP field bias exceeds iteration cap");
+        }
+        initialise_opencl();
+        if (!opencl_kfp_colour_available()) {
+            throw std::runtime_error(
+                opencl_runtime && !opencl_runtime->error.empty()
+                    ? opencl_runtime->error
+                    : "OpenCL KFP colourizer is unavailable");
+        }
+        const double smooth_offset = kfp_smooth_offset(transfer_options);
+        double transfer_minimum = 0.0;
+        double transfer_maximum = 1.0;
+        if (transfer_options.color_method == 4) {
+            const KfpTransferBounds bounds = kfp_transfer_bounds(
+                field,
+                width,
+                height,
+                max_iter,
+                transfer_options.field_bias,
+                smooth_offset);
+            transfer_minimum = bounds.minimum;
+            transfer_maximum = bounds.maximum;
+        }
+        const KfpSlopeDirection slope_direction = kfp_slope_direction(
+            transfer_options);
+        const size_t pixel_count = static_cast<size_t>(width)
+            * static_cast<size_t>(height);
+        const size_t field_bytes = pixel_count * sizeof(float);
+        const size_t output_bytes = pixel_count * 3U * sizeof(std::uint8_t);
+        const size_t lut_bytes = static_cast<size_t>(lut_size) * 3U;
+        OpenClRuntime& runtime = *opencl_runtime;
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        cl_int status = CL_SUCCESS;
+        const auto ensure_buffer = [&] (
+            cl_mem& buffer,
+            size_t& capacity,
+            cl_mem_flags flags,
+            size_t bytes
+        ) {
+            if (buffer && capacity >= bytes) return true;
+            cl_mem replacement = clCreateBuffer(
+                runtime.context, flags, bytes, nullptr, &status);
+            if (status != CL_SUCCESS || !replacement) return false;
+            if (buffer) clReleaseMemObject(buffer);
+            buffer = replacement;
+            capacity = bytes;
+            return true;
+        };
+        if (!ensure_buffer(runtime.colour_field, runtime.colour_field_capacity,
+                           CL_MEM_READ_ONLY, field_bytes)
+            || !ensure_buffer(runtime.colour_palette, runtime.colour_palette_capacity,
+                              CL_MEM_READ_ONLY, lut_bytes)
+            || !ensure_buffer(runtime.colour_output, runtime.colour_output_capacity,
+                              CL_MEM_WRITE_ONLY, output_bytes)) {
+            throw std::runtime_error(opencl_error_text(status));
+        }
+        status = clEnqueueWriteBuffer(
+            runtime.queue, runtime.colour_field, CL_TRUE, 0,
+            field_bytes, field, 0, nullptr, nullptr);
+        if (status == CL_SUCCESS) {
+            status = clEnqueueWriteBuffer(
+                runtime.queue, runtime.colour_palette, CL_TRUE, 0,
+                lut_bytes, lut, 0, nullptr, nullptr);
+        }
+
+        const int iter_division = transfer_options.iter_div != 1.0 ? 1 : 0;
+        const int smooth = transfer_options.smooth;
+        const int inverse_transition = transfer_options.inverse_transition;
+        const int flat = transfer_options.flat;
+        const int slopes = transfer_options.slopes;
+        const int differences = transfer_options.differences;
+        const int interior_red = transfer_options.interior_color[0];
+        const int interior_green = transfer_options.interior_color[1];
+        const int interior_blue = transfer_options.interior_color[2];
+        const int lut_size_int = lut_size;
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 0, sizeof(runtime.colour_field),
+            &runtime.colour_field);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 1, sizeof(runtime.colour_palette),
+            &runtime.colour_palette);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 2, sizeof(runtime.colour_output),
+            &runtime.colour_output);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 3, sizeof(width), &width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 4, sizeof(height), &height);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 5, sizeof(max_iter), &max_iter);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 6, sizeof(transfer_options.field_bias),
+            &transfer_options.field_bias);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 7, sizeof(smooth_offset), &smooth_offset);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 8, sizeof(iter_division), &iter_division);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 9, sizeof(transfer_options.iter_div),
+            &transfer_options.iter_div);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 10, sizeof(transfer_options.color_offset),
+            &transfer_options.color_offset);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 11, sizeof(transfer_options.color_method),
+            &transfer_options.color_method);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 12, sizeof(smooth), &smooth);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 13, sizeof(inverse_transition),
+            &inverse_transition);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 14, sizeof(flat), &flat);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 15, sizeof(slopes), &slopes);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 16, sizeof(transfer_options.slope_power),
+            &transfer_options.slope_power);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 17, sizeof(transfer_options.slope_ratio),
+            &transfer_options.slope_ratio);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 18, sizeof(slope_direction.cosine),
+            &slope_direction.cosine);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 19, sizeof(slope_direction.sine),
+            &slope_direction.sine);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 20, sizeof(differences), &differences);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 21, sizeof(interior_red), &interior_red);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 22, sizeof(interior_green), &interior_green);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 23, sizeof(interior_blue), &interior_blue);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 24, sizeof(transfer_minimum),
+            &transfer_minimum);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 25, sizeof(transfer_maximum),
+            &transfer_maximum);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.kfp_colour_kernel, 26, sizeof(lut_size_int), &lut_size_int);
+
+        const size_t workgroup = runtime.kfp_colour_workgroup_size;
+        const size_t global_size = workgroup > 0
+            ? ((pixel_count + workgroup - 1U) / workgroup) * workgroup
+            : pixel_count;
+        const size_t* local_work_size = workgroup > 0 ? &workgroup : nullptr;
+        if (status == CL_SUCCESS) status = clEnqueueNDRangeKernel(
+            runtime.queue, runtime.kfp_colour_kernel, 1, nullptr,
+            &global_size, local_work_size, 0, nullptr, nullptr);
+        if (status == CL_SUCCESS) status = clEnqueueReadBuffer(
+            runtime.queue, runtime.colour_output, CL_TRUE, 0, output_bytes,
+            output, 0, nullptr, nullptr);
+        if (status != CL_SUCCESS) {
+            throw std::runtime_error(opencl_error_text(status));
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("OpenCL KFP colourizer failed with an unknown exception");
+        return 1;
+    }
+}
+
+bool opencl_rgb_available() {
+    return opencl_available()
+        && opencl_runtime != nullptr
+        && opencl_runtime->rgb_crop_kernel != nullptr
+        && opencl_runtime->rgb_composite_kernel != nullptr;
+}
+
+int crop_rgb_opencl_impl(
+    const std::uint8_t* source,
+    int source_width,
+    int source_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int threads
+) {
+    try {
+        if (!source || !output
+            || !valid_pixel_dimensions(source_width, source_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_thread_count(threads)
+            || !std::isfinite(zoom_factor) || zoom_factor <= 0.0) {
+            throw std::runtime_error("invalid OpenCL RGB crop dimensions");
+        }
+        initialise_opencl();
+        if (!opencl_rgb_available()) {
+            throw std::runtime_error(
+                opencl_runtime && !opencl_runtime->error.empty()
+                    ? opencl_runtime->error
+                    : "OpenCL RGB compositor is unavailable");
+        }
+        OpenClRuntime& runtime = *opencl_runtime;
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        const size_t source_bytes = static_cast<size_t>(source_width)
+            * static_cast<size_t>(source_height) * 3U;
+        const size_t output_bytes = static_cast<size_t>(output_width)
+            * static_cast<size_t>(output_height) * 3U;
+        cl_int status = CL_SUCCESS;
+        const auto ensure_buffer = [&] (
+            cl_mem& buffer,
+            size_t& capacity,
+            cl_mem_flags flags,
+            size_t bytes
+        ) {
+            if (buffer && capacity >= bytes) return true;
+            cl_mem replacement = clCreateBuffer(
+                runtime.context, flags, bytes, nullptr, &status);
+            if (status != CL_SUCCESS || !replacement) return false;
+            if (buffer) clReleaseMemObject(buffer);
+            buffer = replacement;
+            capacity = bytes;
+            return true;
+        };
+        if (!ensure_buffer(runtime.rgb_parent, runtime.rgb_parent_capacity,
+                           CL_MEM_READ_ONLY, source_bytes)
+            || !ensure_buffer(runtime.rgb_output, runtime.rgb_output_capacity,
+                              CL_MEM_WRITE_ONLY, output_bytes)) {
+            throw std::runtime_error(opencl_error_text(status));
+        }
+        status = clEnqueueWriteBuffer(
+            runtime.queue, runtime.rgb_parent, CL_TRUE, 0,
+            source_bytes, source, 0, nullptr, nullptr);
+        // This buffer is shared with the atlas compositor.  A crop call may
+        // replace its contents, so invalidate the immutable-tile token before
+        // any later cached atlas call can inspect it.
+        runtime.rgb_parent_cache_token = 0;
+        runtime.rgb_parent_cache_bytes = 0;
+        cl_mem source_buffer = runtime.rgb_parent;
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_crop_kernel, 0, sizeof(source_buffer), &source_buffer);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_crop_kernel, 1, sizeof(source_width), &source_width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_crop_kernel, 2, sizeof(source_height), &source_height);
+        cl_mem output_buffer = runtime.rgb_output;
+        const float zoom_value = static_cast<float>(zoom_factor);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_crop_kernel, 3, sizeof(output_buffer), &output_buffer);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_crop_kernel, 4, sizeof(output_width), &output_width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_crop_kernel, 5, sizeof(output_height), &output_height);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_crop_kernel, 6, sizeof(zoom_value), &zoom_value);
+        const size_t pixel_count = static_cast<size_t>(output_width)
+            * static_cast<size_t>(output_height);
+        const size_t workgroup = runtime.rgb_workgroup_size;
+        const size_t global_size = workgroup > 0
+            ? ((pixel_count + workgroup - 1U) / workgroup) * workgroup
+            : pixel_count;
+        const size_t* local_work_size = workgroup > 0 ? &workgroup : nullptr;
+        if (status == CL_SUCCESS) status = clEnqueueNDRangeKernel(
+            runtime.queue, runtime.rgb_crop_kernel, 1, nullptr,
+            &global_size, local_work_size, 0, nullptr, nullptr);
+        if (status == CL_SUCCESS) status = clEnqueueReadBuffer(
+            runtime.queue, runtime.rgb_output, CL_TRUE, 0, output_bytes,
+            output, 0, nullptr, nullptr);
+        if (status != CL_SUCCESS) throw std::runtime_error(opencl_error_text(status));
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("OpenCL RGB crop failed with an unknown exception");
+        return 1;
+    }
+}
+
+int atlas_composite_rgb_opencl_impl(
+    const std::uint8_t* parent,
+    int parent_width,
+    int parent_height,
+    const std::uint8_t* child,
+    int child_width,
+    int child_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    int feather,
+    int threads,
+    std::uint64_t parent_cache_token = 0,
+    std::uint64_t child_cache_token = 0,
+    bool reuse_cached_inputs = false
+) {
+    try {
+        if (!parent || !output
+            || !valid_pixel_dimensions(parent_width, parent_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_thread_count(threads)
+            || !std::isfinite(parent_zoom) || parent_zoom <= 0.0
+            || !std::isfinite(child_fraction)
+            || child_fraction < 0.0 || child_fraction > 1.0
+            || !std::isfinite(child_zoom) || child_zoom <= 0.0
+            || feather < 0) {
+            throw std::runtime_error("invalid OpenCL RGB atlas dimensions");
+        }
+        parent_zoom = std::max(parent_zoom, 1.0);
+        child_zoom = std::max(child_zoom, 1.0);
+        const bool use_child = child != nullptr && child_fraction > 0.0;
+        if (!use_child && child_fraction > 0.0) {
+            throw std::runtime_error("OpenCL RGB atlas child is missing");
+        }
+        if (use_child
+            && (!valid_pixel_dimensions(child_width, child_height)
+                || feather > std::min(output_width, output_height))) {
+            throw std::runtime_error("invalid OpenCL RGB atlas child tile");
+        }
+        initialise_opencl();
+        if (!opencl_rgb_available()) {
+            throw std::runtime_error(
+                opencl_runtime && !opencl_runtime->error.empty()
+                    ? opencl_runtime->error
+                    : "OpenCL RGB compositor is unavailable");
+        }
+        OpenClRuntime& runtime = *opencl_runtime;
+        std::lock_guard<std::mutex> lock(runtime.mutex);
+        const size_t parent_bytes = static_cast<size_t>(parent_width)
+            * static_cast<size_t>(parent_height) * 3U;
+        const size_t child_bytes = use_child
+            ? static_cast<size_t>(child_width) * static_cast<size_t>(child_height) * 3U
+            : 1U;
+        const size_t output_bytes = static_cast<size_t>(output_width)
+            * static_cast<size_t>(output_height) * 3U;
+        cl_int status = CL_SUCCESS;
+        const auto ensure_buffer = [&] (
+            cl_mem& buffer,
+            size_t& capacity,
+            cl_mem_flags flags,
+            size_t bytes
+        ) {
+            if (buffer && capacity >= bytes) return true;
+            cl_mem replacement = clCreateBuffer(
+                runtime.context, flags, bytes, nullptr, &status);
+            if (status != CL_SUCCESS || !replacement) return false;
+            if (buffer) clReleaseMemObject(buffer);
+            buffer = replacement;
+            capacity = bytes;
+            if (&buffer == &runtime.rgb_parent) {
+                runtime.rgb_parent_cache_token = 0;
+                runtime.rgb_parent_cache_bytes = 0;
+            } else if (&buffer == &runtime.rgb_child) {
+                runtime.rgb_child_cache_token = 0;
+                runtime.rgb_child_cache_bytes = 0;
+            }
+            return true;
+        };
+        if (!ensure_buffer(runtime.rgb_parent, runtime.rgb_parent_capacity,
+                           CL_MEM_READ_ONLY, parent_bytes)
+            || !ensure_buffer(runtime.rgb_child, runtime.rgb_child_capacity,
+                              CL_MEM_READ_ONLY, child_bytes)
+            || !ensure_buffer(runtime.rgb_output, runtime.rgb_output_capacity,
+                              CL_MEM_WRITE_ONLY, output_bytes)) {
+            throw std::runtime_error(opencl_error_text(status));
+        }
+        if (!reuse_cached_inputs) {
+            runtime.rgb_parent_cache_token = 0;
+            runtime.rgb_parent_cache_bytes = 0;
+            runtime.rgb_child_cache_token = 0;
+            runtime.rgb_child_cache_bytes = 0;
+        }
+        const bool parent_cached = reuse_cached_inputs
+            && parent_cache_token != 0
+            && runtime.rgb_parent_cache_token == parent_cache_token
+            && runtime.rgb_parent_cache_bytes == parent_bytes;
+        const bool child_cached = !use_child || (
+            reuse_cached_inputs
+            && child_cache_token != 0
+            && runtime.rgb_child_cache_token == child_cache_token
+            && runtime.rgb_child_cache_bytes == child_bytes);
+        if (!parent_cached) {
+            status = clEnqueueWriteBuffer(
+                runtime.queue, runtime.rgb_parent, CL_TRUE, 0,
+                parent_bytes, parent, 0, nullptr, nullptr);
+            if (status == CL_SUCCESS && reuse_cached_inputs) {
+                runtime.rgb_parent_cache_token = parent_cache_token;
+                runtime.rgb_parent_cache_bytes = parent_bytes;
+            }
+        }
+        if (status == CL_SUCCESS && use_child && !child_cached) {
+            status = clEnqueueWriteBuffer(
+                runtime.queue, runtime.rgb_child, CL_TRUE, 0,
+                child_bytes, child, 0, nullptr, nullptr);
+            if (status == CL_SUCCESS && reuse_cached_inputs) {
+                runtime.rgb_child_cache_token = child_cache_token;
+                runtime.rgb_child_cache_bytes = child_bytes;
+            }
+        }
+        cl_mem parent_buffer = runtime.rgb_parent;
+        cl_mem child_buffer = use_child ? runtime.rgb_child : runtime.rgb_parent;
+        cl_mem output_buffer = runtime.rgb_output;
+        const int visible_child = use_child ? 1 : 0;
+        const float parent_zoom_value = static_cast<float>(parent_zoom);
+        const float child_fraction_value = static_cast<float>(child_fraction);
+        const float child_zoom_value = static_cast<float>(child_zoom);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 0, sizeof(parent_buffer), &parent_buffer);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 1, sizeof(parent_width), &parent_width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 2, sizeof(parent_height), &parent_height);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 3, sizeof(child_buffer), &child_buffer);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 4, sizeof(child_width), &child_width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 5, sizeof(child_height), &child_height);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 6, sizeof(output_buffer), &output_buffer);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 7, sizeof(output_width), &output_width);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 8, sizeof(output_height), &output_height);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 9, sizeof(parent_zoom_value),
+            &parent_zoom_value);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 10, sizeof(child_fraction_value),
+            &child_fraction_value);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 11, sizeof(child_zoom_value),
+            &child_zoom_value);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 12, sizeof(feather), &feather);
+        if (status == CL_SUCCESS) status = clSetKernelArg(
+            runtime.rgb_composite_kernel, 13, sizeof(visible_child), &visible_child);
+        const size_t pixel_count = static_cast<size_t>(output_width)
+            * static_cast<size_t>(output_height);
+        const size_t workgroup = runtime.rgb_workgroup_size;
+        const size_t global_size = workgroup > 0
+            ? ((pixel_count + workgroup - 1U) / workgroup) * workgroup
+            : pixel_count;
+        const size_t* local_work_size = workgroup > 0 ? &workgroup : nullptr;
+        if (status == CL_SUCCESS) status = clEnqueueNDRangeKernel(
+            runtime.queue, runtime.rgb_composite_kernel, 1, nullptr,
+            &global_size, local_work_size, 0, nullptr, nullptr);
+        if (status == CL_SUCCESS) status = clEnqueueReadBuffer(
+            runtime.queue, runtime.rgb_output, CL_TRUE, 0, output_bytes,
+            output, 0, nullptr, nullptr);
+        if (status != CL_SUCCESS) throw std::runtime_error(opencl_error_text(status));
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("OpenCL RGB atlas compositor failed with an unknown exception");
+        return 1;
+    }
+}
+#endif
+
 } // namespace
 
 extern "C" {
@@ -6645,7 +15874,17 @@ int fractal_backend_capabilities() {
         if (avx2_runtime_available()) capabilities |= 2;
 #endif
 #ifdef FRACTAL_HAVE_OPENCL
-        if (opencl_available()) capabilities |= 4;
+        const bool opencl_ok = opencl_available();
+        if (opencl_ok) {
+            capabilities |= 4;
+            // This supplementary bit lets front ends prefer a real GPU in
+            // automatic mode while still exposing a CPU OpenCL ICD to users
+            // who explicitly request it.
+            if (opencl_runtime && opencl_runtime->device_is_gpu) capabilities |= 8;
+        } else if (opencl_runtime && !opencl_runtime->error.empty()) {
+            set_error(opencl_runtime->error);
+            return capabilities;
+        }
 #endif
         set_error("");
         return capabilities;
@@ -6687,6 +15926,263 @@ int fractal_colourise(
         threads,
         nullptr,
         nullptr);
+}
+
+/* Optional GPU Aurora colour path. KFP and accented palettes intentionally
+ * use their specialised CPU APIs instead. */
+int fractal_colourise_opencl(
+    const float* field,
+    std::uint8_t* output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int threads
+) {
+#ifdef FRACTAL_HAVE_OPENCL
+    return colourise_field_opencl_impl(
+        field, output, width, height, max_iter, phase, vocal,
+        instrumental, pitch, threads);
+#else
+    (void)field;
+    (void)output;
+    (void)width;
+    (void)height;
+    (void)max_iter;
+    (void)phase;
+    (void)vocal;
+    (void)instrumental;
+    (void)pitch;
+    (void)threads;
+    set_error("OpenCL colourizer is not available in this build");
+    return 1;
+#endif
+}
+
+int fractal_atlas_colourise_opencl(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    double parent_field_bias,
+    double child_field_bias,
+    double output_field_bias,
+    int palette_max_iter,
+    int feather,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int threads,
+    std::uint64_t parent_cache_token,
+    std::uint64_t child_cache_token
+) {
+#ifdef FRACTAL_HAVE_OPENCL
+    return atlas_colourise_opencl_impl(
+        parent, parent_width, parent_height, parent_max_iter,
+        child, child_width, child_height, child_max_iter,
+        output, output_width, output_height, parent_zoom, child_fraction,
+        child_zoom, parent_field_bias, child_field_bias, output_field_bias,
+        palette_max_iter, feather, phase, vocal, instrumental, pitch,
+        threads, parent_cache_token, child_cache_token, nullptr, nullptr);
+#else
+    (void)parent;
+    (void)parent_width;
+    (void)parent_height;
+    (void)parent_max_iter;
+    (void)child;
+    (void)child_width;
+    (void)child_height;
+    (void)child_max_iter;
+    (void)output;
+    (void)output_width;
+    (void)output_height;
+    (void)parent_zoom;
+    (void)child_fraction;
+    (void)child_zoom;
+    (void)parent_field_bias;
+    (void)child_field_bias;
+    (void)output_field_bias;
+    (void)palette_max_iter;
+    (void)feather;
+    (void)phase;
+    (void)vocal;
+    (void)instrumental;
+    (void)pitch;
+    (void)threads;
+    (void)parent_cache_token;
+    (void)child_cache_token;
+    set_error("OpenCL fused atlas colourizer is not available in this build");
+    return 1;
+#endif
+}
+
+int fractal_atlas_colourise_opencl_accents(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    double parent_field_bias,
+    double child_field_bias,
+    double output_field_bias,
+    int palette_max_iter,
+    int feather,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    int threads,
+    std::uint64_t parent_cache_token,
+    std::uint64_t child_cache_token,
+    const std::uint8_t* accents,
+    int interior_red,
+    int interior_green,
+    int interior_blue
+) {
+#ifdef FRACTAL_HAVE_OPENCL
+    const int interior_color[3] = {
+        interior_red,
+        interior_green,
+        interior_blue,
+    };
+    return atlas_colourise_opencl_impl(
+        parent, parent_width, parent_height, parent_max_iter,
+        child, child_width, child_height, child_max_iter,
+        output, output_width, output_height, parent_zoom, child_fraction,
+        child_zoom, parent_field_bias, child_field_bias, output_field_bias,
+        palette_max_iter, feather, phase, vocal, instrumental, pitch,
+        threads, parent_cache_token, child_cache_token, accents,
+        interior_color);
+#else
+    (void)parent;
+    (void)parent_width;
+    (void)parent_height;
+    (void)parent_max_iter;
+    (void)child;
+    (void)child_width;
+    (void)child_height;
+    (void)child_max_iter;
+    (void)output;
+    (void)output_width;
+    (void)output_height;
+    (void)parent_zoom;
+    (void)child_fraction;
+    (void)child_zoom;
+    (void)parent_field_bias;
+    (void)child_field_bias;
+    (void)output_field_bias;
+    (void)palette_max_iter;
+    (void)feather;
+    (void)phase;
+    (void)vocal;
+    (void)instrumental;
+    (void)pitch;
+    (void)threads;
+    (void)parent_cache_token;
+    (void)child_cache_token;
+    (void)accents;
+    (void)interior_red;
+    (void)interior_green;
+    (void)interior_blue;
+    set_error("OpenCL fused atlas colourizer is not available in this build");
+    return 1;
+#endif
+}
+
+int fractal_atlas_colourise_opencl_batch(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    const FractalAtlasColourFrame* frames,
+    int frame_count,
+    int threads,
+    std::uint64_t parent_cache_token,
+    std::uint64_t child_cache_token,
+    const std::uint8_t* accents,
+    int interior_red,
+    int interior_green,
+    int interior_blue
+) {
+#ifdef FRACTAL_HAVE_OPENCL
+    const int interior_color[3] = {
+        interior_red,
+        interior_green,
+        interior_blue,
+    };
+    return atlas_colourise_opencl_batch_impl(
+        parent,
+        parent_width,
+        parent_height,
+        parent_max_iter,
+        child,
+        child_width,
+        child_height,
+        child_max_iter,
+        output,
+        output_width,
+        output_height,
+        frames,
+        frame_count,
+        threads,
+        parent_cache_token,
+        child_cache_token,
+        accents,
+        interior_color);
+#else
+    (void)parent;
+    (void)parent_width;
+    (void)parent_height;
+    (void)parent_max_iter;
+    (void)child;
+    (void)child_width;
+    (void)child_height;
+    (void)child_max_iter;
+    (void)output;
+    (void)output_width;
+    (void)output_height;
+    (void)frames;
+    (void)frame_count;
+    (void)threads;
+    (void)parent_cache_token;
+    (void)child_cache_token;
+    (void)accents;
+    (void)interior_red;
+    (void)interior_green;
+    (void)interior_blue;
+    set_error("OpenCL fused atlas colourizer is not available in this build");
+    return 1;
+#endif
 }
 
 int fractal_colourise_accents(
@@ -6793,7 +16289,7 @@ int fractal_apply_aurora_accents(
     }
 }
 
-int fractal_colourise_kfp(
+int fractal_colourise_kfp_impl(
     const float* field,
     std::uint8_t* output,
     int width,
@@ -6804,6 +16300,7 @@ int fractal_colourise_kfp(
     double instrumental,
     double pitch,
     const FractalKfpOptions* options,
+    const FractalKfpPlanes* planes,
     const std::uint8_t* lut,
     int lut_size,
     int threads
@@ -6812,29 +16309,110 @@ int fractal_colourise_kfp(
         if (!field || !output || !valid_pixel_dimensions(width, height)
             || !valid_iteration_count(max_iter) || !valid_thread_count(threads)
             || !valid_colour_controls(phase, vocal, instrumental, pitch)
-            || !lut || !valid_kfp_options(options, lut_size)) {
+            || !lut || !valid_kfp_options(options, lut_size)
+            || !valid_kfp_planes(planes, width, height)) {
             throw std::runtime_error("invalid native KFP colour dimensions or controls");
         }
         const FractalKfpOptions& transfer_options = *options;
         if (transfer_options.field_bias > static_cast<double>(max_iter)) {
             throw std::runtime_error("native KFP field bias exceeds iteration cap");
         }
+        const double smooth_offset = kfp_smooth_offset(transfer_options);
         const KfpSlopeDirection slope_direction = kfp_slope_direction(transfer_options);
+        const KfpPixelContext pixel_context = kfp_pixel_context(
+            transfer_options, smooth_offset, planes);
+#ifdef _OPENMP
+        if (threads > 0) {
+            omp_set_dynamic(0);
+            omp_set_num_threads(threads);
+        }
+#endif
+        std::vector<double> orbit_colour_samples;
+        const double* orbit_colour_samples_data = nullptr;
+        std::vector<double> scalar_colour_samples;
+        const double* scalar_colour_samples_data = nullptr;
+        if (planes != nullptr && planes->orbit_iteration != nullptr
+            && (pixel_context.needs_difference
+                || pixel_context.needs_slopes
+                || pixel_context.texture_active)) {
+            // SetColor samples the same continuous orbit value for the
+            // centre and for several stencil neighbours. Materialize that
+            // value once in double precision: this preserves the exact
+            // arithmetic of kfp_plane_orbit_sample while avoiding repeated
+            // log/pow work and making the stencil a cache-friendly read.
+            const size_t pixel_count = static_cast<size_t>(width)
+                * static_cast<size_t>(height);
+            orbit_colour_samples.resize(pixel_count);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int pixel = 0; pixel < width * height; ++pixel) {
+                orbit_colour_samples[static_cast<size_t>(pixel)] =
+                    kfp_plane_orbit_sample(
+                        max_iter,
+                        transfer_options,
+                        planes,
+                        static_cast<size_t>(pixel),
+                        &pixel_context).colour;
+            }
+            orbit_colour_samples_data = orbit_colour_samples.data();
+        }
+        if (!kfp_planes_have_iteration(planes)
+            && (pixel_context.needs_difference
+                || pixel_context.needs_slopes
+                || pixel_context.texture_active)) {
+            // The scalar compatibility field is already the compact value
+            // used by the visualizer. Materialize Kalles' continuous color
+            // sample once so each stencil neighbour reuses the same exact
+            // clamp/offset arithmetic instead of repeating it in the hot
+            // pixel loop. This is especially useful for the default KFP,
+            // whose difference and relief stages both read the same samples.
+            const size_t pixel_count = static_cast<size_t>(width)
+                * static_cast<size_t>(height);
+            scalar_colour_samples.resize(pixel_count);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int pixel = 0; pixel < width * height; ++pixel) {
+                scalar_colour_samples[static_cast<size_t>(pixel)] =
+                    kfp_colour_sample(
+                        field,
+                        width,
+                        height,
+                        pixel % width,
+                        pixel / width,
+                        max_iter,
+                        smooth_offset,
+                        transfer_options.field_bias);
+            }
+            scalar_colour_samples_data = scalar_colour_samples.data();
+        }
         double transfer_minimum = 0.0;
         double transfer_maximum = 1.0;
-        if (threads > 0) {
-#ifdef _OPENMP
-            omp_set_num_threads(threads);
-#endif
-        }
         if (transfer_options.color_method == 4) {
-            const KfpTransferBounds bounds = kfp_transfer_bounds(
-                field, width, height, max_iter, transfer_options.field_bias);
+            const KfpTransferBounds bounds = planes != nullptr
+                ? kfp_transfer_bounds_planes(
+                    field,
+                    width,
+                    height,
+                    max_iter,
+                    transfer_options,
+                    planes,
+                    orbit_colour_samples_data)
+                : kfp_transfer_bounds(
+                    field,
+                    width,
+                    height,
+                    max_iter,
+                    transfer_options.field_bias,
+                    smooth_offset);
             transfer_minimum = bounds.minimum;
             transfer_maximum = bounds.maximum;
         }
-        const bool fast_default = kfp_is_default_fast_options(transfer_options)
-            && !kfp_force_precise;
+        // The former default branch used approximate transcendental
+        // functions and was the reason the bundled palette differed from
+        // Kalles even when the scalar field was identical.
+        const bool fast_default = false;
         if (fast_default) {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -6868,6 +16446,7 @@ int fractal_colourise_kfp(
                         write_kfp_default_fast_block8(
                         field,
                         width,
+                        height,
                         x,
                         y,
                         x,
@@ -6919,12 +16498,16 @@ int fractal_colourise_kfp(
                         width,
                         max_iter,
                         transfer_options,
+                        pixel_context,
                         lut,
                         lut_size,
                         transfer_minimum,
                         transfer_maximum,
                         slope_direction,
-                        destination);
+                        destination,
+                        planes,
+                        orbit_colour_samples_data,
+                        scalar_colour_samples_data);
                 }
             }
         }
@@ -6937,6 +16520,209 @@ int fractal_colourise_kfp(
         set_error("native KFP colouriser failed with an unknown exception");
         return 1;
     }
+}
+
+int fractal_colourise_kfp(
+    const float* field,
+    std::uint8_t* output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    return fractal_colourise_kfp_impl(
+        field, output, width, height, max_iter, phase, vocal,
+        instrumental, pitch, options, nullptr, lut, lut_size, threads);
+}
+
+/* Optional OpenCL scalar KFP colour pass. Plane-aware, textured, and
+ * multi-colour profiles intentionally remain on the exact CPU SetColor path. */
+int fractal_colourise_kfp_opencl(
+    const float* field,
+    std::uint8_t* output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+#ifdef FRACTAL_HAVE_OPENCL
+    return colourise_kfp_opencl_impl(
+        field, output, width, height, max_iter, phase, vocal,
+        instrumental, pitch, options, lut, lut_size, threads);
+#else
+    (void)field;
+    (void)output;
+    (void)width;
+    (void)height;
+    (void)max_iter;
+    (void)phase;
+    (void)vocal;
+    (void)instrumental;
+    (void)pitch;
+    (void)options;
+    (void)lut;
+    (void)lut_size;
+    (void)threads;
+    set_error("OpenCL KFP colourizer is not available in this build");
+    return 1;
+#endif
+}
+
+/* Optional OpenCL RGB atlas compositor.  The CPU RGB ABI remains available
+ * as a fallback for older drivers and for callers that do not request GPU
+ * composition. */
+int fractal_crop_rgb_opencl(
+    const std::uint8_t* source,
+    int source_width,
+    int source_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double zoom_factor,
+    int threads
+) {
+#ifdef FRACTAL_HAVE_OPENCL
+    return crop_rgb_opencl_impl(
+        source, source_width, source_height, output, output_width,
+        output_height, zoom_factor, threads);
+#else
+    (void)source;
+    (void)source_width;
+    (void)source_height;
+    (void)output;
+    (void)output_width;
+    (void)output_height;
+    (void)zoom_factor;
+    (void)threads;
+    set_error("OpenCL RGB compositor is not available in this build");
+    return 1;
+#endif
+}
+
+int fractal_atlas_composite_rgb_opencl(
+    const std::uint8_t* parent,
+    int parent_width,
+    int parent_height,
+    const std::uint8_t* child,
+    int child_width,
+    int child_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    int feather,
+    int threads
+) {
+#ifdef FRACTAL_HAVE_OPENCL
+    return atlas_composite_rgb_opencl_impl(
+        parent, parent_width, parent_height, child, child_width,
+        child_height, output, output_width, output_height, parent_zoom,
+        child_fraction, child_zoom, feather, threads);
+#else
+    (void)parent;
+    (void)parent_width;
+    (void)parent_height;
+    (void)child;
+    (void)child_width;
+    (void)child_height;
+    (void)output;
+    (void)output_width;
+    (void)output_height;
+    (void)parent_zoom;
+    (void)child_fraction;
+    (void)child_zoom;
+    (void)feather;
+    (void)threads;
+    set_error("OpenCL RGB compositor is not available in this build");
+    return 1;
+#endif
+}
+
+/* Cached-input variant for the static KFP atlas. The caller promises that
+ * the parent/child byte arrays remain unchanged while their tokens remain
+ * unchanged; the ordinary entry point above keeps the conservative upload on
+ * every call for general ABI users. */
+int fractal_atlas_composite_rgb_opencl_cached(
+    const std::uint8_t* parent,
+    int parent_width,
+    int parent_height,
+    const std::uint8_t* child,
+    int child_width,
+    int child_height,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    int feather,
+    int threads,
+    std::uint64_t parent_cache_token,
+    std::uint64_t child_cache_token
+) {
+#ifdef FRACTAL_HAVE_OPENCL
+    return atlas_composite_rgb_opencl_impl(
+        parent, parent_width, parent_height, child, child_width,
+        child_height, output, output_width, output_height, parent_zoom,
+        child_fraction, child_zoom, feather, threads,
+        parent_cache_token, child_cache_token, true);
+#else
+    (void)parent;
+    (void)parent_width;
+    (void)parent_height;
+    (void)child;
+    (void)child_width;
+    (void)child_height;
+    (void)output;
+    (void)output_width;
+    (void)output_height;
+    (void)parent_zoom;
+    (void)child_fraction;
+    (void)child_zoom;
+    (void)feather;
+    (void)threads;
+    (void)parent_cache_token;
+    (void)child_cache_token;
+    set_error("OpenCL RGB compositor is not available in this build");
+    return 1;
+#endif
+}
+
+int fractal_colourise_kfp_planes(
+    const float* field,
+    std::uint8_t* output,
+    int width,
+    int height,
+    int max_iter,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const FractalKfpPlanes* planes,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    return fractal_colourise_kfp_impl(
+        field, output, width, height, max_iter, phase, vocal,
+        instrumental, pitch, options, planes, lut, lut_size, threads);
 }
 
 int fractal_atlas_colourise_kfp(
@@ -6999,16 +16785,19 @@ int fractal_atlas_colourise_kfp(
         if (transfer_options.field_bias > static_cast<double>(max_iter)) {
             throw std::runtime_error("native KFP field bias exceeds iteration cap");
         }
+        const double smooth_offset = kfp_smooth_offset(transfer_options);
         const KfpSlopeDirection slope_direction = kfp_slope_direction(transfer_options);
-        const bool fast_default = kfp_is_default_fast_options(transfer_options)
-            && !kfp_force_precise;
+        const KfpPixelContext pixel_context = kfp_pixel_context(
+            transfer_options, smooth_offset, nullptr);
+        const bool fast_default = false;
         const KfpTransferBounds parent_bounds = transfer_options.color_method == 4
             ? kfp_transfer_bounds(
                 parent,
                 parent_width,
                 parent_height,
                 max_iter,
-                transfer_options.field_bias)
+                transfer_options.field_bias,
+                smooth_offset)
             : KfpTransferBounds{};
         const KfpTransferBounds child_bounds = use_child && transfer_options.color_method == 4
             ? kfp_transfer_bounds(
@@ -7016,8 +16805,61 @@ int fractal_atlas_colourise_kfp(
                 child_width,
                 child_height,
                 max_iter,
-                transfer_options.field_bias)
+                transfer_options.field_bias,
+                smooth_offset)
             : KfpTransferBounds{};
+
+        std::vector<double> parent_colour_samples;
+        std::vector<double> child_colour_samples;
+        const double* parent_colour_samples_data = nullptr;
+        const double* child_colour_samples_data = nullptr;
+        if (pixel_context.needs_difference || pixel_context.needs_slopes) {
+            // Atlas tiles use the same Kalles stencil as a direct frame, but
+            // each source has its own local edge. Cache the exact continuous
+            // source samples once per tile so every parent/child pixel does
+            // not redo the scalar clamp and smoothing offset for each
+            // neighbour read.
+            const size_t parent_count = static_cast<size_t>(parent_width)
+                * static_cast<size_t>(parent_height);
+            parent_colour_samples.resize(parent_count);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int pixel = 0; pixel < parent_width * parent_height; ++pixel) {
+                parent_colour_samples[static_cast<size_t>(pixel)] =
+                    kfp_colour_sample(
+                        parent,
+                        parent_width,
+                        parent_height,
+                        pixel % parent_width,
+                        pixel / parent_width,
+                        max_iter,
+                        smooth_offset,
+                        transfer_options.field_bias);
+            }
+            parent_colour_samples_data = parent_colour_samples.data();
+            if (use_child) {
+                const size_t child_count = static_cast<size_t>(child_width)
+                    * static_cast<size_t>(child_height);
+                child_colour_samples.resize(child_count);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (int pixel = 0; pixel < child_width * child_height; ++pixel) {
+                    child_colour_samples[static_cast<size_t>(pixel)] =
+                        kfp_colour_sample(
+                            child,
+                            child_width,
+                            child_height,
+                            pixel % child_width,
+                            pixel / child_width,
+                            max_iter,
+                            smooth_offset,
+                            transfer_options.field_bias);
+                }
+                child_colour_samples_data = child_colour_samples.data();
+            }
+        }
 
         std::vector<float> child_edge_x;
         std::vector<float> child_edge_y;
@@ -7060,6 +16902,7 @@ int fractal_atlas_colourise_kfp(
                             write_kfp_default_fast_block8(
                                 parent,
                                 parent_width,
+                                parent_height,
                                 x,
                                 y,
                                 x,
@@ -7109,6 +16952,7 @@ int fractal_atlas_colourise_kfp(
                             write_kfp_default_fast_block8(
                                 child,
                                 child_width,
+                                child_height,
                                 child_x,
                                 child_y,
                                 x,
@@ -7250,12 +17094,16 @@ int fractal_atlas_colourise_kfp(
                         output_width,
                         max_iter,
                         transfer_options,
+                        pixel_context,
                         lut,
                         lut_size,
                         parent_bounds.minimum,
                         parent_bounds.maximum,
                         slope_direction,
-                        destination);
+                        destination,
+                        nullptr,
+                        nullptr,
+                        parent_colour_samples_data);
                     continue;
                 }
 
@@ -7290,12 +17138,16 @@ int fractal_atlas_colourise_kfp(
                         output_width,
                         max_iter,
                         transfer_options,
+                        pixel_context,
                         lut,
                         lut_size,
                         child_bounds.minimum,
                         child_bounds.maximum,
                         slope_direction,
-                        destination);
+                        destination,
+                        nullptr,
+                        nullptr,
+                        child_colour_samples_data);
                     continue;
                 }
 
@@ -7317,12 +17169,16 @@ int fractal_atlas_colourise_kfp(
                             output_width,
                             max_iter,
                             transfer_options,
+                            pixel_context,
                             lut,
                             lut_size,
                             parent_bounds.minimum,
                             parent_bounds.maximum,
                             slope_direction,
-                            destination);
+                            destination,
+                            nullptr,
+                            nullptr,
+                            parent_colour_samples_data);
                     } else {
                         write_kfp_pixel(
                             child,
@@ -7335,12 +17191,16 @@ int fractal_atlas_colourise_kfp(
                             output_width,
                             max_iter,
                             transfer_options,
+                            pixel_context,
                             lut,
                             lut_size,
                             child_bounds.minimum,
                             child_bounds.maximum,
                             slope_direction,
-                            destination);
+                            destination,
+                            nullptr,
+                            nullptr,
+                            child_colour_samples_data);
                     }
                     continue;
                 }
@@ -7357,12 +17217,16 @@ int fractal_atlas_colourise_kfp(
                         output_width,
                         max_iter,
                         transfer_options,
+                        pixel_context,
                         lut,
                         lut_size,
                         child_bounds.minimum,
                         child_bounds.maximum,
                         slope_direction,
-                        destination);
+                        destination,
+                        nullptr,
+                        nullptr,
+                        child_colour_samples_data);
                     continue;
                 }
 
@@ -7380,12 +17244,16 @@ int fractal_atlas_colourise_kfp(
                     output_width,
                     max_iter,
                     transfer_options,
+                    pixel_context,
                     lut,
                     lut_size,
                     parent_bounds.minimum,
                     parent_bounds.maximum,
                     slope_direction,
-                    parent_rgb);
+                    parent_rgb,
+                    nullptr,
+                    nullptr,
+                    parent_colour_samples_data);
                 write_kfp_pixel(
                     child,
                     child_width,
@@ -7397,12 +17265,16 @@ int fractal_atlas_colourise_kfp(
                     output_width,
                     max_iter,
                     transfer_options,
+                    pixel_context,
                     lut,
                     lut_size,
                     child_bounds.minimum,
                     child_bounds.maximum,
                     slope_direction,
-                    child_rgb);
+                    child_rgb,
+                    nullptr,
+                    nullptr,
+                    child_colour_samples_data);
                 destination[0] = rounded_colour_byte(
                     static_cast<double>(parent_rgb[0]) * (1.0 - alpha)
                     + static_cast<double>(child_rgb[0]) * alpha);
@@ -7422,6 +17294,486 @@ int fractal_atlas_colourise_kfp(
         return 1;
     } catch (...) {
         set_error("native KFP atlas colouriser failed with an unknown exception");
+        return 1;
+    }
+}
+
+int fractal_atlas_colourise_kfp_planes(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const FractalKfpPlanes* parent_planes,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    const FractalKfpPlanes* child_planes,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    int max_iter,
+    int centered_input,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    try {
+        if (!parent || !output || !parent_planes
+            || !valid_pixel_dimensions(parent_width, parent_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_iteration_count(parent_max_iter)
+            || !valid_iteration_count(max_iter)
+            || !valid_thread_count(threads)
+            || centered_input < 0 || centered_input > 1
+            || !std::isfinite(parent_zoom) || parent_zoom <= 0.0
+            || !std::isfinite(child_fraction)
+            || child_fraction < 0.0 || child_fraction > 1.0
+            || !std::isfinite(child_zoom) || child_zoom <= 0.0
+            || !valid_colour_controls(phase, vocal, instrumental, pitch)
+            || !lut || !valid_kfp_options(options, lut_size)
+            || !valid_kfp_planes(parent_planes, parent_width, parent_height)) {
+            throw std::runtime_error(
+                "invalid native plane-aware KFP atlas dimensions or controls");
+        }
+
+        const bool use_child = child != nullptr && child_fraction > 0.0;
+        if (use_child) {
+            if (!valid_pixel_dimensions(child_width, child_height)
+                || !valid_iteration_count(child_max_iter)
+                || !child_planes
+                || !valid_kfp_planes(child_planes, child_width, child_height)) {
+                throw std::runtime_error(
+                    "invalid native plane-aware KFP atlas child tile");
+            }
+        } else if (child != nullptr || child_planes != nullptr
+                   || child_width != 0 || child_height != 0
+                   || child_max_iter != 0) {
+            throw std::runtime_error(
+                "invalid native plane-aware KFP atlas child absence");
+        }
+
+        const FractalKfpOptions& transfer_options = *options;
+        if (transfer_options.field_bias > static_cast<double>(max_iter)) {
+            throw std::runtime_error("native KFP field bias exceeds iteration cap");
+        }
+        parent_zoom = std::max(parent_zoom, 1.0);
+        child_zoom = std::max(child_zoom, 1.0);
+
+        const bool full_child = use_child && child_fraction >= 0.999999;
+        const float* primary_field = full_child ? child : parent;
+        const int primary_width = full_child ? child_width : parent_width;
+        const int primary_height = full_child ? child_height : parent_height;
+        const int primary_max_iter = full_child ? child_max_iter : parent_max_iter;
+        const double primary_zoom = full_child ? child_zoom : parent_zoom;
+        const FractalKfpPlanes* primary_planes = full_child
+            ? child_planes : parent_planes;
+        const float* secondary_field = !full_child && use_child ? child : nullptr;
+        const int secondary_width = !full_child && use_child ? child_width : 0;
+        const int secondary_height = !full_child && use_child ? child_height : 0;
+        const int secondary_max_iter = !full_child && use_child
+            ? child_max_iter : 0;
+        const double secondary_zoom = child_zoom;
+        const FractalKfpPlanes* secondary_planes = !full_child && use_child
+            ? child_planes : nullptr;
+        const int target_max_iter = full_child ? child_max_iter : max_iter;
+        const double primary_field_bias = centered_input
+            ? static_cast<double>(primary_max_iter) : 0.0;
+        const double secondary_field_bias = centered_input
+            ? static_cast<double>(secondary_max_iter) : 0.0;
+
+        const int visible_child_width = secondary_field != nullptr
+            ? std::max(1, static_cast<int>(std::lround(
+                static_cast<double>(output_width) * child_fraction))) : 0;
+        const int visible_child_height = secondary_field != nullptr
+            ? std::max(1, static_cast<int>(std::lround(
+                static_cast<double>(output_height) * child_fraction))) : 0;
+        const int child_left = secondary_field != nullptr
+            ? (output_width - visible_child_width) / 2 : 0;
+        const int child_top = secondary_field != nullptr
+            ? (output_height - visible_child_height) / 2 : 0;
+        const int seam_feather = secondary_field != nullptr
+            ? std::min(2, std::min(visible_child_width / 2,
+                                   visible_child_height / 2)) : 0;
+
+        BilinearWorkspace& workspace = bilinear_workspace;
+        BilinearAxis& primary_x_axis = workspace.parent_x_axis;
+        BilinearAxis& primary_y_axis = workspace.parent_y_axis;
+        fill_bilinear_axis(
+            primary_x_axis, primary_width, output_width, primary_zoom);
+        fill_bilinear_axis(
+            primary_y_axis, primary_height, output_height, primary_zoom);
+        BilinearAxis& secondary_x_axis = workspace.child_x_axis;
+        BilinearAxis& secondary_y_axis = workspace.child_y_axis;
+        if (secondary_field != nullptr) {
+            fill_bilinear_axis(
+                secondary_x_axis, secondary_width, visible_child_width,
+                secondary_zoom);
+            fill_bilinear_axis(
+                secondary_y_axis, secondary_height, visible_child_height,
+                secondary_zoom);
+        }
+
+        std::vector<float>& output_field = workspace.kfp_parent_field;
+        const size_t pixel_count = static_cast<size_t>(output_width)
+            * static_cast<size_t>(output_height);
+        output_field.resize(pixel_count);
+        FractalKfpPlanes output_planes{};
+        output_planes.struct_size = sizeof(FractalKfpPlanes);
+        output_planes.version = FRACTAL_KFP_PLANES_VERSION;
+
+        // Bind only the planes that actually exist in either source. This is
+        // important for live mode: a profile can omit phase/DE data and must
+        // not pay for several extra full-resolution double buffers.
+        auto bind_int_plane = [&](
+            const std::int64_t* FractalKfpPlanes::* member,
+            std::vector<std::int64_t>& storage
+        ) {
+            const std::int64_t* primary = primary_planes->*member;
+            const std::int64_t* secondary = secondary_planes != nullptr
+                ? secondary_planes->*member : nullptr;
+            if (!primary && !secondary) return;
+            storage.resize(pixel_count);
+            if (!primary) std::fill(storage.begin(), storage.end(), 0);
+            output_planes.*member = storage.data();
+        };
+        auto bind_double_plane = [&](
+            const double* FractalKfpPlanes::* member,
+            std::vector<double>& storage
+        ) {
+            const double* primary = primary_planes->*member;
+            const double* secondary = secondary_planes != nullptr
+                ? secondary_planes->*member : nullptr;
+            if (!primary && !secondary) return;
+            storage.resize(pixel_count);
+            if (!primary) std::fill(storage.begin(), storage.end(), 0.0);
+            output_planes.*member = storage.data();
+        };
+        bind_int_plane(
+            &FractalKfpPlanes::orbit_iteration,
+            workspace.kfp_atlas_orbit_iteration);
+        bind_int_plane(
+            &FractalKfpPlanes::iteration,
+            workspace.kfp_atlas_iteration);
+        bind_double_plane(
+            &FractalKfpPlanes::bailout,
+            workspace.kfp_atlas_bailout);
+        bind_double_plane(
+            &FractalKfpPlanes::transition,
+            workspace.kfp_atlas_transition);
+        bind_double_plane(
+            &FractalKfpPlanes::phase,
+            workspace.kfp_atlas_phase);
+        bind_double_plane(
+            &FractalKfpPlanes::de_x,
+            workspace.kfp_atlas_de_x);
+        bind_double_plane(
+            &FractalKfpPlanes::de_y,
+            workspace.kfp_atlas_de_y);
+        bind_double_plane(
+            &FractalKfpPlanes::test1,
+            workspace.kfp_atlas_test1);
+        bind_double_plane(
+            &FractalKfpPlanes::test2,
+            workspace.kfp_atlas_test2);
+
+        // Texture coordinates are evaluated in final screen space. Keep one
+        // source image attached to the output plane bundle rather than
+        // attempting to crop or blend it with the atlas tiles.
+        const FractalKfpPlanes* texture_planes = primary_planes;
+        if (texture_planes->texture_rgb == nullptr
+            && secondary_planes != nullptr
+            && secondary_planes->texture_rgb != nullptr) {
+            texture_planes = secondary_planes;
+        }
+        output_planes.texture_rgb = texture_planes->texture_rgb;
+        output_planes.texture_width = texture_planes->texture_width;
+        output_planes.texture_height = texture_planes->texture_height;
+        output_planes.texture_stride = texture_planes->texture_stride;
+
+        auto primary_scalar = [&](int x, int y, bool& inside) {
+            const float smooth = sample_bilinear_mapped_preserving_interior(
+                primary_field,
+                primary_width,
+                primary_x_axis,
+                primary_y_axis,
+                x,
+                y,
+                primary_max_iter,
+                inside,
+                primary_field_bias);
+            return inside
+                ? encode_render_iteration(target_max_iter, transfer_options.field_bias)
+                : encode_render_value(
+                    static_cast<long double>(smooth),
+                    transfer_options.field_bias);
+        };
+        auto secondary_scalar = [&](int x, int y, bool& inside) {
+            const float smooth = sample_bilinear_mapped_preserving_interior(
+                secondary_field,
+                secondary_width,
+                secondary_x_axis,
+                secondary_y_axis,
+                x,
+                y,
+                secondary_max_iter,
+                inside,
+                secondary_field_bias);
+            return inside
+                ? encode_render_iteration(target_max_iter, transfer_options.field_bias)
+                : encode_render_value(
+                    static_cast<long double>(smooth),
+                    transfer_options.field_bias);
+        };
+
+        auto write_primary_int_plane = [&](
+            const std::int64_t* source,
+            std::int64_t* destination,
+            int x,
+            int y,
+            bool inside
+        ) {
+            if (!source || !destination) return;
+            destination[static_cast<size_t>(y) * static_cast<size_t>(output_width)
+                + static_cast<size_t>(x)] = inside
+                ? static_cast<std::int64_t>(target_max_iter)
+                : sample_nearest_mapped_int64(
+                    source, primary_width, primary_x_axis,
+                    primary_y_axis, x, y);
+        };
+        auto write_primary_double_plane = [&](
+            const double* source,
+            double* destination,
+            bool preserve_negative,
+            bool reset_inside,
+            int x,
+            int y,
+            bool inside
+        ) {
+            if (!source || !destination) return;
+            double value = sample_bilinear_mapped_double(
+                source, primary_width, primary_x_axis, primary_y_axis,
+                x, y, preserve_negative);
+            if (preserve_negative) {
+                const double nearest = sample_nearest_mapped_double(
+                    source, primary_width, primary_x_axis, primary_y_axis,
+                    x, y);
+                if (nearest < 0.0) value = nearest;
+            }
+            destination[static_cast<size_t>(y) * static_cast<size_t>(output_width)
+                + static_cast<size_t>(x)] = inside && reset_inside ? 0.0 : value;
+        };
+
+        const std::int64_t* parent_orbit = primary_planes->orbit_iteration;
+        const std::int64_t* parent_iteration = primary_planes->iteration;
+        const double* parent_bailout = primary_planes->bailout;
+        const double* parent_transition = primary_planes->transition;
+        const double* parent_phase = primary_planes->phase;
+        const double* parent_de_x = primary_planes->de_x;
+        const double* parent_de_y = primary_planes->de_y;
+        const double* parent_test1 = primary_planes->test1;
+        const double* parent_test2 = primary_planes->test2;
+
+        std::int64_t* output_orbit = const_cast<std::int64_t*>(
+            output_planes.orbit_iteration);
+        std::int64_t* output_iteration = const_cast<std::int64_t*>(
+            output_planes.iteration);
+        double* output_bailout = const_cast<double*>(output_planes.bailout);
+        double* output_transition = const_cast<double*>(output_planes.transition);
+        double* output_phase = const_cast<double*>(output_planes.phase);
+        double* output_de_x = const_cast<double*>(output_planes.de_x);
+        double* output_de_y = const_cast<double*>(output_planes.de_y);
+        double* output_test1 = const_cast<double*>(output_planes.test1);
+        double* output_test2 = const_cast<double*>(output_planes.test2);
+
+#ifdef _OPENMP
+        if (threads > 0) {
+            omp_set_dynamic(0);
+            omp_set_num_threads(threads);
+        }
+#pragma omp parallel for schedule(static)
+#endif
+        for (int y = 0; y < output_height; ++y) {
+            for (int x = 0; x < output_width; ++x) {
+                const size_t index = static_cast<size_t>(y)
+                    * static_cast<size_t>(output_width)
+                    + static_cast<size_t>(x);
+                bool primary_inside = false;
+                output_field[index] = primary_scalar(x, y, primary_inside);
+                write_primary_int_plane(
+                    parent_orbit, output_orbit, x, y, primary_inside);
+                write_primary_int_plane(
+                    parent_iteration, output_iteration, x, y, primary_inside);
+                write_primary_double_plane(
+                    parent_bailout, output_bailout, false, false,
+                    x, y, primary_inside);
+                write_primary_double_plane(
+                    parent_transition, output_transition, true, true,
+                    x, y, primary_inside);
+                write_primary_double_plane(
+                    parent_phase, output_phase, false, true,
+                    x, y, primary_inside);
+                write_primary_double_plane(
+                    parent_de_x, output_de_x, false, true,
+                    x, y, primary_inside);
+                write_primary_double_plane(
+                    parent_de_y, output_de_y, false, true,
+                    x, y, primary_inside);
+                write_primary_double_plane(
+                    parent_test1, output_test1, false, true,
+                    x, y, primary_inside);
+                write_primary_double_plane(
+                    parent_test2, output_test2, false, true,
+                    x, y, primary_inside);
+            }
+        }
+
+        if (secondary_field != nullptr) {
+            const std::int64_t* child_orbit = secondary_planes->orbit_iteration;
+            const std::int64_t* child_iteration = secondary_planes->iteration;
+            const double* child_bailout = secondary_planes->bailout;
+            const double* child_transition = secondary_planes->transition;
+            const double* child_phase = secondary_planes->phase;
+            const double* child_de_x = secondary_planes->de_x;
+            const double* child_de_y = secondary_planes->de_y;
+            const double* child_test1 = secondary_planes->test1;
+            const double* child_test2 = secondary_planes->test2;
+            const bool parent_has_bailout = parent_bailout != nullptr;
+            const bool parent_has_transition = parent_transition != nullptr;
+            const bool parent_has_phase = parent_phase != nullptr;
+            const bool parent_has_de_x = parent_de_x != nullptr;
+            const bool parent_has_de_y = parent_de_y != nullptr;
+            const bool parent_has_test1 = parent_test1 != nullptr;
+            const bool parent_has_test2 = parent_test2 != nullptr;
+            const auto child_alpha = [&](int x, int y) {
+                if (seam_feather < 2) return 1.0F;
+                const int local_x = x - child_left;
+                const int local_y = y - child_top;
+                const int edge_distance = std::min(
+                    std::min(local_x, visible_child_width - 1 - local_x),
+                    std::min(local_y, visible_child_height - 1 - local_y));
+                const float linear = std::clamp(
+                    static_cast<float>(edge_distance)
+                        / static_cast<float>(seam_feather),
+                    0.0F,
+                    1.0F);
+                return linear * linear * (3.0F - 2.0F * linear);
+            };
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int y = child_top; y < child_top + visible_child_height; ++y) {
+                for (int x = child_left;
+                     x < child_left + visible_child_width; ++x) {
+                    const size_t index = static_cast<size_t>(y)
+                        * static_cast<size_t>(output_width)
+                        + static_cast<size_t>(x);
+                    const int child_x = x - child_left;
+                    const int child_y = y - child_top;
+                    bool child_inside = false;
+                    const float child_value = secondary_scalar(
+                        child_x, child_y, child_inside);
+                    const float alpha = child_alpha(x, y);
+                    output_field[index] = output_field[index]
+                        * (1.0F - alpha) + child_value * alpha;
+
+                    auto merge_int_plane = [&](
+                        const std::int64_t* child_source,
+                        std::int64_t* destination
+                    ) {
+                        if (!child_source || !destination) return;
+                        destination[index] = child_inside
+                            ? static_cast<std::int64_t>(target_max_iter)
+                            : sample_nearest_mapped_int64(
+                                child_source, secondary_width,
+                                secondary_x_axis, secondary_y_axis,
+                                child_x, child_y);
+                    };
+                    auto merge_double_plane = [&] (
+                        const double* child_source,
+                        double* destination,
+                        bool preserve_negative,
+                        bool reset_inside,
+                        bool parent_exists
+                    ) {
+                        if (!child_source || !destination) return;
+                        double child_value_sample = sample_bilinear_mapped_double(
+                            child_source, secondary_width,
+                            secondary_x_axis, secondary_y_axis,
+                            child_x, child_y, preserve_negative);
+                        if (preserve_negative) {
+                            const double nearest = sample_nearest_mapped_double(
+                                child_source, secondary_width,
+                                secondary_x_axis, secondary_y_axis,
+                                child_x, child_y);
+                            if (nearest < 0.0) child_value_sample = nearest;
+                        }
+                        if (child_inside && reset_inside) {
+                            child_value_sample = 0.0;
+                        }
+                        if (!parent_exists) {
+                            destination[index] = child_value_sample;
+                            return;
+                        }
+                        const double parent_value = destination[index];
+                        const double blended = parent_value * (1.0 - alpha)
+                            + child_value_sample * alpha;
+                        if (preserve_negative) {
+                            const double selected = alpha >= 0.5F
+                                ? child_value_sample : parent_value;
+                            destination[index] = selected < 0.0
+                                ? selected : blended;
+                        } else {
+                            destination[index] = blended;
+                        }
+                    };
+
+                    merge_int_plane(child_orbit, output_orbit);
+                    merge_int_plane(child_iteration, output_iteration);
+                    merge_double_plane(
+                        child_bailout, output_bailout, false, false,
+                        parent_has_bailout);
+                    merge_double_plane(
+                        child_transition, output_transition, true, true,
+                        parent_has_transition);
+                    merge_double_plane(
+                        child_phase, output_phase, false, true,
+                        parent_has_phase);
+                    merge_double_plane(
+                        child_de_x, output_de_x, false, true,
+                        parent_has_de_x);
+                    merge_double_plane(
+                        child_de_y, output_de_y, false, true,
+                        parent_has_de_y);
+                    merge_double_plane(
+                        child_test1, output_test1, false, true,
+                        parent_has_test1);
+                    merge_double_plane(
+                        child_test2, output_test2, false, true,
+                        parent_has_test2);
+                }
+            }
+        }
+
+        const int colour_max_iter = target_max_iter;
+        return fractal_colourise_kfp_impl(
+            output_field.data(), output, output_width, output_height,
+            colour_max_iter, phase, vocal, instrumental, pitch,
+            &transfer_options, &output_planes, lut, lut_size, threads);
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error(
+            "native plane-aware KFP atlas colourizer failed with an unknown exception");
         return 1;
     }
 }
@@ -7473,6 +17825,7 @@ int fractal_crop_colourise_kfp(
         if (transfer_options.field_bias > static_cast<double>(max_iter)) {
             throw std::runtime_error("native KFP field bias exceeds iteration cap");
         }
+        const double smooth_offset = kfp_smooth_offset(transfer_options);
 #ifdef _OPENMP
         if (threads > 0) {
             omp_set_dynamic(0);
@@ -7503,16 +17856,41 @@ int fractal_crop_colourise_kfp(
         }
 
         const KfpSlopeDirection slope_direction = kfp_slope_direction(transfer_options);
+        const KfpPixelContext pixel_context = kfp_pixel_context(
+            transfer_options, smooth_offset, nullptr);
         const KfpTransferBounds bounds = transfer_options.color_method == 4
             ? kfp_transfer_bounds(
                 cropped.data(),
                 output_width,
                 output_height,
                 max_iter,
-                transfer_options.field_bias)
+                transfer_options.field_bias,
+                smooth_offset)
             : KfpTransferBounds{};
-        const bool fast_default = kfp_is_default_fast_options(transfer_options)
-            && !kfp_force_precise;
+        std::vector<double> colour_samples;
+        const double* colour_samples_data = nullptr;
+        if (pixel_context.needs_difference || pixel_context.needs_slopes) {
+            const size_t pixel_count = static_cast<size_t>(output_width)
+                * static_cast<size_t>(output_height);
+            colour_samples.resize(pixel_count);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int pixel = 0; pixel < output_width * output_height; ++pixel) {
+                colour_samples[static_cast<size_t>(pixel)] =
+                    kfp_colour_sample(
+                        cropped.data(),
+                        output_width,
+                        output_height,
+                        pixel % output_width,
+                        pixel / output_width,
+                        max_iter,
+                        smooth_offset,
+                        transfer_options.field_bias);
+            }
+            colour_samples_data = colour_samples.data();
+        }
+        const bool fast_default = false;
         if (fast_default) {
             colourise_kfp_default_fast_field(
                 cropped.data(),
@@ -7541,13 +17919,17 @@ int fractal_crop_colourise_kfp(
                     output_width,
                     max_iter,
                     transfer_options,
+                    pixel_context,
                     lut,
                     lut_size,
                     bounds.minimum,
                     bounds.maximum,
                     slope_direction,
                     output + (static_cast<size_t>(y) * static_cast<size_t>(output_width)
-                        + static_cast<size_t>(x)) * 3U);
+                        + static_cast<size_t>(x)) * 3U,
+                    nullptr,
+                    nullptr,
+                    colour_samples_data);
             }
         }
         }
@@ -7840,10 +18222,9 @@ int fractal_atlas_colourise_kfp_raw(
     }
 }
 
-// Additive exact wrappers for diagnostics and pixel-for-pixel comparisons.
-// Production rendering uses the default AVX2/native kernel; these symbols keep
-// the slower reference implementation available without changing its ABI or
-// the atlas cache format.
+// Additive compatibility wrappers for callers that still request the precise
+// symbol. The production entry point currently uses the same source-faithful
+// native transfer path; retaining this symbol avoids an ABI break.
 int fractal_colourise_kfp_precise(
     const float* field,
     std::uint8_t* output,
@@ -7918,6 +18299,43 @@ int fractal_atlas_colourise_kfp_precise(
         parent, parent_width, parent_height, child, child_width,
         child_height, output, output_width, output_height, max_iter,
         child_left, child_top, feather, phase, vocal, instrumental,
+        pitch, options, lut, lut_size, threads);
+}
+
+int fractal_atlas_colourise_kfp_planes_precise(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const FractalKfpPlanes* parent_planes,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    const FractalKfpPlanes* child_planes,
+    std::uint8_t* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    int max_iter,
+    int centered_input,
+    double phase,
+    double vocal,
+    double instrumental,
+    double pitch,
+    const FractalKfpOptions* options,
+    const std::uint8_t* lut,
+    int lut_size,
+    int threads
+) {
+    KfpPreciseGuard guard;
+    return fractal_atlas_colourise_kfp_planes(
+        parent, parent_width, parent_height, parent_max_iter, parent_planes,
+        child, child_width, child_height, child_max_iter, child_planes,
+        output, output_width, output_height, parent_zoom, child_fraction,
+        child_zoom, max_iter, centered_input, phase, vocal, instrumental,
         pitch, options, lut, lut_size, threads);
 }
 
@@ -8244,6 +18662,245 @@ int fractal_crop_field(
         set_error("native raw-field crop failed with an unknown exception");
         return 1;
     }
+}
+
+/* Reproject a parent/child scalar atlas in one native pass.  The Python
+ * compositor used to do this with two Pillow resizes plus a NumPy feather for
+ * every video frame before handing the result to the OpenCL palette lookup.
+ * Keep the same interior-aware sampling rules as the native RGB compositor,
+ * but expose the scalar surface so the device can colour it without another
+ * host-side crop/composite round trip. */
+int fractal_atlas_field_ex(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    float* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    double child_zoom,
+    double parent_field_bias,
+    double child_field_bias,
+    double output_field_bias,
+    int palette_max_iter,
+    int feather,
+    int threads
+) {
+    try {
+        if (!parent || !output
+            || !valid_pixel_dimensions(parent_width, parent_height)
+            || !valid_pixel_dimensions(output_width, output_height)
+            || !valid_iteration_count(parent_max_iter)
+            || !valid_thread_count(threads)
+            || !std::isfinite(parent_zoom) || parent_zoom <= 0.0
+            || !std::isfinite(child_fraction)
+            || child_fraction < 0.0 || child_fraction > 1.0
+            || !std::isfinite(child_zoom) || child_zoom <= 0.0
+            || !std::isfinite(parent_field_bias)
+            || parent_field_bias < 0.0
+            || parent_field_bias > static_cast<double>(parent_max_iter)
+            || !std::isfinite(child_field_bias) || child_field_bias < 0.0
+            || !std::isfinite(output_field_bias)
+            || output_field_bias < 0.0
+            || feather < 0
+            || !valid_iteration_count(palette_max_iter)) {
+            throw std::runtime_error("invalid native scalar atlas dimensions");
+        }
+        const bool use_child = child != nullptr && child_fraction > 0.0;
+        if (use_child && (!valid_pixel_dimensions(child_width, child_height)
+                          || !valid_iteration_count(child_max_iter)
+                          || child_field_bias > static_cast<double>(child_max_iter))) {
+            throw std::runtime_error("invalid native scalar atlas child tile");
+        }
+        const int effective_iter = std::max(
+            palette_max_iter,
+            std::max(parent_max_iter, use_child ? child_max_iter : 0));
+        if (!valid_iteration_count(effective_iter)
+            || output_field_bias > static_cast<double>(effective_iter)) {
+            throw std::runtime_error("invalid native scalar atlas iteration cap");
+        }
+        const bool full_child = use_child && child_fraction >= 0.999999;
+        const int visible_child_width = use_child
+            ? std::max(1, static_cast<int>(std::lround(
+                static_cast<double>(output_width) * child_fraction)))
+            : 0;
+        const int visible_child_height = use_child
+            ? std::max(1, static_cast<int>(std::lround(
+                static_cast<double>(output_height) * child_fraction)))
+            : 0;
+        const int child_left = use_child
+            ? (output_width - visible_child_width) / 2
+            : 0;
+        const int child_top = use_child
+            ? (output_height - visible_child_height) / 2
+            : 0;
+        const int seam_feather = use_child && !full_child
+            ? std::min(feather, std::min(visible_child_width / 8,
+                                          visible_child_height / 8))
+            : 0;
+
+        BilinearWorkspace& workspace = bilinear_workspace;
+        BilinearAxis& parent_x_axis = workspace.parent_x_axis;
+        BilinearAxis& parent_y_axis = workspace.parent_y_axis;
+        if (!full_child) {
+            fill_bilinear_axis(parent_x_axis, parent_width, output_width, parent_zoom);
+            fill_bilinear_axis(parent_y_axis, parent_height, output_height, parent_zoom);
+        }
+        BilinearAxis& child_x_axis = workspace.child_x_axis;
+        BilinearAxis& child_y_axis = workspace.child_y_axis;
+        if (use_child) {
+            fill_bilinear_axis(
+                child_x_axis,
+                child_width,
+                full_child ? output_width : visible_child_width,
+                std::max(child_zoom, 1.0));
+            fill_bilinear_axis(
+                child_y_axis,
+                child_height,
+                full_child ? output_height : visible_child_height,
+                std::max(child_zoom, 1.0));
+        }
+        std::vector<float>& child_edge_x = workspace.child_edge_x;
+        std::vector<float>& child_edge_y = workspace.child_edge_y;
+        if (use_child && !full_child && seam_feather >= 2) {
+            child_edge_x.resize(static_cast<size_t>(visible_child_width));
+            child_edge_y.resize(static_cast<size_t>(visible_child_height));
+            for (int x = 0; x < visible_child_width; ++x) {
+                const int edge = std::min(x, visible_child_width - 1 - x);
+                const float linear = std::min(
+                    1.0F, static_cast<float>(edge) / static_cast<float>(seam_feather));
+                child_edge_x[static_cast<size_t>(x)] = linear * linear
+                    * (3.0F - 2.0F * linear);
+            }
+            for (int y = 0; y < visible_child_height; ++y) {
+                const int edge = std::min(y, visible_child_height - 1 - y);
+                const float linear = std::min(
+                    1.0F, static_cast<float>(edge) / static_cast<float>(seam_feather));
+                child_edge_y[static_cast<size_t>(y)] = linear * linear
+                    * (3.0F - 2.0F * linear);
+            }
+        }
+
+#ifdef _OPENMP
+        if (threads > 0) omp_set_num_threads(threads);
+#pragma omp parallel for schedule(static)
+#endif
+        for (int output_y = 0; output_y < output_height; ++output_y) {
+            for (int output_x = 0; output_x < output_width; ++output_x) {
+                float value = 0.0F;
+                if (full_child) {
+                    bool child_inside = false;
+                    const float child_smooth =
+                        sample_bilinear_mapped_preserving_interior(
+                            child, child_width, child_x_axis, child_y_axis,
+                            output_x,
+                            output_y,
+                            child_max_iter,
+                            child_inside,
+                            child_field_bias);
+                    value = child_inside
+                        ? static_cast<float>(effective_iter - output_field_bias)
+                        : child_smooth - static_cast<float>(output_field_bias);
+                } else {
+                    bool parent_inside = false;
+                    const float parent_smooth =
+                        sample_bilinear_mapped_preserving_interior(
+                            parent, parent_width, parent_x_axis, parent_y_axis,
+                            output_x,
+                            output_y,
+                            parent_max_iter,
+                            parent_inside,
+                            parent_field_bias);
+                    value = parent_inside
+                        ? static_cast<float>(effective_iter - output_field_bias)
+                        : parent_smooth - static_cast<float>(output_field_bias);
+                    if (use_child
+                        && output_x >= child_left
+                        && output_x < child_left + visible_child_width
+                        && output_y >= child_top
+                        && output_y < child_top + visible_child_height) {
+                        const int child_x = output_x - child_left;
+                        const int child_y = output_y - child_top;
+                        bool child_inside = false;
+                        const float child_smooth =
+                            sample_bilinear_mapped_preserving_interior(
+                                child, child_width, child_x_axis, child_y_axis,
+                                child_x,
+                                child_y,
+                                child_max_iter,
+                                child_inside,
+                                child_field_bias);
+                        const float child_value = child_inside
+                            ? static_cast<float>(effective_iter - output_field_bias)
+                            : child_smooth - static_cast<float>(output_field_bias);
+                        float alpha = 1.0F;
+                        if (seam_feather >= 2) {
+                            alpha = std::min(
+                                child_edge_x[static_cast<size_t>(child_x)],
+                                child_edge_y[static_cast<size_t>(child_y)]);
+                        }
+                        value = value * (1.0F - alpha) + child_value * alpha;
+                    }
+                }
+                output[static_cast<size_t>(output_y) * output_width + output_x] = value;
+            }
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native scalar atlas compositor failed with an unknown exception");
+        return 1;
+    }
+}
+
+/* Keep the original ABI available for older callers. */
+int fractal_atlas_field(
+    const float* parent,
+    int parent_width,
+    int parent_height,
+    int parent_max_iter,
+    const float* child,
+    int child_width,
+    int child_height,
+    int child_max_iter,
+    float* output,
+    int output_width,
+    int output_height,
+    double parent_zoom,
+    double child_fraction,
+    int palette_max_iter,
+    int threads
+) {
+    return fractal_atlas_field_ex(
+        parent,
+        parent_width,
+        parent_height,
+        parent_max_iter,
+        child,
+        child_width,
+        child_height,
+        child_max_iter,
+        output,
+        output_width,
+        output_height,
+        parent_zoom,
+        child_fraction,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        palette_max_iter,
+        48,
+        threads);
 }
 
 int crop_colourise_impl(
@@ -8942,6 +19599,38 @@ void* fractal_create_reference_reusable(
     }
 }
 
+void* fractal_create_reference_reusable_options(
+    const char* x_center,
+    const char* y_center,
+    const char* viewport_zoom,
+    int max_iter,
+    int precision_bits,
+    int series_order,
+    const FractalRenderOptions* supplied_options
+) {
+    try {
+        if (!x_center || !y_center || !viewport_zoom
+            || !valid_iteration_count(max_iter)
+            || !valid_precision_bits(precision_bits)
+            || !valid_series_parameters(series_order, 2)) {
+            throw std::runtime_error("invalid reusable reference configuration");
+        }
+        const FractalRenderOptions options = checked_render_options(supplied_options);
+        auto context = create_reference_context(
+            x_center, y_center, viewport_zoom, max_iter, precision_bits,
+            series_order, true, FRACTAL_FORMULA_MANDELBROT,
+            "0", "0", options.escape_radius_mode, options.coordinate_mode);
+        set_error("");
+        return register_reference(std::move(context));
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return nullptr;
+    } catch (...) {
+        set_error("native reusable reference creation failed with an unknown exception");
+        return nullptr;
+    }
+}
+
 void* fractal_create_reference_ex(
     const char* x_center,
     const char* y_center,
@@ -8966,6 +19655,47 @@ void* fractal_create_reference_ex(
             x_center, y_center, viewport_zoom, max_iter, precision_bits,
             series_order, formula != FRACTAL_FORMULA_MANDELBROT,
             formula, julia_real, julia_imag);
+        set_error("");
+        return register_reference(std::move(context));
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return nullptr;
+    } catch (...) {
+        set_error("formula-aware reference creation failed with an unknown exception");
+        return nullptr;
+    }
+}
+
+void* fractal_create_reference_ex_options(
+    const char* x_center,
+    const char* y_center,
+    const char* viewport_zoom,
+    int max_iter,
+    int precision_bits,
+    int series_order,
+    int formula,
+    const char* julia_real,
+    const char* julia_imag,
+    const FractalRenderOptions* supplied_options
+) {
+    try {
+        if (!x_center || !y_center || !viewport_zoom
+            || !julia_real || !julia_imag
+            || !valid_iteration_count(max_iter)
+            || !valid_precision_bits(precision_bits)
+            || !valid_series_parameters(series_order, 2)
+            || !valid_formula(formula)) {
+            throw std::runtime_error("invalid formula-aware reference configuration");
+        }
+        const FractalRenderOptions options = checked_render_options(supplied_options);
+        auto context = create_reference_context(
+            x_center, y_center, viewport_zoom, max_iter, precision_bits,
+            series_order, formula != FRACTAL_FORMULA_MANDELBROT,
+            formula,
+            julia_real,
+            julia_imag,
+            options.escape_radius_mode,
+            options.coordinate_mode);
         set_error("");
         return register_reference(std::move(context));
     } catch (const std::exception& error) {
@@ -9057,7 +19787,7 @@ int fractal_get_reference_stats(
     }
 }
 
-int fractal_render_reference_ex(
+int fractal_render_reference_ex_planes(
     float* output,
     int width,
     int height,
@@ -9067,12 +19797,14 @@ int fractal_render_reference_ex(
     int threads,
     int series_order,
     int series_block,
-    const FractalRenderOptions* supplied_options
+    const FractalRenderOptions* supplied_options,
+    FractalRenderPlanes* planes
 ) {
     try {
         if (!output || !zoom_text || !handle || !valid_pixel_dimensions(width, height)
             || !valid_iteration_count(max_iter) || !valid_thread_count(threads)
-            || !valid_series_parameters(series_order, series_block)) {
+            || !valid_series_parameters(series_order, series_block)
+            || (planes != nullptr && !valid_render_planes(planes, width, height))) {
             throw std::runtime_error("invalid native render dimensions or handle");
         }
         const FractalRenderOptions options = checked_render_options(supplied_options);
@@ -9082,6 +19814,17 @@ int fractal_render_reference_ex(
         const auto context = acquire_reference(handle);
         if (!context) {
             throw std::runtime_error("invalid or already-destroyed reference handle");
+        }
+        if (planes != nullptr
+            && options.backend != 0
+            && !(options.backend == 2
+                 && context->formula == FRACTAL_FORMULA_MANDELBROT)) {
+            throw std::runtime_error(
+                "render metadata requires the native scalar backend for this formula");
+        }
+        if (context->escape_radius_mode != options.escape_radius_mode) {
+            throw std::runtime_error(
+                "reference escape-radius mode does not match render options");
         }
         if (max_iter > context->requested_max_iter) {
             throw std::runtime_error("render iteration count exceeds prepared reference");
@@ -9102,39 +19845,49 @@ int fractal_render_reference_ex(
         if (zoom_log10 >= 6.0L && context->formula != FRACTAL_FORMULA_MANDELBROT) {
 #ifdef FRACTAL_HAVE_MPFR
             if (options.backend == 2) {
-                throw std::runtime_error(
-                    "OpenCL backend is only valid for direct renders; alternate deep "
-                    "formulas use the native scaled CPU path");
-            }
+#ifdef FRACTAL_HAVE_OPENCL
+                render_deep_perturbation_opencl(
+                    output, width, height, zoom_text, *context, max_iter, options, nullptr);
+#else
+                throw std::runtime_error("OpenCL backend is not available in this build");
+#endif
+            } else {
             RenderStats stats;
             if (render_stats_enabled.load(std::memory_order_relaxed)) {
                 render_alternate_reference_impl(
                     output, width, height, zoom_text, *context, max_iter,
-                    threads, options, &stats);
+                    threads, options, &stats, nullptr, nullptr, planes);
                 publish_render_stats(stats);
             } else {
                 render_alternate_reference_impl(
                     output, width, height, zoom_text, *context, max_iter,
-                    threads, options, nullptr);
+                    threads, options, nullptr, nullptr, nullptr, planes);
+            }
             }
 #else
             throw std::runtime_error("deep rendering requires MPFR/GMP; rebuild with make");
 #endif
         } else if (zoom_log10 >= 6.0L) {
 #ifdef FRACTAL_HAVE_MPFR
-            if (options.backend == 2) {
-                throw std::runtime_error(
-                    "OpenCL backend currently supports only direct zooms below 1e6; "
-                    "deep perturbation remains on the validated CPU backend");
-            }
-            RenderStats stats;
-            if (render_stats_enabled.load(std::memory_order_relaxed)) {
-                render_bla_dispatch<true>(output, width, height, zoom_text, *context, max_iter,
-                                          threads, series_order, series_block, options, &stats);
-                publish_render_stats(stats);
+            if (options.backend == 2 && zoom_log10 >= 12.0L) {
+#ifdef FRACTAL_HAVE_OPENCL
+                render_deep_perturbation_opencl(
+                    output, width, height, zoom_text, *context, max_iter, options, planes);
+#else
+                throw std::runtime_error("OpenCL backend is not available in this build");
+#endif
             } else {
-                render_bla_dispatch<false>(output, width, height, zoom_text, *context, max_iter,
-                                           threads, series_order, series_block, options, nullptr);
+                RenderStats stats;
+                if (render_stats_enabled.load(std::memory_order_relaxed)) {
+                    render_bla_dispatch<true>(output, width, height, zoom_text, *context, max_iter,
+                                              threads, series_order, series_block, options, &stats,
+                                              nullptr, nullptr, planes);
+                    publish_render_stats(stats);
+                } else {
+                    render_bla_dispatch<false>(output, width, height, zoom_text, *context, max_iter,
+                                               threads, series_order, series_block, options, nullptr,
+                                               nullptr, nullptr, planes);
+                }
             }
 #else
             (void)zoom;
@@ -9144,20 +19897,42 @@ int fractal_render_reference_ex(
 #ifdef FRACTAL_HAVE_MPFR
             const long double zoom = parse_zoom(zoom_text);
 #endif
-            render_direct(
-                output,
-                width,
-                height,
-                zoom,
-                context->x_center,
-                context->y_center,
-                max_iter,
-                threads,
-                options.backend,
-                context->formula,
-                context->julia_real,
-                context->julia_imag,
-                options.output_bias);
+            if (planes != nullptr) {
+                render_direct_with_planes(
+                    output,
+                    width,
+                    height,
+                    zoom,
+                    context->x_center,
+                    context->y_center,
+                    max_iter,
+                    threads,
+                    context->formula,
+                    context->julia_real,
+                    context->julia_imag,
+                    options.output_bias,
+                    options.escape_radius_mode,
+                    options.coordinate_mode,
+                    static_cast<std::uint32_t>(options.reserved[0]),
+                    planes);
+            } else {
+                render_direct(
+                    output,
+                    width,
+                    height,
+                    zoom,
+                    context->x_center,
+                    context->y_center,
+                    max_iter,
+                    threads,
+                    options.backend,
+                    context->formula,
+                    context->julia_real,
+                    context->julia_imag,
+                    options.output_bias,
+                    options.escape_radius_mode,
+                    options.coordinate_mode);
+            }
         }
         set_error("");
         return 0;
@@ -9168,6 +19943,32 @@ int fractal_render_reference_ex(
         set_error("native reference render failed with an unknown exception");
         return 1;
     }
+}
+
+int fractal_render_reference_ex(
+    float* output,
+    int width,
+    int height,
+    const char* zoom_text,
+    void* handle,
+    int max_iter,
+    int threads,
+    int series_order,
+    int series_block,
+    const FractalRenderOptions* supplied_options
+) {
+    return fractal_render_reference_ex_planes(
+        output,
+        width,
+        height,
+        zoom_text,
+        handle,
+        max_iter,
+        threads,
+        series_order,
+        series_block,
+        supplied_options,
+        nullptr);
 }
 
 int fractal_render_mandelbrot_reference_ex(
@@ -9191,7 +19992,7 @@ int fractal_render_mandelbrot_reference_ex(
 // layer uses this to sample (log radius, angle) coordinates directly; the
 // numerical core and its validated series/BLA machinery remain shared with
 // rectangular atlas tiles.
-int fractal_render_points(
+int fractal_render_points_impl(
     float* output,
     int point_count,
     const char* zoom_text,
@@ -9203,11 +20004,13 @@ int fractal_render_points(
     int threads,
     int series_order,
     int series_block,
-    const FractalRenderOptions* supplied_options
+    const FractalRenderOptions* supplied_options,
+    FractalRenderPlanes* planes
 ) {
     try {
         if (!output || point_count <= 0 || point_count > MAX_NATIVE_POINTS || !zoom_text
-            || !real_mantissa || !imag_mantissa || !exponents || !handle) {
+            || !real_mantissa || !imag_mantissa || !exponents || !handle
+            || (planes != nullptr && !valid_render_planes(planes, point_count, 1))) {
             throw std::runtime_error("invalid native point-render arguments");
         }
         if (!valid_iteration_count(max_iter) || !valid_thread_count(threads)
@@ -9215,8 +20018,12 @@ int fractal_render_points(
             throw std::runtime_error("invalid native point-render limits");
         }
         const FractalRenderOptions options = checked_render_options(supplied_options);
-        if (options.backend != 0 && options.backend != 1) {
+        if (options.backend != 0 && options.backend != 1 && options.backend != 2) {
             throw std::runtime_error("unknown native render backend");
+        }
+        if (planes != nullptr && options.backend != 0) {
+            throw std::runtime_error(
+                "point metadata requires the native scalar backend");
         }
         const auto context = acquire_reference(handle);
         if (!context) {
@@ -9254,7 +20061,26 @@ int fractal_render_points(
         };
         const FloatExp point_radius = fe_sqrt(point_radius_squared);
         RenderStats stats;
-        if (context->formula != FRACTAL_FORMULA_MANDELBROT) {
+        if (options.backend == 2) {
+#ifdef FRACTAL_HAVE_OPENCL
+            if (options.coordinate_mode != COORDINATE_MODE_PROJECT) {
+                throw std::runtime_error(
+                    "OpenCL point rendering requires project coordinates");
+            }
+            render_deep_perturbation_opencl(
+                output,
+                point_count,
+                1,
+                zoom_text,
+                *context,
+                max_iter,
+                options,
+                nullptr,
+                &points);
+#else
+            throw std::runtime_error("OpenCL backend is not available in this build");
+#endif
+        } else if (context->formula != FRACTAL_FORMULA_MANDELBROT) {
             if (render_stats_enabled.load(std::memory_order_relaxed)) {
                 render_alternate_reference_impl(
                     output,
@@ -9267,7 +20093,8 @@ int fractal_render_points(
                     options,
                     &stats,
                     &points,
-                    &point_radius);
+                    &point_radius,
+                    planes);
                 publish_render_stats(stats);
             } else {
                 render_alternate_reference_impl(
@@ -9281,7 +20108,8 @@ int fractal_render_points(
                     options,
                     nullptr,
                     &points,
-                    &point_radius);
+                    &point_radius,
+                    planes);
             }
         } else {
             if (render_stats_enabled.load(std::memory_order_relaxed)) {
@@ -9298,7 +20126,8 @@ int fractal_render_points(
                     options,
                     &stats,
                     &points,
-                    &point_radius);
+                    &point_radius,
+                    planes);
                 publish_render_stats(stats);
             } else {
                 render_bla_dispatch<false>(
@@ -9314,7 +20143,8 @@ int fractal_render_points(
                     options,
                     nullptr,
                     &points,
-                    &point_radius);
+                    &point_radius,
+                    planes);
             }
         }
         set_error("");
@@ -9329,6 +20159,67 @@ int fractal_render_points(
         set_error("native point render failed with an unknown exception");
         return 1;
     }
+}
+
+int fractal_render_points(
+    float* output,
+    int point_count,
+    const char* zoom_text,
+    const double* real_mantissa,
+    const double* imag_mantissa,
+    const std::int32_t* exponents,
+    void* handle,
+    int max_iter,
+    int threads,
+    int series_order,
+    int series_block,
+    const FractalRenderOptions* supplied_options
+) {
+    return fractal_render_points_impl(
+        output,
+        point_count,
+        zoom_text,
+        real_mantissa,
+        imag_mantissa,
+        exponents,
+        handle,
+        max_iter,
+        threads,
+        series_order,
+        series_block,
+        supplied_options,
+        nullptr);
+}
+
+int fractal_render_points_ex_planes(
+    float* output,
+    int point_count,
+    const char* zoom_text,
+    const double* real_mantissa,
+    const double* imag_mantissa,
+    const std::int32_t* exponents,
+    void* handle,
+    int max_iter,
+    int threads,
+    int series_order,
+    int series_block,
+    const FractalRenderOptions* supplied_options,
+    FractalRenderPlanes* planes
+) {
+    return fractal_render_points_impl(
+        output,
+        point_count,
+        zoom_text,
+        real_mantissa,
+        imag_mantissa,
+        exponents,
+        handle,
+        max_iter,
+        threads,
+        series_order,
+        series_block,
+        supplied_options,
+        planes);
 }
 
 // Stable compatibility entry point.  New callers should use the `_ex`
@@ -9408,12 +20299,10 @@ int render_fractal_ex(
                 formula,
                 julia_real,
                 julia_imag,
-                options.output_bias);
+                options.output_bias,
+                options.escape_radius_mode,
+                options.coordinate_mode);
         } else {
-            if (options.backend == 2) {
-                throw std::runtime_error(
-                    "OpenCL backend is only valid for direct one-shot renders");
-            }
             char julia_real_text[64];
             char julia_imag_text[64];
             if (std::snprintf(
@@ -9424,9 +20313,9 @@ int render_fractal_ex(
                     < 0) {
                 throw std::runtime_error("failed to format the Julia constant");
             }
-            void* context_handle = fractal_create_reference_ex(
+            void* context_handle = fractal_create_reference_ex_options(
                 x_center, y_center, zoom_text, max_iter, precision_bits, 8,
-                formula, julia_real_text, julia_imag_text);
+                formula, julia_real_text, julia_imag_text, &options);
             if (!context_handle) throw std::runtime_error(last_error);
             const int status = fractal_render_reference_ex(
                 output,
@@ -9450,6 +20339,112 @@ int render_fractal_ex(
         return 1;
     } catch (...) {
         set_error("native render failed with an unknown exception");
+        return 1;
+    }
+}
+
+int render_fractal_ex_planes(
+    float* output,
+    int width,
+    int height,
+    const char* zoom_text,
+    const char* x_center,
+    const char* y_center,
+    int max_iter,
+    int precision_bits,
+    int use_perturbation,
+    int threads,
+    int formula,
+    double julia_real,
+    double julia_imag,
+    const FractalRenderOptions* supplied_options,
+    FractalRenderPlanes* planes
+) {
+    try {
+        if (!output || !zoom_text || !x_center || !y_center
+            || !valid_pixel_dimensions(width, height)
+            || !valid_render_planes(planes, width, height)
+            || !valid_iteration_count(max_iter)
+            || !valid_precision_bits(precision_bits)
+            || use_perturbation < 0 || use_perturbation > 1
+            || !valid_thread_count(threads)
+            || !valid_formula(formula)
+            || !std::isfinite(julia_real) || !std::isfinite(julia_imag)) {
+            throw std::runtime_error(
+                "render metadata requires valid native render arguments");
+        }
+        const FractalRenderOptions options = checked_render_options(supplied_options);
+        if (options.backend != 0
+            && !(options.backend == 2
+                 && formula == FRACTAL_FORMULA_MANDELBROT)) {
+            throw std::runtime_error(
+                "render metadata requires the native scalar backend for this formula");
+        }
+        if (use_perturbation == 0) {
+            const long double zoom = parse_zoom(zoom_text);
+            render_direct_with_planes(
+                output,
+                width,
+                height,
+                zoom,
+                parse_coordinate(x_center, "real"),
+                parse_coordinate(y_center, "imaginary"),
+                max_iter,
+                threads,
+                formula,
+                julia_real,
+                julia_imag,
+                options.output_bias,
+                options.escape_radius_mode,
+                options.coordinate_mode,
+                static_cast<std::uint32_t>(options.reserved[0]),
+                planes);
+        } else {
+            char julia_real_text[64];
+            char julia_imag_text[64];
+            if (std::snprintf(
+                    julia_real_text, sizeof(julia_real_text), "%.17g", julia_real)
+                < 0
+                || std::snprintf(
+                    julia_imag_text, sizeof(julia_imag_text), "%.17g", julia_imag)
+                    < 0) {
+                throw std::runtime_error("failed to format the Julia constant");
+            }
+            void* context_handle = fractal_create_reference_ex_options(
+                x_center,
+                y_center,
+                zoom_text,
+                max_iter,
+                precision_bits,
+                8,
+                formula,
+                julia_real_text,
+                julia_imag_text,
+                &options);
+            if (!context_handle) throw std::runtime_error(last_error);
+            const int status = fractal_render_reference_ex_planes(
+                output,
+                width,
+                height,
+                zoom_text,
+                context_handle,
+                max_iter,
+                threads,
+                8,
+                32,
+                &options,
+                planes);
+            const std::string render_error = last_error;
+            fractal_destroy_reference(context_handle);
+            if (status != 0) throw std::runtime_error(render_error);
+        }
+        set_error("");
+        return 0;
+    } catch (const std::exception& error) {
+        set_error(error.what());
+        return 1;
+    } catch (...) {
+        set_error("native metadata render failed with an unknown exception");
         return 1;
     }
 }

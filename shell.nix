@@ -29,6 +29,14 @@ pkgs.mkShell {
   ];
 
   shellHook = ''
+    # GTK's file chooser reads org.gtk.Settings.FileChooser when it opens.
+    # The GTK package keeps that schema in its gsettings-schemas output, but
+    # the development shell does not export the directory automatically.
+    # Without this, clicking any GUI Browse button aborts with
+    # "No GSettings schemas are installed".
+    if [ -z "''${GSETTINGS_SCHEMA_DIR:-}" ]; then
+      export GSETTINGS_SCHEMA_DIR="${pkgs.gtk3}/share/gsettings-schemas/gtk+3-${pkgs.gtk3.version}/glib-2.0/schemas"
+    fi
     # This renderer is compiled locally for the current CPU.  Nix normally
     # strips -march=native to keep builds portable; opting in here is useful
     # for the intended single-machine 15 W rendering workflow.

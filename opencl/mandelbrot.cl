@@ -1,8 +1,9 @@
-// Reference source for the optional OpenCL preview backend.
-// The compiled C++ backend embeds the same kernel so installed binaries do
-// not depend on the current working directory.  It intentionally uses double
-// precision and is limited to direct zooms below 1e6; deep MPFR/perturbation
-// rendering remains on the validated native CPU path.
+// Reference source for the optional OpenCL field backend.
+// The compiled C++ backend embeds its kernels so installed binaries do not
+// depend on the current working directory.  This small standalone source is
+// kept for driver experiments and documents the original direct-kernel shape;
+// production embedded source additionally contains formula-specialized
+// wrappers and the scaled deep perturbation kernel.
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 
 __kernel void mandelbrot_direct(

@@ -35,8 +35,11 @@ the render is roughly five stages:
 4. **fractal rendering.** shallow views use the native renderer directly. For
    very deep Mandelbrot views, the C++ code builds an MPFR reference orbit and
    uses perturbation arithmetic, BLA maps, OpenMP, and a few depth-specific
-   reference tiers to keep the work manageable. Julia, Burning Ship, and
-   Tricorn use their own formula-aware path.
+   reference tiers to keep the work manageable. On a physical OpenCL GPU,
+   large scalar fields use a faster mixed mantissa/exponent recurrence while
+   strict double precision remains available for exact comparisons and for
+   KFP profiles that need orbit metadata. Julia, Burning Ship, and Tricorn
+   use their own formula-aware path.
 
 5. **colour and encoding.** keyframes contain scalar iteration data. It is
    colourised after cropping, using the native code when available. Ordinary
@@ -60,6 +63,12 @@ profiles above Full HD use a 1920×1080 source to keep the render practical.
 Imported `.kfp` palettes are denser by design, up to a 3840×2160 source, since
 Kalles' distance and slope shading needs real screen-space neighbours to stay
 sharp instead of magnifying a soft 1080p stencil.
+when a KFP surface is resized for export, the final image uses Kalles'
+Lanczos-style bitmap scaling rather than nearest-neighbour. nearest is still
+kept for ordinary palettes, while even the deliberately small `upscaled` KFP
+preview follows Kalles' smooth scaling. the KFP 3D/relief
+switch is also still available: it preserves Kalles' bright white relief
+highlights when enabled, or gives a flat palette when disabled.
 `--source-mode native` renders one source sample per output pixel. For the fast,
 lower-detail version, use `--source-mode upscaled` (or `--upscaling`), which
 starts from a quarter-resolution source and enlarges it at the end.
@@ -203,9 +212,11 @@ then add the options you care about:
 profiles are just shortcuts for a group of settings. The main presets are
 `sd60`, `hd60`, `fhd60`, `2k60`, `4k60`, and `8k60`. They all use 60 fps, e100,
 the native C++ colour path, and CRF 10. Lower-density sources are enlarged
-with crisp nearest-neighbour sampling; the atlas crop itself stays continuous
-so the zoom remains smooth. The larger three profiles use a 1920×1080 source
-field and upscale that to the requested output. Without a profile, `4k60` is
+with crisp nearest-neighbour sampling for ordinary palettes; imported KFP
+palettes use Kalles' smooth Lanczos scale whenever the output is resized. The
+atlas crop itself stays continuous so the zoom remains smooth. The larger
+three profiles use a 1920×1080 source field and upscale that to the requested
+output. Without a profile, `4k60` is
 used. Options written after the profile override it.
 
 ```sh
@@ -351,7 +362,9 @@ native reference arithmetic instead of pretending to be Mandelbrot.
 ### resolution profiles
 
 the six profiles all use 60 fps, e100, balanced atlas rendering, the native
-C++ colour path, nearest-neighbour final enlargement, and CRF 10. The larger
+C++ colour path, CRF 10, and nearest-neighbour final enlargement for ordinary
+palettes. KFP palettes automatically use Kalles' Lanczos scale when resized.
+The larger
 profiles use a 1920×1080 source field for ordinary palettes and upscale it,
 which is considerably more practical than calculating the whole atlas at 4K
 or 8K. KFP palettes use the denser 4K-capped source automatically so their
@@ -477,8 +490,8 @@ unless noted otherwise, the values in parentheses are the defaults.
 | `--series-order N` (`3`) | Local BLA polynomial degree. Values `1`–`3` are effective; values through `32` are accepted for compatibility and clamp to the native range. |
 | `--series-block N` (`256`) | Requested BLA block length, from `2` to `4096`. The native renderer applies its validated limits. |
 | `--renderer MODE` (`auto`) | `auto` uses the native library when available; `native` requires it; `python` forces the Python fallback and is limited to roughly e300. |
-| `--native-threads N` (`0`) | OpenMP worker count. `0` selects an automatic runtime/video setting. |
-| `--native-backend MODE` (`auto`) | Native backend: `auto`, `scalar`, `avx2`, or `opencl`. OpenCL is an optional direct/shallow backend and is rejected for deep perturbation renders. |
+| `--native-threads N` (`0`) | OpenMP worker count. `0` uses a bounded automatic default that reserves two logical CPUs and caps native work at six threads; enter a positive value to override it. |
+| `--native-backend MODE` (`auto`) | Native backend: `auto`, `scalar`, `avx2`, or `opencl`. Auto selects the physical GPU for large ordinary/deep scalar fields and Mandelbrot KFP plane fields; small live KFP sources can stay on AVX2 to avoid transfer overhead. Explicit `opencl` forces the GPU path. KFP profiles that need orbit planes, textures, or multi-colour waves retain their complete metadata path. |
 
 ### video encoding and colour
 
@@ -488,12 +501,12 @@ unless noted otherwise, the values in parentheses are the defaults.
 | `--codec NAME` (`auto`) | FFmpeg video encoder. `auto` probes NVENC, QSV, VAAPI, and VideoToolbox at the requested output size, then validates the `libx264` fallback before selecting it. |
 | `--crf N` (`10` with a resolution profile) | Quality value from `0` to `51`. CRF 10 is the near-lossless profile target; it is passed as CRF to software encoders and as the corresponding quality/QP control for supported hardware paths. |
 | `--lossless` | Use lossless H.264 rate control where supported (`constqp/qp 0` for NVENC, CRF 0 for x264) and preserve 4:4:4 chroma where the encoder accepts it. |
-| `--resample MODE` (`nearest` with a resolution profile) | Final output resize filter. Nearest-neighbour keeps an enlarged lossless-compressed source crisp; bilinear and Lanczos remain available for explicit smooth-output experiments. Internal atlas crops stay continuous and native. |
+| `--resample MODE` (`nearest` with a resolution profile) | Final output resize filter. Ordinary sources default to nearest-neighbour; every resized KFP output follows Kalles with Lanczos, including the small `upscaled` mode and when `nearest` is selected. Internal atlas crops stay continuous and native. |
 | `--palette NAME` (`aurora`) | Colour palette: `aurora`, `fire`, `ocean`, `neon`, `sunset`, `mono`, `midnight`, `ember-night`, `terminal`, or `kalles-default`. The night themes use dark exteriors with white interiors; `kalles-default` matches the bundled Kalles Fraktaler profile in `palettes/kalles-default.kfp`. Its first exterior key is intentionally white and its separate interior colour is black, matching Kalles' defaults. |
 | `--palette-file PATH` | Read at least two `#rrggbb` or `r g b` stops from a text file, or import a Kalles `.kfp` gradient and its colour settings. ordinary text palettes use the fast Aurora wave path; `.kfp` uses the Kalles-style transfer path. |
 | `--glow N` (`0`) | Add a low-resolution bloom pass after colourisation, from `0` to `1`. It is off by default for the 10-minute target. |
 | `--motion-blur N` (`0`) | Blend the current frame with the previous one, from `0` to below `1`. It is off by default. |
-| `--encoder-threads N` (`0`) | FFmpeg encoder thread hint. `0` lets FFmpeg choose; a smaller value leaves more CPU for fractal rendering. Hardware encoders may ignore or reinterpret it. |
+| `--encoder-threads N` (`0`) | FFmpeg encoder threads. `0` uses a bounded default of at most two threads and leaves CPU headroom; enter a positive value to override it. Hardware encoders may ignore or reinterpret it. |
 
 ### caching and inspection
 
@@ -534,10 +547,10 @@ that distinction matters.
 | requested path | actual path | boundary |
 | --- | --- | --- |
 | `--renderer python` | Python direct/perturbed renderer | All formulas; exploratory fallback supports up to approximately `10^300`. |
-| `--renderer auto` + shallow zoom | Native direct CPU renderer when available; Python fallback otherwise | All formulas; OpenCL is used only when explicitly selected. |
+| `--renderer auto` + shallow zoom | Native direct CPU/GPU renderer when available; Python fallback otherwise | All four supported formulas; auto chooses OpenCL when the measured field size makes it worthwhile. |
 | `--renderer auto` + deep Mandelbrot | Native MPFR reference + scaled perturbation/BLA | Production path from approximately `10^12` through the validated catalogue depth. |
 | `--renderer auto` + deep alternate formula | Native formula-aware MPFR reference + scaled perturbation/BLA when available; Python high-precision fallback otherwise | Julia, Burning Ship, and Tricorn use formula-specific boundary targets. |
-| `--native-backend opencl` | Native OpenCL direct renderer | Mandelbrot-only shallow views; unavailable or deep paths fail clearly rather than silently changing numerical mode. |
+| `--native-backend opencl` | Native OpenCL direct renderer, scaled perturbation renderer, and supported scalar KFP field/colour pass | Mandelbrot, Julia, Burning Ship, and Tricorn are supported in project and Kalles coordinates. Explicit OpenCL is the fast, opt-in deep KFP field path; `auto` keeps that field on the exact CPU recovery path. KFP profiles needing orbit planes, textures, or multi-colour waves stay on the exact scalar path. |
 | `--codec auto` | First passing hardware probe, otherwise `libx264` | The selected encoder is recorded in the manifest; hardware output is not byte-for-byte portable. |
 
 ## caching and reruns
@@ -578,14 +591,15 @@ python3 live_view.py song.mp3 --formula mandelbrot --palette aurora
 
 the live view is deliberately cheaper than an export. It renders a real
 854×480 widescreen source for every native formula, enlarges it to the window
-size with nearest-neighbour sampling, and prepares at most 224 fields.
-It pre-renders source coverage for the first 75% of the song before starting
+size with a smooth Kalles-style filter for `.kfp` palettes (nearest-neighbour
+for ordinary palettes), and prepares at most 224 fields.
+It pre-renders source coverage for the first 60% of the song before starting
 audio, then builds the remaining zoom sources in the background. Native live
 sources use a fixed bounded draft budget and one pass, so startup does not
 fall into the export renderer's repeated deep retries. If a deep source is
 still building, playback holds the last complete source instead of showing a
 tile slideshow. It uses the fast atlas path and caps the interactive zoom at
-e300. Live native rendering uses all available OpenMP threads by default;
+e300. Live native rendering uses the same bounded OpenMP default as export;
 `--native-threads` can still set an explicit limit. `ffplay` is used for audio
 playback when installed; without it, the visual preview still works.
 
@@ -635,8 +649,8 @@ benchmark arguments:
 | `--formula` (`mandelbrot`) | Formula to benchmark: `mandelbrot`, `julia`, `burning-ship`, or `tricorn`. |
 | `--julia-c` (`-0.8,0.156`) | Fixed Julia constant when benchmarking the Julia formula. |
 | `--renderer` (`auto`) | `auto`, `native`, or `python`. |
-| `--backend` (`auto`) | `auto`, `scalar`, `avx2`, or `opencl`. OpenCL is shallow only. |
-| `--threads` (`0`) | Native OpenMP worker count. |
+| `--backend` (`auto`) | `auto`, `scalar`, `avx2`, or `opencl`. OpenCL covers shallow formulas, the scaled deep path, and supported scalar KFP colourisation. |
+| `--threads` (`0`) | Native OpenMP worker count. `0` uses the bounded automatic default; a positive value overrides it. |
 | `--series-order` (`3`) | Local BLA degree. |
 | `--disable-series` | Disable the validated image-wide series for comparison. |
 | `--series-block` (`256`) | Requested BLA block length. |

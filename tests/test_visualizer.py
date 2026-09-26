@@ -1,4 +1,5 @@
 import unittest
+import ctypes
 import tempfile
 import math
 import locale
@@ -6,6 +7,7 @@ import os
 import struct
 import io
 from contextlib import redirect_stdout
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -30,6 +32,455 @@ from profiles import (
 
 
 class AnimationTests(unittest.TestCase):
+    def test_native_backend_auto_prefers_hardware_opencl_not_cpu_icd(self):
+        class CapabilityLibrary:
+            def __init__(self, capabilities):
+                self.capabilities = capabilities
+
+            def fractal_backend_capabilities(self):
+                return self.capabilities
+
+        # Bit 4 alone means OpenCL is available, but it may be a CPU ICD;
+        # keep AVX2 in that case. Bit 8 means the native probe selected an
+        # fp64-capable GPU and auto mode should use it.
+        self.assertEqual(
+            visualizer._native_backend_id("auto", CapabilityLibrary(2 | 4)), 1
+        )
+        self.assertEqual(
+            visualizer._native_backend_id("auto", CapabilityLibrary(2 | 4 | 8)), 2
+        )
+        self.assertEqual(
+            visualizer._native_backend_id("auto", CapabilityLibrary(1)), 0
+        )
+
+        gpu = CapabilityLibrary(2 | 4 | 8)
+        # The policy is intentionally workload-sensitive: a physical OpenCL
+        # GPU wins for normal 1080p+ direct fields, live's compact source,
+        # and the e12+ deep Mandelbrot path.
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 1920, 1080, 0.0, "mandelbrot"
+            ),
+            2,
+        )
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 3840, 2160, 0.0, "mandelbrot"
+            ),
+            2,
+        )
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 1920, 1080, 12.0, "mandelbrot"
+            ),
+            2,
+        )
+        for formula in ("julia", "burning-ship", "tricorn"):
+            self.assertEqual(
+                visualizer._native_backend_for_workload(
+                    "auto", gpu, 1920, 1080, 12.0, formula
+                ),
+                2,
+            )
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 960, 540, 0.0, "julia", live_source=True
+            ),
+            2,
+        )
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 3840, 2160, 0.0, "burning-ship"
+            ),
+            2,
+        )
+        # At 720p Mandelbrot remains quicker on AVX2, while the branch-heavy
+        # Burning Ship path is already GPU-favourable.
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 1280, 720, 0.0, "mandelbrot"
+            ),
+            1,
+        )
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 1280, 720, 0.0, "burning-ship"
+            ),
+            2,
+        )
+        # Deep Mandelbrot KFP planes use the dedicated OpenCL metadata
+        # kernel; alternate-formula metadata remains on scalar until its
+        # formula-specific device contract is implemented.
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 3840, 2160, 40.0, "mandelbrot", kfp_planes=True
+            ),
+            2,
+        )
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 3840, 2160, 40.0, "julia", kfp_planes=True
+            ),
+            1,
+        )
+        # A scalar-only KFP recipe uses GPU for full-size shallow and deep
+        # fields, while the smaller 720p/540p sources remain on AVX2 to avoid
+        # transfer overhead. Its independent palette pass may use OpenCL too.
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 1920, 1080, 0.0, "mandelbrot", kfp_scalar=True
+            ),
+            2,
+        )
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 3840, 2160, 0.0, "mandelbrot", kfp_scalar=True
+            ),
+            2,
+        )
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 1920, 1080, 40.0, "mandelbrot", kfp_scalar=True
+            ),
+            2,
+        )
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 1280, 720, 0.0, "mandelbrot", kfp_scalar=True
+            ),
+            1,
+        )
+        self.assertEqual(
+            visualizer._native_backend_for_workload(
+                "auto", gpu, 960, 540, 0.0, "mandelbrot",
+                live_source=True, kfp_scalar=True
+            ),
+            1,
+        )
+
+    def test_scalar_kfp_gpu_support_rejects_orbit_only_profiles(self):
+        self.assertTrue(visualizer._kfp_gpu_supported(visualizer.KALLES_DEFAULT_KFP))
+        self.assertFalse(
+            visualizer._kfp_gpu_supported(
+                replace(visualizer.KALLES_DEFAULT_KFP, differences=7, color_method=7)
+            )
+        )
+        self.assertFalse(
+            visualizer._kfp_gpu_supported(
+                replace(visualizer.KALLES_DEFAULT_KFP, phase_color_strength=0.5)
+            )
+        )
+
+    def test_opencl_kfp_deep_field_matches_scalar_kalles_coordinates(self):
+        """Explicit OpenCL keeps deep Kalles fields finite and close to CPU."""
+
+        library = visualizer._get_native_library()
+        if (
+            library is None
+            or not hasattr(library, "fractal_backend_capabilities")
+            or not library.fractal_backend_capabilities() & 8
+        ):
+            raise unittest.SkipTest("native OpenCL GPU backend is unavailable")
+        common = dict(
+            width=16,
+            height=12,
+            log10_zoom=12.0,
+            x_center="-1.711030826576984823314722728180246694222252285",
+            y_center="0.000001509818957972609043170877447547323633361251",
+            max_iter=600,
+            renderer="native",
+            native_threads=2,
+            formula="mandelbrot",
+        )
+        scalar = visualizer.render_fractal(
+            **common,
+            render_options=visualizer.NativeRenderOptions(
+                backend=0,
+                escape_radius_mode=1,
+                coordinate_mode=1,
+                output_bias=237.0,
+            ),
+        )
+        gpu = visualizer.render_fractal(
+            **common,
+            render_options=visualizer.NativeRenderOptions(
+                backend=2,
+                escape_radius_mode=1,
+                coordinate_mode=1,
+                output_bias=237.0,
+            ),
+        )
+        np.testing.assert_array_equal(gpu, scalar)
+
+    def test_opencl_kfp_deep_planes_match_scalar_metadata(self):
+        """The GPU Mandelbrot plane path preserves Kalles' metadata contract."""
+
+        library = visualizer._get_native_library()
+        if (
+            library is None
+            or not hasattr(library, "fractal_backend_capabilities")
+            or not library.fractal_backend_capabilities() & 8
+        ):
+            raise unittest.SkipTest("native OpenCL GPU backend is unavailable")
+        common = dict(
+            width=16,
+            height=12,
+            log10_zoom=12.0,
+            x_center="-1.711030826576984823314722728180246694222252285",
+            y_center="0.000001509818957972609043170877447547323633361251",
+            max_iter=600,
+            renderer="native",
+            native_threads=2,
+            formula="mandelbrot",
+            return_planes=True,
+        )
+        scalar = visualizer.render_fractal(
+            **common,
+            render_options=visualizer.NativeRenderOptions(
+                backend=0,
+                escape_radius_mode=1,
+                coordinate_mode=1,
+            ),
+        )
+        gpu = visualizer.render_fractal(
+            **common,
+            render_options=visualizer.NativeRenderOptions(
+                backend=2,
+                escape_radius_mode=1,
+                coordinate_mode=1,
+            ),
+        )
+        scalar_field, scalar_planes = scalar
+        gpu_field, gpu_planes = gpu
+        np.testing.assert_allclose(gpu_field, scalar_field, rtol=0.0, atol=3.0e-5)
+        np.testing.assert_array_equal(
+            gpu_planes.orbit_iteration,
+            scalar_planes.orbit_iteration,
+        )
+        for name in ("phase", "de_x", "de_y", "test1", "test2"):
+            np.testing.assert_allclose(
+                getattr(gpu_planes, name),
+                getattr(scalar_planes, name),
+                rtol=2.0e-6,
+                atol=3.0e-8,
+                err_msg=name,
+            )
+
+    def test_opencl_direct_backend_matches_cpu_for_supported_formula_contracts(self):
+        """GPU direct fields cover the four ordinary fractal formulas.
+
+        Burning Ship's piecewise absolute-value recurrence, and Kalles'
+        viewport/bailout contract, must not silently drift when a GUI user
+        selects OpenCL.
+        """
+
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_backend_capabilities"):
+            raise unittest.SkipTest("native OpenCL capability ABI is unavailable")
+        if not library.fractal_backend_capabilities() & 4:
+            raise unittest.SkipTest("OpenCL double-precision backend is unavailable")
+
+        cases = (
+            ("mandelbrot", "-0.743643887037151", "0.13182590420533", 0, 0),
+            ("julia", "0.0", "0.0", 0, 0),
+            ("burning-ship", "-1.75", "-0.03", 0, 0),
+            ("burning-ship", "-1.45", "-0.12", 0, 0),
+            ("burning-ship", "-1.86", "-0.01", 0, 0),
+            ("tricorn", "-0.1", "0.7", 0, 0),
+            # A Kalles-coordinate scalar field is a valid GPU contract;
+            # deep Mandelbrot metadata is covered by the plane test above.
+            ("mandelbrot", "-0.743643887037151", "0.13182590420533", 1, 1),
+        )
+        for formula, x_center, y_center, bailout, coordinate_mode in cases:
+            common = dict(
+                width=37,
+                height=23,
+                log10_zoom=0.35,
+                x_center=x_center,
+                y_center=y_center,
+                max_iter=180,
+                renderer="native",
+                native_threads=2,
+                formula=formula,
+            )
+            scalar = visualizer.render_fractal(
+                **common,
+                render_options=visualizer.NativeRenderOptions(
+                    backend=0,
+                    escape_radius_mode=bailout,
+                    coordinate_mode=coordinate_mode,
+                ),
+            )
+            gpu = visualizer.render_fractal(
+                **common,
+                render_options=visualizer.NativeRenderOptions(
+                    backend=2,
+                    escape_radius_mode=bailout,
+                    coordinate_mode=coordinate_mode,
+                ),
+            )
+            np.testing.assert_allclose(gpu, scalar, rtol=0.0, atol=3.0e-5)
+
+    def test_opencl_aurora_colouriser_matches_cpu_when_gpu_available(self):
+        library = visualizer._get_native_library()
+        if (
+            library is None
+            or not hasattr(library, "fractal_colourise_opencl")
+            or not hasattr(library, "fractal_backend_capabilities")
+            or not library.fractal_backend_capabilities() & 8
+        ):
+            raise unittest.SkipTest("hardware OpenCL Aurora colourizer is unavailable")
+        field = np.linspace(-3.0, 300.5, 37 * 23, dtype=np.float32).reshape(23, 37)
+        field[0, 0] = np.nan
+        field[1, 1] = 300.0
+        cpu = np.empty(field.shape + (3,), dtype=np.uint8)
+        gpu = np.empty_like(cpu)
+        common = (
+            field.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            37,
+            23,
+            300,
+            0.37,
+            0.63,
+            0.4,
+            0.77,
+            2,
+        )
+        self.assertEqual(
+            library.fractal_colourise(
+                common[0],
+                cpu.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                *common[1:],
+            ),
+            0,
+        )
+        self.assertEqual(
+            library.fractal_colourise_opencl(
+                common[0],
+                gpu.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                *common[1:],
+            ),
+            0,
+            library.fractal_last_error(),
+        )
+        np.testing.assert_array_equal(gpu, cpu)
+
+    def test_opencl_fused_ordinary_atlas_matches_cpu_at_child_seam(self):
+        """The GPU atlas compositor must preserve RGB seam blending."""
+
+        library = visualizer._get_native_library()
+        if (
+            library is None
+            or not hasattr(library, "fractal_atlas_colourise_opencl_accents")
+            or not hasattr(library, "fractal_backend_capabilities")
+            or not library.fractal_backend_capabilities() & 8
+        ):
+            raise unittest.SkipTest("hardware fused ordinary atlas colourizer is unavailable")
+        parent = np.linspace(
+            0.0, 96.0, num=32 * 48, dtype=np.float32
+        ).reshape(32, 48)
+        child = np.linspace(
+            0.0, 160.0, num=32 * 48, dtype=np.float32
+        ).reshape(32, 48)
+        for palette_name in ("fire", "ocean", "mono"):
+            accents = visualizer._aurora_accents_for_selection(palette_name, None)
+            interior = visualizer._ordinary_interior_color(palette_name, None)
+            gpu = visualizer._atlas_colourise_opencl_native(
+                parent,
+                child,
+                48,
+                32,
+                1.7,
+                0.63,
+                96,
+                160,
+                160,
+                1.0,
+                0.31,
+                0.62,
+                0.27,
+                0.71,
+                5,
+                library,
+                2,
+                parent_cache_token=101,
+                child_cache_token=102,
+                accents=accents,
+                interior_color=interior,
+            )
+            cpu = visualizer._atlas_colourise_native(
+                parent,
+                child,
+                48,
+                32,
+                1.7,
+                0.63,
+                96,
+                160,
+                0.31,
+                0.62,
+                0.27,
+                2,
+                library,
+                0.71,
+                interior_color=interior,
+                accents=accents,
+            )
+            np.testing.assert_array_equal(gpu, cpu, palette_name)
+
+    def test_native_mandelbrot_analytic_de_matches_kalles_jacobian_orientation(self):
+        """The native DE plane must use Kalles' conjugate Jacobian product."""
+
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "render_fractal_ex_planes"):
+            raise unittest.SkipTest("native render metadata ABI is unavailable")
+
+        options = visualizer.NativeRenderOptions(backend=1)
+        field, planes = visualizer._render_native(
+            1,
+            1,
+            0.0,
+            "0.5",
+            "0.5",
+            100,
+            1,
+            options,
+            formula="mandelbrot",
+            return_planes=True,
+        )
+        # AVX2 is still a valid automatic choice for ordinary scalar fields,
+        # but the plane ABI must transparently use the scalar metadata path.
+        self.assertEqual(int(options.backend), 1)
+        # The fifth orbit sample escapes, but Kalles stores the zero-based
+        # count of samples completed before it: antal == 4.
+        self.assertEqual(int(planes.orbit_iteration[0, 0]), 4)
+        self.assertTrue(math.isfinite(float(field[0, 0])))
+
+        # Independently replay the escaped orbit and parameter derivative for
+        # c = 0.5 + 0.5i.  Kalles represents the holomorphic Jacobian as
+        # [ dr -di ; di dr ], so its analytic denominator is z * conj(dz),
+        # including the screen-space pixel spacing.
+        zr = zi = dr = di = 0.0
+        for _ in range(100):
+            next_zr = zr * zr - zi * zi + 0.5
+            next_zi = 2.0 * zr * zi + 0.5
+            next_dr = 2.0 * zr * dr - 2.0 * zi * di + 1.0
+            next_di = 2.0 * zr * di + 2.0 * zi * dr
+            zr, zi, dr, di = next_zr, next_zi, next_dr, next_di
+            if zr * zr + zi * zi > 4.0:
+                break
+
+        magnitude = math.hypot(zr, zi)
+        unit = complex(zr, zi) / magnitude
+        denominator = unit * complex(dr, -di) * 2.8
+        expected = magnitude * math.log(magnitude) / denominator
+        self.assertAlmostEqual(
+            float(planes.de_x[0, 0]), expected.real, places=10
+        )
+        self.assertAlmostEqual(
+            float(planes.de_y[0, 0]), expected.imag, places=10
+        )
+
     def test_cli_launch_without_audio_prints_help_and_exits_cleanly(self):
         output = io.StringIO()
         with mock.patch.object(visualizer.sys, "argv", ["visualizer.py"]), \
@@ -233,6 +684,132 @@ class AnimationTests(unittest.TestCase):
         finally:
             locale.setlocale(locale.LC_NUMERIC, previous_locale)
 
+    def test_native_canonicalises_decimal_coordinate_spellings(self):
+        """GUI pastes accepted by Decimal must not trigger native fallback."""
+
+        if visualizer._get_native_library() is None:
+            raise unittest.SkipTest("native renderer is unavailable")
+        canonical = visualizer.render_fractal(
+            16,
+            9,
+            0.0,
+            "-0.743643887037151",
+            "0.13182590420533",
+            128,
+            renderer="native",
+            native_threads=1,
+        )
+        pasted = visualizer.render_fractal(
+            16,
+            9,
+            0.0,
+            "-0.743_643_887_037_151",
+            "０.１３１８２５９０４２０５３３０",
+            128,
+            renderer="native",
+            native_threads=1,
+        )
+        np.testing.assert_array_equal(pasted, canonical)
+
+    def test_native_thread_default_leaves_cpu_headroom(self):
+        with mock.patch.object(
+            visualizer.os,
+            "sched_getaffinity",
+            return_value={0, 1, 2, 3},
+            create=True,
+        ):
+            self.assertEqual(visualizer._default_native_thread_count(), 2)
+            self.assertEqual(visualizer._default_encoder_thread_count(0), 1)
+            self.assertEqual(visualizer._default_encoder_thread_count(2), 1)
+
+        with mock.patch.object(
+            visualizer.os,
+            "sched_getaffinity",
+            return_value=set(range(12)),
+            create=True,
+        ):
+            self.assertEqual(visualizer._default_native_thread_count(), 6)
+            self.assertEqual(visualizer._default_encoder_thread_count(0), 2)
+
+    def test_native_kfp_plane_hints_follow_profile_features(self):
+        stops = ((0, 0, 0), (255, 255, 255))
+        flat_profile = visualizer.KfpPalette(stops=stops, differences=0)
+        self.assertEqual(visualizer._native_kfp_plane_flags(flat_profile), 3)
+
+        full_profile = visualizer.KfpPalette(
+            stops=stops,
+            phase_color_strength=25.0,
+            differences=7,
+            color_method=7,
+        )
+        self.assertEqual(visualizer._native_kfp_plane_flags(full_profile), 0)
+
+    def test_kfp_render_planes_are_reserved_for_orbit_dependent_features(self):
+        stops = ((0, 0, 0), (255, 255, 255))
+        scalar_profile = visualizer.KfpPalette(stops=stops, differences=3)
+        self.assertFalse(visualizer._kfp_requires_render_planes(scalar_profile))
+        self.assertFalse(
+            visualizer._kfp_requires_render_planes(
+                replace(scalar_profile, slopes=True)
+            )
+        )
+        self.assertTrue(
+            visualizer._kfp_requires_render_planes(
+                replace(scalar_profile, slopes=True, differences=7)
+            )
+        )
+        self.assertTrue(
+            visualizer._kfp_requires_render_planes(
+                replace(scalar_profile, smooth_method=1)
+            )
+        )
+        self.assertTrue(
+            visualizer._kfp_requires_render_planes(
+                replace(scalar_profile, phase_color_strength=20.0)
+            )
+        )
+        self.assertTrue(
+            visualizer._kfp_requires_render_planes(
+                replace(scalar_profile, differences=7, color_method=7)
+            )
+        )
+        self.assertFalse(
+            visualizer._kfp_requires_render_planes(
+                replace(scalar_profile, differences=7, color_method=0)
+            )
+        )
+
+    def test_kfp_plane_compaction_keeps_standard_3d_colour_inputs(self):
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 255, 255)),
+            slopes=True,
+            differences=3,
+            phase_color_strength=0.0,
+        )
+        field = np.asarray([[8.5, 9.5], [10.5, 11.5]], dtype=np.float32)
+        planes = visualizer.KfpFramePlanes(
+            orbit_iteration=np.asarray([[8, 9], [10, 11]], dtype=np.int64),
+            phase=np.zeros((2, 2), dtype=np.float64),
+            de_x=np.zeros((2, 2), dtype=np.float64),
+            de_y=np.zeros((2, 2), dtype=np.float64),
+            test1=np.full((2, 2), 128.0, dtype=np.float64),
+            test2=np.full((2, 2), 32.0, dtype=np.float64),
+        )
+        compact = visualizer._compact_kfp_render_planes(profile, planes)
+        self.assertIsNotNone(compact)
+        assert compact is not None
+        self.assertIsNone(compact.phase)
+        self.assertIsNone(compact.de_x)
+        self.assertIsNone(compact.de_y)
+        self.assertIsNone(compact.test2)
+        complete = visualizer._colourise_kfp(
+            field, 100, 0.0, 0.0, 0.0, 0.0, profile, planes=planes
+        )
+        reduced = visualizer._colourise_kfp(
+            field, 100, 0.0, 0.0, 0.0, 0.0, profile, planes=compact
+        )
+        np.testing.assert_array_equal(reduced, complete)
+
     def test_alternate_e150_catalogue_targets_are_finite_and_structured(self):
         for formula, points in visualizer.FORMULA_POINT_CATALOGUES.items():
             if formula == "mandelbrot":
@@ -395,6 +972,10 @@ class AnimationTests(unittest.TestCase):
     def test_native_reference_tiers_switch_before_deep_bla_can_fail(self):
         self.assertEqual(visualizer._native_reference_tier_logs(20.0), [12.0])
         self.assertEqual(
+            visualizer._native_reference_tier_logs(30.0),
+            [12.0, 20.0, 30.0],
+        )
+        self.assertEqual(
             visualizer._native_reference_tier_logs(83.0),
             [12.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 83.0],
         )
@@ -529,9 +1110,9 @@ class AnimationTests(unittest.TestCase):
                 "sd60": 1.0,
                 "hd60": 1.0,
                 "fhd60": 1.0,
-                "2k60": 0.75,
-                "4k60": 0.5,
-                "8k60": 0.25,
+                "2k60": 1.0,
+                "4k60": 1.0,
+                "8k60": 1.0,
             }
             self.assertEqual(values["quality"], "balanced")
             self.assertEqual(values["fractal_scale"], expected_source_scales[name])
@@ -635,12 +1216,15 @@ class AnimationTests(unittest.TestCase):
         bundled = Path(__file__).resolve().parents[1] / "palettes" / "kalles-default.kfp"
         palette = visualizer._palette_from_file(bundled, 17)
         self.assertEqual(tuple(palette[0]), (255, 255, 255))
-        self.assertEqual(tuple(palette[-1]), (0, 0, 255))
         profile = visualizer._kfp_profile_for_selection("kalles-default", None)
         self.assertIsNotNone(profile)
         assert profile is not None
         file_profile = visualizer._kfp_profile_for_selection("aurora", bundled)
         self.assertEqual(file_profile, profile)
+        np.testing.assert_array_equal(
+            palette,
+            visualizer._kfp_palette_lut(profile, 17),
+        )
         self.assertEqual(profile.stops, (
             (255, 255, 255),
             (128, 0, 64),
@@ -670,7 +1254,10 @@ class AnimationTests(unittest.TestCase):
             imported = visualizer._palette_from_file(path, 3)
             np.testing.assert_array_equal(
                 imported,
-                np.asarray([[0, 0, 0], [128, 128, 128], [255, 255, 255]], dtype=np.uint8),
+                visualizer._kfp_palette_lut(
+                    visualizer._kfp_profile_for_selection("aurora", path),
+                    3,
+                ),
             )
             profile = visualizer._kfp_profile_for_selection("aurora", path)
             self.assertIsNotNone(profile)
@@ -693,6 +1280,75 @@ class AnimationTests(unittest.TestCase):
             self.assertTrue(extended_profile.flat)
             self.assertTrue(extended_profile.inverse_transition)
             self.assertEqual(extended_profile.interior_color, (1, 2, 3))
+
+            asymmetric = Path(directory) / "asymmetric.kfp"
+            asymmetric.write_text(
+                "Colors: 10,20,30,40,50,60\n"
+                "InteriorColor: 1,2,3\n",
+                encoding="utf-8",
+            )
+            asymmetric_profile = visualizer._kfp_profile_for_selection(
+                "aurora", asymmetric
+            )
+            self.assertIsNotNone(asymmetric_profile)
+            assert asymmetric_profile is not None
+            self.assertEqual(asymmetric_profile.stops, ((10, 20, 30), (40, 50, 60)))
+            self.assertEqual(asymmetric_profile.interior_color, (1, 2, 3))
+            self.assertEqual(asymmetric_profile.differences, 0)
+            np.testing.assert_array_equal(
+                visualizer._palette_from_file(asymmetric, 17),
+                visualizer._kfp_palette_lut(asymmetric_profile, 17),
+            )
+
+            for raw_offset in ("-1", "1024", "2048"):
+                invalid_offset = Path(directory) / f"offset-{raw_offset}.kfp"
+                invalid_offset.write_text(
+                    "Colors: 0,0,0,255,255,255\n"
+                    f"ColorOffset: {raw_offset}\n",
+                    encoding="utf-8",
+                )
+                invalid_profile = visualizer._kfp_profile_for_selection(
+                    "aurora", invalid_offset
+                )
+                self.assertIsNotNone(invalid_profile)
+                assert invalid_profile is not None
+                self.assertEqual(invalid_profile.color_offset, 0.0)
+
+    def test_kfp_3d_override_preserves_all_other_profile_settings(self):
+        profile = visualizer.KfpPalette(
+            stops=((10, 20, 30), (40, 50, 60)),
+            iter_div=3.0,
+            color_method=7,
+            slope_power=71.0,
+        )
+        flat = visualizer._kfp_profile_with_3d(profile, False)
+        relief = visualizer._kfp_profile_with_3d(profile, True)
+        self.assertIsNotNone(flat)
+        self.assertIsNotNone(relief)
+        assert flat is not None and relief is not None
+        self.assertFalse(flat.slopes)
+        self.assertTrue(relief.slopes)
+        self.assertEqual(flat.stops, profile.stops)
+        self.assertEqual(relief.iter_div, profile.iter_div)
+        self.assertIs(visualizer._kfp_profile_with_3d(profile, None), profile)
+
+    def test_kfp_glitch_override_preserves_the_colour_recipe(self):
+        profile = visualizer.KfpPalette(
+            stops=((10, 20, 30), (40, 50, 60)),
+            iter_div=3.0,
+            color_method=7,
+            show_glitches=True,
+        )
+        hidden = visualizer._kfp_profile_with_glitches(profile, False)
+        shown = visualizer._kfp_profile_with_glitches(profile, True)
+        self.assertIsNotNone(hidden)
+        self.assertIsNotNone(shown)
+        assert hidden is not None and shown is not None
+        self.assertFalse(hidden.show_glitches)
+        self.assertTrue(shown.show_glitches)
+        self.assertEqual(hidden.stops, profile.stops)
+        self.assertEqual(shown.iter_div, profile.iter_div)
+        self.assertIs(visualizer._kfp_profile_with_glitches(profile, None), profile)
 
     def test_kfp_palette_lut_wraps_from_last_stop_to_first(self):
         profile = visualizer.KfpPalette(
@@ -723,6 +1379,180 @@ class AnimationTests(unittest.TestCase):
                 for channel in range(3)
             ))
         np.testing.assert_array_equal(lut, np.asarray(expected, dtype=np.uint8))
+
+    def test_kfp_iter_div_is_applied_once_like_kalles_setcolor(self):
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 255, 255)),
+            iter_div=2.0,
+            smooth_method=1,
+            smooth=False,
+            slopes=False,
+        )
+        planes = visualizer.KfpFramePlanes(
+            iteration=np.asarray([[1025]], dtype=np.int64),
+            transition=np.asarray([[1.0]], dtype=np.float64),
+        )
+        actual = visualizer._colourise_kfp(
+            np.asarray([[1025.0]], dtype=np.float32),
+            5000,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            profile,
+            planes=planes,
+        )
+        # Kalles computes 1025 / 2 = 512.5 and, with transitions disabled,
+        # selects LUT entry 512. A second division would select entry 256.
+        expected = visualizer._kfp_palette_lut(profile)[512]
+        self.assertEqual(tuple(actual[0, 0]), tuple(expected))
+
+    def test_kfp_glitch_transition_is_not_clipped_and_matches_native(self):
+        """Kalles' negative glitch transition survives the portable path."""
+
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_kfp_planes"):
+            raise unittest.SkipTest("native KFP plane colouriser is unavailable")
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 32, 220), (32, 220, 255)),
+            iter_div=0.01,
+            color_method=0,
+            smooth=True,
+            slopes=False,
+        )
+        field = np.zeros((1, 3), dtype=np.float32)
+        transition = np.asarray(
+            [[0.25, math.log2(1.5) - 2048.0, 0.75]],
+            dtype=np.float64,
+        )
+        planes = visualizer.KfpFramePlanes(
+            iteration=np.full((1, 3), 12, dtype=np.int64),
+            transition=transition,
+        )
+        portable = visualizer._colourise_kfp(
+            field, 100, 0.0, 0.0, 0.0, 0.0, profile, planes=planes
+        )
+        native = visualizer._colourise_kfp_native(
+            field, 100, 0.0, 0.0, 0.0, 0.0, profile, library, 2,
+            planes=planes,
+        )
+        difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 1)
+        clipped = visualizer._colourise_kfp(
+            field,
+            100,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            profile,
+            planes=visualizer.KfpFramePlanes(
+                iteration=planes.iteration,
+                transition=np.clip(transition, 0.0, 1.0),
+            ),
+        )
+        self.assertFalse(np.array_equal(portable[:, 1], clipped[:, 1]))
+
+    def test_kfp_show_glitches_option_hides_negative_transition_pixels(self):
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 32, 220), (32, 220, 255)),
+            iter_div=0.01,
+            color_method=0,
+            smooth=True,
+            slopes=False,
+            show_glitches=False,
+        )
+        field = np.zeros((1, 3), dtype=np.float32)
+        transition = np.asarray(
+            [[0.25, math.log2(1.5) - 2048.0, 0.75]],
+            dtype=np.float64,
+        )
+        planes = visualizer.KfpFramePlanes(
+            iteration=np.full((1, 3), 12, dtype=np.int64),
+            transition=transition,
+        )
+        hidden = visualizer._colourise_kfp(
+            field, 100, 0.0, 0.0, 0.0, 0.0, profile, planes=planes
+        )
+        np.testing.assert_array_equal(hidden[0, 1], (0, 0, 0))
+
+        visible_profile = visualizer.KfpPalette(
+            stops=profile.stops,
+            iter_div=profile.iter_div,
+            color_method=profile.color_method,
+            smooth=profile.smooth,
+            slopes=profile.slopes,
+            show_glitches=True,
+        )
+        visible = visualizer._colourise_kfp(
+            field, 100, 0.0, 0.0, 0.0, 0.0, visible_profile, planes=planes
+        )
+        self.assertFalse(np.array_equal(visible[0, 1], hidden[0, 1]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hidden-glitches.kfp"
+            path.write_text(
+                "Colors: 0,0,0,255,255,255\nShowGlitches: 0\n",
+                encoding="utf-8",
+            )
+            parsed = visualizer._kfp_profile_for_selection("aurora", path)
+            self.assertIsNotNone(parsed)
+            assert parsed is not None
+            self.assertFalse(parsed.show_glitches)
+
+        library = visualizer._get_native_library()
+        if library is not None and hasattr(library, "fractal_colourise_kfp_planes"):
+            native = visualizer._colourise_kfp_native(
+                field,
+                100,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                profile,
+                library,
+                2,
+                planes=planes,
+            )
+            np.testing.assert_array_equal(native[0, 1], (0, 0, 0))
+
+    def test_kfp_glitch_transition_stays_categorical_through_atlas_planes(self):
+        glitch = math.log2(2.0) - 2048.0
+        source = np.asarray(
+            [[0.1, 0.2, 0.3], [0.4, glitch, 0.6], [0.7, 0.8, 0.9]],
+            dtype=np.float64,
+        )
+        cropped = visualizer._crop_resize_kfp_plane(
+            source,
+            3,
+            3,
+            1.0,
+            "bilinear",
+            discrete=False,
+            preserve_negative=True,
+        )
+        self.assertLess(float(cropped[1, 1]), 0.0)
+        self.assertAlmostEqual(float(cropped[0, 0]), 0.1, places=6)
+
+        parent = visualizer.KfpFramePlanes(
+            transition=np.zeros((3, 3), dtype=np.float64)
+        )
+        child = visualizer.KfpFramePlanes(
+            transition=np.asarray([[glitch]], dtype=np.float64)
+        )
+        merged = visualizer._merge_kfp_plane_views(
+            parent,
+            child,
+            (3, 3),
+            1,
+            1,
+            1,
+            1,
+            np.asarray([[0.75]], dtype=np.float64),
+        )
+        self.assertIsNotNone(merged)
+        assert merged is not None
+        self.assertLess(float(merged.transition[1, 1]), 0.0)
 
     def test_kfp_zero_distance_uses_the_imported_first_colour(self):
         field = np.zeros((5, 7), dtype=np.float32)
@@ -763,17 +1593,48 @@ class AnimationTests(unittest.TestCase):
             dtype=np.float32,
         )
         gradient = visualizer._kfp_difference_magnitude(field, 0, np)
-        # Kalles multiplies each delta by sqrt(2), then divides diagonal
-        # neighbours by their geometric distance sqrt(2). Axis terms retain
-        # sqrt(2), while diagonal terms retain unit weight.
-        expected = 20.0 + 4.0 * math.sqrt(2.0)
+        # Kalles uses the literal 1.414 for the two axis terms, while the
+        # diagonal terms are divided by their geometric distance sqrt(2).
+        expected = 20.0 + 4.0 * 1.414
         self.assertAlmostEqual(float(gradient[1, 1]), expected, places=12)
+
+    def test_native_kfp_least_squares_matches_kalles_hypot1(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_kfp"):
+            raise unittest.SkipTest("native KFP colouriser is unavailable")
+        rng = np.random.default_rng(4412)
+        field = rng.uniform(0.0, 180.0, size=(11, 15)).astype(np.float32)
+        for differences in (4, 5):
+            profile = visualizer.KfpPalette(
+                stops=((0, 0, 0), (255, 80, 20), (20, 220, 255)),
+                iter_div=1.0,
+                color_method=5,
+                smooth=False,
+                slopes=False,
+                differences=differences,
+            )
+            portable = visualizer._colourise_kfp(
+                field, 200, 0.0, 0.0, 0.0, 0.5, profile
+            )
+            native = visualizer._colourise_kfp_native(
+                field,
+                200,
+                0.0,
+                0.0,
+                0.0,
+                0.5,
+                profile,
+                library,
+                2,
+            )
+            difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
+            self.assertLessEqual(int(np.max(difference)), 1, differences)
 
     def test_kfp_de_plus_standard_uses_kalles_sqrt_distance(self):
         profile = visualizer.KfpPalette(
             stops=((0, 0, 0), (255, 255, 255)),
-            iter_div=11.0,
-            color_offset=256.0,
+            iter_div=1.0,
+            color_offset=0.0,
             color_method=6,
             smooth=False,
             slopes=False,
@@ -905,6 +1766,131 @@ class AnimationTests(unittest.TestCase):
         )
         difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
         self.assertLessEqual(int(np.max(difference)), 1)
+
+    def test_native_kfp_cached_smoothing_does_not_promote_escaped_pixels(self):
+        """A smoothing offset must not change raw interior membership."""
+
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_kfp"):
+            raise unittest.SkipTest("native KFP colouriser is unavailable")
+        profile = visualizer.KfpPalette(
+            stops=((8, 20, 240), (240, 40, 12), (30, 220, 120)),
+            color_method=1,
+            smooth_method=0,
+            smooth=False,
+            flat=True,
+            slopes=True,
+            slope_power=18.0,
+            slope_ratio=65.0,
+            slope_angle=-96.0,
+            differences=3,
+            power=2.0,
+            bailout_radius_preset=1,
+            interior_color=(229, 200, 205),
+        )
+        # With the radius-2 smoothing offset, 31.884 becomes a continuous
+        # color sample above 32. It is nevertheless escaped because the raw
+        # field value remains below max_iter. The native stencil cache must
+        # preserve that distinction.
+        field = np.asarray(
+            [[10.0, 12.0, 14.0], [16.0, 31.884, 20.0], [22.0, 24.0, 26.0]],
+            dtype=np.float32,
+        )
+        portable = visualizer._colourise_kfp(
+            field, 32, 0.0, 0.0, 0.0, 0.5, profile
+        )
+        native = visualizer._colourise_kfp_native(
+            field, 32, 0.0, 0.0, 0.0, 0.5, profile, library, 2
+        )
+        difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 1)
+        self.assertNotEqual(tuple(native[1, 1]), profile.interior_color)
+
+    def test_native_kfp_analytic_distance_preserves_large_prelog_values(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_kfp_planes"):
+            raise unittest.SkipTest("native KFP plane colouriser is unavailable")
+
+        # ColorMethod 7 is DistanceLog. Its input must remain larger than
+        # 1e12 until after the logarithm; clamping the raw analytic distance
+        # first is visible as a hard band in deep zooms.
+        shape = (5, 7)
+        field = np.full(shape, 12.0, dtype=np.float32)
+        planes = visualizer.KfpFramePlanes(
+            iteration=np.full(shape, 12, dtype=np.int64),
+            transition=np.full(shape, 0.25, dtype=np.float64),
+            phase=np.full(shape, 0.125, dtype=np.float64),
+            de_x=np.full(shape, 1.0e-16, dtype=np.float64),
+            de_y=np.full(shape, 2.0e-16, dtype=np.float64),
+        )
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 40, 220), (20, 255, 80)),
+            iter_div=1.0,
+            color_method=7,
+            differences=7,
+            phase_color_strength=35.0,
+            slopes=False,
+        )
+        portable = visualizer._colourise_kfp(
+            field, 200, 0.0, 0.0, 0.0, 0.5, profile, planes=planes
+        )
+        native = visualizer._colourise_kfp_native(
+            field,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            profile,
+            library,
+            2,
+            planes=planes,
+        )
+        np.testing.assert_array_equal(native, portable)
+
+    def test_native_kfp_analytic_slopes_are_used_without_distance_transfer(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_kfp_planes"):
+            raise unittest.SkipTest("native KFP plane colouriser is unavailable")
+
+        # Kalles shares the analytic DE plane between its distance and slope
+        # stages.  A normal palette method can therefore still request
+        # Differences_Analytic through Slopes; it must not fall back to a
+        # zero slope just because ColorMethod is not 5..8.
+        shape = (7, 9)
+        field = np.linspace(2.0, 160.0, num=shape[0] * shape[1], dtype=np.float32)
+        field = field.reshape(shape)
+        planes = visualizer.KfpFramePlanes(
+            de_x=np.linspace(-1.75, 2.25, num=field.size, dtype=np.float64).reshape(shape),
+            de_y=np.linspace(2.5, -1.25, num=field.size, dtype=np.float64).reshape(shape),
+        )
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 50, 220), (20, 255, 80)),
+            iter_div=1.0,
+            color_method=0,
+            smooth=True,
+            slopes=True,
+            slope_power=55.0,
+            slope_ratio=42.0,
+            slope_angle=31.0,
+            differences=7,
+        )
+        portable = visualizer._colourise_kfp(
+            field, 200, 0.0, 0.0, 0.0, 0.5, profile, planes=planes
+        )
+        native = visualizer._colourise_kfp_native(
+            field,
+            200,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            profile,
+            library,
+            2,
+            planes=planes,
+        )
+        np.testing.assert_array_equal(native, portable)
 
     def test_native_ordinary_colouriser_uses_one_fused_accent_pass(self):
         library = visualizer._get_native_library()
@@ -1226,7 +2212,7 @@ class AnimationTests(unittest.TestCase):
             )
         np.testing.assert_array_equal(actual, expected)
 
-    def test_static_kfp_atlas_is_reserved_for_upscaled_mode(self):
+    def test_static_kfp_atlas_is_available_for_lossless_and_upscaled_modes(self):
         library = visualizer._get_native_library()
         if library is None or not all(
             hasattr(library, name)
@@ -1238,7 +2224,7 @@ class AnimationTests(unittest.TestCase):
         ):
             raise unittest.SkipTest("native static KFP atlas path is unavailable")
         profile = visualizer.KALLES_DEFAULT_KFP
-        self.assertFalse(
+        self.assertTrue(
             visualizer._use_static_kfp_atlas(
                 "lossless-compressed", profile, library, "bilinear"
             )
@@ -1258,6 +2244,19 @@ class AnimationTests(unittest.TestCase):
                 "upscaled", profile, library, "lanczos"
             )
         )
+
+    def test_kfp_audio_invariant_frame_reuse_requires_no_phase_transfer(self):
+        profile = visualizer.KfpPalette(
+            stops=((10, 20, 30), (40, 50, 60)),
+            phase_color_strength=0.0,
+        )
+        self.assertTrue(visualizer._kfp_frame_is_audio_invariant(profile))
+        self.assertFalse(
+            visualizer._kfp_frame_is_audio_invariant(
+                replace(profile, phase_color_strength=0.01)
+            )
+        )
+        self.assertFalse(visualizer._kfp_frame_is_audio_invariant(None))
 
     def test_quality_kfp_atlas_reprojects_before_colourising(self):
         library = visualizer._get_native_library()
@@ -1309,7 +2308,7 @@ class AnimationTests(unittest.TestCase):
         self.assertEqual(actual.dtype, np.uint8)
 
     def test_kfp_smooth_offset_matches_kalles_log_smoothing(self):
-        expected = 1.0 + math.log(math.log(10000.0)) / math.log(2.0)
+        expected = math.log(math.log(10000.0)) / math.log(2.0)
         self.assertAlmostEqual(
             visualizer._kfp_smooth_offset(visualizer.KALLES_DEFAULT_KFP),
             expected,
@@ -1325,6 +2324,382 @@ class AnimationTests(unittest.TestCase):
             0.0,
         )
 
+    def test_native_scalar_kfp_smoothing_matches_orbit_planes(self):
+        """The scalar compatibility field must map to Kalles' plane value."""
+
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_kfp_planes"):
+            raise unittest.SkipTest("native KFP plane colouriser is unavailable")
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 255, 255)),
+            iter_div=0.01,
+            color_method=0,
+            smooth_method=0,
+            smooth=True,
+            bailout_radius_preset=0,
+            power=2.0,
+            slopes=False,
+        )
+        raw_iteration = 12
+        test1 = 100.0
+        # The native scalar field contains nIter + 1 - log(log(|z|))/log(p).
+        # Kalles' plane path adds only log(log(radius))/log(p) to reconstruct
+        # the selected high-bailout value.
+        scalar_field = np.asarray(
+            [[
+                raw_iteration
+                + 1.0
+                - math.log(math.log(math.sqrt(test1))) / math.log(profile.power)
+            ]],
+            dtype=np.float32,
+        )
+        planes = visualizer.KfpFramePlanes(
+            orbit_iteration=np.asarray([[raw_iteration]], dtype=np.int64),
+            test1=np.asarray([[test1]], dtype=np.float64),
+        )
+        scalar = visualizer._colourise_kfp_native(
+            scalar_field,
+            100,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            profile,
+            library,
+            2,
+        )
+        orbit = visualizer._colourise_kfp_native(
+            scalar_field,
+            100,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            profile,
+            library,
+            2,
+            planes=planes,
+        )
+        np.testing.assert_array_equal(scalar, orbit)
+
+    def test_kfp_plane_log_smoothing_matches_materialized_npixels_and_ntrans(self):
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 64, 16)),
+            bailout_radius_preset=1,
+            smooth_method=0,
+        )
+        test1 = 3.0
+        smooth = 1.0 - math.log(
+            math.log(math.sqrt(test1)) / math.log(2.0)
+        ) / math.log(2.0)
+        combined = 12.0 + smooth
+        stored = math.floor(combined)
+        transition = 1.0 - (combined - stored)
+        raw = visualizer._colourise_kfp(
+            np.zeros((1, 1), dtype=np.float32),
+            100,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            profile,
+            planes=visualizer.KfpFramePlanes(
+                orbit_iteration=np.array([[12]], dtype=np.int64),
+                test1=np.array([[test1]], dtype=np.float64),
+            ),
+        )
+        materialized = visualizer._colourise_kfp(
+            np.zeros((1, 1), dtype=np.float32),
+            100,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            profile,
+            planes=visualizer.KfpFramePlanes(
+                iteration=np.array([[stored]], dtype=np.int64),
+                transition=np.array([[transition]], dtype=np.float64),
+            ),
+        )
+        np.testing.assert_array_equal(raw, materialized)
+
+    def test_native_kfp_plane_log_smoothing_matches_materialized_transition(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_kfp_planes"):
+            raise unittest.SkipTest("native KFP plane colouriser is unavailable")
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 64, 16)),
+            bailout_radius_preset=1,
+            smooth_method=0,
+            iter_div=0.25,
+            slopes=False,
+        )
+        test1 = 3.0
+        smooth = 1.0 - math.log(
+            math.log(math.sqrt(test1)) / math.log(2.0)
+        ) / math.log(2.0)
+        combined = 12.0 + smooth
+        stored = math.floor(combined)
+        transition = 1.0 - (combined - stored)
+        field = np.zeros((2, 2), dtype=np.float32)
+        raw_planes = visualizer.KfpFramePlanes(
+            orbit_iteration=np.full((2, 2), 12, dtype=np.int64),
+            test1=np.full((2, 2), test1, dtype=np.float64),
+        )
+        materialized_planes = visualizer.KfpFramePlanes(
+            iteration=np.full((2, 2), stored, dtype=np.int64),
+            transition=np.full((2, 2), transition, dtype=np.float64),
+        )
+        raw = visualizer._colourise_kfp_native(
+            field, 100, 0.0, 0.0, 0.0, 0.0, profile, library, 2,
+            planes=raw_planes,
+        )
+        materialized = visualizer._colourise_kfp_native(
+            field, 100, 0.0, 0.0, 0.0, 0.0, profile, library, 2,
+            planes=materialized_planes,
+        )
+        difference = np.abs(raw.astype(np.int16) - materialized.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 1)
+
+    def test_kfp_plane_sqrt_smoothing_uses_bailout_norm_and_radius(self):
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 64, 16)),
+            bailout_radius_preset=1,
+            bailout_norm_preset=1,
+            smooth_method=1,
+        )
+        root1 = math.sqrt(8.0)
+        root2 = math.sqrt(1.0)
+        smooth = 1.0 - (root1 - 2.0) / (root1 - root2)
+        combined = 12.0 + smooth
+        stored = math.floor(combined)
+        transition = 1.0 - (combined - stored)
+        raw = visualizer._colourise_kfp(
+            np.zeros((1, 1), dtype=np.float32),
+            100,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            profile,
+            planes=visualizer.KfpFramePlanes(
+                orbit_iteration=np.array([[12]], dtype=np.int64),
+                test1=np.array([[8.0]], dtype=np.float64),
+                test2=np.array([[1.0]], dtype=np.float64),
+            ),
+        )
+        materialized = visualizer._colourise_kfp(
+            np.zeros((1, 1), dtype=np.float32),
+            100,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            profile,
+            planes=visualizer.KfpFramePlanes(
+                iteration=np.array([[stored]], dtype=np.int64),
+                transition=np.array([[transition]], dtype=np.float64),
+            ),
+        )
+        np.testing.assert_array_equal(raw, materialized)
+
+    def test_kfp_plane_phase_and_analytic_distance_reach_setcolor(self):
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 64, 16)),
+            color_method=5,
+            differences=7,
+            phase_color_strength=100.0,
+        )
+        base_planes = visualizer.KfpFramePlanes(
+            iteration=np.full((2, 2), 10, dtype=np.int64),
+            transition=np.full((2, 2), 0.25, dtype=np.float64),
+        )
+        complete_planes = visualizer.KfpFramePlanes(
+            iteration=base_planes.iteration,
+            transition=base_planes.transition,
+            phase=np.full((2, 2), 0.25, dtype=np.float64),
+            de_x=np.full((2, 2), 0.5, dtype=np.float64),
+            de_y=np.full((2, 2), 0.25, dtype=np.float64),
+        )
+        base = visualizer._colourise_kfp(
+            np.zeros((2, 2), dtype=np.float32),
+            100,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            profile,
+            planes=base_planes,
+        )
+        complete = visualizer._colourise_kfp(
+            np.zeros((2, 2), dtype=np.float32),
+            100,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            profile,
+            planes=complete_planes,
+        )
+        self.assertFalse(np.array_equal(base, complete))
+
+    def test_kfp_plane_texture_is_used_without_a_texture_file(self):
+        texture = np.asarray(
+            [
+                [(10, 20, 30), (40, 50, 60), (70, 80, 90)],
+                [(100, 110, 120), (130, 140, 150), (160, 170, 180)],
+            ],
+            dtype=np.uint8,
+        )
+        field = np.full((2, 3), 12.0, dtype=np.float32)
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 255, 255)),
+            texture_enabled=True,
+            texture_file="",
+            texture_merge=1.0,
+            texture_power=0.0,
+            texture_ratio=100.0,
+            slopes=False,
+        )
+        actual = visualizer._colourise_kfp(
+            field,
+            100,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            profile,
+            planes=visualizer.KfpFramePlanes(texture_rgb=texture),
+        )
+        # SetTexture samples Kalles' bottom-up DIB with integer coordinates;
+        # a zero warp therefore returns the supplied plane vertically flipped.
+        np.testing.assert_array_equal(actual, texture[::-1])
+
+    def test_native_kfp_plane_texture_matches_portable_texture_stage(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_kfp_planes"):
+            raise unittest.SkipTest("native KFP plane colouriser is unavailable")
+        texture = np.asarray(
+            [
+                [(10, 20, 30), (40, 50, 60), (70, 80, 90)],
+                [(100, 110, 120), (130, 140, 150), (160, 170, 180)],
+            ],
+            dtype=np.uint8,
+        )
+        field = np.asarray(
+            [[12.0, 13.5, 15.0], [16.0, 17.5, 19.0]],
+            dtype=np.float32,
+        )
+        profile = visualizer.KfpPalette(
+            stops=((0, 0, 0), (255, 255, 255)),
+            texture_enabled=True,
+            texture_file="",
+            texture_merge=0.7,
+            texture_power=0.0,
+            texture_ratio=100.0,
+            slopes=False,
+        )
+        planes = visualizer.KfpFramePlanes(texture_rgb=texture)
+        portable = visualizer._colourise_kfp(
+            field, 100, 0.0, 0.0, 0.0, 0.5, profile, planes=planes
+        )
+        native = visualizer._colourise_kfp_native(
+            field, 100, 0.0, 0.0, 0.0, 0.5, profile, library, 2,
+            planes=planes,
+        )
+        difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 1)
+
+    def test_native_kfp_profile_texture_file_matches_portable_stage(self):
+        """A normal .kfp TextureFile uses the native texture-plane path."""
+
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "fractal_colourise_kfp_planes"):
+            raise unittest.SkipTest("native KFP plane colouriser is unavailable")
+        # Use a tiny PPM so the fixture does not depend on Pillow for writing
+        # the image. The renderer still exercises Pillow's normal TextureFile
+        # decoder, exactly as a GUI-imported .kfp does.
+        texture_rows = (
+            bytes((10, 20, 30, 40, 50, 60, 70, 80, 90)),
+            bytes((100, 110, 120, 130, 140, 150, 160, 170, 180)),
+        )
+        field = np.asarray(
+            [[12.0, 13.5, 15.0], [16.0, 17.5, 19.0]],
+            dtype=np.float32,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            texture_path = Path(directory) / "texture.ppm"
+            texture_path.write_bytes(
+                b"P6\n3 2\n255\n" + b"".join(texture_rows)
+            )
+            profile = visualizer.KfpPalette(
+                stops=((0, 0, 0), (255, 255, 255)),
+                texture_enabled=True,
+                texture_file=str(texture_path),
+                texture_resize=False,
+                texture_merge=0.7,
+                texture_power=200.0,
+                texture_ratio=100.0,
+                slopes=False,
+            )
+            portable = visualizer._colourise_kfp(
+                field, 100, 0.0, 0.0, 0.0, 0.5, profile
+            )
+            native = visualizer._colourise_kfp_native(
+                field,
+                100,
+                0.0,
+                0.0,
+                0.0,
+                0.5,
+                profile,
+                library,
+                2,
+            )
+        difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 1)
+
+    def test_kfp_embedded_texture_survives_atlas_plane_crop_and_merge(self):
+        texture = np.asarray(
+            [
+                [(10, 20, 30), (40, 50, 60), (70, 80, 90)],
+                [(100, 110, 120), (130, 140, 150), (160, 170, 180)],
+            ],
+            dtype=np.uint8,
+        )
+        planes = visualizer.KfpFramePlanes(
+            texture_rgb=texture,
+            texture_width=3,
+            texture_height=2,
+            texture_stride=9,
+        )
+        cropped = visualizer._crop_kfp_planes(
+            planes,
+            (2, 3),
+            4,
+            3,
+            1.0,
+            "bilinear",
+        )
+        self.assertIsNotNone(cropped)
+        np.testing.assert_array_equal(cropped.texture_rgb, texture)
+        self.assertEqual(cropped.texture_width, 3)
+        self.assertEqual(cropped.texture_height, 2)
+        self.assertEqual(cropped.texture_stride, 9)
+
+        merged = visualizer._merge_kfp_plane_views(
+            cropped,
+            visualizer.KfpFramePlanes(texture_rgb=texture),
+            (3, 4),
+            1,
+            0,
+            2,
+            2,
+            np.ones((2, 2), dtype=np.float64),
+        )
+        self.assertIsNotNone(merged)
+        np.testing.assert_array_equal(merged.texture_rgb, texture)
+
     def test_kfp_final_scale_is_sharp_and_working_surface_is_dense(self):
         self.assertEqual(
             visualizer._final_video_resample(
@@ -1335,6 +2710,43 @@ class AnimationTests(unittest.TestCase):
                 1080,
                 3840,
                 2160,
+            ),
+            "lanczos",
+        )
+        self.assertEqual(
+            visualizer._final_video_resample(
+                "nearest",
+                "kalles-default",
+                None,
+                1920,
+                1080,
+                3840,
+                2160,
+            ),
+            "lanczos",
+        )
+        self.assertEqual(
+            visualizer._final_video_resample(
+                "nearest",
+                "kalles-default",
+                None,
+                640,
+                360,
+                1280,
+                720,
+            ),
+            "lanczos",
+        )
+        self.assertEqual(
+            visualizer._final_video_resample(
+                "nearest",
+                "kalles-default",
+                None,
+                480,
+                270,
+                1920,
+                1080,
+                "upscaled",
             ),
             "lanczos",
         )
@@ -1693,6 +3105,28 @@ class AnimationTests(unittest.TestCase):
             else:
                 self.assertFalse(visualizer._cache_file_is_safe(symlink))
 
+    def test_kfp_plane_cache_round_trips_complete_metadata_atomically(self):
+        shape = (3, 4)
+        field = np.arange(12, dtype=np.float32).reshape(shape)
+        planes = visualizer.KfpFramePlanes(
+            orbit_iteration=np.full(shape, 7, dtype=np.int64),
+            phase=np.full(shape, 0.25, dtype=np.float64),
+            de_x=np.full(shape, 1.5, dtype=np.float64),
+            de_y=np.full(shape, -2.0, dtype=np.float64),
+            test1=np.full(shape, 16.0, dtype=np.float64),
+            test2=np.full(shape, 4.0, dtype=np.float64),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "atlas-tile-test.npz"
+            visualizer._atomic_save_kfp_planes(path, field, planes)
+            self.assertTrue(path.is_file())
+            with visualizer._safe_cache_load(path) as cached:
+                self.assertIsNotNone(cached)
+                assert cached is not None
+                np.testing.assert_array_equal(cached["field"], field)
+                for name in visualizer._KFP_REQUIRED_RENDER_PLANES:
+                    np.testing.assert_array_equal(cached[name], getattr(planes, name))
+
     def test_native_formula_modes_produce_fields(self):
         if visualizer._get_native_library() is None:
             raise unittest.SkipTest("native renderer is unavailable")
@@ -1718,6 +3152,130 @@ class AnimationTests(unittest.TestCase):
                 formula,
             )
             np.testing.assert_allclose(field, expected, rtol=0.0, atol=1.0e-4)
+
+    def test_native_direct_render_exposes_kalles_orbit_planes(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(library, "render_fractal_ex_planes"):
+            raise unittest.SkipTest("native orbit-plane renderer is unavailable")
+        options = visualizer.NativeRenderOptions(
+            backend=0,
+            escape_radius_mode=1,
+        )
+        field, planes = visualizer.render_fractal(
+            32,
+            24,
+            0.0,
+            *visualizer.FORMULA_DEFAULT_CENTERS["mandelbrot"],
+            128,
+            "native",
+            2,
+            render_options=options,
+            return_planes=True,
+        )
+        self.assertEqual(field.shape, (24, 32))
+        self.assertEqual(planes.orbit_iteration.shape, field.shape)
+        self.assertEqual(planes.test1.shape, field.shape)
+        self.assertEqual(planes.test2.shape, field.shape)
+        self.assertTrue(np.isfinite(field).all())
+        self.assertTrue(np.isfinite(planes.phase).all())
+        profile = visualizer.KALLES_DEFAULT_KFP
+        native = visualizer._colourise_kfp_native(
+            field,
+            128,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            profile,
+            library,
+            2,
+            planes=planes,
+        )
+        portable = visualizer._colourise_kfp(
+            field,
+            128,
+            0.0,
+            0.0,
+            0.0,
+            0.5,
+            profile,
+            planes=planes,
+        )
+        difference = np.abs(native.astype(np.int16) - portable.astype(np.int16))
+        self.assertLessEqual(int(np.max(difference)), 1)
+
+    def test_kalles_coordinate_mode_matches_python_shallow_renderer(self):
+        if visualizer._get_native_library() is None:
+            raise unittest.SkipTest("native renderer is unavailable")
+        options = visualizer.NativeRenderOptions(escape_radius_mode=1)
+        native = visualizer.render_fractal(
+            34,
+            26,
+            0.0,
+            *visualizer.FORMULA_DEFAULT_CENTERS["mandelbrot"],
+            160,
+            "native",
+            2,
+            render_options=options,
+        )
+        expected = visualizer._render_direct(
+            34,
+            26,
+            0.0,
+            *visualizer.FORMULA_DEFAULT_CENTERS["mandelbrot"],
+            160,
+            "mandelbrot",
+            visualizer.DEFAULT_JULIA_C,
+            1,
+            1,
+        )
+        np.testing.assert_allclose(native, expected, rtol=0.0, atol=1.0e-4)
+
+    def test_native_reusable_reference_exposes_kalles_orbit_planes(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(
+            library,
+            "fractal_render_reference_ex_planes",
+        ):
+            raise unittest.SkipTest("native reusable-reference plane renderer is unavailable")
+        reference_library, reference = visualizer._create_native_reference(
+            visualizer.DEFAULT_X_CENTER,
+            visualizer.DEFAULT_Y_CENTER,
+            256,
+            20.0,
+            3,
+            20.0,
+            escape_radius_mode=1,
+        )
+        try:
+            field, planes = visualizer.render_fractal(
+                16,
+                12,
+                20.0,
+                visualizer.DEFAULT_X_CENTER,
+                visualizer.DEFAULT_Y_CENTER,
+                128,
+                "native",
+                2,
+                reference,
+                3,
+                256,
+                visualizer.NativeRenderOptions(
+                    backend=0,
+                    escape_radius_mode=1,
+                ),
+                return_planes=True,
+            )
+        finally:
+            reference_library.fractal_destroy_reference(reference)
+        self.assertEqual(field.shape, (12, 16))
+        self.assertEqual(planes.orbit_iteration.shape, field.shape)
+        self.assertEqual(planes.test1.shape, field.shape)
+        self.assertEqual(planes.test2.shape, field.shape)
+        self.assertTrue(np.isfinite(field).all())
+        self.assertTrue(np.isfinite(planes.phase).all())
+        self.assertTrue(np.isfinite(planes.test1).all())
+        self.assertTrue(np.isfinite(planes.test2).all())
 
     def test_deep_local_reference_geometry_supports_odd_tiles(self):
         centres = visualizer._atlas_local_reference_centres(
@@ -1868,6 +3426,399 @@ class AnimationTests(unittest.TestCase):
             )
         np.testing.assert_array_equal(field, repaired)
         repair.assert_called_once()
+
+    def test_gpu_deep_tile_skips_cpu_secondary_reference_grid(self):
+        field = np.ones((4, 4), dtype=np.float32)
+        with mock.patch.object(
+            visualizer,
+            "_atlas_local_reference_field",
+            side_effect=AssertionError("GPU tile entered the CPU repair grid"),
+        ) as local, mock.patch.object(
+            visualizer,
+            "render_fractal",
+            return_value=field,
+        ) as render:
+            result = visualizer._atlas_tile_field(
+                cache_dir=None,
+                cache_identity="test",
+                render_width=4,
+                render_height=4,
+                level=0,
+                log_zoom=40.0,
+                x_center="-0.7",
+                y_center="0.1",
+                max_iter=128,
+                series_order=3,
+                series_block=256,
+                renderer="auto",
+                native_reference=object(),
+                native_threads=1,
+                native_library=object(),
+                native_backend=2,
+            )
+        np.testing.assert_array_equal(result, field)
+        local.assert_not_called()
+        render.assert_called_once()
+
+    def test_glitch_repair_keeps_native_kfp_planes(self):
+        field = np.arange(16, dtype=np.float32).reshape(4, 4)
+        planes = visualizer.KfpFramePlanes(
+            orbit_iteration=np.full((4, 4), 9, dtype=np.int64),
+            phase=np.full((4, 4), 0.25, dtype=np.float64),
+            de_x=np.full((4, 4), 1.5, dtype=np.float64),
+            de_y=np.full((4, 4), -0.5, dtype=np.float64),
+            test1=np.full((4, 4), 2.0, dtype=np.float64),
+            test2=np.full((4, 4), 3.0, dtype=np.float64),
+        )
+
+        def render_with_planes(*_args, **kwargs):
+            self.assertTrue(kwargs.get("return_planes"))
+            return field, planes
+
+        with mock.patch.object(
+            visualizer,
+            "render_fractal",
+            side_effect=render_with_planes,
+        ):
+            repaired_field, repaired_planes = visualizer._atlas_glitch_reference_field(
+                render_width=4,
+                render_height=4,
+                log10_zoom=15.0,
+                x_center="-0.7",
+                y_center="0.1",
+                max_iter=128,
+                series_order=3,
+                series_block=256,
+                native_threads=1,
+                native_library=object(),
+                native_backend=0,
+                native_reference=object(),
+                fallback_field=None,
+                fallback_zoom_factor=2.0,
+                fallback_max_iter=None,
+                allow_recovery=False,
+                return_planes=True,
+            )
+        np.testing.assert_array_equal(repaired_field, field)
+        self.assertIs(repaired_planes, planes)
+
+    def test_glitch_repair_drops_incomplete_kfp_planes(self):
+        field = np.arange(16, dtype=np.float32).reshape(4, 4)
+        planes = visualizer.KfpFramePlanes(
+            orbit_iteration=np.full((4, 4), 9, dtype=np.int64),
+            phase=np.full((4, 4), np.nan, dtype=np.float64),
+            de_x=np.full((4, 4), 1.5, dtype=np.float64),
+            de_y=np.full((4, 4), -0.5, dtype=np.float64),
+            test1=np.full((4, 4), 2.0, dtype=np.float64),
+            test2=np.full((4, 4), 3.0, dtype=np.float64),
+        )
+
+        with mock.patch.object(
+            visualizer,
+            "render_fractal",
+            return_value=(field, planes),
+        ):
+            repaired_field, repaired_planes = visualizer._atlas_glitch_reference_field(
+                render_width=4,
+                render_height=4,
+                log10_zoom=15.0,
+                x_center="-0.7",
+                y_center="0.1",
+                max_iter=128,
+                series_order=3,
+                series_block=256,
+                native_threads=1,
+                native_library=object(),
+                native_backend=0,
+                native_reference=object(),
+                fallback_field=None,
+                fallback_zoom_factor=2.0,
+                fallback_max_iter=None,
+                allow_recovery=False,
+                return_planes=True,
+            )
+        np.testing.assert_array_equal(repaired_field, field)
+        self.assertIsNone(repaired_planes)
+
+    def test_glitch_repair_splits_a_fully_unresolved_point_cell(self):
+        """A bad probe must be replaced by child probes, not retried forever."""
+
+        width = height = 16
+        shared_field = np.full((height, width), 12.0, dtype=np.float32)
+        shared_field[3:13, 3:13] = np.nan
+
+        def make_planes(shape):
+            plane_height, plane_width = shape
+            return visualizer.KfpFramePlanes(
+                orbit_iteration=np.full(shape, 7, dtype=np.int64),
+                phase=np.ones(shape, dtype=np.float64),
+                de_x=np.ones(shape, dtype=np.float64),
+                de_y=np.ones(shape, dtype=np.float64),
+                test1=np.ones(shape, dtype=np.float64),
+                test2=np.ones(shape, dtype=np.float64),
+            )
+
+        native_library = mock.Mock()
+        calls = []
+
+        def render_points(**kwargs):
+            cell = kwargs["cell"]
+            calls.append(cell)
+            cell_width = cell[1] - cell[0]
+            cell_height = cell[3] - cell[2]
+            if cell_width > 8 or cell_height > 8:
+                local_field = np.full(
+                    (cell_height, cell_width), np.nan, dtype=np.float32
+                )
+            else:
+                local_field = np.full(
+                    (cell_height, cell_width), 5.0, dtype=np.float32
+                )
+            return local_field, make_planes(local_field.shape)
+
+        diagnostics = {}
+        with mock.patch.object(
+            visualizer,
+            "render_fractal",
+            return_value=(shared_field, make_planes(shared_field.shape)),
+        ), mock.patch.object(
+            visualizer,
+            "_create_native_reference",
+            return_value=(native_library, object()),
+        ), mock.patch.object(
+            visualizer,
+            "_render_native_reference_points",
+            side_effect=render_points,
+        ):
+            field, planes = visualizer._atlas_glitch_reference_field(
+                render_width=width,
+                render_height=height,
+                log10_zoom=15.0,
+                x_center="-0.7",
+                y_center="0.1",
+                max_iter=128,
+                series_order=3,
+                series_block=256,
+                native_threads=1,
+                native_library=native_library,
+                native_backend=0,
+                native_reference=object(),
+                fallback_field=None,
+                fallback_zoom_factor=2.0,
+                fallback_max_iter=None,
+                allow_recovery=False,
+                diagnostics=diagnostics,
+                return_planes=True,
+            )
+
+        self.assertEqual(calls[0], (2, 14, 2, 14))
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(all(max(cell[1] - cell[0], cell[3] - cell[2]) <= 8 for cell in calls[1:]))
+        self.assertGreater(diagnostics["refined_regions"], 0)
+        self.assertTrue(np.isfinite(field).all())
+        self.assertIsNotNone(planes)
+        for plane_name in (
+            "orbit_iteration",
+            "phase",
+            "de_x",
+            "de_y",
+            "test1",
+            "test2",
+        ):
+            self.assertTrue(np.isfinite(getattr(planes, plane_name)).all())
+
+    def test_glitch_repair_splits_large_point_cells_before_native_work(self):
+        """Frame-sized masks are subdivided before exact point repair."""
+
+        width = height = 128
+        shared_field = np.full((height, width), np.nan, dtype=np.float32)
+        native_library = mock.Mock()
+        calls = []
+
+        def render_points(**kwargs):
+            cell = kwargs["cell"]
+            calls.append(cell)
+            shape = (cell[3] - cell[2], cell[1] - cell[0])
+            return np.full(shape, 5.0, dtype=np.float32)
+
+        with mock.patch.object(
+            visualizer,
+            "render_fractal",
+            return_value=shared_field,
+        ), mock.patch.object(
+            visualizer,
+            "_create_native_reference",
+            return_value=(native_library, object()),
+        ), mock.patch.object(
+            visualizer,
+            "_render_native_reference_points",
+            side_effect=render_points,
+        ):
+            field = visualizer._atlas_glitch_reference_field(
+                render_width=width,
+                render_height=height,
+                log10_zoom=15.0,
+                x_center="-0.7",
+                y_center="0.1",
+                max_iter=128,
+                series_order=3,
+                series_block=256,
+                native_threads=1,
+                native_library=native_library,
+                native_backend=0,
+                native_reference=object(),
+                fallback_field=None,
+                fallback_zoom_factor=2.0,
+                fallback_max_iter=None,
+                allow_recovery=False,
+                native_reference_root=None,
+        )
+
+        self.assertTrue(np.isfinite(field).all())
+        self.assertGreater(len(calls), 1)
+        self.assertTrue(
+            all(
+                (cell[1] - cell[0]) * (cell[3] - cell[2])
+                <= visualizer.ATLAS_LOCAL_REFERENCE_MAX_POINT_CELL_PIXELS
+                for cell in calls
+            )
+        )
+
+    def test_glitch_repair_tries_edge_probe_when_small_cell_has_no_finite_sample(self):
+        """A probe-free small cell gets a bounded deterministic retry."""
+
+        width = height = 12
+        shared_field = np.full((height, width), 12.0, dtype=np.float32)
+        shared_field[5, 5] = np.nan
+
+        def make_planes(shape):
+            return visualizer.KfpFramePlanes(
+                orbit_iteration=np.full(shape, 7, dtype=np.int64),
+                phase=np.ones(shape, dtype=np.float64),
+                de_x=np.ones(shape, dtype=np.float64),
+                de_y=np.ones(shape, dtype=np.float64),
+                test1=np.ones(shape, dtype=np.float64),
+                test2=np.ones(shape, dtype=np.float64),
+            )
+
+        native_library = mock.Mock()
+        calls = []
+
+        def render_points(**kwargs):
+            calls.append((kwargs["cell"], kwargs["probe"]))
+            cell = kwargs["cell"]
+            shape = (cell[3] - cell[2], cell[1] - cell[0])
+            value = np.nan if kwargs["probe"] == (5, 5) else 5.0
+            return np.full(shape, value, dtype=np.float32), make_planes(shape)
+
+        with mock.patch.object(
+            visualizer,
+            "render_fractal",
+            return_value=(shared_field, make_planes(shared_field.shape)),
+        ), mock.patch.object(
+            visualizer,
+            "_create_native_reference",
+            return_value=(native_library, object()),
+        ), mock.patch.object(
+            visualizer,
+            "_render_native_reference_points",
+            side_effect=render_points,
+        ):
+            field, planes = visualizer._atlas_glitch_reference_field(
+                render_width=width,
+                render_height=height,
+                log10_zoom=15.0,
+                x_center="-0.7",
+                y_center="0.1",
+                max_iter=128,
+                series_order=3,
+                series_block=256,
+                native_threads=1,
+                native_library=native_library,
+                native_backend=0,
+                native_reference=object(),
+                fallback_field=None,
+                fallback_zoom_factor=2.0,
+                fallback_max_iter=None,
+                allow_recovery=False,
+                return_planes=True,
+            )
+
+        self.assertEqual(calls[0], ((4, 7, 4, 7), (5, 5)))
+        self.assertEqual(len(calls), 2)
+        self.assertNotEqual(calls[1][1], (5, 5))
+        self.assertTrue(np.isfinite(field).all())
+        self.assertIsNotNone(planes)
+
+    def test_glitch_repair_can_use_a_finite_neighbouring_probe(self):
+        """A thin failed cell may borrow a stable orbit from its halo."""
+
+        width = height = 12
+        shared_field = np.full((height, width), 12.0, dtype=np.float32)
+        shared_field[5, 5] = np.nan
+
+        def make_planes(shape):
+            return visualizer.KfpFramePlanes(
+                orbit_iteration=np.full(shape, 7, dtype=np.int64),
+                phase=np.ones(shape, dtype=np.float64),
+                de_x=np.ones(shape, dtype=np.float64),
+                de_y=np.ones(shape, dtype=np.float64),
+                test1=np.ones(shape, dtype=np.float64),
+                test2=np.ones(shape, dtype=np.float64),
+            )
+
+        native_library = mock.Mock()
+        calls = []
+
+        def render_points(**kwargs):
+            calls.append((kwargs["cell"], kwargs["probe"]))
+            cell = kwargs["cell"]
+            shape = (cell[3] - cell[2], cell[1] - cell[0])
+            value = np.nan if kwargs["probe"] == (5, 5) else 5.0
+            return np.full(shape, value, dtype=np.float32), make_planes(shape)
+
+        with mock.patch.object(
+            visualizer,
+            "render_fractal",
+            return_value=(shared_field, make_planes(shared_field.shape)),
+        ), mock.patch.object(
+            visualizer,
+            "_create_native_reference",
+            return_value=(native_library, object()),
+        ), mock.patch.object(
+            visualizer,
+            "_render_native_reference_points",
+            side_effect=render_points,
+        ):
+            field, planes = visualizer._atlas_glitch_reference_field(
+                render_width=width,
+                render_height=height,
+                log10_zoom=15.0,
+                x_center="-0.7",
+                y_center="0.1",
+                max_iter=128,
+                series_order=3,
+                series_block=256,
+                native_threads=1,
+                native_library=native_library,
+                native_backend=0,
+                native_reference=object(),
+                fallback_field=None,
+                fallback_zoom_factor=2.0,
+                fallback_max_iter=None,
+                allow_recovery=False,
+                return_planes=True,
+            )
+
+        self.assertTrue(np.isfinite(field).all())
+        self.assertIsNotNone(planes)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertTrue(
+            any(
+                not (cell[0] <= probe[0] < cell[1] and cell[2] <= probe[1] < cell[3])
+                for cell, probe in calls[1:]
+            )
+        )
 
     def test_probe_centred_point_reference_preserves_global_pixel_alignment(self):
         library = visualizer._get_native_library()
@@ -2318,6 +4269,84 @@ class AnimationTests(unittest.TestCase):
             field, 200, 1.7, 1.0, 0.9, 0.0, profile
         )
         np.testing.assert_array_equal(varied, baseline)
+
+    def test_sparse_kfp_inherits_kalles_slope_ratio_reset(self):
+        profile = visualizer._parse_kfp_profile(
+            "Colors: 0,0,0, 255,255,255\nSlopes: 1\n",
+            Path("sparse.kfp"),
+        )
+        self.assertTrue(profile.slopes)
+        self.assertEqual(profile.slope_ratio, 50.0)
+
+    def test_ffmpeg_idle_between_deep_tiles_is_not_a_stdin_stall(self):
+        """A long native tile must not kill an encoder with no queued frame."""
+
+        writer = object.__new__(visualizer._FFmpegFrameWriter)
+        writer.errors = []
+        writer.process = mock.Mock()
+        writer.process.poll.return_value = None
+        writer.diagnostics = None
+        writer.reader = None
+        writer.queue = visualizer.queue.Queue()
+        writer.progress = (
+            visualizer.time.monotonic()
+            - visualizer.FFMPEG_STDIN_STALL_TIMEOUT_SECONDS - 1.0
+        )
+
+        with mock.patch.object(visualizer, "_terminate_subprocess") as terminate:
+            writer.check_health()
+        terminate.assert_not_called()
+
+        writer.queue.put(b"an outstanding frame")
+        with mock.patch.object(visualizer, "_terminate_subprocess") as terminate:
+            with self.assertRaisesRegex(RuntimeError, "stopped draining"):
+                writer.check_health()
+        terminate.assert_called_once_with(writer.process)
+
+    def test_kfp_palette_load_ignores_saved_scene_smoothing_settings(self):
+        """Kalles opens .kfp files with bNoLocation, not as project files."""
+
+        profile = visualizer._parse_kfp_profile(
+            """
+            Re: -0.75
+            Im: 0.125
+            Zoom: 123456
+            FractalType: 3
+            Power: 7
+            SmoothMethod: 2
+            SmoothingMethod: 1
+            BailoutRadiusPreset: 3
+            BailoutRadiusCustom: 93
+            BailoutNormPreset: 3
+            BailoutNormCustom: 5
+            ColorMethod: 7
+            IterDiv: 0.25
+            Slopes: 2
+            TextureEnabled: -1
+            SlopePower: 77.9
+            SlopeRatio: 42.8
+            SlopeAngle: -30.7
+            TextureRatio: 88.6
+            ColorPhaseStrength: -37.5
+            Colors: 0,0,0, 255,128,64
+            """,
+            Path("saved-scene.kfp"),
+        )
+        # These defaults describe the selected project renderer, not the
+        # saved KFP's old scene. They match Kalles OpenString(..., TRUE).
+        self.assertEqual(profile.power, 2.0)
+        self.assertEqual(profile.smooth_method, 0)
+        self.assertEqual(profile.bailout_radius_preset, 0)
+        self.assertEqual(profile.bailout_norm_preset, 1)
+        self.assertEqual(profile.color_method, 7)
+        self.assertAlmostEqual(profile.iter_div, 0.25)
+        self.assertAlmostEqual(profile.phase_color_strength, -37.5)
+        self.assertTrue(profile.slopes)
+        self.assertTrue(profile.texture_enabled)
+        self.assertEqual(profile.slope_power, 77.0)
+        self.assertEqual(profile.slope_ratio, 42.0)
+        self.assertEqual(profile.slope_angle, -30.0)
+        self.assertEqual(profile.texture_ratio, 88.0)
 
     def test_ordinary_palettes_keep_aurora_detail_beyond_iteration_cap(self):
         field = np.asarray([[10.0, 11.0, 1000.0, 1001.0]], dtype=np.float32)

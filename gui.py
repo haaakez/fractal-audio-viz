@@ -300,6 +300,30 @@ if Gtk is not None:
                 visualizer.PALETTE_CHOICES,
                 "aurora",
             )
+            self.kfp_3d = self._combo(
+                ("file", "on", "off"),
+                "file",
+                {
+                    "file": "file setting",
+                    "on": "on (Kalles relief/highlights)",
+                    "off": "off (flat)",
+                },
+            )
+            self.kfp_3d.set_tooltip_text(
+                "KFP only: use the palette setting, keep Kalles' relief/white highlights, or use flat colour"
+            )
+            self.kfp_glitches = self._combo(
+                ("file", "on", "off"),
+                "file",
+                {
+                    "file": "file setting",
+                    "on": "show artefacts",
+                    "off": "hide artefacts",
+                },
+            )
+            self.kfp_glitches.set_tooltip_text(
+                "KFP only: preserve or suppress Kalles' bright glitch/transition artefacts"
+            )
             self.palette_file = self._entry()
             self.palette_preview = Gtk.DrawingArea()
             self.palette_preview.set_hexpand(True)
@@ -364,6 +388,20 @@ if Gtk is not None:
                 dimensions.pack_start(entry, True, True, 0)
             row = self._add_widget_row(render_grid, row, "Video", dimensions)
             row = self._add_widget_row(render_grid, row, "Palette", self.palette)
+            row = self._add_widget_row(
+                render_grid,
+                row,
+                "KFP 3D",
+                self.kfp_3d,
+                "file setting, relief/highlights, or flat",
+            )
+            row = self._add_widget_row(
+                render_grid,
+                row,
+                "KFP artefacts",
+                self.kfp_glitches,
+                "file setting, show, or hide bright glitches",
+            )
             row = self._add_widget_row(
                 render_grid,
                 row,
@@ -467,13 +505,21 @@ if Gtk is not None:
                 ("Series order", self.series_order, "native BLA polynomial degree"),
                 ("Series block", self.series_block, "native BLA block length"),
                 ("Renderer", self.renderer, "auto / native / python"),
-                ("Native threads", self.native_threads, "0 uses the runtime default"),
+                (
+                    "Native threads",
+                    self.native_threads,
+                    "0 uses the bounded default; enter a number to override",
+                ),
                 ("Native backend", self.native_backend, "hardware field backend"),
                 ("Video preset", self.video_preset, "FFmpeg speed / size trade-off"),
                 ("Codec", self.codec, "FFmpeg encoder name or auto"),
                 ("CRF", self.crf, "encoder quality, 0 to 51"),
                 ("Resample", self.resample, "final output filter; atlas crop stays continuous"),
-                ("Encoder threads", self.encoder_threads, "0 lets FFmpeg choose"),
+                (
+                    "Encoder threads",
+                    self.encoder_threads,
+                    "0 uses the bounded default; enter a number to override",
+                ),
                 ("Cache limit MB", self.cache_limit_mb, "0 means unlimited"),
             ):
                 technical_row = self._add_widget_row(technical_grid, technical_row, label, widget, hint)
@@ -691,12 +737,22 @@ if Gtk is not None:
             for pattern in patterns:
                 file_filter.add_pattern(pattern)
             dialog.add_filter(file_filter)
+            all_files_filter = Gtk.FileFilter()
+            all_files_filter.set_name("All files")
+            all_files_filter.add_pattern("*")
+            dialog.add_filter(all_files_filter)
             existing = entry.get_text().strip()
             if existing:
                 try:
                     dialog.set_filename(existing)
                 except Exception:
                     pass
+            # Explicitly show/present the dialog before entering its nested
+            # event loop. This matters for some GTK/Windows combinations,
+            # where run() alone can leave a transient chooser behind the main
+            # window even though the button callback did fire.
+            dialog.show_all()
+            dialog.present()
             response = dialog.run()
             if response == Gtk.ResponseType.ACCEPT:
                 filename = dialog.get_filename()
@@ -790,6 +846,14 @@ if Gtk is not None:
                 julia_constant=julia_constant,
                 palette=self._combo_text(self.palette),
                 palette_file=palette_file,
+                kfp_3d={
+                    "on": True,
+                    "off": False,
+                }.get(self._combo_text(self.kfp_3d)),
+                kfp_glitches={
+                    "on": True,
+                    "off": False,
+                }.get(self._combo_text(self.kfp_glitches)),
                 # Live view is deliberately a bounded draft source. The
                 # window/monitor may enlarge it, but the export profile must
                 # never accidentally turn the screensaver into a 4K render.
@@ -797,6 +861,7 @@ if Gtk is not None:
                 height=LIVE_DEFAULT_HEIGHT,
                 fps=min(60, max(1, int(self.fps.get_text()))),
                 native_threads=int(self.native_threads.get_text()),
+                native_backend=self._combo_text(self.native_backend),
                 loop=True,
                 fullscreen=True,
                 base_zoom=base_zoom,
@@ -999,6 +1064,16 @@ if Gtk is not None:
                 "--encoder-threads", self.encoder_threads.get_text(),
                 "--cache-limit-mb", self.cache_limit_mb.get_text(),
             ])
+            kfp_3d = self._combo_text(self.kfp_3d)
+            if kfp_3d == "on":
+                command.append("--kfp-3d")
+            elif kfp_3d == "off":
+                command.append("--no-kfp-3d")
+            kfp_glitches = self._combo_text(self.kfp_glitches)
+            if kfp_glitches == "on":
+                command.append("--kfp-glitches")
+            elif kfp_glitches == "off":
+                command.append("--no-kfp-glitches")
             if self.lossless.get_active():
                 command.append("--lossless")
             if formula == "julia":
