@@ -91,8 +91,25 @@ constexpr int MAX_NATIVE_PRECISION_BITS = 131'072;
 constexpr int MAX_NATIVE_PIXELS = 100'000'000;
 constexpr int MAX_NATIVE_POINTS = 100'000'000;
 constexpr std::size_t MAX_NATIVE_TEXT_LENGTH = 50'000;
+constexpr int KFP_ATLAS_SEAM_FEATHER_MAX = 64;
+constexpr int KFP_ATLAS_SEAM_FEATHER_DIVISOR = 2;
 constexpr long double MIN_NATIVE_LOG10_ZOOM = -300.0L;
 constexpr long double MAX_NATIVE_LOG10_ZOOM = 9800.0L;
+
+inline int kfp_atlas_seam_feather(int width, int height) noexcept {
+    const int minimum = std::min(width, height);
+    if (minimum <= 0) return 0;
+    const int requested = std::max(
+        2,
+        std::min(
+            KFP_ATLAS_SEAM_FEATHER_MAX,
+            minimum / KFP_ATLAS_SEAM_FEATHER_DIVISOR));
+    // Leave a fully-owned sample in the middle of even child rectangles.
+    // With minimum=32 the greatest edge distance is 15, so a feather of 16
+    // would blend the whole child and hide its interior sentinel.
+    const int plateau_limit = std::max(0, (minimum - 1) / 2);
+    return std::min(requested, plateau_limit);
+}
 
 // Store a large iteration field relative to a nearby bias when the caller is
 // going to quantise it to float32.  Keeping the fractional part close to zero
@@ -2308,10 +2325,15 @@ __kernel void rgb_atlas_composite(
     const int feather,
     const int use_child
 ) {
-    const int x = (int)get_global_id(0);
-    const int y = (int)get_global_id(1);
-    if (x >= output_width || y >= output_height) return;
-    const size_t pixel = (size_t)y * (size_t)output_width + (size_t)x;
+    // The host launches this kernel as a one-dimensional work list, just
+    // like rgb_crop.  Derive both coordinates from that linear pixel index;
+    // asking OpenCL for get_global_id(1) from a 1-D launch leaves the second
+    // coordinate at zero on several drivers and produces only the top row.
+    const size_t pixel = get_global_id(0);
+    const size_t pixel_count = (size_t)output_width * (size_t)output_height;
+    if (pixel >= pixel_count) return;
+    const int y = (int)(pixel / (size_t)output_width);
+    const int x = (int)(pixel - (size_t)y * (size_t)output_width);
     const size_t destination = pixel * 3U;
     uchar parent_rgb[3];
     rgb_sample_rgb_at(
@@ -17401,8 +17423,8 @@ int fractal_atlas_colourise_kfp_planes(
         const int child_top = secondary_field != nullptr
             ? (output_height - visible_child_height) / 2 : 0;
         const int seam_feather = secondary_field != nullptr
-            ? std::min(2, std::min(visible_child_width / 2,
-                                   visible_child_height / 2)) : 0;
+            ? kfp_atlas_seam_feather(visible_child_width, visible_child_height)
+            : 0;
 
         BilinearWorkspace& workspace = bilinear_workspace;
         BilinearAxis& primary_x_axis = workspace.parent_x_axis;
@@ -18050,7 +18072,9 @@ int fractal_atlas_colourise_kfp_raw(
         // Tricorn.
         const int ownership_left = visible_child_left;
         const int ownership_top = visible_child_top;
-        const int seam_feather = halo;
+        const int seam_feather = use_child
+            ? kfp_atlas_seam_feather(visible_child_width, visible_child_height)
+            : 0;
         BilinearWorkspace& workspace = bilinear_workspace;
         BilinearAxis& parent_x_axis = workspace.parent_x_axis;
         BilinearAxis& parent_y_axis = workspace.parent_y_axis;
@@ -18167,9 +18191,9 @@ int fractal_atlas_colourise_kfp_raw(
                         * static_cast<size_t>(sampled_child_width)
                         + static_cast<size_t>(child_x)];
                     // The child owns the visible region. Its source halo is
-                    // used only to make edge samples well-defined; a fixed
-                    // two-pixel scalar blend keeps an interior sentinel from
-                    // becoming a hard rectangular RGB patch.
+                    // used only to make edge samples well-defined; the
+                    // resolution-scaled scalar blend keeps an interior
+                    // sentinel from becoming a hard rectangular RGB patch.
                     float alpha = 1.0F;
                     if (seam_feather >= 2) {
                         const int visible_x = x - ownership_left;
@@ -18741,8 +18765,8 @@ int fractal_atlas_field_ex(
             ? (output_height - visible_child_height) / 2
             : 0;
         const int seam_feather = use_child && !full_child
-            ? std::min(feather, std::min(visible_child_width / 8,
-                                          visible_child_height / 8))
+            ? std::min(feather, std::min(visible_child_width / 2,
+                                          visible_child_height / 2))
             : 0;
 
         BilinearWorkspace& workspace = bilinear_workspace;

@@ -102,6 +102,74 @@ else:
 VISUALIZER = RESOURCE_ROOT / "visualizer.py"
 
 
+def _native_build_target() -> Path:
+    """Return the source-tree native library produced on this platform."""
+
+    return RESOURCE_ROOT / ("mandelbrot.dll" if os.name == "nt" else "mandelbrot.so")
+
+
+def _source_native_build_required() -> bool:
+    """Tell whether a source GUI launch needs a native rebuild.
+
+    A stale shared library is particularly dangerous here: it can still load
+    successfully while containing an older atlas kernel.  Frozen releases
+    already carry their native library, and an explicitly configured library
+    belongs to the caller, so both cases are left alone.
+    """
+
+    if getattr(sys, "frozen", False) or os.environ.get("MANDELBROT_LIBRARY"):
+        return False
+    source_paths = (
+        RESOURCE_ROOT / "renderer.cpp",
+        RESOURCE_ROOT / "renderer.h",
+        RESOURCE_ROOT / "opencl" / "mandelbrot.cl",
+    )
+    if not all(path.is_file() for path in source_paths):
+        return False
+    target = _native_build_target()
+    try:
+        target_mtime = target.stat().st_mtime_ns
+    except OSError:
+        return True
+    try:
+        return any(path.stat().st_mtime_ns > target_mtime for path in source_paths)
+    except OSError:
+        return True
+
+
+def _ensure_source_native_build() -> str:
+    """Build the source-tree native renderer when it is missing or stale."""
+
+    if not _source_native_build_required():
+        return ""
+    target = _native_build_target()
+    try:
+        result = subprocess.run(
+            ["make", "-B", target.name],
+            cwd=RESOURCE_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        raise RuntimeError(
+            f"could not rebuild {target.name} automatically; run `make -B` "
+            "inside nix-shell first: " + str(error)
+        ) from error
+    output = result.stdout or ""
+    if result.returncode != 0 or not target.is_file():
+        details = output[-8_000:].strip()
+        message = (
+            f"could not rebuild {target.name} automatically; run `make -B` "
+            "inside nix-shell first"
+        )
+        if details:
+            message += f"\n\n{details}"
+        raise RuntimeError(message)
+    return output
+
+
 def _renderer_command(arguments: list[str]) -> list[str]:
     """Build the renderer command for source and frozen GUI launches."""
 
@@ -898,7 +966,7 @@ if Gtk is not None:
             try:
                 profile = visualizer._kfp_profile_for_selection(name, palette_file)
                 if profile is not None:
-                    lut = visualizer._kfp_palette_lut(profile, 128)
+                    lut = visualizer._kfp_palette_lut(profile, 1024)
                     return tuple(tuple(int(channel) for channel in row) for row in lut)
                 if palette_file is not None:
                     palette = visualizer._palette_from_file(palette_file, 128)
@@ -1183,6 +1251,14 @@ if Gtk is not None:
                 return
             try:
                 command = self._command(estimate=estimate)
+                native_build_output = ""
+                if self._combo_text(self.renderer) != "python":
+                    native_build_output = _ensure_source_native_build()
+                if native_build_output:
+                    self._append(
+                        "Native renderer was missing or stale; rebuilt it before launch.\n"
+                        + native_build_output
+                    )
                 self._process_exit_code = None
                 self.process = subprocess.Popen(
                     command,
@@ -1193,7 +1269,7 @@ if Gtk is not None:
                     bufsize=1,
                     **self._process_options(),
                 )
-            except (OSError, ValueError) as error:
+            except (OSError, ValueError, RuntimeError) as error:
                 self._show_error("Could not start renderer", str(error))
                 return
             self._set_progress(None, "Estimating…" if estimate else "Starting…")

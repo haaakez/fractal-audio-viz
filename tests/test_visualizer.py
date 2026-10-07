@@ -1227,13 +1227,13 @@ class AnimationTests(unittest.TestCase):
         )
         self.assertEqual(profile.stops, (
             (255, 255, 255),
-            (128, 0, 64),
-            (160, 0, 0),
-            (192, 128, 0),
-            (64, 128, 0),
-            (0, 255, 255),
-            (64, 128, 255),
-            (0, 0, 255),
+            (64, 0, 128),
+            (0, 0, 160),
+            (0, 128, 192),
+            (0, 128, 64),
+            (255, 255, 0),
+            (255, 128, 64),
+            (255, 0, 0),
         ))
         self.assertEqual(
             (profile.iter_div, profile.color_method, profile.differences),
@@ -1279,7 +1279,7 @@ class AnimationTests(unittest.TestCase):
             self.assertEqual(extended_profile.color_method, 11)
             self.assertTrue(extended_profile.flat)
             self.assertTrue(extended_profile.inverse_transition)
-            self.assertEqual(extended_profile.interior_color, (1, 2, 3))
+            self.assertEqual(extended_profile.interior_color, (3, 2, 1))
 
             asymmetric = Path(directory) / "asymmetric.kfp"
             asymmetric.write_text(
@@ -1292,8 +1292,8 @@ class AnimationTests(unittest.TestCase):
             )
             self.assertIsNotNone(asymmetric_profile)
             assert asymmetric_profile is not None
-            self.assertEqual(asymmetric_profile.stops, ((10, 20, 30), (40, 50, 60)))
-            self.assertEqual(asymmetric_profile.interior_color, (1, 2, 3))
+            self.assertEqual(asymmetric_profile.stops, ((30, 20, 10), (60, 50, 40)))
+            self.assertEqual(asymmetric_profile.interior_color, (3, 2, 1))
             self.assertEqual(asymmetric_profile.differences, 0)
             np.testing.assert_array_equal(
                 visualizer._palette_from_file(asymmetric, 17),
@@ -1357,6 +1357,30 @@ class AnimationTests(unittest.TestCase):
         lut = visualizer._kfp_palette_lut(profile, 16)
         self.assertEqual(tuple(lut[0]), (0, 0, 0))
         self.assertLess(int(lut[-1, 0]), 255)
+
+    def test_kfp_file_triplets_match_kalles_display_order(self):
+        profile = visualizer._parse_kfp_profile(
+            "Colors: 0,0,0, 194,99,48, 255,207,96, 252,75,172, "
+            "255,191,238, 255,255,255, 235,235,50, 250,61,5, "
+            "0,0,0, 20,20,205, 5,194,250, 255,255,255\n",
+            Path("rb12.kfp"),
+        )
+        self.assertEqual(profile.stops[:6], (
+            (0, 0, 0),
+            (48, 99, 194),
+            (96, 207, 255),
+            (172, 75, 252),
+            (238, 191, 255),
+            (255, 255, 255),
+        ))
+        self.assertEqual(profile.stops[6:], (
+            (50, 235, 235),
+            (5, 61, 250),
+            (0, 0, 0),
+            (205, 20, 20),
+            (250, 194, 5),
+            (255, 255, 255),
+        ))
 
     def test_kfp_palette_lut_matches_kalles_sine_interpolation(self):
         profile = visualizer.KfpPalette(
@@ -2092,6 +2116,30 @@ class AnimationTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(composed, source)
 
+    def test_native_opencl_rgb_atlas_writes_every_output_row(self):
+        library = visualizer._get_native_library()
+        if library is None or not hasattr(
+            library, "fractal_atlas_composite_rgb_opencl"
+        ):
+            raise unittest.SkipTest("native OpenCL RGB atlas compositor is unavailable")
+        source = np.full((10, 16, 3), (17, 83, 211), dtype=np.uint8)
+        composed = visualizer._atlas_composite_rgb_native(
+            source,
+            None,
+            source.shape[1],
+            source.shape[0],
+            1.0,
+            0.0,
+            1.0,
+            0,
+            library,
+            2,
+            use_opencl=True,
+        )
+        # The OpenCL atlas kernel is launched as a one-dimensional pixel
+        # list. A regression to get_global_id(1) would fill only row zero.
+        np.testing.assert_array_equal(composed, source)
+
     def test_native_rgb_atlas_crops_overscan_child_during_transition(self):
         library = visualizer._get_native_library()
         if library is None or not hasattr(library, "fractal_atlas_composite_rgb"):
@@ -2212,7 +2260,7 @@ class AnimationTests(unittest.TestCase):
             )
         np.testing.assert_array_equal(actual, expected)
 
-    def test_static_kfp_atlas_is_available_for_lossless_and_upscaled_modes(self):
+    def test_static_kfp_atlas_is_reserved_for_upscaled_mode(self):
         library = visualizer._get_native_library()
         if library is None or not all(
             hasattr(library, name)
@@ -2224,7 +2272,7 @@ class AnimationTests(unittest.TestCase):
         ):
             raise unittest.SkipTest("native static KFP atlas path is unavailable")
         profile = visualizer.KALLES_DEFAULT_KFP
-        self.assertTrue(
+        self.assertFalse(
             visualizer._use_static_kfp_atlas(
                 "lossless-compressed", profile, library, "bilinear"
             )
@@ -4218,12 +4266,23 @@ class AnimationTests(unittest.TestCase):
                 0.5,
                 selected_file,
             )
-            # The child starts at y=16 and the shared two-pixel feather ends
-            # at y=20. The first two rows must retain parent colour; only the
-            # fully-owned child interior is allowed to be the interior colour.
+            # The child starts at y=16. KFP uses a resolution-scaled feather
+            # because its relief stencil amplifies a narrow atlas seam; the
+            # ordinary palette path keeps its two-pixel boundary.
+            feather = visualizer._atlas_feather(
+                32,
+                32,
+                kfp=selected_file is not None,
+            )
             self.assertNotEqual(tuple(result[16, 32]), (0, 0, 0))
-            self.assertNotEqual(tuple(result[17, 32]), (0, 0, 0))
-            self.assertEqual(tuple(result[20, 32]), (0, 0, 0))
+            if feather > 1:
+                self.assertNotEqual(tuple(result[16 + feather - 1, 32]), (0, 0, 0))
+            # The native RGB stencil can carry the transition a little beyond
+            # the scalar feather on this deliberately tiny fixture. It must
+            # settle by the first fully-owned child row, rather than leaving
+            # a rectangular boundary behind.
+            settled_y = 16 + max(feather, 4)
+            self.assertEqual(tuple(result[settled_y, 32]), (0, 0, 0))
 
     def test_custom_palettes_are_cached_and_finite(self):
         field = np.linspace(0.0, 100.0, 64 * 64, dtype=np.float32).reshape(64, 64)

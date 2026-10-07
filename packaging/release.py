@@ -34,8 +34,6 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_FILES = (
     "README.md",
     "LICENSE",
-    "CONTRIBUTING.md",
-    "IMPROVEMENT_PLAN.md",
     "Makefile",
     "pyproject.toml",
     "requirements.txt",

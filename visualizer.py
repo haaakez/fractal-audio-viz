@@ -234,19 +234,19 @@ PALETTE_CHOICES = (
     "terminal",
     "kalles-default",
 )
-# Kalles stores and reads the palette channels as COLOR14 r,g,b values.  The
-# Windows bitmap is bottom-up, but that affects row order only; it does not
-# reverse the colour channels.  Keep these stops in the same RGB order used by
-# the file parser, native renderer, and portable fallback.
+# Kalles stores the key triplets in COLOR14 r,g,b order, but its Windows DIB
+# preview/export path presents those bytes as BGR.  The rest of this project
+# works in display RGB, so KFP imports must apply that conversion once.  Keep
+# ordinary palette files and programmatic KfpPalette values in normal RGB.
 KALLES_DEFAULT_PALETTE_STOPS = (
     (255, 255, 255),
-    (128, 0, 64),
-    (160, 0, 0),
-    (192, 128, 0),
-    (64, 128, 0),
-    (0, 255, 255),
-    (64, 128, 255),
-    (0, 0, 255),
+    (64, 0, 128),
+    (0, 0, 160),
+    (0, 128, 192),
+    (0, 128, 64),
+    (255, 255, 0),
+    (255, 128, 64),
+    (255, 0, 0),
 )
 # Kalles' smooth escape convention uses a radius of 10000.  Keep the value
 # explicit at the scalar-render boundary: ordinary palettes retain the
@@ -648,6 +648,13 @@ ATLAS_NEAR_FULL_CHILD_FRACTION = 0.98
 # passing their overscanned fields to the old fast compositor was the source of
 # the visible centred replacement rectangle in older builds.
 ATLAS_TILE_OVERSCAN_FACTOR = 1.2
+# KFP's one-sided relief stencil magnifies even a small parent/child
+# derivative mismatch. Blend a modest, resolution-scaled band of scalar
+# samples at the atlas handoff so 3D KFP does not outline the child rectangle.
+# The cap keeps the transition local at 1080p and above; the lower bound keeps
+# small live-view surfaces from falling back to the old two-pixel seam.
+ATLAS_KFP_SEAM_FEATHER_MAX = 64
+ATLAS_KFP_SEAM_FEATHER_DIVISOR = 2
 # KFP's relief transfer needs enough pixels to preserve its fine gradients,
 # but colouring an 8K atlas tile for every level is needlessly expensive.  A
 # 4K is the current dense working-surface ceiling for imported KFP profiles.
@@ -1412,6 +1419,55 @@ def _native_library_candidates() -> list[Path]:
     return candidates
 
 
+def _native_library_stale_reason(candidate: Path) -> Optional[str]:
+    """Return a useful error when a source-tree native library is stale.
+
+    Development launches intentionally load the shared library beside this
+    module.  That also makes it easy to accidentally render with yesterday's
+    OpenCL kernel after changing ``renderer.cpp``: the ABI still matches, so
+    ctypes accepts the library and the visual failure only appears in the
+    output.  Packaged builds do not contain these source files, so this check
+    is limited to a source tree and never rejects a portable release.
+    """
+
+    try:
+        candidate = candidate.resolve()
+        source_root = Path(__file__).resolve().parent
+        if candidate.parent != source_root:
+            return None
+        source_paths = tuple(
+            source_root / name
+            for name in ("renderer.cpp", "renderer.h", "opencl/mandelbrot.cl")
+        )
+        if not all(path.is_file() for path in source_paths):
+            return None
+        library_mtime = candidate.stat().st_mtime_ns
+        newer = [
+            path.name
+            for path in source_paths
+            if path.stat().st_mtime_ns > library_mtime
+        ]
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not newer:
+        return None
+    names = ", ".join(newer)
+    return (
+        f"native library {candidate.name} is older than {names}; "
+        "rebuild it with `make -B` inside `nix-shell`"
+    )
+
+
+def _native_library_unavailable_message(default: str) -> str:
+    """Explain a source-tree stale-library failure instead of hiding it."""
+
+    for candidate in _native_library_candidates():
+        reason = _native_library_stale_reason(candidate)
+        if reason is not None:
+            return reason
+    return default
+
+
 def _bundled_external_tool(name: str) -> Optional[str]:
     """Return a bundled media tool beside a frozen app, when present."""
 
@@ -1470,6 +1526,12 @@ def _get_native_library() -> Any:
         for candidate in candidates:
             try:
                 if not candidate.is_file():
+                    continue
+                # A stale source-tree library can expose the complete ABI and
+                # still contain an old OpenCL kernel (for example, one that
+                # writes only the first output row).  Do not silently accept
+                # it as a valid native renderer.
+                if _native_library_stale_reason(candidate) is not None:
                     continue
                 if os.name == "nt" and hasattr(os, "add_dll_directory"):
                     # Python 3.8+ intentionally tightened DLL search rules.
@@ -2768,7 +2830,11 @@ def render_exponential_field(
     y_center = _validate_center_text(y_center, "imaginary")
     library = _get_native_library()
     if library is None or not hasattr(library, "fractal_render_points"):
-        raise RuntimeError("native point renderer is unavailable; run `make`")
+        raise RuntimeError(
+            _native_library_unavailable_message(
+                "native point renderer is unavailable; run `make`"
+            )
+        )
     if native_reference is None:
         # The reference viewport radius is 2.8 / zoom.  Choose it from the
         # largest radius in the map so every point stays inside the BLA/series
@@ -6074,7 +6140,11 @@ def _render_native(
     formula = _formula_name(formula)
     library = _get_native_library()
     if library is None:
-        raise RuntimeError("native renderer is unavailable; run `make` inside `nix-shell`")
+        raise RuntimeError(
+            _native_library_unavailable_message(
+                "native renderer is unavailable; run `make` inside `nix-shell`"
+            )
+        )
 
     output = np.empty((height, width), dtype=np.float32)
     zoom_text = _zoom_text(log10_zoom)
@@ -6223,7 +6293,11 @@ def _create_native_reference(
         raise ValueError("escape radius mode must be classic (0) or Kalles high (1)")
     library = _get_native_library()
     if library is None:
-        raise RuntimeError("native renderer is unavailable; run `make` inside `nix-shell`")
+        raise RuntimeError(
+            _native_library_unavailable_message(
+                "native renderer is unavailable; run `make` inside `nix-shell`"
+            )
+        )
     precision_bits = _native_precision_bits(x_center, y_center, log10_zoom)
     reference_options = NativeRenderOptions(
         escape_radius_mode=escape_radius_mode,
@@ -6469,7 +6543,9 @@ def _render_native_reference(
     np = _require_numpy()
     library = _get_native_library()
     if library is None:
-        raise RuntimeError("native renderer is unavailable")
+        raise RuntimeError(
+            _native_library_unavailable_message("native renderer is unavailable")
+        )
 
     output = np.empty((height, width), dtype=np.float32)
     zoom_text = _zoom_text(log10_zoom)
@@ -10037,12 +10113,24 @@ def _atlas_colourise_native(
 def _atlas_feather(width: int, height: int, *, kfp: bool = False) -> int:
     """Return the shared scalar/RGB atlas seam width."""
 
-    # The source tile is already sampled in the output coordinate system. A
-    # wide blend here does not hide a seam; it smears the Kalles finite-
-    # difference stencil over a visible rectangle and makes deep zooms look
-    # soft. Two pixels are enough for the one-pixel neighbour halo. KFP uses
-    # the same narrow boundary so a cap cannot turn into a large rectangle.
-    return min(2, max(0, int(width) // 2), max(0, int(height) // 2))
+    width = max(0, int(width))
+    height = max(0, int(height))
+    if not kfp:
+        return min(2, width // 2, height // 2)
+    minimum = min(width, height)
+    if minimum <= 0:
+        return 0
+    requested = max(
+        2,
+        min(ATLAS_KFP_SEAM_FEATHER_MAX, minimum // ATLAS_KFP_SEAM_FEATHER_DIVISOR),
+    )
+    # Keep at least one fully-owned child sample in the middle of an even
+    # rectangle.  ``minimum // 2`` is one pixel too wide for e.g. a 32x32
+    # child: its maximum edge distance is 15, so a feather of 16 would blend
+    # the entire child forever and turn an interior sentinel into a palette
+    # colour.  Large production surfaces are unchanged by this clamp.
+    plateau_limit = max(0, (minimum - 1) // 2)
+    return min(requested, plateau_limit)
 
 
 def _use_static_kfp_atlas(
@@ -10064,7 +10152,14 @@ def _use_static_kfp_atlas(
     # bilinear/native crop as the existing fast path.
     resample = _atlas_resample_mode(resample)
     return (
-        source_mode in {"lossless-compressed", "upscaled"}
+        # A cached RGB tile has already gone through Kalles' spatial stencil.
+        # Reusing two independently colourised tiles at a quality/lossless
+        # atlas handoff gives the child a different pixel spacing and exposes
+        # the exact rectangle seen in KFP exports.  Keep this shortcut only
+        # for the deliberately low-resolution upscaled path; quality output
+        # must reproject the scalar atlas and colourise one screen-space
+        # surface.
+        source_mode == "upscaled"
         and profile is not None
         and not _kfp_has_texture(profile)
         and native_library is not None
@@ -10410,7 +10505,7 @@ def _colourise_kfp_atlas_planes(
     top = (output_height - child_height) // 2
     right = left + child_width
     bottom = top + child_height
-    # Use the same narrow seam policy as the scalar atlas path. The scalar
+    # Use the same KFP seam policy as the scalar atlas path. The scalar
     # surface and continuous planes share one smoothstep, while categorical
     # iteration counters use child ownership at the same boundary.
     feather = _atlas_feather(child_width, child_height, kfp=True)
@@ -10547,6 +10642,13 @@ def _atlas_colour_frame(
     centered_kfp = kfp_profile is not None and float(kfp_field_bias) > 0.0
     effective_iter = max(int(parent_iter), int(child_iter or parent_iter))
     target_kfp_bias = float(effective_iter) if centered_kfp else 0.0
+    partial_kfp_relief_transition = (
+        kfp_profile is not None
+        and bool(kfp_profile.slopes)
+        and child is not None
+        and child_iter is not None
+        and 0.0 < float(child_fraction) < 0.999999
+    )
     if (
         child is not None
         and child_iter is not None
@@ -10600,6 +10702,7 @@ def _atlas_colour_frame(
             or child_iter is None
             or child_planes is not None
         )
+        and not partial_kfp_relief_transition
     ):
         # Do not let a scalar atlas fast path discard the raw orbit data. A
         # shallow direct tile can carry Kalles' complete SetColor inputs all
@@ -10690,13 +10793,19 @@ def _atlas_colour_frame(
         and native_library is not None
         and hasattr(native_library, "fractal_atlas_field_ex")
         and resample == "bilinear"
+        and (
+            (parent_planes is None and child_planes is None)
+            or partial_kfp_relief_transition
+        )
     ):
         # The OpenCL KFP colourizer still needs one continuous screen-space
         # scalar field. Keep the complete parent/child crop, deep-tile
-        # overscan, source bias conversion, and narrow seam in the native
-        # compositor; the former fallback did two Pillow resizes plus a
-        # NumPy blend for every frame, which made deep KFP exports spend
-        # minutes on otherwise trivial atlas updates.
+        # overscan, source bias conversion, and resolution-scaled seam in the
+        # native compositor. During a partial relief transition, deliberately
+        # do not merge the child orbit planes: categorical orbit/iteration
+        # ownership would otherwise jump at the child rectangle and the
+        # screen-space slope stencil would reproduce that rectangle even
+        # though the scalar field itself is smoothly feathered.
         child_width = max(1, int(round(output_width * float(child_fraction))))
         child_height = max(1, int(round(output_height * float(child_fraction))))
         composed_field = _atlas_field_native(
@@ -11025,9 +11134,8 @@ def _atlas_colour_frame(
     right = left + child_width
     bottom = top + child_height
     if kfp_profile is not None:
-        # Keep KFP's seam narrow. The child owns the interior, while the
-        # two-pixel boundary prevents its screen-space stencil from outlining
-        # a square when the child contains an interior sentinel.
+        # The child owns the interior. KFP uses a resolution-scaled boundary
+        # so its screen-space stencil cannot outline the atlas rectangle.
         feather = _atlas_feather(child_width, child_height, kfp=True)
         if (
             native_library is not None
@@ -13014,6 +13122,18 @@ def _parse_palette_colour(value: str) -> tuple[int, int, int]:
     return channels  # type: ignore[return-value]
 
 
+def _kalles_display_rgb(colour: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Convert one serialized Kalles colour to the displayed RGB order.
+
+    Kalles' ``COLOR14`` fields are serialized as ``r,g,b`` but the 24-bit
+    Windows bitmap/preview path exposes the bytes as ``b,g,r``.  KFP colours
+    enter our pipeline as final display RGB, so do this at the file boundary
+    instead of making every renderer carry a Kalles-specific channel swap.
+    """
+
+    return (int(colour[2]), int(colour[1]), int(colour[0]))
+
+
 def _parse_kfp_integer_values(value: str, path: Path) -> list[int]:
     """Parse one comma-separated KFP ``Colors`` fragment."""
 
@@ -13070,13 +13190,10 @@ def _parse_kfp_stops(palette_text: str, path: Path) -> list[tuple[int, int, int]
         )
     stops = []
     for index in range(0, len(values), 3):
-        # Parameter.cpp writes m_cKeys as r,g,b and SetColor reads the same
-        # values directly.  The Windows DIB is bottom-up, but that affects
-        # image rows, not the serialized palette channel order.
-        channels = tuple(values[index:index + 3])
-        if not all(0 <= channel <= 255 for channel in channels):
+        serialized = tuple(values[index:index + 3])
+        if not all(0 <= channel <= 255 for channel in serialized):
             raise ValueError(f"KFP RGB values must be between 0 and 255: {path}")
-        stops.append(channels)  # type: ignore[arg-type]
+        stops.append(_kalles_display_rgb(serialized))
     return stops
 
 
@@ -13235,8 +13352,7 @@ def _parse_kfp_profile(palette_text: str, path: Path) -> KfpPalette:
     interior_text = fields.get("interiorcolor", "0,0,0").rstrip(" ,;")
     try:
         raw_interior_color = _parse_palette_colour(interior_text)
-        # Kalles' Parameter.cpp also stores InteriorColor in RGB order.
-        interior_color = raw_interior_color
+        interior_color = _kalles_display_rgb(raw_interior_color)
     except ValueError as error:
         raise ValueError(f"invalid KFP InteriorColor field: {path}") from error
     raw_color_offset = _parse_kfp_int(
@@ -15347,7 +15463,7 @@ def _atlas_colourise_kfp_native(
     child_height, child_width = child_array.shape
     # The native raw atlas path owns the stencil halo explicitly. This
     # compatibility compositor must not grow the child rectangle itself; the
-    # caller's narrow seam width is still passed through for compatibility.
+    # caller's seam width is still passed through for compatibility.
     feather = 0
     output = np.empty((int(output_height), int(output_width), 3), dtype=np.uint8)
     lut = np.ascontiguousarray(_kfp_palette_lut(profile), dtype=np.uint8)
@@ -16029,6 +16145,8 @@ def _keyframe_field(
     planes = None
     if return_planes:
         field, planes = rendered
+    else:
+        field = rendered
     field = _validated_field(field, (render_height, render_width), "keyframe")
     if cache_path is not None and not return_planes:
         _atomic_save_field(cache_path, field, durable=durable_cache)
@@ -16670,7 +16788,11 @@ def render_video(
                     f"native backend {native_backend} was requested, but the native library is unavailable"
                 )
             if renderer == "native":
-                raise RuntimeError("native renderer is unavailable; run `make` inside `nix-shell`")
+                raise RuntimeError(
+                    _native_library_unavailable_message(
+                        "native renderer is unavailable; run `make` inside `nix-shell`"
+                    )
+                )
             active_renderer = "python"
         else:
             native_backend_id = _native_backend_for_workload(
